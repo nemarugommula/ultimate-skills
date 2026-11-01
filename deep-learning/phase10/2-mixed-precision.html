@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10.2 Mixed precision: fp32, fp16, bf16, fp8 · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .bits { display: flex; flex-wrap: wrap; gap: 2px; margin: 6px 0; font-family: var(--mono); font-size: .8rem; }
+  .bits span { width: 18px; text-align: center; border-radius: 4px; padding: 2px 0; color: #fff; }
+  .bits .bs { background: var(--c-gr); } .bits .be { background: var(--c-w); } .bits .bm { background: var(--c-x); }
+  .bits .gap { width: 6px; background: none; }
+  canvas.rng { width: 100%; height: 214px; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  canvas.hist { width: 100%; height: 210px; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  table.fmt td, table.fmt th { font-size: .9rem; }
+  input.num { font: inherit; font-family: var(--mono); padding: 4px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); width: 150px; }
+  .st-ok { color: var(--good); font-weight: 700; } .st-bad { color: var(--c-dead); font-weight: 700; } .st-mid { color: var(--c-at); font-weight: 700; }
+</style>
+</head>
+<body data-lesson="d10-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 10 · Lesson 2</div>
+  <h1>Mixed precision: fp32, fp16, bf16, fp8</h1>
+  <p class="subtitle">Store numbers in 16 or 8 bits instead of 32 and training gets about twice as fast per halving, with half the memory. The catch: some numbers fall off the edge. Learn exactly which ones, and the three tricks that catch them.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Big matmuls are compute-bound, most other ops are memory-bound; fewer bytes per number helps both (Lesson 10.1).</li>
+      <li><span class="gr">Gradients</span> are often tiny numbers, and Adam keeps two extra numbers per <span class="w">weight</span> (Lesson 1.5).</li>
+      <li>Computers store real numbers as floating point: a sign, an exponent and a few significant digits (<a href="../../math-course/phase8/5-numerics.html">math 8.5</a>).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2017, researchers at Baidu and NVIDIA tried to train the SSD object detector with 16-bit numbers. It <b>diverged</b>. Same model, same data, fine in 32-bit.</p>
+    <p>The fix was almost comically small: <b>multiply the loss by 8</b> before backprop, and divide the gradients by 8 afterwards. With that one change, 16-bit training matched 32-bit accuracy (Micikevicius et al., “Mixed Precision Training”).</p>
+    <p>Today every large model is trained this way or with its descendant, bf16, and the frontier is pushing to 8 bits: DeepSeek-V3 (2024) reported training at scale with an fp8 framework. <b>Why would multiplying by 8 save a network, and why did the industry then pick a format where it isn't needed at all?</b></p>
+  </div>
+
+  <h2>Numbers first: what a float actually stores</h2>
+  <p>A floating-point number is scientific notation in binary: <b>sign</b> × 1.<b>mantissa</b> × 2<sup><b>exponent</b></sup>. The exponent bits decide the <b>range</b> (how big and how small). The mantissa bits decide the <b>precision</b> (how many significant digits). Every format is a different split of the same budget:</p>
+  <table class="fmt">
+    <tr><th>Format</th><th>Bits: sign · exponent · mantissa</th><th>Largest</th><th>Smallest above 0</th><th>Step after 1.0 (precision)</th><th>Bytes</th></tr>
+    <tr><td><b>fp32</b></td><td>1 · <span class="w">8</span> · <span class="x">23</span></td><td>3.4 × 10³⁸</td><td>1.4 × 10⁻⁴⁵</td><td>1.2 × 10⁻⁷ (~7 digits)</td><td>4</td></tr>
+    <tr><td><b>fp16</b></td><td>1 · <span class="w">5</span> · <span class="x">10</span></td><td class="dead">65,504</td><td class="dead">6.0 × 10⁻⁸</td><td>9.8 × 10⁻⁴ (~3 digits)</td><td>2</td></tr>
+    <tr><td><b>bf16</b></td><td>1 · <span class="w">8</span> · <span class="x">7</span></td><td>3.4 × 10³⁸</td><td>9.2 × 10⁻⁴¹</td><td class="dead">7.8 × 10⁻³ (~2 digits)</td><td>2</td></tr>
+    <tr><td><b>fp8 E4M3</b></td><td>1 · <span class="w">4</span> · <span class="x">3</span></td><td>448</td><td>0.002</td><td>0.125</td><td>1</td></tr>
+    <tr><td><b>fp8 E5M2</b></td><td>1 · <span class="w">5</span> · <span class="x">2</span></td><td>57,344</td><td>1.5 × 10⁻⁵</td><td>0.25</td><td>1</td></tr>
+  </table>
+  <p>Read the two 16-bit rows side by side. <b>fp16</b> spends its bits on precision and has a tiny range: anything under about 6 × 10⁻⁸ becomes exactly 0, anything over 65,504 becomes infinity. <b>bf16</b> (“brain float”, from Google Brain) keeps fp32's 8 exponent bits, so it has fp32's whole range, and pays with precision: only about 2 to 3 significant digits.</p>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a ruler with a fixed number of marks</span>
+    <p>You get the same number of tick marks either way. fp16 packs them close together on a short ruler: precise, but a tiny gradient falls off the left end and a huge activation off the right. bf16 spreads the same marks over a ruler as long as fp32's: nothing falls off, but each measurement is rounded more coarsely. Deep learning turns out to forgive coarse marks far more than it forgives falling off the ruler.</p>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> type <code>1e-8</code>, a perfectly ordinary gradient value. Which formats keep it, and which turn it into 0?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Float-format explorer</span>
+    <p class="hint">Type any number (or click a preset). Each row shows what that format actually stores, the relative error, and what went wrong. The bit strip shows the chosen format's sign (pink), exponent (orange) and mantissa (blue) bits. These are exact IEEE-style round-to-nearest-even results; they match PyTorch's own casts.</p>
+    <div class="goals"><span class="goal" id="gUnder">🎯 A gradient fp16 flushes to 0 but bf16 keeps</span><span class="goal" id="gOver">🎯 A value that overflows fp16 but not bf16</span><span class="goal" id="gPrec">🎯 A number fp16 stores 10× more accurately than bf16</span></div>
+    <div class="controls">
+      <label>number <input class="num" id="xIn" value="0.1"></label>
+      <span class="seg" id="pre"><button data-v="0.1">0.1</button><button data-v="1.001">1.001</button><button data-v="1e-8">1e-8</button><button data-v="3e-5">3e-5</button><button data-v="65504">65504</button><button data-v="70000">70000</button><button data-v="500">500</button></span>
+    </div>
+    <table class="fmt" id="fTab"></table>
+    <div class="controls"><span class="seg" id="bitSeg"><button data-v="fp32">fp32 bits</button><button data-v="fp16" class="on">fp16 bits</button><button data-v="bf16">bf16 bits</button><button data-v="e4m3">E4M3 bits</button><button data-v="e5m2">E5M2 bits</button></span></div>
+    <div class="bits" id="bitBox"></div>
+    <canvas class="rng" id="rngCan"></canvas>
+    <p class="hint" id="xMsg"></p>
+  </div>
+  <p><b>What you should see:</b> <code>1e-8</code> survives in fp32 and bf16 (bf16 stores 1.0012 × 10⁻⁸, off by 0.1%) and becomes <span class="dead">exactly 0</span> in fp16 and both fp8 formats: it's below half of fp16's smallest step. <code>70000</code> is <span class="dead">infinity</span> in fp16, while bf16 rounds it to 70,144. <code>1.001</code> is the opposite story: fp16 stores 1.00098 (0.002% off), bf16 can only say 1.0 (0.1% off). Range vs precision, live.</p>
+
+  <h2>The first leak: tiny gradients become zero</h2>
+  <p>Gradients are much smaller than weights or activations. The 2017 paper plotted the activation gradients of the SSD detector and found that many sat <b>below 2⁻²⁴ ≈ 6 × 10⁻⁸</b>, fp16's floor: they would all become exactly 0. Their key observation: values below 2⁻²⁷ didn't matter for training, but values between 2⁻²⁷ and 2⁻²⁴ did, and fp16 was throwing them away.</p>
+  <p>The fix uses the chain rule: if you multiply the loss by a constant S, every gradient in the network is multiplied by S too. So <b>scale the loss up</b> before <code>backward()</code>, which lifts the gradients onto fp16's ruler, then <b>divide by S</b> in fp32 before the optimizer step. This is <b>loss scaling</b>.</p>
+
+  <p class="predict">🔮 <b>Predict:</b> the histogram below is 4,000 gradient values, spread like real ones. At scale 1 in fp16, roughly what share is lost? How big a scale do you need before none are lost, and what happens if you overdo it?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Loss scaling: lift the gradients onto the ruler</span>
+    <p class="hint">x-axis: log₂ of each gradient's size <i>after</i> scaling. Blue = stored fine, coral = flushed to 0, red = overflowed to infinity. The shaded band is what fp16 can hold. Drag the scale, or let a GradScaler-style loop find it (it doubles the scale after a run of good steps and halves it, skipping the step, whenever it sees infinity).</p>
+    <div class="goals"><span class="goal" id="gSafe">🎯 fp16: zero lost, zero overflow</span><span class="goal" id="gBoom">🎯 Overflow it and skip a step</span><span class="goal" id="gAuto">🎯 Let the scaler find the edge</span></div>
+    <div class="controls">
+      <span class="seg" id="hFmt"><button data-v="fp16" class="on">fp16</button><button data-v="bf16">bf16</button></span>
+      <label>loss scale S = 2^<input type="range" id="kS" min="0" max="30" step="1" value="0"> <b class="mono" id="kV"></b></label>
+      <button class="btn" id="auto">▶ Run a dynamic scaler for 40 steps</button>
+    </div>
+    <canvas class="hist" id="hCan"></canvas>
+    <div class="stat-row">
+      <div class="stat">lost to zero <b id="hZ" class="dead">–</b></div>
+      <div class="stat">overflowed <b id="hInf" class="dead">–</b></div>
+      <div class="stat">mean rounding error of the rest <b id="hErr">–</b></div>
+      <div class="stat">optimizer step <b id="hStep">–</b></div>
+    </div>
+    <canvas class="chart" id="sCan" style="height:150px"></canvas>
+    <p class="hint" id="hMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at S = 1, fp16 flushes about <b>9%</b> of these gradients to zero. S = 8 (the paper's factor) cuts that to 1.2%; from S = 2⁸ none are lost and the survivors' rounding error drops from 6% to 0.1%. Push past S = 2²² and the largest gradients overflow: one infinity poisons the update, so the step is skipped. The dynamic scaler climbs from PyTorch's default 2¹⁶ until it hits an overflow, halves, and then saw-tooths along the edge. Switch to <b>bf16</b>: nothing is lost at S = 1. That's the whole reason bf16 won.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Loss scaling</span></span>
+    <ol>
+      <li><b>The problem before</b> fp16's smallest positive number is 2⁻²⁴ ≈ 6 × 10⁻⁸. A meaningful chunk of real gradients is smaller, so in pure fp16 they become 0: in the paper's SSD run, training diverged.</li>
+      <li><b>What people tried</b> Staying in fp32 (2× the memory, much slower tensor-core-free math), or keeping only some layers in fp16.</li>
+      <li><b>Why this works</b> Backprop is linear in the loss: scale the loss by S and every gradient is scaled by S. A gradient of 10⁻⁸ times S = 1,024 is 10⁻⁵, comfortably on fp16's ruler. Divide by S in fp32 before updating, and the math is unchanged. The paper found S = 8 enough for SSD.</li>
+      <li><b>What it costs, when it fails</b> Pick S too big and large gradients overflow to infinity (65,504 is the ceiling), so the step must be skipped. The right S drifts during training. And it's one more thing to get wrong in custom training loops (gradient clipping must happen <i>after</i> unscaling).</li>
+      <li><b>What refined it</b> <b>Dynamic loss scaling</b>: start high (PyTorch: 65,536), halve and skip on overflow, double after 2,000 clean steps. That's <code>torch.amp.GradScaler("cuda")</code>. Then bf16, which doesn't need any of it.</li>
+    </ol>
+  </div>
+
+  <h2>The second leak: tiny updates vanish</h2>
+  <p>Even when the gradient survives, the <i>update</i> can vanish. fp16 has about 3 significant digits near 1.0: its next number after 1.0 is 1.000977. Add an update of 0.0001 to a weight of 1.0 and the true answer, 1.0001, rounds straight back to <b>1.0</b>. The paper notes this happens whenever the weight is about 2,048× bigger than its update. Thousands of steps, all lost.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: one update, three formats</span>
+    <table>
+      <tr><th></th><th>w = 1.0, add 0.0001</th><th>Why</th></tr>
+      <tr><td>fp32</td><td class="ev">1.0001</td><td>steps of 1.2 × 10⁻⁷ near 1.0: plenty</td></tr>
+      <tr><td>fp16</td><td class="dead">1.0</td><td>steps of 9.8 × 10⁻⁴; 0.0001 is less than half a step, so it rounds away</td></tr>
+      <tr><td>bf16</td><td class="dead">1.0</td><td>steps of 7.8 × 10⁻³: even worse</td></tr>
+    </table>
+    <p>We ran this in PyTorch: <code>torch.tensor(1.0).half() + 1e-4</code> gives <b>1.0</b>; in fp32 it gives 1.0001. Hence the second ingredient of mixed precision: keep an <b>fp32 master copy</b> of the weights for the update, and use 16-bit copies only for the forward and backward math.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">fp32 master weights (the “mixed” in mixed precision)</span></span>
+    <ol>
+      <li><b>The problem before</b> In pure 16-bit training, updates smaller than half a step of the weight round to nothing (1.0 + 0.0001 = 1.0 in fp16). The paper also found about 5% of weight gradients in one model had exponents below −24.</li>
+      <li><b>What people tried</b> Bigger learning rates (unstable), or giving up and training in fp32.</li>
+      <li><b>Why this works</b> The expensive part, the matmuls of forward and backward, runs in 16 bits on tensor cores. The cheap part, <span class="w">w</span> ← <span class="w">w</span> − <span class="lr">η</span>·<span class="gr">g</span>, runs in fp32, where 1.0 + 0.0001 is 1.0001. Each step, the 16-bit copy is refreshed from the master.</li>
+      <li><b>What it costs, when it fails</b> Memory: per parameter you now hold 2 bytes (16-bit weight) + 2 (16-bit gradient) + 4 (fp32 master) + 8 (Adam's two fp32 moments) = <b>16 bytes</b>. A 7B model needs 112 GB just for that, which is where Lesson 10.3 starts.</li>
+      <li><b>What refined it</b> Sharding the master weights and optimizer states across GPUs (ZeRO / FSDP, Lesson 10.3); 8-bit optimizer states; stochastic rounding, which lets some systems update low-precision weights directly.</li>
+    </ol>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">bf16 (brain floating point)</span></span>
+    <ol>
+      <li><b>The problem before</b> fp16's 5 exponent bits give it a range of only about 6 × 10⁻⁸ to 65,504. Gradients fall off the bottom and activations sometimes off the top, so fp16 needs loss scaling, skipped steps and care.</li>
+      <li><b>What people tried</b> Loss scaling (above) and per-layer exceptions that stay in fp32.</li>
+      <li><b>Why this works</b> bf16 is simply the top 16 bits of fp32: same sign, same 8 exponent bits, mantissa cut from 23 bits to 7. Same range as fp32, so 1e-8 and 70,000 both survive and no loss scaling is needed. Google's TPU team wrote that bf16 “works as well as the FP32 format” for the models they trained, and is close to a drop-in replacement. SGD is noisy anyway; 2–3 significant digits in the matmul inputs are enough, as long as accumulations happen in fp32 inside the tensor cores.</li>
+      <li><b>What it costs, when it fails</b> Less precision than fp16 (step 0.0078 near 1.0). Long sums in bf16 lose information, so reductions, softmax, norms and the loss are kept in fp32 (autocast does this for you). Hardware support arrived later: on NVIDIA from the A100 (2020); older GPUs like the V100 only have fp16 tensor cores.</li>
+      <li><b>What refined it</b> bf16 became the default training format for large models. Below it: fp8 for the matmuls (next), with bf16 or fp32 for everything else.</li>
+    </ol>
+  </div>
+
+  <h2>Going to 8 bits: fp8 and scaling factors</h2>
+  <p>With only 8 bits, you can't have both range and precision, so there are two fp8 formats (Micikevicius et al., 2022, a joint NVIDIA, Arm and Intel proposal): <b>E4M3</b> (more precision, max 448) and <b>E5M2</b> (more range, max 57,344). Their recommendation: E4M3 for weights and activations, E5M2 for gradients. On an H100, fp8 tensor-core math is 2× bf16 (1,979 vs 989 dense TFLOP/s).</p>
+  <p>Even E5M2's range is narrow, so fp8 always comes with <b>scaling factors</b>: before casting, divide a tensor by a scale chosen from its largest absolute value, so its values land in the format's sweet spot; multiply back after. The finer the groups that share one scale, the less an outlier hurts its neighbours:</p>
+  <table>
+    <tr><th>Scaling granularity</th><th>Who uses it</th><th>Idea</th></tr>
+    <tr><td>One scale per tensor</td><td>NVIDIA Transformer Engine on H100 (the scale is often inferred from a history of recent maximum values)</td><td>Simple; one huge outlier squashes everything else toward 0</td></tr>
+    <tr><td>Per tile or block</td><td>DeepSeek-V3: 1 × 128 tiles for activations, 128 × 128 blocks for weights, E4M3 everywhere</td><td>Outliers only affect their own block</td></tr>
+    <tr><td>Microscaling (MX) formats</td><td>OCP standard: MXFP8, MXFP6, MXFP4 with a shared power-of-two (E8M0) scale per block of 32</td><td>Block scaling built into hardware</td></tr>
+    <tr><td>NVFP4</td><td>NVIDIA Blackwell: 4-bit E2M1 values, an E4M3 scale per 16 values, plus one fp32 scale per tensor</td><td>Even smaller blocks for 4-bit</td></tr>
+  </table>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">fp8 training with scaling</span></span>
+    <ol>
+      <li><b>The problem before</b> Even in bf16, the biggest models cost tens of millions of GPU-hours, and the matmuls dominate. Halving the bits again doubles tensor-core throughput and halves memory traffic.</li>
+      <li><b>What people tried</b> Integer (int8) training, which is hard because gradients span many orders of magnitude; fp8 with no scaling, which flushes or saturates too many values.</li>
+      <li><b>Why this works</b> Two formats split the job: E4M3's precision for forward values, E5M2's range for gradients. A per-tensor or per-block scale slides each tensor into the format's window, just like loss scaling did for fp16, but automatically and everywhere. DeepSeek-V3 went further and used E4M3 for all tensors, relying on fine-grained (1 × 128 and 128 × 128) scaling to tame outliers.</li>
+      <li><b>What it costs, when it fails</b> More engineering: computing scales, keeping sensitive layers (embeddings, output head, norms, optimizer) in higher precision, and guarding against rare outliers that cause loss spikes. It only helps on hardware with fp8 tensor cores (H100 and later).</li>
+      <li><b>What refined it</b> MX block formats and NVFP4 put the block scales into the hardware, pushing toward 4-bit matmuls. The same scale-and-round idea is the heart of quantization for inference (Lesson 10.4).</li>
+    </ol>
+  </div>
+
+  <h2>What you get</h2>
+  <table>
+    <tr><th>Format for the matmuls</th><th>H100 dense tensor-core TFLOP/s</th><th>Bytes per number</th><th>Needs</th></tr>
+    <tr><td>fp32 (no tensor cores)</td><td>67</td><td>4</td><td>nothing</td></tr>
+    <tr><td>TF32 (fp32 in, 10-bit mantissa math)</td><td>494</td><td>4</td><td>one flag</td></tr>
+    <tr><td>bf16 / fp16</td><td>989</td><td>2</td><td>autocast (+ GradScaler for fp16)</td></tr>
+    <tr><td>fp8</td><td>1,979</td><td>1</td><td>scaling factors, e.g. Transformer Engine or torchao</td></tr>
+  </table>
+  <p class="muted">Dense numbers are half of NVIDIA's “with sparsity” datasheet figures. Real speed-ups are smaller than these ratios because not everything is a matmul.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>The standard recipe is <code>torch.autocast</code>: it runs matmuls and convolutions in the low-precision type and keeps sensitive ops (softmax, norms, losses) in fp32, while your weights and optimizer stay fp32. This ran on a laptop CPU with bf16:</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn
+
+<span class="c"># What each format does to a tiny gradient, a normal one and a big activation</span>
+g = torch.tensor([<span class="n">1e-8</span>, <span class="n">1e-3</span>, <span class="n">70000.0</span>])
+<span class="k">for</span> dt <span class="k">in</span> [torch.float16, torch.bfloat16, torch.float8_e4m3fn, torch.float8_e5m2]:
+    print(<span class="s">f"{str(dt):22s}"</span>, g.to(dt).float().tolist())
+
+torch.manual_seed(<span class="n">0</span>)
+model = nn.Sequential(nn.Linear(<span class="n">16</span>, <span class="n">32</span>), nn.ReLU(), nn.Linear(<span class="n">32</span>, <span class="n">1</span>))
+opt = torch.optim.AdamW(model.parameters(), lr=<span class="n">1e-3</span>)
+x, y = torch.randn(<span class="n">64</span>, <span class="n">16</span>), torch.randn(<span class="n">64</span>, <span class="n">1</span>)
+<span class="k">with</span> torch.autocast(device_type=<span class="s">"cpu"</span>, dtype=torch.bfloat16):
+    out = model(x)
+    loss = nn.functional.mse_loss(out.float(), y)
+loss.backward()
+opt.step()
+print(<span class="s">"output:"</span>, out.dtype, <span class="s">"| loss:"</span>, loss.dtype, <span class="s">"| weight:"</span>, model[<span class="n">0</span>].weight.dtype, <span class="s">"| grad:"</span>, model[<span class="n">0</span>].weight.grad.dtype)
+
+<span class="c"># Output (torch 2.8, CPU):</span>
+<span class="c"># torch.float16          [0.0, 0.0010004043579101562, inf]</span>
+<span class="c"># torch.bfloat16         [1.0011717677116394e-08, 0.00099945068359375, 70144.0]</span>
+<span class="c"># torch.float8_e4m3fn    [0.0, 0.001953125, nan]</span>
+<span class="c"># torch.float8_e5m2      [0.0, 0.0009765625, inf]</span>
+<span class="c"># output: torch.bfloat16 | loss: torch.float32 | weight: torch.float32 | grad: torch.float32</span></code></pre>
+    <p>On a GPU with fp16 you add the scaler (current API; <code>torch.cuda.amp.*</code> is deprecated). Not run here: no GPU.</p>
+<pre><code>scaler = torch.amp.GradScaler(<span class="s">"cuda"</span>)            <span class="c"># init_scale 65536, ×2 every 2000 good steps</span>
+<span class="k">for</span> x, y <span class="k">in</span> loader:
+    opt.zero_grad(set_to_none=<span class="k">True</span>)
+    <span class="k">with</span> torch.autocast(device_type=<span class="s">"cuda"</span>, dtype=torch.float16):
+        loss = loss_fn(model(x), y)
+    scaler.scale(loss).backward()                   <span class="c"># gradients are ×S</span>
+    scaler.unscale_(opt)                            <span class="c"># back to true size, in fp32</span>
+    torch.nn.utils.clip_grad_norm_(model.parameters(), <span class="n">1.0</span>)   <span class="c"># clip AFTER unscaling</span>
+    scaler.step(opt)                                <span class="c"># skipped if any grad is inf/NaN</span>
+    scaler.update()                                 <span class="c"># halve on overflow, grow when stable</span>
+<span class="c"># With dtype=torch.bfloat16, drop the scaler lines: no loss scaling needed.</span></code></pre>
+    <p class="hint">fp8 training on H100-class GPUs goes through libraries such as NVIDIA Transformer Engine or torchao's float8 training, which handle the scaling factors.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>fp16 + loss scaling</td><td>Works on older GPUs (V100, T4); more precise than bf16</td><td>Overflow/underflow handling, skipped steps, GradScaler bookkeeping</td></tr>
+      <tr><td>bf16 autocast</td><td>fp32's range: no loss scaling; the 2026 default</td><td>Fewer digits; needs A100-class or newer GPUs (or TPUs)</td></tr>
+      <tr><td>Pure bf16 weights (no fp32 master)</td><td>Saves 4 bytes per parameter</td><td>Small updates vanish unless you use tricks like stochastic rounding</td></tr>
+      <tr><td>fp8 matmuls</td><td>2× tensor-core throughput over bf16, half the traffic</td><td>Scaling factors, outlier risk, H100+ only, more to debug</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Why do we train in bf16 instead of fp16?” A strong answer:</p>
+    <ul>
+      <li>Explains the <b>bit split</b>: bf16 has 8 exponent bits (fp32's range) and 7 mantissa bits; fp16 has 5 and 10.</li>
+      <li>Names fp16's failure: gradients under 6 × 10⁻⁸ underflow to 0 and values over 65,504 overflow, hence <b>loss scaling</b> and skipped steps.</li>
+      <li>Explains why reduced precision is fine: SGD is noisy; accumulations, softmax, norms and the loss stay in fp32; the <b>fp32 master weights</b> catch tiny updates.</li>
+      <li>Bonus: memory math (16 bytes/param with Adam), and fp8's E4M3/E5M2 split with per-block scaling.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The recipe everyone still uses</b> <span class="tag res">🧪 Research · 2017</span> <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Micikevicius et al.: Mixed Precision Training</a></div>
+      <p><b>How:</b> fp16 math, fp32 master weights, loss scaling. Tested on image classification, detection, speech, translation and language models.</p>
+      <p><b>Why this method:</b> matched fp32 accuracy with about half the memory; SSD only trained with loss scaling (a factor of 8 was enough).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>bf16 on TPUs</b> <span class="tag co">🏢 Google · 2019</span> <a href="https://cloud.google.com/blog/products/ai-machine-learning/bfloat16-the-secret-to-high-performance-on-cloud-tpus" target="_blank" rel="noopener">BFloat16: the secret to high performance on Cloud TPUs</a></div>
+      <p><b>How:</b> TPU matrix units multiply in bf16; the format was conceived at Google Brain.</p>
+      <p><b>Why this method:</b> the same dynamic range as fp32 makes it close to a drop-in replacement, unlike fp16, which typically needs loss scaling.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Two 8-bit formats, one standard</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2209.05433" target="_blank" rel="noopener">Micikevicius et al.: FP8 Formats for Deep Learning</a></div>
+      <p><b>How:</b> defines E4M3 (max 448, no infinities) and E5M2 (IEEE-like, max 57,344).</p>
+      <p><b>Why this method:</b> E4M3 for weights and activations, E5M2 for gradients; with scaling, fp8 training matched 16-bit results across the models they tested.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>fp8 at frontier scale</b> <span class="tag co">🏢 DeepSeek · 2024</span> <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-V3 Technical Report</a></div>
+      <p><b>How:</b> an fp8 mixed-precision framework with 1 × 128 activation tiles and 128 × 128 weight blocks, each with its own scale, using E4M3 for all tensors.</p>
+      <p><b>Why this method:</b> fine-grained scaling contains outliers, so the higher-precision E4M3 can be used even for gradients; the report says this is the first validation of fp8 training on an extremely large-scale model.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · bf16 is fp32 with the bottom half cut off</span>
+    <p>Write an fp32 number as 32 bits. The first 16 (sign, all 8 exponent bits, the top 7 mantissa bits) are exactly a bf16 number. That's why converting between them is so cheap, and why bf16 keeps fp32's range for free. Try it in the explorer: flip between the fp32 and bf16 bit strips for the same number and compare the first 16 bits.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Floating point and rounding errors in general: <a href="../../math-course/phase8/5-numerics.html">math 8.5</a>. In this course: why matmuls dominate (10.1), the 16 bytes/parameter that parallelism must split up (10.3), the same scale-and-round trick applied to inference weights as int8/int4 (10.4), and exploding values and gradient clipping (2.1). For quantized LLM serving in practice: <a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/docs/stable/amp.html" target="_blank" rel="noopener">PyTorch: Automatic Mixed Precision</a>. Which ops autocast runs in which precision, and GradScaler.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Mixed Precision Training (2017)</a>. Short and readable; Figure 3's gradient histogram is the picture behind our playground.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/NVIDIA/TransformerEngine" target="_blank" rel="noopener">NVIDIA Transformer Engine</a>. Production fp8 (and fp4) training layers for PyTorch and JAX.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A gradient is 1 × 10⁻⁹. fp16 rounds anything below about 3 × 10⁻⁸ (half its smallest step) to zero. What's the smallest power-of-two loss scale that keeps it alive?</div>
+    <div class="opts"><button class="opt">8</button><button class="opt" data-ok>32</button><button class="opt">65,536 (only the default works)</button></div>
+    <div class="explain">You need 10⁻⁹ × S &gt; 3 × 10⁻⁸, so S &gt; 30: the smallest power of two is 32. S = 8 gives 8 × 10⁻⁹, still under the line. 65,536 also works, but the question asks for the smallest; dynamic scalers start high and back off only when something overflows.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You move an fp16 training job (with GradScaler) from V100s to A100s and switch autocast to bf16. What can you delete?</div>
+    <div class="opts"><button class="opt" data-ok>The GradScaler: bf16 has fp32's exponent range, so gradients don't underflow and loss scaling isn't needed</button><button class="opt">The fp32 optimizer states: bf16 makes them unnecessary</button><button class="opt">Nothing: bf16 needs a bigger loss scale than fp16</button></div>
+    <div class="explain">Loss scaling exists because fp16's range ends at 6 × 10⁻⁸. bf16's 8 exponent bits reach 10⁻⁴⁰ like fp32, so the scaler has nothing to rescue. The optimizer states and master weights still stay in fp32: bf16 has even less precision than fp16, so tiny updates would vanish.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. To save memory, a teammate stores the weights <i>only</i> in bf16 (no fp32 copy). With a learning rate of 1e-5 the loss stops improving, though gradients look healthy. Why?</div>
+    <div class="opts"><button class="opt">bf16 gradients underflow to zero</button><button class="opt" data-ok>Each update is smaller than half of bf16's step size near the weight, so w + update rounds back to w</button><button class="opt">bf16 can't represent weights above 1</button></div>
+    <div class="explain">bf16 has about 2–3 significant digits: near a weight of 0.05 its steps are about 0.0002. An update of 1e-5 × gradient is far smaller than half a step, so it's rounded away every time. That's why mixed precision keeps fp32 master weights (or uses stochastic rounding). Underflow isn't the issue: bf16's range matches fp32.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Exponent bits = range, mantissa bits = precision. fp16: 5/10 (range 6 × 10⁻⁸ to 65,504). bf16: 8/7 (fp32's range, ~2–3 digits). fp8: E4M3 (max 448) and E5M2 (max 57,344).</li>
+      <li>fp16 drops tiny gradients to 0 → <b>loss scaling</b>: multiply the loss by S, divide the gradients by S; dynamic scalers halve on overflow (<code>torch.amp.GradScaler("cuda")</code>).</li>
+      <li>Tiny updates vanish in 16 bits (1.0 + 0.0001 = 1.0) → keep <b>fp32 master weights</b> and optimizer states: 16 bytes per parameter with Adam.</li>
+      <li><b>bf16</b> needs no loss scaling and is the default for training; use <code>torch.autocast(device_type, dtype=torch.bfloat16)</code>.</li>
+      <li><b>fp8</b> doubles tensor-core throughput again, with per-tensor or per-block scales (DeepSeek-V3, MX formats, NVFP4).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const setup = c => { const d = window.devicePixelRatio || 1, w = c.clientWidth || 600, h = c.clientHeight || 200; c.width = w * d; c.height = h * d; const x = c.getContext("2d"); x.setTransform(d, 0, 0, d, 0, 0); x.clearRect(0, 0, w, h); x.font = "12px " + css("--font"); return { x, w, h }; };
+
+  /* ---------- exact binary-float rounding (round to nearest even, with subnormals; checked against torch casts) ---------- */
+  const FMT = {
+    fp32: { name: "fp32", e: 8, m: 23, inf: true }, fp16: { name: "fp16", e: 5, m: 10, inf: true }, bf16: { name: "bf16", e: 8, m: 7, inf: true },
+    e4m3: { name: "fp8 E4M3", e: 4, m: 3, inf: false, max: 448 }, e5m2: { name: "fp8 E5M2", e: 5, m: 2, inf: true },
+  };
+  Object.values(FMT).forEach(f => {
+    f.bias = 2 ** (f.e - 1) - 1; f.emin = 1 - f.bias; f.emax = f.inf ? 2 ** f.e - 2 - f.bias : 2 ** f.e - 1 - f.bias;
+    f.max = f.max || (2 - 2 ** -f.m) * 2 ** f.emax; f.minN = 2 ** f.emin; f.minS = 2 ** (f.emin - f.m);
+  });
+  const rne = v => (Math.abs(v % 1) === 0.5 ? 2 * Math.round(v / 2) : Math.round(v));
+  function quant(x, f) {
+    if (!isFinite(x) || x === 0) return x;
+    const s = Math.sign(x), a = Math.abs(x);
+    let e = Math.floor(Math.log2(a)); if (2 ** e > a) e--; if (2 ** (e + 1) <= a) e++;
+    e = Math.max(e, f.emin);
+    const ulp = 2 ** (e - f.m), q = rne(a / ulp) * ulp;
+    const lim = f.inf ? (2 - 2 ** -(f.m + 1)) * 2 ** f.emax : f.max + 2 ** (f.emax - f.m - 1);
+    if ((f.inf ? a >= lim : a > lim) || q > f.max) return f.inf ? s * Infinity : NaN;
+    return s * q;
+  }
+  function bitsOf(q, f) {   // sign, exponent field, mantissa field of an already-rounded value
+    const s = q < 0 || Object.is(q, -0) ? 1 : 0, a = Math.abs(q), ones = 2 ** f.e - 1;
+    if (Number.isNaN(q)) return { s: 0, E: ones, M: 2 ** f.m - 1 };
+    if (!isFinite(q)) return { s, E: ones, M: 0 };
+    if (a === 0) return { s, E: 0, M: 0 };
+    if (a < f.minN) return { s, E: 0, M: Math.round(a / f.minS) };
+    let e = Math.floor(Math.log2(a)); if (2 ** e > a) e--; if (2 ** (e + 1) <= a) e++;
+    return { s, E: e + f.bias, M: Math.round((a / 2 ** e - 1) * 2 ** f.m) };
+  }
+  const show = v => (Number.isNaN(v) ? "NaN" : !isFinite(v) ? (v > 0 ? "+∞" : "−∞") : v === 0 ? "0" : Math.abs(v) >= 1e5 || Math.abs(v) < 1e-3 ? v.toExponential(5) : (+v.toPrecision(8)).toString());
+
+  /* ---------- 1. explorer ---------- */
+  let bitF = "fp16";
+  function explore() {
+    const raw = $("xIn").value.trim(), x = Number(raw);
+    if (raw === "" || Number.isNaN(x)) { $("xMsg").textContent = "Type a number like 0.1, 3e-8 or 70000."; return; }
+    const res = {};
+    let rows = `<tr><th>Format</th><th>Stored value</th><th>Relative error</th><th>What happened</th></tr>`;
+    for (const k of ["fp32", "fp16", "bf16", "e4m3", "e5m2"]) {
+      const f = FMT[k], q = quant(x, f), a = Math.abs(x); res[k] = q;
+      const err = isFinite(q) && x !== 0 ? Math.abs(q - x) / a : NaN;
+      let st;
+      if (x === 0) st = `<span class="st-ok">exact</span>`;
+      else if (Number.isNaN(q)) st = `<span class="st-bad">overflow → NaN (E4M3 has no ∞)</span>`;
+      else if (!isFinite(q)) st = `<span class="st-bad">overflow → ∞</span>`;
+      else if (q === 0) st = `<span class="st-bad">underflow → 0</span>`;
+      else if (a < f.minN) st = `<span class="st-mid">subnormal (few digits left)</span>`;
+      else st = err === 0 ? `<span class="st-ok">exact</span>` : `<span class="st-ok">rounded</span>`;
+      rows += `<tr><td><b>${f.name}</b></td><td class="mono">${show(q)}</td><td class="mono">${Number.isNaN(err) ? "–" : err === 0 ? "0" : (100 * err).toPrecision(2) + "%"}</td><td>${st}</td></tr>`;
+    }
+    $("fTab").innerHTML = rows;
+    const f = FMT[bitF], b = bitsOf(res[bitF], f), bin = (v, n) => v.toString(2).padStart(n, "0");
+    const cells = (str, cls) => [...str].map(c => `<span class="${cls}">${c}</span>`).join("");
+    $("bitBox").innerHTML = cells(String(b.s), "bs") + `<span class="gap"></span>` + cells(bin(b.E, f.e), "be") + `<span class="gap"></span>` + cells(bin(b.M, f.m), "bm");
+    drawRange(Math.abs(x));
+    const r16 = res.fp16, rb = res.bf16, e16 = Math.abs(r16 - x) / Math.abs(x), eb = Math.abs(rb - x) / Math.abs(x);
+    win("gUnder", x !== 0 && r16 === 0 && rb !== 0);
+    win("gOver", !isFinite(r16) && isFinite(rb));
+    win("gPrec", isFinite(r16) && r16 !== 0 && rb !== 0 && eb > 10 * e16 && e16 > 0);
+    $("xMsg").textContent = x !== 0 && r16 === 0 && rb !== 0 ? "fp16 drops it, bf16 keeps it: range wins. This is what happens to small gradients." :
+      !isFinite(r16) && isFinite(rb) ? "Too big for fp16 (max 65,504). bf16's 8 exponent bits reach 3.4 × 10³⁸." :
+      isFinite(r16) && rb !== 0 && eb > 10 * e16 && e16 > 0 ? `fp16 is ${Math.round(eb / e16)}× more accurate here: 10 mantissa bits vs bf16's 7.` : "";
+  }
+  function drawRange(a) {
+    const { x, w, h } = setup($("rngCan")), m = { l: 74, r: 12 }, lo = -46, hi = 40;
+    const X = v => m.l + (v - lo) / (hi - lo) * (w - m.l - m.r);
+    x.fillStyle = css("--muted"); x.textAlign = "center";
+    for (let k = -40; k <= 30; k += 10) { x.fillText("10^" + k, X(k), h - 6); x.strokeStyle = css("--line"); x.beginPath(); x.moveTo(X(k), 6); x.lineTo(X(k), h - 20); x.stroke(); }
+    ["fp32", "fp16", "bf16", "e4m3", "e5m2"].forEach((k, i) => {
+      const f = FMT[k], y = 12 + i * 31;
+      x.fillStyle = css("--text"); x.textAlign = "right"; x.fillText(f.name, m.l - 6, y + 13);
+      x.globalAlpha = 0.35; x.fillStyle = css("--c-x"); x.fillRect(X(Math.log10(f.minS)), y + 2, X(Math.log10(f.minN)) - X(Math.log10(f.minS)), 16);
+      x.globalAlpha = 1; x.fillRect(X(Math.log10(f.minN)), y + 2, X(Math.log10(f.max)) - X(Math.log10(f.minN)), 16);
+    });
+    if (a > 0 && isFinite(a)) { const px = X(Math.max(lo, Math.min(hi, Math.log10(a)))); x.strokeStyle = css("--c-gr"); x.lineWidth = 3; x.beginPath(); x.moveTo(px, 4); x.lineTo(px, h - 20); x.stroke(); x.lineWidth = 1; }
+    x.fillStyle = css("--muted"); x.textAlign = "left"; x.fillText("pale = subnormal (losing digits) · pink line = your number", m.l, h - 26);
+  }
+  $("xIn").oninput = explore;
+  seg("pre", v => { $("xIn").value = v; explore(); });
+  seg("bitSeg", v => { bitF = v; explore(); });
+
+  /* ---------- 2. loss scaling ---------- */
+  const r = NN.rng(5), G = Array.from({ length: 4000 }, () => (r.u() < 0.5 ? -1 : 1) * 2 ** (-20 + 3.5 * r.n()));
+  let hF = "fp16", scaleHist = [];
+  function measure(k) {
+    const S = 2 ** k, f = FMT[hF]; let z = 0, inf = 0, err = 0; const kinds = [];
+    for (const g of G) { const q = quant(g * S, f); if (q === 0) { z++; kinds.push(0); } else if (!isFinite(q)) { inf++; kinds.push(2); } else { err += Math.abs(q / S - g) / Math.abs(g); kinds.push(1); } }
+    return { z, inf, err: err / Math.max(1, G.length - z - inf), kinds };
+  }
+  function drawHist(k, kinds) {
+    const { x, w, h } = setup($("hCan")), m = { l: 34, r: 10, t: 10, b: 30 }, lo = -36, hi = 22, nb = hi - lo;
+    const X = v => m.l + (v - lo) / (hi - lo) * (w - m.l - m.r), f = FMT[hF];
+    const bins = Array.from({ length: nb }, () => [0, 0, 0]);
+    G.forEach((g, i) => { const b = Math.floor(Math.log2(Math.abs(g)) + k - lo); if (b >= 0 && b < nb) bins[b][kinds[i]]++; });
+    const mx = Math.max(1, ...bins.map(b => b[0] + b[1] + b[2]));
+    x.globalAlpha = 0.12; x.fillStyle = css("--c-x"); x.fillRect(X(Math.log2(f.minS)), m.t, X(Math.min(hi, Math.log2(f.max))) - X(Math.log2(f.minS)), h - m.t - m.b); x.globalAlpha = 1;
+    const cols = [css("--c-w"), css("--c-x"), css("--c-dead")];
+    bins.forEach((b, i) => { let y = h - m.b; [1, 0, 2].forEach(j => { const bh = (b[j] / mx) * (h - m.t - m.b - 12); x.fillStyle = cols[j]; x.fillRect(X(lo + i) + 1, y - bh, X(lo + i + 1) - X(lo + i) - 2, bh); y -= bh; }); });
+    x.fillStyle = css("--muted"); x.textAlign = "center";
+    for (let v = -32; v <= 20; v += 8) x.fillText("2^" + v, X(v), h - 12);
+    x.textAlign = "left"; x.fillText(hF === "fp16" ? "fp16 holds 2^-24 … 65,504" : "bf16 holds 2^-133 … 3.4e38 (off the chart)", X(lo) + 2, m.t + 10);
+  }
+  function hUpdate(k) {
+    $("kV").textContent = k + " = " + (2 ** k).toLocaleString();
+    const M = measure(k);
+    drawHist(k, M.kinds);
+    $("hZ").textContent = (100 * M.z / G.length).toFixed(2) + "%";
+    $("hInf").textContent = M.inf + " values";
+    $("hErr").textContent = (100 * M.err).toPrecision(2) + "%";
+    $("hStep").innerHTML = M.inf ? `<span class="dead">skipped (inf in grads)</span>` : `<span class="ev">applied</span>`;
+    win("gSafe", hF === "fp16" && M.z === 0 && M.inf === 0);
+    win("gBoom", M.inf > 0);
+    $("hMsg").textContent = M.inf ? "Overflow: an infinity would poison the update, so the step is thrown away and a dynamic scaler halves S." :
+      M.z ? (hF === "fp16" ? `${M.z} gradients became exactly 0. Raise S to lift them onto fp16's ruler.` : "") :
+      hF === "bf16" ? "bf16: every gradient survives at S = 1. Loss scaling has nothing to do." : "Every gradient survives, none overflow. Note how the rounding error of the survivors also fell.";
+    return M;
+  }
+  function drawScale() {
+    Plot.line($("sCan"), { series: [{ label: "log₂ of the loss scale", color: css("--c-ls"), data: scaleHist.length ? scaleHist : [[0, 16]], width: 2.5 }], yMin: 10, yMax: 26, xLabel: "training step (dynamic scaler, growth every 3 good steps)" });
+  }
+  seg("hFmt", v => { hF = v; hUpdate(+$("kS").value); });
+  $("kS").oninput = () => hUpdate(+$("kS").value);
+  let running = false;
+  $("auto").onclick = async () => {
+    if (running) return; running = true; scaleHist = []; let k = 16, good = 0, skipped = 0;
+    for (let step = 1; step <= 40; step++) {
+      $("kS").value = k; const M = hUpdate(k);
+      scaleHist.push([step, k]); drawScale();
+      if (M.inf) { k -= 1; good = 0; skipped++; } else if (++good >= 3) { k += 1; good = 0; }
+      await new Promise(res => setTimeout(res, 90));
+    }
+    win("gAuto", true);
+    $("hMsg").textContent = `The scaler climbed from 2^16, skipped ${skipped} steps on overflow, and now hovers just under the edge: as large as possible without overflowing.`;
+    running = false;
+  };
+  window.addEventListener("resize", () => { explore(); hUpdate(+$("kS").value); drawScale(); });
+  window.addEventListener("themechange", () => { explore(); hUpdate(+$("kS").value); });
+  explore(); hUpdate(0); drawScale();
+})();
+</script>
+</body>
+</html>

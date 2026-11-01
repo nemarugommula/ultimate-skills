@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9.1 Imitation learning, covariate shift &amp; DAgger · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.strip { width: 100%; aspect-ratio: 7 / 1; height: auto; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  canvas.retina { width: 100%; height: 74px; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); margin-top: 6px; }
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+</style>
+</head>
+<body data-lesson="s9-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 9 · Lesson 1</div>
+  <h1>Imitation learning: copy the expert, then fall off the road</h1>
+  <p class="subtitle">The simplest way to teach a car to drive: record a good driver and train a model to copy every steering move. It works surprisingly well, right up to the moment the copy makes a mistake the expert never made. That moment, and the 2011 fix called DAgger, is this lesson.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Closed loop</b>: a controller reads the state, sends a command, the car moves, and the next reading depends on that command (Lesson 0.1, and Phase 8 for PID and path tracking).</li>
+      <li><b>Lane offset and heading error</b>: how far the car is from the lane center (meters) and how much its nose points away from the lane direction (radians). The path trackers of Lesson 8.3 steer to drive both to zero.</li>
+      <li><b>Least squares</b>: fit the numbers <i>w</i> of a model so its outputs are as close as possible to the targets, on average squared. Refresher: <a href="../../math-course/phase3/4-gradient-descent.html">gradient descent</a> and <a href="../../math-course/phase5/6-overfitting.html">overfitting</a> in the Math course.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>You record an expert driving one perfect lap. You train a model that copies the expert's steering with almost no error on that lap. You let it drive. <b>Within one lap it's in the grass.</b></p>
+    <p>Nothing about the road changed, the model isn't broken, and its error on the recorded lap is tiny. <b>So what went wrong?</b> And here's the follow-up that trips up most people: would recording <i>five more</i> perfect laps fix it?</p>
+    <p>This exact problem showed up in the very first neural-network car. In 1988–89, Dean Pomerleau's <b>ALVINN</b> steered Carnegie Mellon's Navlab test vehicle from a tiny <b>30 × 32 pixel</b> camera image (<a href="https://papers.nips.cc/paper/1988/hash/812b4ba287f5ee0bc9d43bbf5bbe87fb-Abstract.html" target="_blank" rel="noopener">NIPS 1988</a>). In 2016 NVIDIA trained a network on about <b>72 hours</b> of human driving and reported the car steering itself about <b>98% of the time</b> on a test drive in New Jersey (<a href="https://arxiv.org/abs/1604.07316" target="_blank" rel="noopener">Bojarski et al., 2016</a>). Both had to solve the puzzle above to get there.</p>
+  </div>
+
+  <div class="predict" id="pr0">
+    <b class="q">🧩 Predict before you play:</b> the expert below drives on a calm day and almost never drifts more than a few centimeters. What do you think the copy has learned about <i>getting back</i> to the lane center from half a meter off?
+    <div><button class="btn small" data-open="pr0">Show the answer</button></div>
+    <div class="ans"><b>Nothing at all.</b> The expert was never half a meter off, so there is not a single example of “here's how you recover from there”. The copy learned what to do in the states the expert visits, and the first small slip takes it into states nobody showed it. Watch the camera strip under the track: pixels outlined in red are places the lane lines <i>never</i> appeared during training.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Behavior cloning: record, train, drive</span>
+    <p class="hint">The car sees the road through a tiny “camera”: two rows of 24 pixels looking 6 m and 14 m ahead, like a miniature ALVINN. The <b>model</b> is a straight line through those 48 pixels (least squares): steering = <i>w</i>₀ + <i>w</i>₁·pixel₁ + … + <i>w</i>₄₈·pixel₄₈. Press <b>Record an expert lap</b> to collect (pixels, steering) pairs, then <b>Train &amp; drive 3 laps</b>. The test day has gusts of wind that nudge the car.</p>
+    <canvas class="sim" id="bcSim"></canvas>
+    <canvas class="retina" id="bcRet"></canvas>
+    <div class="controls">
+      <button class="btn" id="bcRec">🎥 Record an expert lap</button>
+      <button class="btn primary" id="bcGo">▶ Train &amp; drive 3 laps</button>
+      <button class="btn" id="bcReset">↺ Forget the data</button>
+      <label><input type="checkbox" id="bcGust"> gusty demo day (the expert gets pushed around while recording)</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">expert laps recorded <b id="bcLapsRec">0</b></div>
+      <div class="stat">expert labels <b id="bcLabels">0</b></div>
+      <div class="stat">laps completed (of 3) <b id="bcLaps">–</b></div>
+      <div class="stat">worst lane offset <b id="bcWorst">–</b></div>
+      <div class="stat">pixels never seen in training <b id="bcUnseen">–</b></div>
+    </div>
+    <div class="verdict" id="bcVerdict"></div>
+    <p class="hint">Things to try: record 1 lap and drive; record 4 more calm laps and drive again (does more of the same help?); then tick <b>gusty demo day</b>, forget the data and record 2 laps. Red-outlined pixels in the strip are the ones the model has <i>no</i> experience with.</p>
+  </div>
+
+  <h2>Numbers first: why a small slip becomes a crash</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: one slip, then the snowball</span>
+    <p>Say the copy is very good: in the states the expert visited it makes a mistake on only <b>1 step in 100</b> (<span class="un">ε</span> = 0.01). A lap is <b>T = 100</b> decisions.</p>
+    <ol>
+      <li><b>The expert's world.</b> If every mistake were forgiven (the car snapped back to familiar states), you'd expect <span class="un">ε</span> × T = 0.01 × 100 = <b>1 mistake</b> per lap.</li>
+      <li><b>The copy's world.</b> After its first mistake the car is somewhere the expert never was: 20 cm to the left, nose pointing out. The copy has no data there, so it keeps making mistakes until the end of the lap. The chance it has already slipped by step <i>t</i> is 1 − 0.99<sup><i>t</i></sup>: about 10% by step 10, 40% by step 50, 63% by step 100.</li>
+      <li><b>Add them up.</b> Expected mistakes = Σ<sub><i>t</i>=1..100</sub> (1 − 0.99<sup><i>t</i></sup>) ≈ <b>37 mistakes</b>, not 1.</li>
+    </ol>
+    <p>That's <b>37 times worse</b> from the same 1% error rate, purely because errors land the car in unfamiliar states. Stretch the lap to T = 1,000 and it's about <b>901 versus 10</b>. Ross and Bagnell proved this in general: copying the expert gives errors that grow like <span class="un">ε</span>T², while training on the learner's own states gives errors that grow like <span class="un">ε</span>T (<a href="https://arxiv.org/abs/1011.0686" target="_blank" rel="noopener">Ross, Gordon &amp; Bagnell, AISTATS 2011</a>).</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Behavior cloning</b> is ordinary supervised learning on (observation, expert action) pairs, and it's only as good as the states those pairs cover. Driving is closed-loop: the model's own actions choose its next inputs. So the inputs at test time drift away from the training inputs, a problem called <b>covariate shift</b> (the inputs, the “covariates”, shift). Small errors push you off the data, and off the data errors get bigger: they <b>compound</b>.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: learning to drive by watching from the back seat</span>
+    <p>Imagine learning to drive only by sitting behind an excellent driver for a year. You've seen thousands of hours of “stay in the middle of the lane”. You have never once seen “the car is half on the shoulder, what now?”, because your driver never let that happen. The first time it happens to you, you're improvising. A good instructor fixes this by letting <i>you</i> drive and saying, in the moment, “now steer left a bit”. That is DAgger.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · The snowball, as a chart</span>
+    <p class="hint">The same arithmetic as the worked example, for any error rate and episode length. Purple: plain copying (mistakes compound once you leave the data). Teal: a learner trained on its own states, where each mistake is recoverable.</p>
+    <canvas class="chart" id="snowChart" style="height:240px"></canvas>
+    <div class="controls">
+      <label>mistake rate per step <span class="un">ε</span> <input type="range" id="eps" min="-3" max="-1.3" step="0.05" value="-2"> <b class="mono" id="epsV"></b></label>
+      <label>decisions per episode T <input type="range" id="Tn" min="10" max="1000" step="10" value="100"> <b class="mono" id="TnV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">copying: expected mistakes <b id="snBC">–</b></div>
+      <div class="stat">trained on own states <b id="snDA">–</b></div>
+      <div class="stat">how much worse <b id="snRatio">–</b></div>
+    </div>
+    <p class="hint">Drag T to 1,000 at <span class="un">ε</span> = 1%. A car makes far more than 1,000 decisions in a trip (10 per second for 20 minutes is 12,000), which is why “99% accurate on the log” means very little on its own.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Writing a rule for every driving situation by hand never ends, and learning by trial and error (reinforcement learning) on a real road means crashing to learn what a crash is. Meanwhile millions of people drive well every day. Copying them is the obvious shortcut.</li>
+      <li><b>What people tried.</b> <i>Behavior cloning</i>: ALVINN (1989) on Navlab, NVIDIA's DAVE-2 (2016) mapping raw pixels from a single front camera to steering. Both hit covariate shift. NVIDIA's fix was data augmentation: it also recorded from <b>left and right cameras</b> and randomly shifted and rotated images, labelling them with the steering that would bring the car back, so the model saw fake “I've drifted” views (<a href="https://arxiv.org/abs/1604.07316" target="_blank" rel="noopener">paper</a>). Waymo's ChauffeurNet (2018) found that “30 million examples are still not enough” and added synthesized perturbations, such as going off the road, to its training (<a href="https://arxiv.org/abs/1812.03079" target="_blank" rel="noopener">paper</a>).</li>
+      <li><b>Why DAgger works.</b> Let the <i>learner</i> drive, record the states <i>it</i> visits, ask the expert “what would you do here?”, add those labels to the dataset and retrain. Repeat. The training data now covers the states the learner actually gets into, including its own mistakes. With <span class="un">ε</span> = 1% and T = 100: about <b>37</b> expected mistakes for plain copying versus about <b>1</b> when trained on your own states.</li>
+      <li><b>What it costs, when it fails.</b> You need an expert who can label <i>any</i> state, even weird ones. Easy for a computer expert in simulation; awkward for a human, who must say “steer 4° left” for a car they aren't driving, often from a recording, and whose labels suffer from perceived lag (the HG-DAgger paper calls this out). The learner drives while data is collected, so on a real road a safety driver must be ready to take over. And if the expert relies on information the learner can't see, no amount of copying closes the gap.</li>
+      <li><b>What came next.</b> <b>HG-DAgger</b> (2018): the human takes over only when the learner gets into trouble, and those takeovers become the labels. <b>DART</b> (2017): inject noise while the expert demonstrates, so the demos include recoveries (the gusty-day checkbox in Playground 1). <b>Privileged experts</b> in simulation that know everything and label every state for free (“Learning by Cheating”, 2019). Then fine-tuning the copy with reinforcement learning (Tesla said in April 2026 that FSD v14.3 “upgraded the Reinforcement Learning stage of training”) and checking the copy in closed loop, in simulation (Lessons 9.3 and 9.4).</li>
+    </ol>
+  </div>
+
+  <h2>DAgger in four lines</h2>
+  <p>DAgger stands for <b>Dataset Aggregation</b>. Start with expert demonstrations, then loop:</p>
+  <div class="eq">
+    1. Train policy <span class="pl">π</span> on dataset <span class="mp">D</span><br>
+    2. Run <span class="pl">π</span> in the world; record the <span class="se">observations</span> it actually sees<br>
+    3. Ask the expert for the <span class="ct">action</span> at each of those observations<br>
+    4. <span class="mp">D</span> ← <span class="mp">D</span> ∪ {(<span class="se">observation</span>, expert <span class="ct">action</span>)}; go to 1
+    <span class="say">The learner chooses where the data comes from; the expert only chooses the labels. Keep all the old data too (“aggregation”), so the policy doesn't forget the expert's own states.</span>
+  </div>
+  <p>Two details matter in practice. First, you don't need to label <i>every</i> visited state: neighbouring frames look almost the same, so asking every 10th or 20th frame buys most of the coverage for a fraction of the labels. Second, the expert's answers must be about <b>what to do from here</b>, not “what I would have done to never get here”. Recovery is the whole point.</p>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> in the next playground, DAgger asks for an expert label every N-th state the learner visits. Will asking for <i>every</i> state (N = 2) beat asking for every 20th, if you're scored on <b>labels used</b>?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">Usually not. States 0.05 s apart are nearly identical, so labelling all of them mostly repeats information. Sparse labels over a few rounds spread your budget over <i>more different</i> states, which is what the model needs. Real labelling budgets work the same way: Lesson 9.5's data engine is about choosing <i>which</i> clips are worth a label.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · DAgger: let the learner drive, let the expert correct</span>
+    <p class="hint">You start with one calm expert lap (275 labels). Each <b>DAgger round</b> lets the current model drive one lap in the gusty weather; gold dots are the states where the expert was asked “what would you steer here?”. If the learner leaves the road, a safety driver puts it back on the center line and the lap continues. Then the model is retrained on everything. Press <b>Test 3 laps</b> whenever you like.</p>
+    <canvas class="sim" id="dgSim"></canvas>
+    <canvas class="retina" id="dgRet"></canvas>
+    <div class="controls">
+      <button class="btn primary" id="dgRound">🔁 DAgger round</button>
+      <button class="btn" id="dgTest">▶ Test 3 laps</button>
+      <button class="btn" id="dgReset">↺ Start over</button>
+      <label>ask the expert every <input type="range" id="dgEvery" min="0" max="3" step="1" value="1"> <b class="mono" id="dgEveryV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">expert labels used <b id="dgLabels">275</b></div>
+      <div class="stat">DAgger rounds <b id="dgRounds">0</b></div>
+      <div class="stat">last test: laps completed <b id="dgLaps">–</b></div>
+      <div class="stat">pixels covered by training data <b id="dgCover">–</b></div>
+    </div>
+    <div class="verdict" id="dgVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> finish all <b>3 test laps</b> using <b>400 expert labels or fewer</b> (one calm lap plus plain copying fails). Watch the coverage number: every round the learner wanders, the expert's answers fill in pixels the demos never lit. Then try for under 350.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Behavior cloning is a supervised regression: a dozen lines of NumPy or PyTorch. For experiments, the <b>imitation</b> library (HumanCompatibleAI, built on Stable-Baselines3 and Gymnasium) has BC, DAgger, GAIL and more; <b>CARLA</b> is the usual open driving simulator for imitation research (Lesson 9.4), and “Learning by Cheating” (2019) set records on its benchmarks with a privileged expert teaching a camera-only student.</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+<span class="c"># Behavior cloning with least squares: X = observations (N × d), y = expert steering (N)</span>
+X1 = np.c_[np.ones(len(X)), X]                          <span class="c"># add a bias column</span>
+w = np.linalg.solve(X1.T @ X1 + <span class="n">0.01</span> * np.eye(X1.shape[<span class="n">1</span>]), X1.T @ y)   <span class="c"># ridge fit</span>
+policy = <span class="k">lambda</span> obs: np.clip(w[<span class="n">0</span>] + obs @ w[<span class="n">1</span>:], -<span class="n">0.5</span>, <span class="n">0.5</span>)
+
+<span class="c"># DAgger with the imitation library (from its docs)</span>
+<span class="k">from</span> imitation.algorithms <span class="k">import</span> bc
+<span class="k">from</span> imitation.algorithms.dagger <span class="k">import</span> SimpleDAggerTrainer
+bc_trainer = bc.BC(observation_space=env.observation_space,
+                   action_space=env.action_space, rng=rng)
+dagger_trainer = SimpleDAggerTrainer(venv=env, scratch_dir=tmpdir,
+                                     expert_policy=expert, bc_trainer=bc_trainer, rng=rng)
+dagger_trainer.train(<span class="n">8_000</span>)                               <span class="c"># environment steps, over several rounds</span></code></pre>
+    <p class="hint">The ridge term (0.01 × identity) keeps the fit stable when some pixels never light up. It also means those pixels get weights near zero: the model literally has no opinion about them, which is what you saw in Playground 1.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚘 Tesla</h4><p>Tesla's FSD v12 release notes (Dec 2023) described city driving as “a single end-to-end neural network trained on millions of video clips, replacing over 300k lines of explicit C++ code” (as reproduced by Not a Tesla App). Its Q4 2023 shareholder letter says the system “uses AI to influence vehicle controls… instead of hard-coding every driving behavior”. That is imitation of human driving at fleet scale. By April 2026 Tesla described a further <b>reinforcement learning stage</b> on top for v14.3. Tesla hasn't published how it handles covariate shift; its public answer is scale and fleet data (Lesson 9.5).</p>
+        <p class="src">Sources: <a href="https://digitalassets.tesla.com/tesla-contents/image/upload/IR/TSLA-Q4-2023-Update.pdf" target="_blank" rel="noopener">Tesla Q4 2023 update</a>, <a href="https://assets-ir.tesla.com/tesla-contents/IR/TSLA-Q1-2026-Update.pdf" target="_blank" rel="noopener">Tesla Q1 2026 update</a>, <a href="https://www.notateslaapp.com/software-updates/version/2023.44.30.10/release-notes" target="_blank" rel="noopener">v12.1 notes (Not a Tesla App)</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo's 2018 <b>ChauffeurNet</b> paper is a textbook covariate-shift story: standard behavior cloning was “insufficient… 30 million examples are still not enough”. Their fix was to <b>perturb</b> the expert's logged trajectories (pushing the car toward collisions or off the road) and add losses that penalize those outcomes, so the model learned recoveries. Waymo's current driver combines learned models with structured outputs (Lesson 9.2).</p>
+        <p class="src">Sources: <a href="https://arxiv.org/abs/1812.03079" target="_blank" rel="noopener">ChauffeurNet (Bansal, Krizhevsky, Ogale, 2018)</a>, <a href="https://waymo.com/blog/2025/12/demonstrably-safe-ai-for-autonomous-driving" target="_blank" rel="noopener">Waymo, Dec 2025</a></p></div>
+      <div><h4>🛸 Drones</h4><p>Drone researchers love the “privileged expert in simulation” trick, because a simulated expert can label <i>any</i> state for free. UZH's <b>Deep Drone Acrobatics</b> (2020) trained a policy “entirely in simulation by leveraging demonstrations from an optimal controller that has access to privileged information” and flew it on a real quadrotor without fine-tuning. <b>Learning High-Speed Flight in the Wild</b> (2021) did the same for flying fast through forests, imitating an expert with full knowledge of the map.</p>
+        <p class="src">Sources: <a href="https://arxiv.org/abs/2006.05768" target="_blank" rel="noopener">Kaufmann et al., 2020</a>, <a href="https://arxiv.org/abs/2110.05113" target="_blank" rel="noopener">Loquercio et al., 2021</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> Tesla has millions of cars recording human driving, so it leans on sheer volume of demonstrations. Waymo has far fewer cars but a big simulator and a structured stack, so it synthesizes the hard cases. Drone labs have neither a fleet nor human experts who can fly acrobatics, but they have physics simulators where a perfect expert is cheap, so DAgger-style labelling is almost free.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Plain behavior cloning</td><td>Simple, offline, uses existing logs; no expert needed after recording</td><td>Covariate shift; errors grow like <span class="un">ε</span>T²; copies the expert's bad habits too</td></tr>
+      <tr><td>Augmented demos (side cameras, shifted images, perturbations)</td><td>Adds recovery examples without new driving</td><td>Fake views can look wrong (warped geometry); labels for the recovery are guessed</td></tr>
+      <tr><td>DAgger</td><td>Trains on the learner's own states; errors grow like <span class="un">ε</span>T</td><td>Needs an expert on call for any state; the learner drives during collection (safety)</td></tr>
+      <tr><td>Interventions (HG-DAgger)</td><td>Human only steps in when needed; safer on real roads</td><td>Labels only where things went wrong; humans react late</td></tr>
+      <tr><td>Imitation then RL fine-tuning</td><td>Can exceed the expert; optimizes outcomes, not copying</td><td>Needs a reward and a safe place to practice (simulator or world model)</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your behavior-cloned driving model has 98% accuracy on held-out logs but drifts out of the lane in closed loop. Why, and what do you do?” A strong answer:</p>
+    <ul>
+      <li>Names <b>covariate shift</b>: held-out logs are expert states; in closed loop the model visits its own states, which aren't in the data.</li>
+      <li>Explains <b>compounding</b> with a number: errors grow like <span class="un">ε</span>T² (1% per step over 100 steps ≈ 37 mistakes, not 1).</li>
+      <li>Offers fixes in order of cost: recovery augmentation (side cameras, perturbations), noise injection during demos, DAgger or intervention-based collection, closed-loop evaluation in simulation before the road.</li>
+      <li>Says how they'd <b>measure</b>: closed-loop metrics (off-road rate, interventions per mile), not open-loop accuracy (Lesson 9.4).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>ALVINN steers Navlab</b> <span class="tag hist">📜 History · 1988–89</span> <a href="https://papers.nips.cc/paper/1988/hash/812b4ba287f5ee0bc9d43bbf5bbe87fb-Abstract.html" target="_blank" rel="noopener">Pomerleau, NIPS 1988</a></div>
+      <p><b>How:</b> a small neural network took a 30 × 32 video “retina” and an 8 × 32 range-finder image and output a steering direction for CMU's Navlab, trained on simulated road images; the paper reports driving at 1/2 m/s along a 400 m path.</p>
+      <p><b>Why this method:</b> hand-coding road following for every road appearance was brittle; learning from examples was the first approach that adapted to what the camera saw.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>NVIDIA DAVE-2</b> <span class="tag co">🏢 Company · 2016</span> <a href="https://arxiv.org/abs/1604.07316" target="_blank" rel="noopener">End to End Learning for Self-Driving Cars</a></div>
+      <p><b>How:</b> a CNN mapped raw pixels from a single front camera to steering, trained on about 72 hours of driving, with left and right cameras plus random shifts to teach recoveries; it reported about 98% autonomy on a test route and 10 miles on the Garden State Parkway with zero interventions.</p>
+      <p><b>Why this method:</b> one network, no hand-designed lane detector; the recovery augmentation was there specifically to beat covariate shift.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>DAgger</b> <span class="tag res">🧪 Research · 2011</span> <a href="https://arxiv.org/abs/1011.0686" target="_blank" rel="noopener">Ross, Gordon &amp; Bagnell</a></div>
+      <p><b>How:</b> iteratively run the learned policy, collect expert labels on the visited states, aggregate and retrain; tested on two imitation-learning problems and a sequence-labelling benchmark.</p>
+      <p><b>Why this method:</b> it comes with a guarantee that errors grow linearly with the horizon instead of quadratically.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Acrobatic and high-speed drones</b> <span class="tag res">🧪 Research · 2020–21</span> <a href="https://arxiv.org/abs/2110.05113" target="_blank" rel="noopener">Learning High-Speed Flight in the Wild</a></div>
+      <p><b>How:</b> a network trained only in simulation by imitating a privileged expert, with simulated sensor noise, flew a real quadrotor fast through forests and snow-covered terrain.</p>
+      <p><b>Why this method:</b> the simulator's expert can label any state the learner reaches, so covariate shift is fixed DAgger-style at zero cost.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the 1989 network was tiny</span>
+    <p>ALVINN's input was 30 × 32 = 960 pixels, about what a single app icon on your phone holds today, and it drove a real van. Playground 1's camera has 48 pixels. The lesson both teach is the same one Tesla and Waymo still wrestle with: the hard part isn't fitting the demonstrations, it's what happens one step after you leave them.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Behavior cloning learns the whole mapping from what the car sees to what it does, which is the seed of end-to-end driving (Lesson 9.2), where a second trap, learning the wrong cue, appears. Fixing covariate shift needs a place where the learner can make mistakes safely: learned world models (9.3) and simulators (9.4). The fleet data engine (9.5) is DAgger at company scale: the car drives, interesting moments get flagged, people or auto-labelers provide the answers, and the model retrains. The RL course covers the theory side, including GAIL and inverse RL: <a href="../../rl-course/phase6/7-imitation.html">Imitation learning</a> in the RL course, and its <a href="../../rl-course/phase6/4-offline-rl.html">offline RL</a> lesson for learning from logs without an expert on call.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1011.0686" target="_blank" rel="noopener">Ross, Gordon &amp; Bagnell (2011): DAgger</a>. The εT² versus εT result and the algorithm.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1812.03079" target="_blank" rel="noopener">ChauffeurNet (Waymo, 2018)</a>. Why 30 million examples weren't enough, and how perturbations helped.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1703.09327" target="_blank" rel="noopener">DART (2017): noise injection for robust imitation learning</a>. The gusty-day trick, done carefully.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A cloned policy errs on 2% of steps in states the expert visited (ε = 0.02). Over an episode of T = 50 steps, roughly how many mistakes should you expect if every mistake leads into unfamiliar states?</div>
+    <div class="opts"><button class="opt">1 (ε × T)</button><button class="opt" data-ok>About 19</button><button class="opt">50 (every step)</button></div>
+    <div class="explain">Σ (1 − 0.98<sup>t</sup>) for t = 1..50 ≈ <b>18.8</b>. ε × T = 1 is what you'd get if mistakes were always recoverable (the DAgger regime); the compounding regime is about 19× worse here.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your behavior-cloned car drifts out of its lane on test drives. A teammate proposes recording 10× more expert driving on the same roads in the same way. What's the most likely outcome?</div>
+    <div class="opts"><button class="opt">It fixes the drift, because the model now has 10× more data</button><button class="opt" data-ok>Little improvement: the new data covers the same expert states, still without recoveries from drifting</button><button class="opt">It makes things worse because of overfitting</button></div>
+    <div class="explain">More of the same distribution doesn't add the missing states (Playground 1). You need data from where the learner goes: recovery augmentation, noise injection, interventions or DAgger.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. In DAgger, who decides which states get labelled, and who provides the labels?</div>
+    <div class="opts"><button class="opt">The expert chooses the states and the labels</button><button class="opt" data-ok>The learner's own driving chooses the states; the expert provides the action labels</button><button class="opt">The learner provides both, then the expert approves them</button></div>
+    <div class="explain">That split is the whole trick: data comes from the learner's state distribution (so it covers its mistakes), and correctness comes from the expert. Aggregating with all earlier data keeps the expert's own states covered too.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Behavior cloning = supervised learning on (observation, expert action). Easy, offline, and used from ALVINN (1989) to DAVE-2 (2016) to today's end-to-end stacks.</li>
+      <li>Driving is closed-loop, so the learner's inputs drift from the expert's: covariate shift. Errors compound: ε = 1%, T = 100 → about 37 mistakes, not 1.</li>
+      <li>More demos of the same kind don't help; demos that include recoveries do (side cameras, perturbations, noise injection).</li>
+      <li>DAgger: let the learner drive, have the expert label what it should do there, aggregate, retrain. Errors grow like εT instead of εT².</li>
+      <li>Tesla copies human driving at fleet scale and adds RL; Waymo's ChauffeurNet synthesized the worst cases; drone labs use privileged experts in simulation.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+
+  // ---------- shared lane-keeping world (Frenet coordinates on an oval track) ----------
+  const V = 10, L = 2.7, DT = 0.05, X1 = 25, X2 = 95, R0 = 21.5, YC = 33.5, STR = X2 - X1, LAP = 2 * STR + 2 * Math.PI * R0;
+  const STEPS = Math.round(LAP / V / DT), HALF = 2.0, NPX = 24, WR = 6, D1 = 6, D2 = 14, BL = 0.35, KE = 0.15, KP = 0.8, GUST = 0.06;
+  function trackAt(s) {
+    s = ((s % LAP) + LAP) % LAP;
+    if (s < STR) return [X1 + s, YC - R0, 0];
+    s -= STR; if (s < Math.PI * R0) { const a = -Math.PI / 2 + s / R0; return [X2 + R0 * Math.cos(a), YC + R0 * Math.sin(a), a + Math.PI / 2]; }
+    s -= Math.PI * R0; if (s < STR) return [X2 - s, YC + R0, Math.PI];
+    s -= STR; const a = Math.PI / 2 + s / R0; return [X1 + R0 * Math.cos(a), YC + R0 * Math.sin(a), a + Math.PI / 2];
+  }
+  const kap = s => { s = ((s % LAP) + LAP) % LAP; if (s < STR) return 0; s -= STR; if (s < Math.PI * R0) return 1 / R0; s -= Math.PI * R0; if (s < STR) return 0; return 1 / R0; };
+  const expert = (e, p, k) => MX.clamp(Math.atan(L * k) - KE * e - KP * p, -0.5, 0.5);
+  function retina(e, p, s) {                     // 1 bias + 2 rows × 24 pixels: lane lines seen 6 m and 14 m ahead
+    const out = [1];
+    for (const d of [D1, D2]) {
+      const k = kap(s + d * 0.6);
+      for (let i = 0; i < NPX; i++) {
+        const x = -WR + (i + 0.5) * 2 * WR / NPX; let v = 0;
+        for (const side of [-1.8, 1.8]) { const y = side - e - d * Math.sin(p) + k * d * d / 2; v += Math.exp(-0.5 * ((x - y) / BL) ** 2); }
+        out.push(v);
+      }
+    }
+    return out;
+  }
+  function fit(D) {                              // ridge least squares, D = [{f, a}]
+    const n = 1 + 2 * NPX, A = Array.from({ length: n }, () => new Float64Array(n)), b = new Float64Array(n);
+    for (const d of D) { const f = d.f; for (let i = 0; i < n; i++) { const fi = f[i]; if (fi < 1e-4) continue; b[i] += fi * d.a; const Ai = A[i]; for (let j = 0; j < n; j++) Ai[j] += fi * f[j]; } }
+    const M = Array.from({ length: n }, (_, i) => { const r = Array.from(A[i]); r[i] += 0.01; r.push(b[i]); return r; });
+    for (let c = 0; c < n; c++) {
+      let p = c; for (let r = c + 1; r < n; r++) if (Math.abs(M[r][c]) > Math.abs(M[p][c])) p = r;
+      [M[c], M[p]] = [M[p], M[c]]; const dd = M[c][c] || 1e-12;
+      for (let j = c; j <= n; j++) M[c][j] /= dd;
+      for (let r = 0; r < n; r++) if (r !== c) { const f = M[r][c]; if (f) for (let j = c; j <= n; j++) M[r][j] -= f * M[c][j]; }
+    }
+    return M.map(r => r[n]);
+  }
+  const act = (w, f) => { let a = 0; for (let i = 0; i < f.length; i++) a += w[i] * f[i]; return MX.clamp(a, -0.5, 0.5); };
+  function stepCar(st, a, gust, rng) {
+    const k = kap(st.s), ds = V * Math.cos(st.p) / (1 - k * st.e);
+    st.s += ds * DT; st.e += V * Math.sin(st.p) * DT;
+    st.p += (V * Math.tan(a) / L - k * ds) * DT + gust * Math.sqrt(DT) * Sim.randn(rng);
+  }
+  const pose = st => { const t = trackAt(st.s); return { x: t[0] - Math.sin(t[2]) * st.e, y: t[1] + Math.cos(t[2]) * st.e, th: t[2] + st.p }; };
+  function coverage(D) { const m = new Float64Array(1 + 2 * NPX); for (const d of D) for (let i = 1; i < d.f.length; i++) m[i] = Math.max(m[i], d.f[i]); return m; }
+  const seenCount = m => { let c = 0; for (let i = 1; i < m.length; i++) if (m[i] > 0.3) c++; return c; };
+
+  // one view = a track canvas + a retina strip, with its own run state
+  function makeView(simId, retId) {
+    const view = { trail: [], marks: [], offs: [], st: null, f: null, cover: null };
+    const W = new Sim($(simId), { xRange: [-2, 122] });
+    const pts = [], left = [], right = [];
+    for (let s = 0; s <= LAP + 1; s += 2) { const t = trackAt(s); pts.push([t[0], t[1]]); left.push([t[0] - Math.sin(t[2]) * HALF, t[1] + Math.cos(t[2]) * HALF]); right.push([t[0] + Math.sin(t[2]) * HALF, t[1] - Math.cos(t[2]) * HALF]); }
+    W.render(w => {
+      w.clear();
+      w.line(pts, { color: "--panel", width: w.px(2 * HALF + 0.6), alpha: 1 });
+      w.line(left, { color: "--c-mp", width: 2 }); w.line(right, { color: "--c-mp", width: 2 });
+      w.line(pts, { color: "--line", width: 1, dash: [6, 8] });
+      view.marks.forEach(m => w.dot(m, { color: "--c-un", r: 3, alpha: 0.8 }));
+      if (view.trail.length > 1) w.line(view.trail, { color: "--c-pl", width: 2, alpha: 0.75 });
+      view.offs.forEach(o => { w.text(o, "✕", { color: "--c-ag", size: 18, bold: true }); });
+      if (view.st) { const q = pose(view.st); w.car({ x: q.x - 1.35 * Math.cos(q.th), y: q.y - 1.35 * Math.sin(q.th), th: q.th }, { color: "--c-ct", L: 2.7, width: 1.8 }); }
+      w.text([60, 33.5], view.caption || "", { color: "--muted", size: 13, bold: true });
+    });
+    view.W = W;
+    view.drawRetina = () => {
+      const c = $(retId), dpr = window.devicePixelRatio || 1, cw = c.clientWidth || 600, ch = c.clientHeight || 74;
+      c.width = cw * dpr; c.height = ch * dpr; const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, cw, ch);
+      const pad = 92, cell = (cw - pad - 8) / NPX, rh = (ch - 14) / 2;
+      g.font = "11px " + MX.css("--font"); g.fillStyle = MX.css("--muted"); g.textBaseline = "middle";
+      ["6 m ahead", "14 m ahead"].forEach((t, r) => g.fillText(t, 8, 7 + rh * r + rh / 2));
+      for (let r = 0; r < 2; r++) for (let i = 0; i < NPX; i++) {
+        const idx = 1 + r * NPX + i, x = pad + i * cell, y = 7 + r * rh;
+        const v = view.f ? Math.min(1, view.f[idx]) : 0;
+        g.fillStyle = MX.css("--panel"); g.fillRect(x + 1, y + 1, cell - 2, rh - 2);
+        g.globalAlpha = v; g.fillStyle = MX.css("--c-se"); g.fillRect(x + 1, y + 1, cell - 2, rh - 2); g.globalAlpha = 1;
+        if (view.cover && view.cover[idx] < 0.3) { g.strokeStyle = MX.css("--c-ag"); g.lineWidth = 1.5; g.strokeRect(x + 2, y + 2, cell - 4, rh - 4); }
+      }
+    };
+    window.addEventListener("resize", view.drawRetina);
+    return view;
+  }
+  function showFrame(view, st, w) { view.st = { ...st }; view.f = retina(st.e, st.p, st.s); }
+
+  // drive `laps` laps with weights w (animated); onDone({laps, worst, off})
+  function animate(view, w, opts, onDone) {
+    const rng = Sim.rng(opts.seed), st = { s: 0, e: 0, p: 0 };
+    let i = 0, worst = 0, offs = 0; const total = opts.laps * STEPS;
+    view.trail = []; view.offs = []; view.marks = opts.keepMarks ? view.marks : [];
+    view.W.stop();
+    view.W.run(() => {
+      for (let k = 0; k < 14 && i < total; k++, i++) {
+        const f = retina(st.e, st.p, st.s), a = opts.label ? act(w, f) : act(w, f);
+        if (opts.onState) opts.onState(st, f, i);
+        stepCar(st, a, GUST, rng);
+        worst = Math.max(worst, Math.abs(st.e));
+        const q = pose(st); view.trail.push([q.x, q.y]); if (view.trail.length > 260) view.trail.shift();
+        if (Math.abs(st.e) > HALF) {
+          offs++; view.offs.push([q.x, q.y]);
+          if (opts.recover) { st.e = 0; st.p = 0; } else { i = total + 1; break; }
+        }
+      }
+      showFrame(view, st); view.drawRetina();
+      if (opts.onTick) opts.onTick(st, worst, offs);
+      if (i >= total) { onDone({ laps: Math.min(opts.laps, st.s / LAP), worst, offs }); return false; }
+      return true;
+    });
+  }
+
+  // ---------- Playground 1: behavior cloning ----------
+  const bc = makeView("bcSim", "bcRet");
+  let bcData = [], bcLaps = 0, bcRng = Sim.rng(1);
+  function bcRecord(done) {
+    const gust = $("bcGust").checked ? 2 * GUST : 0.01, st = { s: 0, e: 0, p: 0 };
+    let i = 0; bc.trail = []; bc.offs = []; bc.caption = "🎥 recording the expert";
+    bc.W.stop();
+    bc.W.run(() => {
+      for (let k = 0; k < 20 && i < STEPS; k++, i++) {
+        const f = retina(st.e, st.p, st.s), a = expert(st.e, st.p, kap(st.s));
+        if (i % 2 === 0) bcData.push({ f, a });
+        stepCar(st, a, gust, bcRng);
+        const q = pose(st); bc.trail.push([q.x, q.y]); if (bc.trail.length > 260) bc.trail.shift();
+      }
+      showFrame(bc, st); bc.cover = coverage(bcData); bc.drawRetina();
+      if (i >= STEPS) { bcLaps++; bc.caption = ""; bcStats(); if (done) done(); return false; }
+      return true;
+    });
+  }
+  function bcStats() {
+    $("bcLapsRec").textContent = bcLaps; $("bcLabels").textContent = bcData.length;
+    const c = coverage(bcData); $("bcUnseen").textContent = (2 * NPX - seenCount(c)) + " of 48";
+  }
+  function bcGo() {
+    if (!bcData.length) { bcRecord(bcGo); return; }
+    const w = fit(bcData); bc.cover = coverage(bcData); bc.caption = "";
+    $("bcVerdict").innerHTML = "<span class='muted'>driving…</span>";
+    animate(bc, w, { seed: 4242, laps: 3, onTick: (st, worst) => { $("bcLaps").textContent = fmt(st.s / LAP, 2); $("bcWorst").textContent = fmt(worst, 2) + " m"; } }, r => {
+      $("bcLaps").textContent = fmt(r.laps, 2); $("bcWorst").textContent = fmt(Math.min(r.worst, 9.99), 2) + " m";
+      $("bcVerdict").innerHTML = r.offs === 0
+        ? `<span class="badge-win">✅ 3 clean laps</span> with ${bcData.length} labels. ${$("bcGust").checked ? "The gusty demos showed the model how to recover." : "Lucky gusts, or did your demos include some drift?"}`
+        : `<span class="badge-lose">Off the road after ${fmt(r.laps, 2)} laps</span> The model never saw the lane lines where they were when it left. ${bcLaps < 3 ? "Try recording more calm laps: does it help?" : "More calm laps didn't fix it. Try the gusty demo day."}`;
+    });
+  }
+  $("bcRec").onclick = () => bcRecord();
+  $("bcGo").onclick = bcGo;
+  $("bcReset").onclick = () => { bc.W.stop(); bcData = []; bcLaps = 0; bcRng = Sim.rng(1 + Math.floor(Math.random() * 1000)); bc.trail = []; bc.offs = []; bc.st = null; bc.f = null; bc.cover = null; bcStats(); ["bcLaps", "bcWorst"].forEach(id => ($(id).textContent = "–")); $("bcVerdict").innerHTML = ""; bc.W.render(); bc.drawRetina(); };
+  bc.st = { s: 0, e: 0, p: 0 }; bc.f = retina(0, 0, 0); bc.W.render(); bc.drawRetina(); bcStats();
+
+  // ---------- Playground 2: compounding errors ----------
+  function snow() {
+    const eps = Math.pow(10, +$("eps").value), T = +$("Tn").value;
+    $("epsV").textContent = fmt(eps * 100, 2) + "%"; $("TnV").textContent = T;
+    const bcS = [], daS = []; let s = 0;
+    for (let t = 1; t <= T; t++) { s += 1 - Math.pow(1 - eps, t); if (t % Math.max(1, Math.floor(T / 100)) === 0 || t === T) { bcS.push([t, s]); daS.push([t, eps * t]); } }
+    Plot.line($("snowChart"), { series: [
+      { label: "plain copying (compounding)", color: MX.css("--c-be"), data: bcS, width: 3 },
+      { label: "trained on own states (DAgger)", color: MX.css("--c-pl"), data: daS, width: 3 },
+    ], xMin: 0, xMax: T, yMin: 0, xLabel: "decision step t", yLabel: "expected mistakes so far" });
+    $("snBC").textContent = fmt(s, 1); $("snDA").textContent = fmt(eps * T, 1); $("snRatio").textContent = fmt(s / (eps * T), 0) + "×";
+  }
+  ["eps", "Tn"].forEach(id => ($(id).oninput = snow)); snow();
+
+  // ---------- Playground 3: DAgger ----------
+  const dg = makeView("dgSim", "dgRet");
+  const EVERY = [2, 5, 10, 20];
+  let dgData = [], dgRounds = 0, dgRng, dgBusy = false;
+  function dgInit() {
+    dgRng = Sim.rng(2); dgData = []; dgRounds = 0;
+    const st = { s: 0, e: 0, p: 0 };
+    for (let i = 0; i < STEPS; i++) { const f = retina(st.e, st.p, st.s), a = expert(st.e, st.p, kap(st.s)); if (i % 2 === 0) dgData.push({ f, a }); stepCar(st, a, 0.01, dgRng); }
+    dg.cover = coverage(dgData); dg.marks = []; dg.trail = []; dg.offs = []; dg.st = { s: 0, e: 0, p: 0 }; dg.f = retina(0, 0, 0);
+    dgStats(); $("dgLaps").textContent = "–"; $("dgVerdict").innerHTML = ""; dg.W.render(); dg.drawRetina();
+  }
+  function dgStats() {
+    $("dgLabels").textContent = dgData.length; $("dgRounds").textContent = dgRounds;
+    $("dgCover").textContent = seenCount(coverage(dgData)) + " of 48";
+    $("dgEveryV").textContent = EVERY[+$("dgEvery").value] + "th state";
+  }
+  $("dgRound").onclick = () => {
+    if (dgBusy) return; dgBusy = true;
+    const w = fit(dgData), every = EVERY[+$("dgEvery").value], seedR = 900 + dgRounds;
+    dg.caption = "🔁 learner drives · expert labels the gold dots"; dg.marks = [];
+    animate(dg, w, { seed: seedR, laps: 1, recover: true, keepMarks: true, onState: (st, f, i) => {
+      if (i % every === 0) { dgData.push({ f, a: expert(st.e, st.p, kap(st.s)) }); const q = pose(st); dg.marks.push([q.x, q.y]); }
+    } }, r => {
+      dgRounds++; dg.caption = ""; dg.cover = coverage(dgData); dgStats(); dg.drawRetina(); dg.W.render(); dgBusy = false;
+      $("dgVerdict").innerHTML = `<span class="muted">Round ${dgRounds}: the learner left the road ${r.offs} time${r.offs === 1 ? "" : "s"}; the expert labelled ${Math.ceil(STEPS / every)} states. Retrained on all ${dgData.length}. Test it, or run another round.</span>`;
+    });
+  };
+  $("dgTest").onclick = () => {
+    if (dgBusy) return; dgBusy = true;
+    const w = fit(dgData); dg.marks = []; dg.caption = "";
+    animate(dg, w, { seed: 4242, laps: 3, onTick: st => ($("dgLaps").textContent = fmt(st.s / LAP, 2)) }, r => {
+      dgBusy = false; $("dgLaps").textContent = fmt(r.laps, 2);
+      const n = dgData.length, ok = r.offs === 0;
+      $("dgVerdict").innerHTML = ok
+        ? (n <= 400 ? `<span class="badge-win">🏆 3 clean laps with ${n} expert labels</span> ${n < 350 ? "Under 350: excellent label budgeting." : "Now try for under 350."}` : `<span class="badge-win">✅ 3 clean laps</span> but ${n} labels: over the 400 budget. Start over and ask the expert less often.`)
+        : `<span class="badge-lose">Off the road after ${fmt(r.laps, 2)} laps</span> <span class="muted">(${n} labels so far) Run another DAgger round.</span>`;
+    });
+  };
+  $("dgReset").onclick = () => { dg.W.stop(); dgBusy = false; dgInit(); };
+  $("dgEvery").oninput = dgStats;
+  dgInit();
+})();
+</script>
+</body>
+</html>

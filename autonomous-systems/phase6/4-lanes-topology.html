@@ -1,0 +1,442 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.4 Lanes & road topology · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .tokens { font-family: var(--mono); font-size: .8rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; max-height: 170px; overflow: auto; line-height: 1.7; }
+  .tokens span { display: inline-block; padding: 0 6px; margin: 1px 2px; border-radius: 6px; background: color-mix(in srgb, var(--c-pl) 14%, transparent); }
+  .tokens span.fk { background: color-mix(in srgb, var(--c-un) 22%, transparent); }
+  .tokens span.st { background: color-mix(in srgb, var(--c-mp) 22%, transparent); }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { border: 0; background: var(--bg2); color: var(--text); padding: 5px 12px; font: inherit; font-size: .88rem; cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+</style>
+</head>
+<body data-lesson="s6-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 4</div>
+  <h1>Lanes &amp; road topology: from painted lines to a lane graph</h1>
+  <p class="subtitle">Finding the paint is the easy half. The hard half is knowing that <i>this</i> lane leads to <i>that</i> one through an intersection with no paint at all, and that you may turn left only from the left lane. That's road topology, and it's where lane detection turned into something like language.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>BEV</b>, bird's-eye view: a top-down metric grid around the car, built from cameras with learned depth or attention (Lesson 6.2).</li>
+      <li><b>Least squares</b>: choose curve parameters that minimize the sum of squared errors to the data. A polynomial y = a + b·x + c·x² is the usual lane model.</li>
+      <li><b>Outliers</b>: measurements that don't follow the model at all (a crack in the asphalt detected as paint). One bad point can drag a least-squares fit far off, as one wild GPS fix did to the filter of Lesson 3.3.</li>
+      <li><b>A graph</b>: nodes plus directed edges. Here a node is a lane segment and an edge means “you can drive from this one into that one”.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>You're in the right of two lanes, waiting at a red light. In 40 m the paint ends and the intersection begins: no lines, a few arrows on the asphalt, maybe a sign. <b>Which lanes on the far side can you legally end up in, and how does a car know?</b> No pixel shows the answer: it's a relationship between lanes, not a thing you can see.</p>
+    <p>At AI Day 2022, Tesla described treating this as a <b>language problem</b>: its lanes network outputs “a special language that we developed at Tesla for encoding lanes and their connectivities”, where “the words and tokens are the lane positions in 3D space”, predicted one token at a time like a sentence, with special tokens for where lanes fork (<a href="https://www.youtube.com/watch?v=ODSJsviD_SU" target="_blank" rel="noopener">Tesla AI Day 2022</a>). Waymo takes the opposite route and drives with its own highly detailed maps of every lane. This lesson walks the road from one to the other.</p>
+  </div>
+
+  <h2>Three generations of lane detection</h2>
+  <table>
+    <tr><th>Generation</th><th>Output</th><th>How it works</th><th>Where it breaks</th></tr>
+    <tr><td><b>Classical</b> (1990s–2010s)</td><td>A few fitted curves</td><td>Edge detection → find line pieces (Hough transform) or sliding windows on a top-down warp → fit a polynomial per lane</td><td>Worn paint, shadows, rain glare, curbs without paint; needs hand tuning per camera and road</td></tr>
+    <tr><td><b>Segmentation</b> (~2017–2019)</td><td>Each pixel: which lane line it belongs to</td><td>A network labels pixels; SCNN passes messages across rows and columns so long thin lines stay connected; LaneNet makes each lane its own <i>instance</i></td><td>Early versions output a fixed number of lanes (e.g. ego lanes only) and can't handle lane changes; still pixels, so you fit curves afterwards</td></tr>
+    <tr><td><b>Vectors and graphs</b> (2021→)</td><td>Polylines with IDs, plus which connects to which</td><td>BEV features → a set of point sequences (HDMapNet, MapTR) or a lane graph (Tesla's lanes network, OpenLane-V2 topology)</td><td>Needs large labeled maps; hard to evaluate; topology errors are subtle</td></tr>
+  </table>
+  <p>Segmentation itself is covered in <span class="dlref" data-href="phase4/3-segmentation.html">the Deep Learning course, Phase 4 (segmentation)</span>. Whatever produces the lane points, at some stage you <b>fit a curve</b> through noisy points, and that's the first playground.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: why one outlier hurts</span>
+    <p>Five paint points at lateral offsets (m): 1.75, 1.76, 1.74, 1.75, and one crack at <b>3.25</b>. Fit the simplest model, a constant (a horizontal line), by least squares: that's just the mean, (1.75 + 1.76 + 1.74 + 1.75 + 3.25) ÷ 5 = <b>2.05 m</b>. One bad point moved the lane line 30 cm, enough to put a wheel on the line. The median (1.75 m) ignores it. <b>RANSAC</b> (random sample consensus) generalizes that idea to curves:</p>
+    <ol>
+      <li>Pick the minimum number of random points that define a curve (3 for a parabola) and fit them exactly.</li>
+      <li>Count <b>inliers</b>: points within a threshold, say 0.3 m, of that curve.</li>
+      <li>Repeat many times; keep the curve with the most inliers; refit by least squares using only its inliers.</li>
+    </ol>
+    <p>If 25% of points are outliers, a random 3-point sample is all-inliers with probability 0.75³ ≈ 0.42, so 20 tries miss with probability 0.58²⁰ ≈ 0.00002. Cheap and robust.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Fit a lane line from noisy points</span>
+    <p class="hint">Top-down view, 4–60 m ahead. <span class="se">Blue dots</span> are lane-marking detections on a gently curving lane (grey dashed = truth), with ±8 cm noise and a 10 m gap of worn paint. Turn on <span class="ag">outliers</span> (cracks, tar seams, the next lane's paint) and watch least squares fall apart. The sideways axis is stretched so centimeters show.</p>
+    <canvas class="sim" id="fitCanvas"></canvas>
+    <div class="controls">
+      <span class="seg" id="fitMethod"><button id="fitLS" data-m="ls" class="on">least squares</button><button id="fitRS" data-m="rs">RANSAC</button></span>
+      <label>polynomial degree <input type="range" id="fitDeg" min="1" max="4" step="1" value="1"> <b class="mono" id="fitDegV"></b></label>
+      <label>RANSAC inlier threshold <input type="range" id="fitThr" min="0.05" max="2" step="0.05" value="0.3"> <b class="mono" id="fitThrV"></b></label>
+      <label>RANSAC tries <input type="range" id="fitIt" min="5" max="200" step="5" value="20"> <b class="mono" id="fitItV"></b></label>
+      <label><input type="checkbox" id="fitOut" checked> outliers</label>
+      <button class="btn" id="fitSeed">🎲 New points</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">RMS lateral error, 4–60 m <b id="fitRms">–</b></div>
+      <div class="stat">error at 32 m (in the gap) <b id="fit32">–</b></div>
+      <div class="stat">error at 55 m <b id="fit55">–</b></div>
+      <div class="stat">inliers used <b id="fitInl">–</b></div>
+      <div class="stat">challenge <b id="fitChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> with outliers on, get the RMS error under <b>10 cm</b> and the error at 55 m under <b>10 cm</b> (a lane-keeping controller looks that far ahead at speed). Then try degree 4 without outliers, and a huge threshold: what goes wrong?</p>
+  </div>
+  <p>What you should find: no polynomial degree rescues least squares from outliers; RANSAC with a parabola (degree 2) nails it. Degree 1 can't bend; very high degrees wiggle in the gap and beyond the data. A threshold much larger than the outliers' offset lets them back in. Real lane pipelines also fit in BEV with a lane-width prior and track the coefficients over time with a Kalman filter, so one bad frame can't yank the line.</p>
+
+  <h2>From lines to a lane graph</h2>
+  <p>A car doesn't steer to paint; it steers along <b>lane centerlines</b>, and it needs to know how they connect. A <b>lane graph</b> encodes that:</p>
+  <ul>
+    <li><b>Nodes</b>: lane segments (a centerline polyline, with attributes: width, speed limit, turn type).</li>
+    <li><b>Edges</b>: <i>successor</i> (this lane continues into that one), <i>left/right neighbour</i> (you may change lanes here), plus where lanes <b>fork</b> (one lane splits into a straight lane and a turn lane) and <b>merge</b>.</li>
+    <li>At intersections the edges go through paint-free space; their legality comes from rules, arrows and signs, not geometry alone.</li>
+  </ul>
+  <p>Planning then becomes route search on this graph (“left lane → left turn → second exit”), and prediction uses it too: other cars mostly follow its edges (Lesson 7.1). Waymo's public Motion Dataset ships exactly this kind of map with every scene: lane centers, lane boundaries, road boundaries, crosswalks, speed bumps, stop signs and driveways (<a href="https://waymo.com/open/about/" target="_blank" rel="noopener">Waymo Open Dataset</a>).</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Lane perception has two layers: <b>geometry</b> (where is each lane, as a curve in meters) and <b>topology</b> (which lane leads where). Geometry you can fit from pixels; topology is a <i>structured</i> output, a graph, whose errors are rare but dangerous: one wrong edge sends the car straight from a left-turn-only lane. That's why the field moved from per-pixel masks to vector and graph outputs, and why Tesla borrowed sequence models from language.
+  </div>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> a 4-way intersection, each road with 2 lanes in each direction. If every incoming lane may go straight plus one turn (left lane turns left, right lane turns right), how many lane-to-lane connections are there through the intersection?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans"><b>16.</b> 4 approaches × 2 lanes × 2 choices each. Now imagine a five-way junction with a slip lane and a bus-only lane, and it's clear why hand-coding topology doesn't scale, and why both HD maps and learned lane graphs exist. Build the 16 yourself below.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Build the connectivity at an intersection</span>
+    <p class="hint">Right-hand traffic. <span class="se">Blue dots</span> are where incoming lanes end; <span class="mp">green dots</span> are where outgoing lanes start. <b>Click an incoming lane end, then an outgoing lane start</b> to add (or remove) a connection. Three approaches are already filled in by a “junior labeler”, with mistakes. Rule: left lane = straight or left turn; right lane = straight or right turn; no U-turns.</p>
+    <canvas class="sim square" id="xCanvas"></canvas>
+    <div class="controls">
+      <button class="btn" id="xCheck">🔍 Highlight mistakes</button>
+      <button class="btn" id="xReset">↺ Back to the labeler's version</button>
+      <button class="btn" id="xClear">🧹 Clear all</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">correct connections <b id="xOk">–</b></div>
+      <div class="stat">missing <b id="xMiss">–</b></div>
+      <div class="stat">illegal <b id="xBad">–</b></div>
+      <div class="stat">challenge <b id="xChal">–</b></div>
+    </div>
+    <p class="hint">“Language of lanes” view of your graph (an illustrative token format in the spirit of Tesla's description; Tesla hasn't published its exact vocabulary): each lane is <span style="color:var(--c-mp)">START</span>ed at its position, continues with points, and <span style="color:var(--c-un)">FORK</span> tokens point back to an earlier token where a lane splits.</p>
+    <div class="tokens" id="xTokens"></div>
+    <p class="hint">🏆 <b>Challenge:</b> a perfect lane graph: <b>16 correct, 0 missing, 0 illegal</b>.</p>
+  </div>
+  <p>Notice how a single illegal edge looks perfectly plausible in the drawing. Topology mistakes are geometrically small and semantically huge, which is why lane graphs are evaluated with topology metrics (are the right pairs connected?), not just “are the lines in the right place”. The OpenLane-V2 benchmark (NeurIPS 2023) was built for exactly that, scoring lane–lane and lane–traffic-element relationships.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Classical lane detection found the painted lines in front of the car and fitted a curve, which is enough for highway lane keeping. City driving needs every lane around you, through unpainted intersections, with which lane leads where: a graph, not a picture.</li>
+      <li><b>What people tried.</b> <i>Hough transforms and polynomial fits</i>: fragile in shadow, rain and worn paint. <i>Per-pixel segmentation</i> (SCNN, LaneNet): robust lines, but a fixed number of lanes or pixels you must still group and connect. <i>HD maps</i>: survey every lane ahead of time and drive with the map, accurate but costly to build and to keep fresh when roads change.</li>
+      <li><b>Why this works.</b> Predicting <i>vector</i> lanes and their <i>connections</i> directly in BEV matches what the planner consumes. MapTR models each map element as an ordered set of points and runs camera-only at 25.1 FPS; Tesla models the graph as a token sequence so a network trained like a language model can say “this lane forks here”. Tiny numbers: 16 legal connections in a simple 4-way junction, and one wrong edge is enough to drive straight from a turn-only lane.</li>
+      <li><b>What it costs, when it fails.</b> Needs huge amounts of labeled lane geometry and topology (Tesla described auto-labeling it with multi-trip reconstruction, Lesson 6.7). Occluded intersections, faded paint, construction zones and unusual local rules are where predicted graphs go wrong; evaluating “is the graph right?” is itself hard.</li>
+      <li><b>What came next.</b> Online HD-map building (HDMapNet, MapTR and successors) that blends sensor evidence with cheap navigation maps; topology benchmarks such as OpenLane-V2; and end-to-end driving models that use lanes as an internal hint rather than a hard input (Lessons 0.4 and 9.2 discuss end-to-end driving).</li>
+    </ol>
+  </div>
+
+  <h2>Vector maps: MapTR and the “language of lanes”</h2>
+  <p><b>HDMapNet</b> (2021) framed the task: build the local HD map <i>online</i> from the car's own cameras and/or lidar, and output vectorized map elements in BEV. <b>MapTR</b> (ICLR 2023) made it clean and fast: each map element (lane divider, road edge, crosswalk) is a <b>set of points with equivalent orderings</b>: a closed crosswalk outline is the same shape whichever corner you start from, and a lane divider is the same line read forwards or backwards. Matching predictions to labels while allowing those orderings stabilized training; <b>MapTR-nano runs at 25.1 FPS</b> on an RTX 3090 with cameras only.</p>
+  <p>Tesla's AI Day 2022 lanes network adds topology on top, in three parts (as presented):</p>
+  <ul>
+    <li>a <b>vision component</b> that turns the camera video into a dense feature tensor;</li>
+    <li>a <b>lane guidance module</b> that encodes coarse road-level navigation map data (“not an HD map”) with hints like lane counts and intersection layout;</li>
+    <li>a <b>language component</b> that “captions” the dense tensor: it predicts a lane point (an index into a coarse 3D grid, then refined), then the next token, and so on, with <b>fork tokens</b> that point back to an earlier token, until an end-of-sentence token. The autoregressive idea is in <span class="dlref" data-href="phase7/8-autoregressive-visual.html">the Deep Learning course, Phase 7 (autoregressive models)</span>.</li>
+  </ul>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: dictating a subway map</span>
+    <p>Describe a subway map to a friend over the phone. You don't read out pixels; you say: “The red line starts at Central, goes to Park, then Bridge. At Park, the green line branches off to the airport.” That's a sequence of tokens where “branches off at Park” refers back to something you already said. Tesla's lane “sentences” work the same way, with lane positions as words and forks as references back.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>For classical lanes: OpenCV's <code>Canny</code> + <code>HoughLinesP</code>, and NumPy polynomial fits. For vector maps: the <b>MapTR</b> repo on nuScenes and Argoverse 2. For topology: the <b>OpenLane-V2</b> devkit. For lane graphs in your own code: <b>NetworkX</b>.</p>
+<pre><code><span class="k">import</span> cv2, numpy <span class="k">as</span> np, networkx <span class="k">as</span> nx
+
+<span class="c"># Classical: edges → line segments (each row x1, y1, x2, y2 in pixels)</span>
+edges = cv2.Canny(gray, <span class="n">50</span>, <span class="n">150</span>)
+segs = cv2.HoughLinesP(edges, rho=<span class="n">1</span>, theta=np.pi / <span class="n">180</span>, threshold=<span class="n">40</span>, minLineLength=<span class="n">30</span>, maxLineGap=<span class="n">20</span>)
+
+<span class="c"># Robust fit in BEV: RANSAC a parabola y = c2 x² + c1 x + c0 through lane points (x forward, y left)</span>
+<span class="k">def</span> ransac_poly(x, y, deg=<span class="n">2</span>, thr=<span class="n">0.3</span>, iters=<span class="n">50</span>, rng=np.random.default_rng(<span class="n">0</span>)):
+    best = <span class="k">None</span>
+    <span class="k">for</span> _ <span class="k">in</span> range(iters):
+        i = rng.choice(len(x), deg + <span class="n">1</span>, replace=<span class="k">False</span>)
+        c = np.polyfit(x[i], y[i], deg)
+        inl = np.abs(np.polyval(c, x) - y) &lt; thr
+        <span class="k">if</span> best <span class="k">is None or</span> inl.sum() &gt; best.sum():
+            best = inl
+    <span class="k">return</span> np.polyfit(x[best], y[best], deg), best        <span class="c"># refit on the inliers</span>
+
+<span class="c"># Topology: lanes as nodes, “can drive into” as directed edges</span>
+G = nx.DiGraph()
+G.add_edge(<span class="s">"S_left"</span>, <span class="s">"N_left"</span>, turn=<span class="s">"straight"</span>)
+G.add_edge(<span class="s">"S_left"</span>, <span class="s">"W_left"</span>, turn=<span class="s">"left"</span>)
+G.add_edge(<span class="s">"W_left"</span>, <span class="s">"W_far"</span>, turn=<span class="s">"straight"</span>)
+route = nx.shortest_path(G, <span class="s">"S_left"</span>, <span class="s">"W_far"</span>)            <span class="c"># ['S_left', 'W_left', 'W_far']</span></code></pre>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚘 Tesla</h4><p>No HD maps in what it shows (CVPR 2022). At AI Day 2022 Tesla presented its lanes network: vision features + a lane guidance module from coarse navigation maps + an autoregressive “language of lanes” decoder with fork tokens. Labels come from auto-labeling: multi-trip reconstruction that Tesla said “can replace 5 million hours of manual labeling with just 12 hours on cluster for labeling 10,000 trips”, about 30 minutes per new trip. Tesla also uses those lane-graph labels to generate simulated intersections automatically.</p>
+        <p class="src">Sources: <a href="https://www.youtube.com/watch?v=ODSJsviD_SU" target="_blank" rel="noopener">Tesla AI Day 2022</a>, <a href="https://www.youtube.com/watch?v=jPCV4GKX9Dw" target="_blank" rel="noopener">CVPR'22 WAD keynote</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo drives with its own <b>highly detailed custom maps</b>, which it calls the driver's “memory”: lane merges, stop signs, crosswalks, speed limits and more, so perception can focus on what's changed and what's moving (2020 Driver Handbook post). Its open Motion Dataset publishes the same style of road graph per scene: lane centers and boundaries, road edges, crosswalks, stop signs, speed bumps, driveways.</p>
+        <p class="src">Sources: <a href="https://waymo.com/blog/2020/09/the-waymo-driver-handbook-mapping" target="_blank" rel="noopener">Waymo Driver Handbook: maps</a>, <a href="https://waymo.com/open/about/" target="_blank" rel="noopener">Waymo Open Dataset</a></p></div>
+      <div><h4>🛸 Drones</h4><p>Lanes and lane topology are a road-vehicle problem: the sky has no lanes. A drone's “topology” is free 3D space and its flight plan (waypoints, geofences), and its perception builds volumetric maps for obstacle avoidance (Lesson 6.3). Delivery and inspection drones fly pre-planned routes; Skydio's drones map their surroundings in 3D as they fly.</p>
+        <p class="src">Sources: <a href="https://www.skydio.com/autonomy" target="_blank" rel="noopener">Skydio autonomy</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> Waymo serves chosen cities, so mapping every lane in advance is affordable and makes topology nearly certain. Tesla sells cars that drive anywhere, so it must infer topology on the fly from cameras plus coarse navigation maps. A drone has no lanes; its version of the problem is free-space geometry.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Classical (Hough / sliding windows + fit)</td><td>No training data; tiny compute; easy to debug</td><td>Breaks on worn paint, shadows, rain; no topology</td></tr>
+      <tr><td>Segmentation masks</td><td>Robust lines; handles curves and occlusion better</td><td>Still pixels; fixed lane counts in early designs; grouping and topology left over</td></tr>
+      <tr><td>Vector maps (MapTR-style)</td><td>Planner-ready polylines; real-time (25 FPS)</td><td>Needs map labels; topology still separate</td></tr>
+      <tr><td>Learned lane graph (Tesla-style tokens)</td><td>Topology through unpainted intersections; works without HD maps</td><td>Large labeled data; subtle, dangerous edge errors; hard to verify</td></tr>
+      <tr><td>HD map prior (Waymo-style)</td><td>Near-certain topology; perception focuses on changes</td><td>Mapping and upkeep cost; must detect when the map is wrong (construction)</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you give a planner the lanes at an intersection?” A strong answer:</p>
+    <ul>
+      <li>Separates <b>geometry</b> (centerline polylines in BEV, robustly fitted and tracked) from <b>topology</b> (a directed lane graph of successors, neighbours, forks, merges).</li>
+      <li>Knows <b>RANSAC vs least squares</b> with a number (the probability an all-inlier sample is drawn), and why curves are tracked over time.</li>
+      <li>Compares <b>HD maps vs online mapping</b>: cost, freshness, change detection, and the hybrid of a coarse navigation map plus learned local topology.</li>
+      <li>Talks about <b>evaluation</b>: geometric error by distance and topology correctness per connection, with construction zones and faded paint as test sets.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Tesla's lanes network</b> <span class="tag co">🏢 Tesla · 2022</span> <a href="https://www.youtube.com/watch?v=ODSJsviD_SU" target="_blank" rel="noopener">AI Day 2022</a></div>
+      <p><b>How:</b> dense vision tensor + lane guidance from coarse maps → autoregressive decoder emitting lane-point and fork tokens.</p>
+      <p><b>Why this method:</b> intersections have complex, diverse topology; Tesla said simple per-lane modelling “just totally breaks down” there.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>MapTR</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2208.14437" target="_blank" rel="noopener">Liao et al.</a> · <a href="https://github.com/hustvl/MapTR" target="_blank" rel="noopener">code</a></div>
+      <p><b>How:</b> map elements as permutation-equivalent point sets; hierarchical bipartite matching; camera-only.</p>
+      <p><b>Why this method:</b> online vectorized maps without surveying; MapTR-nano at 25.1 FPS, 8× faster than the previous camera method with higher mAP.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Waymo's detailed maps</b> <span class="tag av">🚗 AV</span> <a href="https://waymo.com/blog/2020/09/the-waymo-driver-handbook-mapping" target="_blank" rel="noopener">Waymo, Sep 2020</a></div>
+      <p><b>How:</b> custom maps with lanes, merges, stop signs, crosswalks and speed limits serve as prior knowledge for every mile.</p>
+      <p><b>Why this method:</b> in a chosen service area, a surveyed map makes topology near-certain and lets perception focus on the dynamic world.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>SCNN and the CULane dataset</b> <span class="tag res">🧪 Research · 2017</span> <a href="https://arxiv.org/abs/1712.06080" target="_blank" rel="noopener">Pan et al.</a></div>
+      <p><b>How:</b> slice-by-slice convolutions pass information along rows and columns, keeping long thin lanes connected through occlusion.</p>
+      <p><b>Why this method:</b> lanes have strong shape but weak appearance; it won the TuSimple lane challenge.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · San Francisco in two weeks</span>
+    <p>Tesla said its simulation team feeds auto-labeled lane graphs into a procedural world builder, and generated “most of San Francisco city streets” as drivable simulation tiles in <b>two weeks by one person</b>, with lane connectivity deciding where road arrows and signs get placed (<a href="https://www.youtube.com/watch?v=ODSJsviD_SU" target="_blank" rel="noopener">Tesla AI Day 2022</a>). The lane graph isn't only an output; it's a recipe for worlds.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Lane points come from the BEV features of 6.2; fitted curves are tracked over time like any state (<a href="../phase3/3-kalman-filter.html">Lesson 3.3</a>, predict then correct) and robust fitting is the outlier story of 3.7. HD maps vs mapless driving, and localizing against a map, are Lessons 5.5 and 5.6; the lane graph feeds prediction (7.1: other cars follow lanes) and planning (Phase 7: route search on the graph). Least squares is the projection idea in <a href="../../math-course/phase2/6-svd-pca.html">SVD and PCA</a> (Math course).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Talk</span> <a href="https://www.youtube.com/watch?v=ODSJsviD_SU" target="_blank" rel="noopener">Tesla AI Day 2022</a>. The lanes network section (around 1 h 26 min) walks through the token sentence step by step.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2208.14437" target="_blank" rel="noopener">MapTR (2022)</a>. Online vectorized HD maps, with the point-set trick.</li>
+      <li><span class="kind">Benchmark</span> <a href="https://github.com/OpenDriveLab/OpenLane-V2" target="_blank" rel="noopener">OpenLane-V2</a>. Lane topology and traffic-element relations as a public benchmark.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 30% of your lane points are outliers. RANSAC fits a parabola from 3 random points per try. About how many tries for a 99% chance that at least one sample is all inliers?</div>
+    <div class="opts"><button class="opt">About 3</button><button class="opt" data-ok>About 11</button><button class="opt">About 100</button></div>
+    <div class="explain">P(all 3 inliers) = 0.7³ = 0.343. Need 1 − (1 − 0.343)ᵏ ≥ 0.99 → k ≥ ln(0.01) ÷ ln(0.657) ≈ <b>11</b>. That's why RANSAC is cheap for small models.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. In testing, your car tries to go straight from a lane marked “left turn only”. The lane lines in BEV are perfect. Where is the bug most likely?</div>
+    <div class="opts"><button class="opt">The polynomial degree of the lane fit</button><button class="opt" data-ok>The topology: a wrong successor edge in the lane graph (missed the arrow or sign semantics)</button><button class="opt">The camera's focal length</button></div>
+    <div class="explain">Geometry can be perfect while topology is wrong. Turn restrictions come from arrows, signs and map priors, and must be represented as which edges exist. Evaluate topology per connection, not just line position.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Why does MapTR treat a crosswalk outline as a set of points with several equivalent orderings?</div>
+    <div class="opts"><button class="opt">To make the network smaller</button><button class="opt" data-ok>Because the same closed shape can be listed starting at any corner (and a line read in either direction); forcing one arbitrary order would punish correct predictions and destabilize training</button><button class="opt">Because crosswalks are always squares</button></div>
+    <div class="explain">Like PointNet's order problem in 6.1: the label's ordering is arbitrary. Matching against all equivalent orderings means the network is only penalized for wrong shapes, not for starting at a different corner.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Lanes went classical (Hough + fit) → segmentation (SCNN, LaneNet instances) → vectors and graphs (HDMapNet, MapTR at 25 FPS, lane graphs).</li>
+      <li>Fit lane curves robustly: least squares is wrecked by outliers; RANSAC (sample, count inliers, refit) is cheap, then track the coefficients over time.</li>
+      <li>Topology = a directed lane graph of successors, neighbours, forks, merges; a 4-way 2-lane junction already has 16 connections, and one wrong edge is dangerous.</li>
+      <li>Tesla (AI Day 2022): vision + coarse-map lane guidance + an autoregressive “language of lanes” with fork tokens, auto-labeled by multi-trip reconstruction.</li>
+      <li>Waymo drives with detailed custom maps of every lane; drones have no lanes, only 3D free space.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+
+  // ---------- Playground 1: lane fitting ----------
+  // ==MODEL64==
+  function rngL(seed){let a=seed>>>0;return()=>{a|=0;a=(a+0x6D2B79F5)|0;let t=Math.imul(a^(a>>>15),1|a);t=(t+Math.imul(t^(t>>>7),61|t))^t;return((t^(t>>>14))>>>0)/4294967296;};}
+  function gaussL(r){let u=0,v=0;while(!u)u=r();while(!v)v=r();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
+  const laneTrue=x=>1.75+0.004*x+0.0011*x*x;
+  function lanePoints(seed,outliers){const r=rngL(seed),pts=[];
+    for(let x=4;x<=60;x+=0.8){if(x>27&&x<37)continue;
+      pts.push({x,y:laneTrue(x)+0.08*gaussL(r),out:false});}
+    if(outliers){for(let k=0;k<16;k++){const x=6+50*r();pts.push({x,y:laneTrue(x)+(r()<0.5?-1:1)*(0.9+1.6*r()),out:true});}
+      for(let k=0;k<6;k++){const x=40+20*r();pts.push({x,y:laneTrue(x)-2.6+0.1*gaussL(r),out:true});}}
+    return pts;}
+  function polyfit(pts,deg){
+    const n=deg+1,A=Array.from({length:n},()=>Array(n+1).fill(0));
+    for(const p of pts){const s=p.x/60,pw=[];for(let i=0;i<=2*deg;i++)pw.push(Math.pow(s,i));for(let i=0;i<n;i++){for(let j=0;j<n;j++)A[i][j]+=pw[i+j];A[i][n]+=pw[i]*p.y;}}
+    for(let i=0;i<n;i++){let m=i;for(let k=i+1;k<n;k++)if(Math.abs(A[k][i])>Math.abs(A[m][i]))m=k;[A[i],A[m]]=[A[m],A[i]];const d=A[i][i]||1e-12;for(let k=i;k<=n;k++)A[i][k]/=d;for(let k=0;k<n;k++)if(k!==i){const f=A[k][i];for(let j=i;j<=n;j++)A[k][j]-=f*A[i][j];}}
+    const c=A.map(r=>r[n]);return x=>{const s=x/60;let y=0,p=1;for(const ci of c){y+=ci*p;p*=s;}return y;};}
+  function ransac(pts,deg,thr,iters,seed){const r=rngL(seed);let best=null,bestN=-1;
+    for(let it=0;it<iters;it++){const sample=[];while(sample.length<deg+1){const p=pts[Math.floor(r()*pts.length)];if(!sample.includes(p))sample.push(p);}
+      const f=polyfit(sample,deg),inl=pts.filter(p=>Math.abs(f(p.x)-p.y)<thr);if(inl.length>bestN){bestN=inl.length;best=inl;}}
+    const f=polyfit(best,deg);return {f,inliers:pts.filter(p=>Math.abs(f(p.x)-p.y)<thr)};}
+  function laneScore(f){let s=0,n=0;for(let x=4;x<=60;x+=1){s+=(f(x)-laneTrue(x))**2;n++;}return {rms:Math.sqrt(s/n),e55:Math.abs(f(55)-laneTrue(55)),e32:Math.abs(f(32)-laneTrue(32))};}
+  // ==END64==
+  let method = "ls", seed = 4, fitRes = null;
+  const FW = new Sim($("fitCanvas"), { xRange: [0, 64], yRange: [-2.2, 8.5], grid: 0 });
+  FW.render(w => {
+    if (!fitRes) return;
+    w.clear();
+    for (let x = 0; x <= 60; x += 10) { w.line([[x, -2.2], [x, 8.5]], { color: "--line", width: 1 }); w.text([x + 0.4, -1.8], x + " m", { color: "--muted", size: 10, align: "left" }); }
+    w.rect(27, -2.2, 10, 10.7, { fill: "--muted", alpha: 0.12 }); w.text([32, 8.0], "worn paint", { color: "--muted", size: 10 });
+    const xs = MX.linspace(0, 64, 129);
+    w.line(xs.map(x => [x, laneTrue(x)]), { color: "--muted", width: 2, dash: [6, 5] });
+    const inl = new Set(fitRes.inliers || []);
+    fitRes.pts.forEach(p => w.dot([p.x, p.y], { color: p.out ? "--c-ag" : "--c-se", r: method === "rs" && !inl.has(p) ? 2 : 3.2, alpha: method === "rs" && !inl.has(p) ? 0.45 : 0.9 }));
+    w.line(xs.map(x => [x, fitRes.f(x)]), { color: "--c-be", width: 3 });
+    w.car({ x: -1, y: 0, th: 0 }, { color: "--c-pl", L: 2.6 });
+  });
+  function refreshFit() {
+    const deg = +$("fitDeg").value, thr = +$("fitThr").value, it = +$("fitIt").value, out = $("fitOut").checked;
+    $("fitDegV").textContent = deg; $("fitThrV").textContent = thr.toFixed(2) + " m"; $("fitItV").textContent = it;
+    $("fitThr").disabled = $("fitIt").disabled = method !== "rs";
+    const pts = lanePoints(seed, out);
+    if (method === "ls") fitRes = { f: polyfit(pts, deg), inliers: pts, pts };
+    else { const r = ransac(pts, deg, thr, it, seed * 7 + 2); fitRes = { f: r.f, inliers: r.inliers, pts }; }
+    const sc = laneScore(fitRes.f);
+    $("fitRms").textContent = fmt(100 * sc.rms, 1) + " cm"; $("fit32").textContent = fmt(100 * sc.e32, 1) + " cm"; $("fit55").textContent = fmt(100 * sc.e55, 1) + " cm";
+    $("fitInl").textContent = fitRes.inliers.length + " of " + pts.length;
+    const win = out && sc.rms < 0.10 && sc.e55 < 0.10;
+    $("fitChal").innerHTML = win ? `<span class="badge-win">✅ robust: ${fmt(100 * sc.rms, 1)} cm RMS</span>` : !out ? `<span class="muted">turn outliers on for the challenge</span>` : `<span class="badge-lose">${fmt(100 * sc.rms, 0)} cm RMS</span>`;
+    FW.render();
+  }
+  $("fitMethod").querySelectorAll("button").forEach(b => (b.onclick = () => { method = b.dataset.m; $("fitMethod").querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b)); refreshFit(); }));
+  ["fitDeg", "fitThr", "fitIt"].forEach(id => ($(id).oninput = refreshFit));
+  $("fitOut").onchange = refreshFit;
+  $("fitSeed").onclick = () => { seed++; refreshFit(); };
+  refreshFit();
+
+  // ---------- Playground 2: intersection topology ----------
+  const rot = ([x, y], k) => { for (let i = 0; i < (k % 4 + 4) % 4; i++) [x, y] = [-y, x]; return [x, y]; };
+  const AP = ["S", "E", "N", "W"];                    // approach k comes from this side
+  const EX = ["N", "W", "S", "E"];                    // exit k leaves toward this side (same heading as approach k)
+  const IN = [], OUT = [];
+  for (let k = 0; k < 4; k++) {
+    IN.push({ id: AP[k] + "-left", k, lane: "L", p: rot([1.75, -10], k), dirIn: rot([0, 1], k) });
+    IN.push({ id: AP[k] + "-right", k, lane: "R", p: rot([5.25, -10], k), dirIn: rot([0, 1], k) });
+    OUT.push({ id: "to " + EX[k] + " (inner)", e: k, lane: "L", p: rot([1.75, 10], k), dirOut: rot([0, 1], k) });
+    OUT.push({ id: "to " + EX[k] + " (outer)", e: k, lane: "R", p: rot([5.25, 10], k), dirOut: rot([0, 1], k) });
+  }
+  const key = (i, o) => i + ">" + o;
+  const LEGAL = new Set();
+  IN.forEach((a, ia) => OUT.forEach((b, ob) => {
+    const turn = (b.e - a.k + 4) % 4;               // 0 straight, 1 left, 3 right, 2 U-turn
+    const ok = (a.lane === "L" && ((turn === 0 && b.lane === "L") || (turn === 1 && b.lane === "L"))) || (a.lane === "R" && ((turn === 0 && b.lane === "R") || (turn === 3 && b.lane === "R")));
+    if (ok) LEGAL.add(key(ia, ob));
+  }));
+  const turnName = (ia, ob) => ["straight", "left turn", "U-turn", "right turn"][(OUT[ob].e - IN[ia].k + 4) % 4];
+  function labelerVersion() {
+    const s = new Set();
+    LEGAL.forEach(k => { const [ia] = k.split(">").map(Number); if (IN[ia].k !== 3) s.add(k); });
+    // the labeler's mistakes on approach E (k = 1): right lane given a left turn instead of its right turn
+    const eR = IN.findIndex(a => a.k === 1 && a.lane === "R");
+    OUT.forEach((b, ob) => { const t = (b.e - 1 + 4) % 4; if (t === 3 && b.lane === "R") s.delete(key(eR, ob)); if (t === 1 && b.lane === "L") s.add(key(eR, ob)); });
+    return s;
+  }
+  let edges = labelerVersion(), selIn = -1, showBad = false;
+  const curve = (a, b) => { const P0 = a.p, P3 = b.p, c1 = [P0[0] + 6 * a.dirIn[0], P0[1] + 6 * a.dirIn[1]], c2 = [P3[0] - 6 * b.dirOut[0], P3[1] - 6 * b.dirOut[1]]; const pts = []; for (let t = 0; t <= 1.0001; t += 0.05) { const u = 1 - t; pts.push([u * u * u * P0[0] + 3 * u * u * t * c1[0] + 3 * u * t * t * c2[0] + t * t * t * P3[0], u * u * u * P0[1] + 3 * u * u * t * c1[1] + 3 * u * t * t * c2[1] + t * t * t * P3[1]]); } return pts; };
+  const XW = new Sim($("xCanvas"), { xRange: [-22, 22], yRange: [-22, 22], onPointer(type, [x, y]) {
+    if (type !== "down") return;
+    const near = list => { let bi = -1, bd = 1.6; list.forEach((n, i) => { const d = Math.hypot(n.p[0] - x, n.p[1] - y); if (d < bd) { bd = d; bi = i; } }); return bi; };
+    const ii = near(IN), oo = near(OUT);
+    if (ii >= 0) selIn = ii === selIn ? -1 : ii;
+    else if (oo >= 0 && selIn >= 0) { const k = key(selIn, oo); edges.has(k) ? edges.delete(k) : edges.add(k); }
+    else selIn = -1;
+    refreshX();
+  } });
+  XW.render(w => {
+    w.clear();
+    w.rect(-22, -7, 44, 14, { fill: "--muted", alpha: 0.18 }); w.rect(-7, -22, 14, 44, { fill: "--muted", alpha: 0.18 });
+    const seg = (a, b, o) => w.line([a, b], o);
+    for (let k = 0; k < 4; k++) {
+      seg(rot([0, -22], k), rot([0, -10], k), { color: "--c-un", width: 2 });
+      seg(rot([3.5, -22], k), rot([3.5, -10], k), { color: "--text", width: 1, dash: [5, 5], alpha: 0.7 });
+      seg(rot([-3.5, -22], k), rot([-3.5, -10], k), { color: "--text", width: 1, dash: [5, 5], alpha: 0.7 });
+      seg(rot([7, -22], k), rot([7, -7], k), { color: "--text", width: 2, alpha: 0.8 });
+      seg(rot([-7, -22], k), rot([-7, -7], k), { color: "--text", width: 2, alpha: 0.8 });
+      seg(rot([0.2, -10], k), rot([7, -10], k), { color: "--text", width: 3 });   // stop line
+      const a = rot([1.75, -15], k), b = rot([5.25, -15], k);
+      w.text(a, "L", { color: "--muted", size: 10 }); w.text(b, "R", { color: "--muted", size: 10 });
+      w.text(rot([3.5, -20.5], k), AP[k], { color: "--muted", size: 12, bold: true });
+    }
+    edges.forEach(k => { const [ia, ob] = k.split(">").map(Number); const bad = !LEGAL.has(k); w.line(curve(IN[ia], OUT[ob]), { color: bad && showBad ? "--bad" : ia === selIn ? "--accent" : "--c-pl", width: bad && showBad ? 3.5 : ia === selIn ? 3 : 2, alpha: 0.9 }); });
+    if (showBad) LEGAL.forEach(k => { if (!edges.has(k)) { const [ia, ob] = k.split(">").map(Number); w.line(curve(IN[ia], OUT[ob]), { color: "--c-un", width: 2, dash: [4, 4], alpha: 0.9 }); } });
+    IN.forEach((n, i) => w.dot(n.p, { color: "--c-se", r: i === selIn ? 8 : 6, ring: i === selIn ? "--accent" : null }));
+    OUT.forEach(n => w.dot(n.p, { color: "--c-mp", r: 6 }));
+    if (selIn >= 0) w.text([0, 20.5], "selected: " + IN[selIn].id + " → click a green dot", { color: "--accent", size: 12, bold: true });
+  });
+  function tokens() {
+    // illustrative token stream: per incoming lane START, then the first successor as CONT, later ones as FORK(→ index of START)
+    const out = []; let idx = 0;
+    IN.forEach((a, ia) => {
+      const succ = OUT.map((b, ob) => ob).filter(ob => edges.has(key(ia, ob)));
+      if (!succ.length) return;
+      const startIdx = idx;
+      out.push(`<span class="st">#${idx++} START(${a.p[0].toFixed(1)},${a.p[1].toFixed(1)})</span>`);
+      succ.forEach((ob, j) => { out.push(j === 0 ? `<span>#${idx++} CONT→${OUT[ob].id} · ${turnName(ia, ob)}</span>` : `<span class="fk">#${idx++} FORK(#${startIdx})→${OUT[ob].id} · ${turnName(ia, ob)}</span>`); });
+    });
+    out.push(`<span class="st">#${idx} END</span>`);
+    return out.join(" ");
+  }
+  function refreshX() {
+    let ok = 0, bad = 0; edges.forEach(k => (LEGAL.has(k) ? ok++ : bad++));
+    const miss = LEGAL.size - ok;
+    $("xOk").textContent = ok + " of " + LEGAL.size; $("xMiss").textContent = miss; $("xBad").textContent = bad;
+    $("xChal").innerHTML = ok === LEGAL.size && bad === 0 ? `<span class="badge-win">✅ perfect lane graph</span>` : `<span class="badge-lose">${miss} missing, ${bad} illegal</span>`;
+    $("xTokens").innerHTML = tokens();
+    XW.render();
+  }
+  $("xCheck").onclick = () => { showBad = !showBad; $("xCheck").textContent = showBad ? "🙈 Hide mistakes" : "🔍 Highlight mistakes"; refreshX(); };
+  $("xReset").onclick = () => { edges = labelerVersion(); selIn = -1; refreshX(); };
+  $("xClear").onclick = () => { edges = new Set(); selIn = -1; refreshX(); };
+  refreshX();
+})();
+</script>
+</body>
+</html>

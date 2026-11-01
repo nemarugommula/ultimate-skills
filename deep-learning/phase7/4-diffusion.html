@@ -1,0 +1,510 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.4 Diffusion models: noise in, image out · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.plane.sq { aspect-ratio: 1 / 1; max-width: 400px; height: auto; }
+  canvas.px { width: 100%; max-width: 150px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 8px; border: 1px solid var(--line); }
+  .imgrow { display: grid; grid-template-columns: repeat(3, minmax(0, 150px)); gap: 14px; align-items: start; }
+  .post { display: grid; grid-template-columns: repeat(10, 1fr); gap: 3px; align-items: end; height: 70px; border-bottom: 1px solid var(--line); margin-top: 6px; }
+  .post div { background: var(--c-y); border-radius: 3px 3px 0 0; min-height: 1px; }
+  .postlab { display: grid; grid-template-columns: repeat(10, 1fr); gap: 3px; text-align: center; font: 700 .8rem var(--mono); color: var(--muted); }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+</style>
+</head>
+<body data-lesson="d7-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 4</div>
+  <h1>Diffusion models: noise in, image out</h1>
+  <p class="subtitle">Destroy a picture with noise, one sprinkle at a time. Train a network to guess the noise. Then start from pure static and run the movie backwards. It sounds too simple to work; it now powers almost every image and video generator.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>The forward process and the shortcut x<sub>t</sub> = √ᾱ<sub>t</sub>·x₀ + √(1 − ᾱ<sub>t</sub>)·ε, the noise-guessing MSE loss and the step-by-step sampler are derived in <a href="../../math-course/phase8/4b-diffusion.html">math 8.4b</a>. This lesson builds the intuition and the engineering on top.</li>
+      <li>A <b>denoising autoencoder</b> learns to rebuild a clean input from a corrupted one (Lesson 7.1). VAEs blur because they average plausible answers (7.2).</li>
+      <li>A <b>U-Net</b> is an encoder–decoder CNN with skip connections that outputs an image the same size as its input (Lesson 4.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2020, Jonathan Ho, Ajay Jain and Pieter Abbeel trained a network to do one thing: look at a noisy image and say what noise was added. They used <b>plain mean squared error</b>, the loss from your first regression lesson. No adversary, no KL balancing act. Generating a picture meant asking that network the same question 1,000 times in a row.</p>
+    <p>It reached an FID of <b>3.17</b> on CIFAR-10, the best reported at the time. A year later, the same family beat the best GANs on ImageNet (Lesson 7.3). Today Stable Diffusion, FLUX, Google's Veo and OpenAI's Sora all build on this idea or its close cousin, flow matching (Lesson 7.6).</p>
+    <p><b>How can “guess the noise” be enough to invent a picture? And if one line of code destroys an image in a single jump, why does undoing it take a thousand steps?</b> Below you'll noise a spiral to static and grow it back, find the fewest steps that still work, and watch an image decide what it is.</p>
+  </div>
+
+  <h2>Numbers first: one pixel, destroyed on schedule</h2>
+  <p>Take one pixel with value 0.8 (images are scaled to −1…1). The forward process mixes in a little Gaussian noise at each of T = 1,000 steps, following DDPM's original <b>linear schedule</b>. Thanks to a shortcut (variances of Gaussian noise add up), you can jump straight to any step t:</p>
+  <table>
+    <tr><th>step t</th><th>0</th><th>250</th><th>500</th><th>750</th><th>1000</th></tr>
+    <tr><td>keep <span class="x">√ᾱ<sub>t</sub></span> of the picture</td><td>1</td><td>0.724</td><td>0.280</td><td>0.058</td><td>0.006</td></tr>
+    <tr><td>pixel 0.8 becomes (signal part)</td><td>0.8</td><td>0.58</td><td>0.22</td><td>0.05</td><td>0.005</td></tr>
+    <tr><td>plus noise of size <span class="gr">√(1 − ᾱ<sub>t</sub>)</span></td><td>0</td><td>0.69</td><td>0.96</td><td>1.00</td><td>1.00</td></tr>
+  </table>
+  <p>ᾱ<sub>t</sub> (“alpha-bar”) is the share of the original signal's power that survives to step t. By the end, the picture is pure N(0, 1) static. That's the easy direction. The hard direction is a network ε<sub>θ</sub>(x<sub>t</sub>, t) that looks at a noisy picture and the step number and <b>predicts the noise ε</b> that was mixed in. Training is one line, repeated on millions of (picture, random t, random noise) triples:</p>
+  <div class="calc"><span class="ls">loss</span> = ‖ ε − ε<sub>θ</sub>( √ᾱ<sub>t</sub>·x₀ + √(1 − ᾱ<sub>t</sub>)·ε, &nbsp;t ) ‖² &nbsp;&nbsp;(plain MSE, “guess the noise I added”)</div>
+  <p>To <b>generate</b>, start from pure noise at t = 1,000, ask the network for its noise guess, remove a slice of it, step to t = 999, and repeat. The full formulas (and why the step adds back a little fresh noise) are in <a href="../../math-course/phase8/4b-diffusion.html">math 8.4b</a>.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A diffusion model is a <b>denoising autoencoder trained at every noise level at once</b>, then run in a loop. Each single step is a small, easy correction (“this static is a little too static”), so one network with a plain MSE loss can learn it. Chaining a thousand small corrections turns pure noise into a sample from the data distribution, with no adversary and no blur from one big guess.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a sculptor and a block of marble</span>
+    <p>Ask a sculptor to carve a statue in one swing of the hammer and you get rubble. Ask “what's the one chip of stone that least belongs here?” a thousand times and a statue emerges. Early chips decide the rough shape (is it a horse or a person?); late chips decide the details (the eyelashes). The noise-predicting network is the sculptor's eye for “what doesn't belong”, asked once per step.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Denoising (noise prediction) as the training target</span></span>
+    <ol>
+      <li><b>The problem before</b> VAEs map noise to an image in <b>one</b> decoder pass, so they average plausible answers and blur (7.2). GANs make sharp images in one pass but train as an unstable game and drop modes (7.3).</li>
+      <li><b>What people tried</b> Better VAEs, stabilized GANs; score matching (learning the direction toward likelier data) worked on toy data but struggled at high noise and high resolution.</li>
+      <li><b>Why this works</b> Predicting the noise for a <i>given</i> noisy picture is an ordinary supervised regression: the right answer is the noise we added ourselves, so the loss is plain MSE, as stable as training a classifier. Each reverse step only has to make a small correction, which a network can learn well; the hard “create a whole picture” problem is split into a thousand easy ones. Ho et al. found that dropping the full probabilistic loss's per-step weights and using this simple MSE gave <b>better</b> samples. Seen as a vector, −ε<sub>θ</sub> points from the noisy point toward likelier data: it's the <b>score</b>, tying diffusion to score-based models (Song et al. 2020).</li>
+      <li><b>What it costs, when it fails</b> Generation needs many network calls (DDPM: 1,000; this is the big cost). A tiny error in each step can drift. Pixel-space diffusion at high resolution is expensive to train and run (Lesson 7.5 fixes that).</li>
+      <li><b>What refined it</b> DDIM (fewer steps, below), better noise schedules (below), latent diffusion (7.5), guidance (7.7), flow matching with straighter paths (7.6), and distillation to 1–4 steps (7.3, 7.6). Some models predict x₀ or a mix called v (“velocity”) instead of ε; same idea, better behaved at the noisiest steps.</li>
+    </ol>
+  </div>
+
+  <h2>Noise a spiral, then grow it back</h2>
+  <p>Our “images” here are 2D points: the dataset is 200 points on a spiral (or a smiley). The playground uses the <b>exact</b> best noise-guesser for this dataset instead of a trained network (honest note: for a finite set of points, the ideal ε<sub>θ</sub> has a formula, a weighted average over the training points; a real model learns an approximation of the same arrows). Everything else is the real DDPM and DDIM sampling loop.</p>
+  <p class="predict">🔮 <b>Predict:</b> DDPM was designed for 1,000 steps. If you generate with only <b>20</b> steps (each one 50× bigger), will the spiral come back sharp, blurry, or not at all? Does the noise schedule matter?</p>
+
+  <div class="playground" id="pgSp">
+    <span class="label">🎮 Playground · The diffusion scrubber: noise it, then generate</span>
+    <p class="hint">Drag <b>t</b> to noise the <span class="x">blue</span> data with the shortcut formula (each point keeps its own fixed noise). Then pick a step count and press <b>✨ Generate</b>: 300 <span class="y">green</span> points start as pure noise and walk back to t = 0. “On the shape” = within 0.05 of a real data point.</p>
+    <div class="goals">
+      <span class="goal" id="gClean">🎯 Generate with ≥ 90% on the shape</span>
+      <span class="goal" id="gFew">🎯 ≥ 90% with the fewest steps you can (≤ 20)</span>
+      <span class="goal" id="gFail">🎯 Break it: ≤ 25% on the shape</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="dSet"><button data-v="spiral" class="on">🌀 Spiral</button><button data-v="smiley">🙂 Smiley</button></span>
+      <label>noise level t <input type="range" id="dT" min="0" max="1000" step="10" value="0"> <b class="mono" id="dTV"></b></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="dSch"><button data-v="linear" class="on">linear schedule</button><button data-v="cosine">cosine schedule</button></span>
+      <span class="seg" id="dSam"><button data-v="ddpm" class="on">DDPM (adds noise)</button><button data-v="ddim">DDIM (deterministic)</button></span>
+      <label>sampling steps <select id="dS" class="btn small"><option>3</option><option>5</option><option>10</option><option>15</option><option selected>20</option><option>30</option><option>40</option><option>50</option><option>100</option><option>1000</option></select></label>
+    </div>
+    <div class="controls"><button class="btn primary" id="dGen">✨ Generate</button><button class="btn" id="dClear">Clear samples</button></div>
+    <div class="pg-cols">
+      <div><canvas class="plane sq" id="dCan"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">signal kept <span class="x">√ᾱ</span> <b id="dSig" class="x">–</b></div>
+          <div class="stat">noise <span class="gr">√(1 − ᾱ)</span> <b id="dNoi" class="gr">–</b></div>
+        </div>
+        <div class="stat-row">
+          <div class="stat">generating: step <b id="dStep">–</b></div>
+          <div class="stat">on the shape <b id="dQ">–</b></div>
+        </div>
+        <p class="hint" id="dMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see</b> (seeded): by t ≈ 500 the spiral is unrecognizable, though √ᾱ = 0.28 of it is still there. With the <b>linear</b> schedule and 1,000 or 100 steps, essentially every generated point lands on the spiral; at 20 steps only about <b>43%</b> do (a blurry, shrunken cloud); at 3–10 steps it falls apart. Switch to the <b>cosine</b> schedule: <b>20 steps give 94%</b>, and 15 steps give about 80%. Same denoiser, same step count: the schedule decided where the steps were spent. DDIM and DDPM are close here (DDIM a few points better at 15–30 steps); with a learned network DDIM's advantage is bigger, as below.</p>
+
+  <h2>Noise schedules: where to spend your steps</h2>
+  <p>A <b>noise schedule</b> says how fast the signal fades: ᾱ<sub>t</sub> for every t. DDPM's linear schedule (β from 0.0001 to 0.02) fades fast. Nichol &amp; Dhariwal (2021) noticed that with it, the latents in the last quarter of the forward process are almost pure noise: those steps teach the model little and waste sampling time. They proposed a <b>cosine</b> schedule that fades slowly at both ends.</p>
+
+  <div class="playground" id="pgSch">
+    <span class="label">🎮 Playground · Linear vs cosine schedule</span>
+    <p class="hint">The curves show how much of the picture survives (√ᾱ<sub>t</sub>) at each step for both schedules. Drag t to compare. The shaded count is how many of the 1,000 steps are nearly pure noise (under 10% of the signal left).</p>
+    <canvas class="chart" id="schC" style="height:200px"></canvas>
+    <div class="controls"><label>t <input type="range" id="schT" min="0" max="1000" step="10" value="750"> <b class="mono" id="schTV"></b></label></div>
+    <div class="stat-row">
+      <div class="stat">linear √ᾱ <b id="schL">–</b></div>
+      <div class="stat">cosine √ᾱ <b id="schCo">–</b></div>
+      <div class="stat">steps that are nearly pure noise <b id="schN">–</b></div>
+    </div>
+  </div>
+  <p>At t = 750 the linear schedule keeps <b>0.058</b> of the signal; cosine keeps <b>0.380</b>. Under the linear schedule <b>327</b> of the 1,000 steps have less than 10% of the signal left; under cosine only <b>65</b>. That's why cosine did so much better with 20 steps in the scrubber: more of its steps happen where the picture is still being shaped.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">The noise schedule (linear → cosine)</span></span>
+    <ol>
+      <li><b>The problem before</b> DDPM's linear schedule destroys small images quickly: the last quarter of the steps are almost pure noise. Training spends a quarter of its effort on steps that barely matter, and samplers that skip steps lose the steps that do matter.</li>
+      <li><b>What people tried</b> Tuning β ranges by hand per resolution.</li>
+      <li><b>Why this works</b> The cosine schedule ᾱ<sub>t</sub> = cos²(((t/T + s)/(1 + s))·π/2), with s = 0.008, falls slowly at the start, almost linearly in the middle, and slowly at the end. Information is removed at a more even pace, so every step does some work. In our toy it cut the nearly-pure-noise steps from 327 to 65 and made 20-step sampling go from 43% to 94% on the shape.</li>
+      <li><b>What it costs, when it fails</b> The “right” schedule depends on resolution and data scale: a 1024-pixel image has so much redundancy that even heavy noise leaves its shape visible, so high-resolution models shift schedules toward more noise. Scaling the data changes the effective schedule too (see the Tools snippet, and SD's 0.18215 from 7.2).</li>
+      <li><b>What refined it</b> Thinking in terms of signal-to-noise ratio, ᾱ / (1 − ᾱ), instead of steps; continuous-time schedules; SD3's “logit-normal” sampling of training times to focus on the middle noise levels (7.6).</li>
+    </ol>
+  </div>
+
+  <h2>DDIM: the same model, far fewer steps</h2>
+  <p>DDPM's sampler takes a step, then adds fresh random noise, as the math of running the noise process backwards requires. Song, Meng &amp; Ermon (2020) showed you can use the <b>same trained model</b> with a different, <b>deterministic</b> update: predict the clean picture x̂₀ from the noise guess, then jump directly to a much earlier noise level along the same “direction”. No retraining, and the step size is up to you.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: one DDIM step by hand</span>
+    <p>A 1-number “image” at a step where ᾱ = 0.5 has the value x<sub>t</sub> = 0.5. The network guesses noise ε̂ = 0.3.</p>
+    <p><b>1. Guess the clean value.</b> Undo the mix: x̂₀ = (x<sub>t</sub> − √(1 − ᾱ)·ε̂) / √ᾱ = (0.5 − 0.707 × 0.3) / 0.707 = <b>0.407</b>.</p>
+    <p><b>2. Jump to a much less noisy level</b>, say ᾱ′ = 0.9, re-using the same noise guess: x′ = √0.9 × 0.407 + √0.1 × 0.3 = 0.386 + 0.095 = <b>0.481</b>.</p>
+    <p>One network call moved us from 50% signal to 90%. DDPM would have needed many small steps for the same distance, each adding fresh noise. DDIM's sampler has a knob η (“eta”): η = 0 is this deterministic version, η = 1 recovers DDPM.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">DDIM (deterministic sampling with fewer steps)</span></span>
+    <ol>
+      <li><b>The problem before</b> DDPM needed about 1,000 network calls per sample: minutes per image on 2020 hardware. Taking bigger DDPM steps degrades samples quickly.</li>
+      <li><b>What people tried</b> Shorter schedules at training time (needs retraining), skipping steps naively.</li>
+      <li><b>Why this works</b> DDIM uses the same training objective, so any pretrained DDPM model works. Its update uses the model's guess of x₀ to jump along a smooth, deterministic path, which tolerates big jumps much better. The paper reports high-quality samples <b>10× to 50× faster</b> in wall-clock time. Being deterministic, the same starting noise always gives the same image, so you can interpolate between noises or run it in reverse to find the noise for a real image (“inversion”, used in image editing).</li>
+      <li><b>What it costs, when it fails</b> Still tens of steps for top quality; very few steps (under ~10) still blur or lose detail. Deterministic sampling can be slightly less diverse.</li>
+      <li><b>What refined it</b> Faster ODE solvers (DPM-Solver and friends), flow matching's straighter paths (7.6), and distillation down to 1–4 steps (consistency models, adversarial distillation).</li>
+    </ol>
+  </div>
+
+  <h2>Watch an image decide what it is</h2>
+  <p>Now real 8×8 images. The dataset is our ten digits; once more the denoiser is the exact ideal one for those ten pictures (labelled honestly: it can only ever reproduce one of the ten). The middle panel is the denoiser's current best guess of the clean picture, x̂₀. The bars show how strongly that guess leans toward each digit.</p>
+  <p class="predict">🔮 <b>Predict:</b> at t = 1,000 the picture is pure static. What will the denoiser's guess x̂₀ look like there: a random digit, static, or something else? And if you noise a 3 to t = 300 and denoise it, do you get your 3 back?</p>
+
+  <div class="playground" id="pgImg">
+    <span class="label">🎮 Playground · An 8×8 image, noised and generated</span>
+    <p class="hint">Pick a digit and drag t to noise it (cosine schedule). <b>✨ Generate</b> starts from fresh static and runs 50 DDIM steps. <b>Denoise from here</b> starts from the noisy picture you're looking at, which is how image-to-image editing works: the higher t, the more freedom the model has to change it.</p>
+    <div class="goals"><span class="goal" id="gKeep">🎯 Denoise from t ≥ 400 and keep your digit</span><span class="goal" id="gSwap">🎯 Denoise from t ≥ 800 and get a different digit</span></div>
+    <div class="controls">
+      <label>digit <select id="iDig" class="btn small"><option>0</option><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option><option>6</option><option>7</option><option>8</option><option>9</option></select></label>
+      <label>t <input type="range" id="iT" min="0" max="1000" step="10" value="300"> <b class="mono" id="iTV"></b></label>
+      <button class="btn small" id="iNew">🎲 new noise</button>
+    </div>
+    <div class="controls"><button class="btn primary" id="iGen">✨ Generate from static</button><button class="btn" id="iDen">Denoise from here</button></div>
+    <div class="imgrow">
+      <div><canvas class="px" id="iX"></canvas><p class="hint">x<sub>t</sub> (what the model sees)</p></div>
+      <div><canvas class="px" id="iX0"></canvas><p class="hint">x̂₀ (its guess of the clean image)</p></div>
+      <div><canvas class="px" id="iEps"></canvas><p class="hint">ε̂ (the noise it would remove)</p></div>
+    </div>
+    <div class="post" id="iPost"></div>
+    <div class="postlab"><span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span><span>6</span><span>7</span><span>8</span><span>9</span></div>
+    <div class="stat-row"><div class="stat">step <b id="iStep">–</b></div><div class="stat">result <b id="iRes">–</b></div></div>
+    <p class="hint" id="iMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at high t the guess x̂₀ is a grey <b>average of all ten digits</b> (the bars are nearly flat): with no information, the MSE-best answer is the average, exactly the VAE's blur. As t falls, the bars sharpen and the guess commits to one digit, typically somewhere between t ≈ 850 and t ≈ 300 for this schedule; the remaining steps only clean up. Denoising your 3 from t ≤ 400 always gives a 3 back; from t = 900 you usually get a different digit, because almost nothing of the 3 survived.</p>
+
+  <h2>The network inside: U-Net, timestep embedding, and soon transformers</h2>
+  <p>The noise predictor must output an image the same size as its input, so DDPM used a <b>U-Net</b> (Lesson 4.3), similar to PixelCNN++'s, with self-attention at low resolutions. It also needs to know <b>how noisy</b> its input is: the step t is turned into a vector with the same sinusoidal trick as a transformer's positional encoding (Lesson 6.3), passed through a small MLP and added into every block. Without it, the network couldn't tell “a little noise on a detailed image” from “lots of noise on a smooth one”.</p>
+  <table>
+    <tr><th>Piece</th><th>Job</th><th>Where it's from</th></tr>
+    <tr><td>U-Net encoder–decoder with skips</td><td>Image in, same-size noise map out; skips keep fine detail</td><td>Segmentation (4.3)</td></tr>
+    <tr><td>Timestep embedding</td><td>Tell every block the noise level</td><td>Sinusoidal positional encodings (6.3)</td></tr>
+    <tr><td>Self-attention at low resolution</td><td>Let distant parts of the image agree</td><td>Transformers (6.1)</td></tr>
+    <tr><td>Cross-attention to text (7.5)</td><td>Follow a prompt</td><td>Encoder–decoder attention (6.5)</td></tr>
+    <tr><td>Diffusion transformer (DiT, 7.5)</td><td>Replace the U-Net with a ViT on latent patches</td><td>ViT (4.5); used by SD3, FLUX, Sora</td></tr>
+  </table>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the perfect denoiser only copies</span>
+    <p>In the image playground, “generate” can only ever produce one of the ten training digits, exactly. That's not a bug of our toy: for a finite training set, the mathematically <b>ideal</b> denoiser regenerates training examples and nothing else. Real diffusion models produce new images precisely because they <i>can't</i> learn that ideal: a network with limited capacity, trained on millions of images, learns smoother arrows that generalize. Researchers measure how often big models still copy training images, and it's one reason dataset de-duplication matters.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>A full diffusion model on a 2D spiral, in PyTorch: an MLP noise predictor with a sinusoidal timestep embedding, the MSE training loop, and the 1,000-step DDPM sampler. One gotcha is built in: the spiral is scaled up 3× so the data's spread is comparable to the noise's (without it, in our runs only about a fifth of samples landed within 0.05 of the spiral).</p>
+<pre><code><span class="k">import</span> math, torch, torch.nn <span class="k">as</span> nn, torch.nn.functional <span class="k">as</span> F
+
+torch.manual_seed(<span class="n">0</span>)
+s_ = torch.linspace(<span class="n">0.15</span>, <span class="n">1</span>, <span class="n">2000</span>)                       <span class="c"># a 2D spiral: our "dataset"</span>
+spiral = torch.stack([<span class="n">0.9</span> * s_ * torch.cos(<span class="n">3.6</span> * math.pi * s_), <span class="n">0.9</span> * s_ * torch.sin(<span class="n">3.6</span> * math.pi * s_)], <span class="n">1</span>)
+data = <span class="n">3</span> * spiral                                        <span class="c"># scale up so the data's spread is comparable to the noise's</span>
+
+T = <span class="n">1000</span>
+beta = torch.linspace(<span class="n">1e-4</span>, <span class="n">0.02</span>, T)                     <span class="c"># DDPM's linear schedule</span>
+alpha_bar = torch.cumprod(<span class="n">1</span> - beta, <span class="n">0</span>)
+
+<span class="k">class</span> EpsNet(nn.Module):                                 <span class="c"># predicts the noise from (x_t, t)</span>
+    <span class="k">def</span> __init__(self, h=<span class="n">128</span>):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(<span class="n">2</span> + <span class="n">16</span>, h), nn.SiLU(), nn.Linear(h, h), nn.SiLU(),
+                                 nn.Linear(h, h), nn.SiLU(), nn.Linear(h, <span class="n">2</span>))
+    <span class="k">def</span> forward(self, x, t):
+        freqs = torch.exp(-math.log(<span class="n">1000</span>) * torch.arange(<span class="n">8</span>) / <span class="n">8</span>)   <span class="c"># sinusoidal timestep embedding</span>
+        ang = t[:, <span class="k">None</span>].float() * freqs[<span class="k">None</span>]
+        <span class="k">return</span> self.net(torch.cat([x, ang.sin(), ang.cos()], <span class="n">1</span>))
+
+model = EpsNet()
+opt = torch.optim.Adam(model.parameters(), lr=<span class="n">3e-3</span>)
+sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, <span class="n">6000</span>)
+<span class="k">for</span> step <span class="k">in</span> range(<span class="n">6000</span>):
+    x0 = data[torch.randint(<span class="n">0</span>, len(data), (<span class="n">512</span>,))]
+    t = torch.randint(<span class="n">0</span>, T, (<span class="n">512</span>,))
+    eps = torch.randn_like(x0)
+    ab = alpha_bar[t][:, <span class="k">None</span>]
+    xt = ab.sqrt() * x0 + (<span class="n">1</span> - ab).sqrt() * eps           <span class="c"># jump straight to step t</span>
+    loss = F.mse_loss(model(xt, t), eps)                  <span class="c"># guess the noise: plain MSE</span>
+    opt.zero_grad(); loss.backward(); opt.step(); sched.step()
+
+@torch.no_grad()
+<span class="k">def</span> ddpm_sample(n=<span class="n">1000</span>):
+    x = torch.randn(n, <span class="n">2</span>)
+    <span class="k">for</span> t <span class="k">in</span> reversed(range(T)):                           <span class="c"># 1,000 small denoising steps</span>
+        eps = model(x, torch.full((n,), t))
+        x = (x - beta[t] / (<span class="n">1</span> - alpha_bar[t]).sqrt() * eps) / (<span class="n">1</span> - beta[t]).sqrt()
+        <span class="k">if</span> t &gt; <span class="n">0</span>: x += beta[t].sqrt() * torch.randn_like(x)
+    <span class="k">return</span> x
+
+dist = torch.cdist(ddpm_sample() / <span class="n">3</span>, spiral).min(<span class="n">1</span>).values
+print(<span class="s">f"samples within 0.05 of the spiral: {(dist &lt; 0.05).float().mean():.0%}"</span>)
+
+<span class="c"># What we got on a laptop CPU (torch 2.8, about 25 s):</span>
+<span class="c"># samples within 0.05 of the spiral: 99%</span></code></pre>
+    <p class="hint">In Hugging Face <code>diffusers</code>, the same pieces are a scheduler and a model: <code>DDPMScheduler(num_train_timesteps=1000, beta_schedule="squaredcos_cap_v2")</code> (the cosine schedule), <code>scheduler.add_noise(x0, noise, t)</code> for training, then <code>scheduler.set_timesteps(50)</code> and <code>scheduler.step(eps, t, x).prev_sample</code> in the sampling loop. Swap in <code>DDIMScheduler</code> to sample the same model in fewer steps. <code>prediction_type</code> can be <code>"epsilon"</code>, <code>"sample"</code> (x₀) or <code>"v_prediction"</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Diffusion vs GAN</td><td>Stable MSE training, covers all modes, easy to condition</td><td>Tens to 1,000 network calls per sample</td></tr>
+      <tr><td>Diffusion vs VAE</td><td>Sharp samples (many small steps instead of one averaged guess)</td><td>Slow sampling; no compact encoder by itself</td></tr>
+      <tr><td>DDPM sampler</td><td>Exactly the reverse of training; stochastic, diverse</td><td>Needs many small steps</td></tr>
+      <tr><td>DDIM sampler</td><td>Same model, 10×–50× faster, deterministic (inversion, interpolation)</td><td>Few-step samples still lose detail</td></tr>
+      <tr><td>Cosine (or SNR-aware) schedule</td><td>Every step does work; better few-step sampling</td><td>Must be adapted to resolution and data scale</td></tr>
+      <tr><td>Pixel-space diffusion</td><td>No autoencoder artifacts</td><td>Very expensive at high resolution (7.5)</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Explain how a diffusion model is trained and sampled.” A strong answer:</p>
+    <ul>
+      <li><b>Forward</b>: mix Gaussian noise into data on a schedule; closed form x<sub>t</sub> = √ᾱ<sub>t</sub>·x₀ + √(1 − ᾱ<sub>t</sub>)·ε lets you jump to any t.</li>
+      <li><b>Train</b>: random image, random t, random ε; network ε<sub>θ</sub>(x<sub>t</sub>, t) predicts ε with MSE. A U-Net or transformer with a timestep embedding. It's a denoising autoencoder at every noise level; −ε points along the score.</li>
+      <li><b>Sample</b>: start at N(0, I), repeatedly remove predicted noise (DDPM: ~1,000 stochastic steps; DDIM: same model, deterministic, tens of steps).</li>
+      <li><b>Knobs</b>: noise schedule (linear vs cosine), prediction target (ε, x₀, v), number of steps; costs are dominated by network calls, so latent diffusion, better solvers and distillation exist.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The paper that made it work</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/2006.11239" target="_blank" rel="noopener">Ho, Jain &amp; Abbeel: Denoising Diffusion Probabilistic Models (DDPM)</a></div>
+      <p><b>How:</b> T = 1,000, β linear from 10⁻⁴ to 0.02, a U-Net with sinusoidal time embedding, the simplified MSE on the noise.</p>
+      <p><b>Why this method:</b> the simple objective gave better samples than the full weighted bound; FID 3.17 and Inception score 9.46 on unconditional CIFAR-10.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Fewer steps, same model</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/2010.02502" target="_blank" rel="noopener">Song, Meng &amp; Ermon: Denoising Diffusion Implicit Models (DDIM)</a></div>
+      <p><b>How:</b> a non-Markovian, deterministic sampler (η = 0) that uses DDPM-trained models unchanged.</p>
+      <p><b>Why this method:</b> 10× to 50× faster wall-clock sampling at high quality, plus meaningful interpolation in the starting noise.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The cosine schedule</b> <span class="tag res">🧪 Research · 2021</span> <a href="https://arxiv.org/abs/2102.09672" target="_blank" rel="noopener">Nichol &amp; Dhariwal: Improved Denoising Diffusion Probabilistic Models</a></div>
+      <p><b>How:</b> ᾱ<sub>t</sub> = f(t)/f(0) with f(t) = cos²(((t/T + s)/(1 + s))·π/2), s = 0.008, plus learned variances.</p>
+      <p><b>Why this method:</b> under the linear schedule the last quarter of latents are almost pure noise; cosine spreads the destruction out, improving sample quality and few-step sampling.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One view of all of it: the score</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/2011.13456" target="_blank" rel="noopener">Song et al.: Score-Based Generative Modeling through SDEs</a></div>
+      <p><b>How:</b> treat noising as a continuous-time process; generation runs it backwards using the learned score. A deterministic “probability flow ODE” samples the same distribution.</p>
+      <p><b>Why this method:</b> unifies score-based models and DDPM, explains DDIM as an ODE solver, and leads straight to flow matching (7.6).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Video, too</b> <span class="tag co">🏢 Google DeepMind · 2025</span> <a href="https://storage.googleapis.com/deepmind-media/veo/Veo-3-Tech-Report.pdf" target="_blank" rel="noopener">Veo 3 technical report</a></div>
+      <p><b>How:</b> Veo 3 uses latent diffusion applied jointly to compressed video and audio latents.</p>
+      <p><b>Why this method:</b> the same denoise-step-by-step recipe scales from 2D points to sound-synced video when it runs in a compressed latent space (Lesson 7.5).</p>
+    </div>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The math (multivariate Gaussians, the shortcut, the sampler) is <a href="../../math-course/phase8/4b-diffusion.html">math 8.4b</a>. Diffusion is a multi-noise-level denoising autoencoder (7.1) that avoids the VAE's one-shot blur (7.2) and the GAN's unstable game (7.3). Its U-Net is 4.3's; its timestep embedding is 6.3's positional encoding. Next: run it in a compressed latent with text conditioning (7.5), straighten its paths for fewer steps (7.6), steer it with classifier-free guidance (7.7). Diffusion also drives robot policies and audio generation (Phase 8).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://lilianweng.github.io/posts/2021-07-11-diffusion-models/" target="_blank" rel="noopener">Lilian Weng: What are Diffusion Models?</a>. The standard long-form explainer, with every derivation and many follow-ups.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2006.11239" target="_blank" rel="noopener">DDPM (2020)</a>. Algorithms 1 and 2 fit in a few lines each: compare them with the Tools snippet.</li>
+      <li><span class="kind">Docs</span> <a href="https://huggingface.co/docs/diffusers/api/schedulers/ddim" target="_blank" rel="noopener">diffusers: DDIMScheduler</a>. How the samplers are packaged in the library you'll actually use.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. With DDPM's linear schedule, √ᾱ at t = 250 is 0.724 and √(1 − ᾱ) is 0.690. A pixel of value 0.8 gets noise ε = −0.5. What is its noisy value x₂₅₀?</div>
+    <div class="opts"><button class="opt">0.8 − 0.5 = 0.30</button><button class="opt" data-ok>0.724 × 0.8 + 0.690 × (−0.5) = 0.579 − 0.345 ≈ 0.23</button><button class="opt">0.724 × (0.8 − 0.5) ≈ 0.22, since the noise is shrunk too</button></div>
+    <div class="explain">The shortcut keeps √ᾱ of the signal and adds √(1 − ᾱ) of the noise: 0.579 + (−0.345) = 0.234. Note 0.724² + 0.690² = 1, so the overall size of the numbers stays steady while the signal fades.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your diffusion model gives great samples at 1,000 DDPM steps but blurry, washed-out ones at 25 DDPM steps. You can't retrain. What's the best first move?</div>
+    <div class="opts"><button class="opt">Add more noise at each of the 25 steps</button><button class="opt" data-ok>Switch the sampler to DDIM (or a modern ODE solver) with the same trained model, and check which timesteps the 25 steps land on</button><button class="opt">Train a bigger U-Net</button></div>
+    <div class="explain">DDIM uses the same ε-prediction model with a deterministic update that tolerates large jumps, giving good samples in tens of steps (10×–50× faster in the paper). Where the steps fall on the schedule matters too, as the cosine-vs-linear scrubber showed.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A colleague says “at t = 1,000 the denoiser's best guess of the clean image is a random training image”. Using the 8×8 playground, what's wrong with that?</div>
+    <div class="opts"><button class="opt">Nothing; that's exactly what it outputs</button><button class="opt" data-ok>With almost no signal left, the MSE-optimal guess x̂₀ is the <i>average</i> of the data (a grey blur); the image only commits to one specific digit as t drops and the signal returns</button><button class="opt">At t = 1,000 the denoiser outputs pure noise</button></div>
+    <div class="explain">MSE rewards the mean of all answers consistent with the input. At pure static every digit is equally consistent, so x̂₀ is their average. Sampling resolves the choice gradually: coarse identity first, details last. That's why the early steps (high t) decide composition and the late ones decide texture.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Forward: noise data on a schedule; jump to any step with x<sub>t</sub> = √ᾱ<sub>t</sub>·x₀ + √(1 − ᾱ<sub>t</sub>)·ε.</li>
+      <li>Train: a U-Net (or transformer) with a timestep embedding predicts ε with plain MSE. It's a denoising autoencoder at every noise level.</li>
+      <li>Sample: start from N(0, I) and remove predicted noise step by step. DDPM ≈ 1,000 stochastic steps; DDIM reuses the same model, deterministic, 10×–50× faster.</li>
+      <li>The schedule decides where steps are spent: cosine left 65 nearly-pure-noise steps vs linear's 327, and turned 20-step sampling from 43% to 94% on our spiral.</li>
+      <li>High t decides the big picture (x̂₀ starts as the average of everything), low t the details. The cost is many network calls, which latent diffusion, better solvers and distillation attack.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/plane.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); return () => bs.find(b => b.classList.contains("on")).dataset.v; };
+  const T = 1000;
+  function sched(kind) {
+    const ab = new Float64Array(T + 1); ab[0] = 1;
+    if (kind === "linear") { let p = 1; for (let t = 1; t <= T; t++) { const b = 1e-4 + (0.02 - 1e-4) * (t - 1) / (T - 1); p *= 1 - b; ab[t] = p; } }
+    else { const f = t => Math.cos(((t / T + 0.008) / 1.008) * Math.PI / 2) ** 2; for (let t = 0; t <= T; t++) ab[t] = Math.max(1e-5, f(t) / f(0)); }
+    return ab;
+  }
+  const AB = { linear: sched("linear"), cosine: sched("cosine") };
+
+  /* ---------- 1. 2D scrubber with the exact denoiser for a cloud of points ---------- */
+  function spiral(n) { const out = []; for (let i = 0; i < n; i++) { const t = 0.15 + 0.85 * i / (n - 1), a = 3.6 * Math.PI * t; out.push([0.9 * t * Math.cos(a), 0.9 * t * Math.sin(a)]); } return out; }
+  function smiley(n) { const out = [], r = NN.rng(4); for (let i = 0; i < n; i++) { const k = i % 10;
+    if (k < 5) { const a = 2 * Math.PI * i / n * 2; out.push([0.85 * Math.cos(a), 0.85 * Math.sin(a)]); }
+    else if (k < 7) { const a = Math.PI * (1.15 + 0.7 * r.u()); out.push([0.5 * Math.cos(a), 0.5 * Math.sin(a) + 0.05]); }
+    else if (k < 8) out.push([-0.3 + 0.06 * r.n(), 0.3 + 0.06 * r.n()]);
+    else if (k < 9) out.push([0.3 + 0.06 * r.n(), 0.3 + 0.06 * r.n()]);
+    else { const a = 2 * Math.PI * r.u(); out.push([0.85 * Math.cos(a), 0.85 * Math.sin(a)]); } } return out; }
+  const SETS = { spiral: spiral(200), smiley: smiley(200) }, SD = 0.02;
+  // the ideal denoiser: data = tiny Gaussians (σ = 0.02) around each point; returns E[x0 | x_t]
+  function x0hat(x, ab, data) {
+    const s = Math.sqrt(ab), v = ab * SD * SD + 1 - ab, k = s * SD * SD / v;
+    let m = -Infinity; const lw = data.map(d => { const q = -((x[0] - s * d[0]) ** 2 + (x[1] - s * d[1]) ** 2) / (2 * v); if (q > m) m = q; return q; });
+    let W = 0, e0 = 0, e1 = 0;
+    data.forEach((d, i) => { const w = Math.exp(lw[i] - m); W += w; e0 += w * (d[0] + k * (x[0] - s * d[0])); e1 += w * (d[1] + k * (x[1] - s * d[1])); });
+    return [e0 / W, e1 / W];
+  }
+  let set = "spiral", sch = "linear", sam = "ddpm", gen = null, genQ = null;
+  const fixedEps = (() => { const r = NN.rng(9); return Array.from({ length: 200 }, () => [r.n(), r.n()]); })();
+  const dp = new Plane($("dCan"), { range: 2.4 });
+  function quality(X, data) { return X.filter(x => data.some(p => Math.hypot(p[0] - x[0], p[1] - x[1]) < 0.05)).length / X.length; }
+  function drawSp() {
+    const data = SETS[set], t = +$("dT").value, ab = AB[sch][t], s = Math.sqrt(ab), n = Math.sqrt(1 - ab);
+    const items = data.map((d, i) => ({ type: "pt", at: [s * d[0] + n * fixedEps[i][0], s * d[1] + n * fixedEps[i][1]], color: "--c-x", r: 2.6 }));
+    if (gen) gen.X.forEach(x => items.push({ type: "pt", at: x, color: "--c-y", r: 2.4 }));
+    dp.draw(items);
+    $("dTV").textContent = t; $("dSig").textContent = s.toFixed(3); $("dNoi").textContent = n.toFixed(3);
+    $("dStep").textContent = gen ? `${gen.k} of ${gen.S} left` : "–";
+    $("dQ").innerHTML = genQ == null ? "–" : `<span class="${genQ >= 0.9 ? "ev" : genQ <= 0.25 ? "dead" : ""}">${Math.round(100 * genQ)}%</span>`;
+  }
+  function startGen() {
+    const S = +$("dS").value, r = NN.rng(1);
+    gen = { S, k: S, r, ab: AB[sch], data: SETS[set], ts: Array.from({ length: S + 1 }, (_, k) => Math.round(T * k / S)), X: Array.from({ length: 300 }, () => [r.n(), r.n()]), method: sam, sch, set };
+    genQ = null; $("dMsg").textContent = "";
+  }
+  function genStep() {
+    const g = gen, t = g.ts[g.k], tp = g.ts[g.k - 1], a = g.ab[t], ap = g.ab[tp];
+    g.X = g.X.map(x => {
+      const x0 = x0hat(x, a, g.data), eps = [(x[0] - Math.sqrt(a) * x0[0]) / Math.sqrt(1 - a), (x[1] - Math.sqrt(a) * x0[1]) / Math.sqrt(1 - a)];
+      if (g.method === "ddim" || tp === 0) return [Math.sqrt(ap) * x0[0] + Math.sqrt(1 - ap) * eps[0], Math.sqrt(ap) * x0[1] + Math.sqrt(1 - ap) * eps[1]];
+      const b = 1 - a / ap, c0 = Math.sqrt(ap) * b / (1 - a), ct = Math.sqrt(a / ap) * (1 - ap) / (1 - a), sv = Math.sqrt(b * (1 - ap) / (1 - a));
+      return [c0 * x0[0] + ct * x[0] + sv * g.r.n(), c0 * x0[1] + ct * x[1] + sv * g.r.n()];
+    });
+    g.k--;
+  }
+  const genLoop = NN.loop(() => {
+    const per = Math.max(1, Math.ceil(gen.S / 50));
+    for (let i = 0; i < per && gen.k > 0; i++) genStep();
+    if (gen.k === 0) {
+      genQ = quality(gen.X, gen.data);
+      win("gClean", genQ >= 0.9); win("gFew", genQ >= 0.9 && gen.S <= 20); win("gFail", genQ <= 0.25);
+      $("dMsg").textContent = genQ >= 0.9 ? `${Math.round(100 * genQ)}% on the shape with ${gen.S} steps (${gen.sch}, ${gen.method.toUpperCase()}). Try fewer steps or the other schedule.` :
+        genQ <= 0.25 ? "Too few, too-big steps: each jump overshoots and the points land in a smeared cloud." : "Partly formed: the shape is there but blurry. More steps, or the cosine schedule.";
+      drawSp(); return false;
+    }
+    drawSp();
+  }, { onStop: () => ($("dGen").textContent = "✨ Generate") });
+  $("dGen").onclick = () => { if (genLoop.running) { genLoop.stop(); return; } startGen(); $("dGen").textContent = "⏸ Stop"; genLoop.start(); };
+  $("dClear").onclick = () => { genLoop.stop(); gen = null; genQ = null; $("dMsg").textContent = ""; drawSp(); };
+  $("dT").oninput = drawSp;
+  seg("dSet", v => { set = v; genLoop.stop(); gen = null; genQ = null; drawSp(); });
+  seg("dSch", v => { sch = v; drawSp(); });
+  seg("dSam", v => { sam = v; });
+  drawSp();
+
+  /* ---------- 2. the schedule plot ---------- */
+  const nearNoise = k => { let c = 0; for (let t = 1; t <= T; t++) if (Math.sqrt(AB[k][t]) < 0.1) c++; return c; };
+  const NL = nearNoise("linear"), NC = nearNoise("cosine");
+  function drawSch() {
+    const t = +$("schT").value, pts = k => Array.from({ length: 101 }, (_, i) => [i * 10, Math.sqrt(AB[k][i * 10])]);
+    Plot.line($("schC"), { series: [
+      { label: "linear √ᾱ", color: MX.css("--c-gr"), data: pts("linear"), width: 2.5 },
+      { label: "cosine √ᾱ", color: MX.css("--c-y"), data: pts("cosine"), width: 2.5 },
+      { label: "t", color: MX.css("--muted"), data: [[t, 0], [t, 1]], width: 1, dash: [4, 4] },
+    ], yMin: 0, yMax: 1, xLabel: "step t", hlines: [{ y: 0.1, label: "10% of the signal", color: MX.css("--muted") }] });
+    $("schTV").textContent = t;
+    $("schL").textContent = Math.sqrt(AB.linear[t]).toFixed(3); $("schCo").textContent = Math.sqrt(AB.cosine[t]).toFixed(3);
+    $("schN").textContent = `linear ${NL} · cosine ${NC}`;
+  }
+  $("schT").oninput = drawSch; drawSch();
+
+  /* ---------- 3. 8×8 digits with the exact denoiser over ten pictures ---------- */
+  const DG = Array.from({ length: 10 }, (_, d) => NN.img.digit(d).flat().map(v => 2 * v - 1));
+  const ABc = AB.cosine;
+  const toM = v => Array.from({ length: 8 }, (_, r) => v.slice(r * 8, r * 8 + 8));
+  const showImg = (cv, v, lo = -1, hi = 1) => NN.heat(cv, toM(v), { cmap: "gray", lo, hi, gap: 0 });
+  function post(x, a) { const s = Math.sqrt(a), lw = DG.map(d => -d.reduce((q, v, i) => q + (x[i] - s * v) ** 2, 0) / (2 * (1 - a))), m = Math.max(...lw), w = lw.map(v => Math.exp(v - m)), W = w.reduce((p, q) => p + q, 0); return w.map(v => v / W); }
+  let noiseSeed = 1, eps0, cur = null, imgRun = null;
+  const newEps = () => { const r = NN.rng(noiseSeed); eps0 = Array.from({ length: 64 }, () => r.n()); };
+  function view(x, t) {
+    const a = Math.max(1e-5, ABc[t]);
+    if (t === 0) { showImg($("iX"), x); showImg($("iX0"), x); showImg($("iEps"), x.map(() => 0), -2.5, 2.5); }
+    else {
+      const w = post(x, a), x0 = x.map((_, i) => DG.reduce((q, d, j) => q + w[j] * d[i], 0)), e = x.map((v, i) => (v - Math.sqrt(a) * x0[i]) / Math.sqrt(1 - a));
+      showImg($("iX"), x, -2.5, 2.5); showImg($("iX0"), x0); showImg($("iEps"), e, -2.5, 2.5);
+      $("iPost").innerHTML = w.map(p => `<div style="height:${Math.max(1, 100 * p)}%"></div>`).join("");
+      return { w, x0, e };
+    }
+    const w = DG.map(d => (d.every((v, i) => Math.abs(v - x[i]) < 1e-6) ? 1 : 0));
+    $("iPost").innerHTML = w.map(p => `<div style="height:${Math.max(1, 100 * p)}%"></div>`).join("");
+    return { w };
+  }
+  function scrub() {
+    if (imgRun) return;
+    const d = +$("iDig").value, t = +$("iT").value, a = ABc[t];
+    cur = { x: DG[d].map((v, i) => Math.sqrt(a) * v + Math.sqrt(1 - a) * eps0[i]), t, from: d };
+    $("iTV").textContent = t; $("iStep").textContent = "–"; $("iRes").textContent = "–"; $("iMsg").textContent = "";
+    view(cur.x, t);
+  }
+  function startRun(x, t0, from) {
+    const S = Math.max(5, Math.round(50 * t0 / 1000));
+    imgRun = { x: x.slice(), t0, S, k: S, from };
+  }
+  const imgLoop = NN.loop(() => {
+    const g = imgRun, t = Math.round(g.t0 * g.k / g.S), tp = Math.round(g.t0 * (g.k - 1) / g.S), a = ABc[t], ap = ABc[tp];
+    const v = view(g.x, t);
+    g.x = g.x.map((_, i) => Math.sqrt(ap) * v.x0[i] + Math.sqrt(1 - ap) * v.e[i]);
+    g.k--;
+    $("iStep").textContent = `t = ${tp}`;
+    if (g.k === 0) {
+      const res = view(g.x, 0).w.indexOf(1);
+      const nearest = res >= 0 ? res : DG.map(d => d.reduce((q, v, i) => q + (v - g.x[i]) ** 2, 0)).reduce((b, v, i, A) => (v < A[b] ? i : b), 0);
+      $("iRes").textContent = `a ${nearest}`;
+      if (g.from != null) {
+        const kept = nearest === g.from;
+        win("gKeep", kept && g.t0 >= 400); win("gSwap", !kept && g.t0 >= 800);
+        $("iMsg").textContent = kept ? `Started from your ${g.from} at t = ${g.t0} and got it back.` : `Started from a ${g.from} at t = ${g.t0}, ended as a ${nearest}: at that noise level little of the original survived.`;
+      } else $("iMsg").textContent = "Generated from pure static. Press again: a new seed, maybe a new digit.";
+      imgRun = null; return false;
+    }
+  }, { onStop: () => {} });
+  let genSeed = 100;
+  $("iGen").onclick = () => { if (imgRun) return; const r = NN.rng(genSeed++); startRun(Array.from({ length: 64 }, () => r.n()), 1000, null); imgLoop.start(); };
+  $("iDen").onclick = () => { if (imgRun || !cur || cur.t === 0) return; startRun(cur.x, cur.t, cur.from); imgLoop.start(); };
+  $("iNew").onclick = () => { noiseSeed++; newEps(); scrub(); };
+  $("iT").oninput = scrub; $("iDig").onchange = scrub;
+  newEps(); scrub();
+})();
+</script>
+</body>
+</html>

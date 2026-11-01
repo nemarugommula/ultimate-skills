@@ -1,0 +1,479 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.1 Time series: lags, seasonality & leakage-safe validation · Machine Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌲</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .folds { display: grid; gap: 4px; margin: 10px 0; }
+  .fold { display: grid; grid-template-columns: 70px 1fr; align-items: center; gap: 8px; font: .78rem var(--mono); color: var(--muted); }
+  .strip { display: flex; height: 14px; border-radius: 4px; overflow: hidden; border: 1px solid var(--line); }
+  .strip i { flex: 1; }
+  .strip i.tr { background: color-mix(in srgb, var(--c-ft) 55%, var(--bg2)); }
+  .strip i.te { background: var(--c-pd); }
+  .strip i.gp { background: repeating-linear-gradient(45deg, var(--line), var(--line) 2px, var(--bg2) 2px, var(--bg2) 5px); }
+  .strip i.no { background: var(--bg2); }
+  .swatch { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; margin: 0 4px 0 10px; }
+</style>
+</head>
+<body data-lesson="ml7-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 1</div>
+  <h1>Time series: lags, seasonality &amp; leakage-safe validation</h1>
+  <p class="subtitle">Sales, traffic, energy demand, sign-ups: half the numbers a business cares about arrive one day at a time. Turn them into an ordinary table of past-only features and any regression model can forecast them. The catch is validation: shuffle the rows and your score quietly reads the future.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Data leakage</b>: any information at training time that won't exist at prediction time makes scores look better than reality (Lesson 0.6).</li>
+      <li><b>k-fold cross-validation</b> (CV) splits the rows into k parts, trains on k − 1 and tests on the rest, k times (Lesson 5.1).</li>
+      <li><b>MAE</b>, mean absolute error, is the average size of a miss in the target's own units; lower is better (Lesson 5.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook: yesterday or last week?</span>
+    <p>In 2020 the <b>M5 competition</b> asked 5,507 teams to forecast 28 days of Walmart unit sales: 42,840 series, from single products in single stores up to the national total. The organizers also scored dumb baselines. One of them, <b>naive</b>, says “tomorrow = today”. Another, <b>seasonal naive</b>, says “next Tuesday = last Tuesday”.</p>
+    <p>Neither needs any machine learning. One of them was <b>more than twice as accurate</b> as the other, and it set a bar that plenty of fancy models failed to clear.</p>
+  </div>
+
+  <div class="predict" data-answer="1">
+    <span class="label">🔮 Predict first</span>
+    <p>For daily retail sales, which copy-paste forecast wins?</p>
+    <div class="choices"><button>Naive: copy yesterday, it's the freshest information</button><button>Seasonal naive: copy the same weekday last week</button><button>They're about the same</button></div>
+    <div class="reveal">Seasonal naive, by a lot: in the organizers' published scores its error (WRMSSE, a scaled RMSE) was <b>0.847</b> against naive's <b>1.752</b>. Shoppers behave like their calendar: Saturday looks like last Saturday, not like Friday. Every forecast you build should beat <i>this</i> baseline, and in this lesson you'll see when that's harder than it sounds.</div>
+  </div>
+
+  <h2>Numbers first: a time series is a table in disguise</h2>
+  <p>Our running example is 420 days (60 weeks) of a shop's daily sales: a slow upward trend, a strong weekly rhythm (Saturdays about 16 units above average, Mondays about 10 below) and noise that lingers for days, like real demand. A forecasting model never sees “a curve”. It sees rows like these, where every <span class="ft">feature</span> is computed only from days <b>before</b> the one we predict:</p>
+  <table class="data">
+    <tr><th>day</th><th>weekday</th><th class="ft">lag_1 (yesterday)</th><th class="ft">lag_7 (same day last week)</th><th class="ft">mean of last 7 days</th><th class="tg">sales y</th></tr>
+    <tr><td>365</td><td>Tue</td><td>91</td><td>101</td><td>105.8</td><td>98</td></tr>
+    <tr><td>366</td><td>Wed</td><td>98</td><td>104</td><td>105.3</td><td>104</td></tr>
+    <tr><td>367</td><td>Thu</td><td>104</td><td>106</td><td>105.4</td><td>107</td></tr>
+    <tr><td>368</td><td>Fri</td><td>107</td><td>112</td><td>105.6</td><td>113</td></tr>
+    <tr class="hl"><td>369</td><td>Sat</td><td>113</td><td>120</td><td>105.8</td><td>122</td></tr>
+  </table>
+  <p>Look at Saturday (highlighted): yesterday said 113, last Saturday said 120, the truth was 122. That's the whole hook in one row. Once the series is a table, <b>any</b> regressor works: linear models, random forests, gradient boosting. Three families of features do most of the work:</p>
+  <table>
+    <tr><th>Family</th><th>Examples</th><th>What it captures</th></tr>
+    <tr><td><b>Lags</b></td><td><code>lag_1</code>, <code>lag_7</code>, <code>lag_364</code></td><td>Persistence (“busy days come in runs”) and seasonality (“same weekday last week”)</td></tr>
+    <tr><td><b>Rolling (window) statistics</b></td><td>mean / std / max of the last 7 or 28 days</td><td>The current level with the noise smoothed out</td></tr>
+    <tr><td><b>Calendar and trend</b></td><td>weekday, month, holiday flags, day index</td><td>Rhythms that are known in advance, even a year ahead, and slow growth</td></tr>
+  </table>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Forecasting with ML = <b>supervised learning where every feature must be knowable at the moment you make the forecast</b>. If you forecast <span class="bd">h</span> days ahead, a lag shorter than h doesn't exist yet. And validation must respect the arrow of time: <b>train on the past, test on the future</b>, never the other way round.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the weather forecaster's notebook</span>
+    <p>A good forecaster asks three questions: what happened recently (lags), what's normal for this time of year (seasonality), and is it slowly getting warmer (trend)? You can't check her skill by hiding random days in last year's notebook and asking her to fill them in: with Tuesday and Thursday in view, guessing Wednesday is easy. The fair test is to give her everything up to Sunday and ask about next week. That's walk-forward validation.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? Why lag features and walk-forward validation?</span>
+    <ol>
+      <li><b>The problem before.</b> Classical forecasting fits one statistical model per series (Lesson 7.2), which is hard to mix with extra information such as prices, promotions or weather. Ordinary ML models can use any features, but they expect a table of independent rows, and a time series is neither a table nor independent: today is a lot like yesterday.</li>
+      <li><b>What people tried.</b> Feed the date in as a feature and validate with a random split or shuffled k-fold. It looks fine and is quietly wrong: each test day sits between training days, so the model interpolates instead of forecasting. In Playground 2 a k-NN model on the date scores MAE <b>4.3</b> in shuffled CV but <b>5.2</b> on the real next 8 weeks.</li>
+      <li><b>Why this works.</b> Rewrite the series as rows “features from the past → <span class="tg">value now</span>” and the problem becomes plain regression. Validate by rolling forward in time: train on days 1–100, test on 101–150; train on 1–150, test on 151–200; and so on. Every test mimics a real deployment. In Playground 2 an honest lag model scores <b>2.40</b> walk-forward and <b>2.13</b> on the real future: the estimate is honest, slightly cautious.</li>
+      <li><b>What it costs, when it fails.</b> Early folds train on little history, so walk-forward scores are noisy and often pessimistic. Every horizon needs its own feature set (or a recursive loop). And no validation scheme survives a <b>break</b> in the world, such as a pandemic, a price change, a new competitor: the past then stops predicting the future (drift, Lesson 8.6).</li>
+      <li><b>What came next.</b> Dedicated forecasting models (exponential smoothing, ARIMA) and gradient boosting with careful features, plus <b>global</b> models trained across thousands of related series, which is how the M5 was won (Lesson 7.2). Deep forecasting models build on the same supervised framing (the sibling Deep Learning course).</li>
+    </ol>
+  </div>
+
+  <h2>Step 1: features, baselines and the forecast horizon</h2>
+  <p>The <b>forecast horizon</b> <span class="bd">h</span> is how far ahead you must predict. A store ordering stock every morning for tomorrow needs h = 1; one ordering from a supplier with a two-week lead time needs h = 14. If you predict day t from data up to day t − h, then <code>lag_1</code> is only legal when h = 1. In general you may use lags ≥ h and windows that end at t − h. Two baselines are free and you should always report them:</p>
+  <ul>
+    <li><b>Naive</b>: ŷ(t) = y(t − h). The last value you know.</li>
+    <li><b>Seasonal naive</b>: ŷ(t) = y(t − 7k), the same weekday from the most recent week you know (k = ⌈h ⁄ 7⌉).</li>
+  </ul>
+  <p>Your model's <b>skill</b> is how much smaller its error is than seasonal naive's: skill = 1 − MAE<sub>model</sub> ⁄ MAE<sub>seasonal naive</sub>. Zero means “all that work bought nothing”.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Build a forecaster from features</span>
+    <p class="hint">A linear regression (Lesson 2.1) trained on the first 364 days, tested on the last 56 (right of the gold line). Each test day is predicted from data that existed <span class="bd">h</span> days earlier. Tick feature families on and off and slide the horizon. The orange line is the model, the dashed line seasonal naive, grey is what really happened.</p>
+    <div class="controls">
+      <label><input type="checkbox" id="fLag" checked> <span class="ft">lag h</span> (latest known day)</label>
+      <label><input type="checkbox" id="fSlag" checked> <span class="ft">seasonal lag</span> (same weekday)</label>
+      <label><input type="checkbox" id="fRoll" checked> <span class="ft">7-day mean</span> (ending at t − h)</label>
+      <label><input type="checkbox" id="fDow" checked> <span class="ft">weekday</span></label>
+      <label><input type="checkbox" id="fTrend" checked> <span class="ft">trend</span> (day index)</label>
+    </div>
+    <div class="controls">
+      <label>horizon <span class="bd">h</span> <input type="range" id="hz" min="1" max="28" step="1" value="1"> <b class="mono" id="hzv"></b></label>
+      <span class="goal" id="goal1">🎯 Goal: at h = 28, beat seasonal naive by at least 25%</span>
+    </div>
+    <canvas class="chart" id="fcChart" style="height:260px"></canvas>
+    <div class="stat-row">
+      <div class="stat">model MAE <b id="mMae">–</b></div>
+      <div class="stat">naive MAE <b id="nMae">–</b></div>
+      <div class="stat">seasonal naive MAE <b id="sMae">–</b></div>
+      <div class="stat">skill vs seasonal naive <b id="skill">–</b></div>
+    </div>
+    <p class="hint" id="fcMsg"></p>
+  </div>
+  <p>What to notice. At <b>h = 1</b> yesterday's value is gold: all features together give MAE <span class="mt">2.09</span>, against <span class="mt">3.56</span> for seasonal naive and <span class="lo">7.63</span> for naive (which copies Friday into Saturday). Slide to <b>h = 28</b>: the same feature set now scores <span class="mt">4.52</span>, only 11% better than seasonal naive, because a four-week-old lag says little about today's level and the model still leans on it. Untick the two lags and the 7-day mean: weekday + trend alone scores <span class="mt">3.26</span>, a 36% skill. <b>Different horizons want different features</b>; many teams train one model per horizon (the “direct” strategy).</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: features for a 7-day-ahead forecast</span>
+    <p>It's Saturday evening, day 369. You must forecast <b>next Saturday, day 376</b>, so h = 7.</p>
+    <ul>
+      <li>Allowed: <span class="ft">lag_7</span> = y(369) = 122 (this Saturday), <span class="ft">lag_14</span> = y(362), the mean of days 363–369 = 105.8, weekday = Saturday, day index = 376. Weekday and day index are known for any future date.</li>
+      <li>Not allowed: <span class="lo">lag_1</span> = y(375), Friday. On Saturday evening it hasn't happened yet. A model trained with <code>lag_1</code> would need a value you don't have, and the code would quietly fill it with something wrong.</li>
+      <li>Seasonal naive says 122. If the model adds a little trend (+0.06 a day × 7 ≈ +0.4), it might say about 122.4. The difference between the two is the model's whole contribution: modest at h = 7, which is why the baseline matters.</li>
+    </ul>
+  </div>
+
+  <h2>Step 2: validation that respects time</h2>
+  <p>Shuffled k-fold assumes rows are independent, like patients in a trial. Time-series rows are not: day 200 and day 201 are near-copies. If day 201 is in the training set, predicting day 200 is barely a forecast at all. <b>Walk-forward validation</b> (also “rolling-origin” or, in scikit-learn, <code>TimeSeriesSplit</code>) always trains on an initial stretch and tests on the block that follows, then grows the training stretch and repeats. A <b>gap</b> drops the last few training days before each test block, so validation can mimic an h-day horizon or a delay before data arrives.</p>
+
+  <div class="predict" data-answer="1">
+    <span class="label">🔮 Predict first</span>
+    <p>A k-NN model uses the date (day index and weekday) as its only features. Shuffled 5-fold CV says its MAE is <b>4.3</b>. What do you expect on the real next 8 weeks?</p>
+    <div class="choices"><button>About 4.3: CV is CV</button><button>Clearly worse, maybe 5</button><button>Better, because it trains on all the data</button></div>
+    <div class="reveal">It scores <b>5.2</b> on the real future, 20% worse than CV promised. In shuffled CV every test day has training neighbours a few days on either side; in the future there are only neighbours behind it. Walk-forward CV catches it (it even says 6.5, erring on the cautious side). Switch models and leak features below to see the other ways CV can lie.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Shuffled k-fold vs walk-forward vs the real future</span>
+    <p class="hint">Days 63–363 are the development data; days 364–419 are the real future, never touched during validation. The strips show each walk-forward fold: <span class="swatch" style="background:color-mix(in srgb, var(--c-ft) 55%, var(--bg2))"></span>train <span class="swatch" style="background:var(--c-pd)"></span>test <span class="swatch" style="background:repeating-linear-gradient(45deg, var(--line), var(--line) 2px, var(--bg2) 2px, var(--bg2) 5px)"></span>gap. Try each model, then tick the leaky feature.</p>
+    <div class="controls">
+      <span class="seg" id="cvModel"><button data-v="lin" class="on">Linear on lags 1–7</button><button data-v="knn">k-NN on the date</button></span>
+      <label><input type="checkbox" id="leak"> leaky 7-day mean that includes today (forgot <code>.shift(1)</code>)</label>
+    </div>
+    <div class="controls">
+      <label>folds <input type="range" id="nsp" min="2" max="8" step="1" value="5"> <b class="mono" id="nspv"></b></label>
+      <label><span class="bd">gap</span> (days) <input type="range" id="gap" min="0" max="14" step="1" value="0"> <b class="mono" id="gapv"></b></label>
+    </div>
+    <div class="folds" id="folds"></div>
+    <canvas class="chart" id="cvChart" style="height:210px"></canvas>
+    <div class="stat-row">
+      <div class="stat">shuffled k-fold MAE <b id="cvShuf">–</b></div>
+      <div class="stat">walk-forward MAE <b id="cvTss">–</b></div>
+      <div class="stat">real future MAE <b id="cvFut">–</b></div>
+      <div class="stat">future ÷ shuffled <b id="cvOpt">–</b></div>
+    </div>
+    <p class="hint" id="cvMsg"></p>
+  </div>
+  <p>Three lessons hide in that playground. <b>(1)</b> For the honest lag model, shuffled CV says <span class="mt">2.05</span>, walk-forward <span class="mt">2.40</span>, the future <span class="mt">2.13</span>: lags already describe the recent past, so shuffling does little harm here. <b>(2)</b> For the date-based k-NN, shuffling flatters it by 20%: models that can interpolate in time are the ones shuffled CV fools. <b>(3)</b> The leaky feature makes <i>both</i> CVs report <span class="lo">0.00</span>, a perfect score, while the real future gets <span class="lo">3.56</span>, worse than the honest model. A 7-day mean that includes today, plus lags 1–6, lets the model solve for today exactly. <b>No split strategy protects you from a leaky feature</b>; a score that's too good to be true is your alarm.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what TimeSeriesSplit actually does</span>
+    <p>300 rows, <code>TimeSeriesSplit(n_splits=5)</code>. By default each test block has 300 ÷ (5 + 1) = <b>50</b> rows.</p>
+    <table>
+      <tr><th>Fold</th><th class="ft">train rows</th><th class="pd">test rows</th></tr>
+      <tr><td>1</td><td>0–49</td><td>50–99</td></tr>
+      <tr><td>2</td><td>0–99</td><td>100–149</td></tr>
+      <tr><td>3</td><td>0–149</td><td>150–199</td></tr>
+      <tr><td>4</td><td>0–199</td><td>200–249</td></tr>
+      <tr><td>5</td><td>0–249</td><td>250–299</td></tr>
+    </table>
+    <p>With <code>gap=7</code>, fold 1 trains on rows 0–42 instead: the 7 rows just before each test block are dropped. Fold 1 has only 50 rows of history; that's why walk-forward scores are noisier and usually a bit worse than the final model trained on everything.</p>
+  </div>
+
+  <h2>Step 3: error grows with the horizon</h2>
+  <p>The further ahead you look, the less the recent past tells you. A chart of error against horizon is the single most useful forecasting picture: it tells you which features matter at which range, and whether your model is worth more than seasonal naive at the horizon the business actually needs.</p>
+
+  <div class="predict" data-answer="2">
+    <span class="label">🔮 Predict first</span>
+    <p>Two linear models: one with all features (lags, 7-day mean, weekday, trend), one with only weekday + trend. Which is better at horizon 28?</p>
+    <div class="choices"><button>All features: more information always helps</button><button>They tie</button><button>Weekday + trend</button></div>
+    <div class="reveal"><b>Weekday + trend</b> (3.26 vs 4.52 MAE). A 28-day-old lag is a weak, noisy signal, and the model fitted on mostly short-range rows overtrusts it. Calendar features don't decay with the horizon. Draw the curves below.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Error vs horizon</span>
+    <p class="hint">For every horizon from 1 to 28 days we refit the models with only the features legal at that horizon and score them on the same 56 test days.</p>
+    <div class="controls"><button class="btn primary" id="hzDraw">📈 Draw error vs horizon</button><span class="seg" id="hzMetric"><button data-v="mae" class="on">MAE</button><button data-v="skill">skill vs seasonal naive</button></span></div>
+    <canvas class="chart" id="hzChart" style="height:250px"></canvas>
+    <div class="stat-row">
+      <div class="stat">all features win up to <b id="hzCross">–</b></div>
+      <div class="stat">best MAE at h = 1 <b id="hzBest1">–</b></div>
+      <div class="stat">best MAE at h = 28 <b id="hzBest28">–</b></div>
+    </div>
+    <p class="hint" id="hzMsg"></p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>pandas</b> (3.1) builds the features: <code>shift(k)</code> for lags, <code>shift(1).rolling(7).mean()</code> for windows (shift <i>first</i>), <code>.dt.dayofweek</code> for calendar. <b>scikit-learn</b> (1.9) supplies <code>TimeSeriesSplit(n_splits, gap, test_size, max_train_size)</code> and any regressor; <code>HistGradientBoostingRegressor</code> is a strong default. For whole forecasting workflows see Lesson 7.2 (statsforecast, sktime, Darts).</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np, pandas <span class="k">as</span> pd
+<span class="k">from</span> sklearn.ensemble <span class="k">import</span> HistGradientBoostingRegressor
+<span class="k">from</span> sklearn.model_selection <span class="k">import</span> KFold, TimeSeriesSplit, cross_val_score
+
+rng = np.random.default_rng(<span class="n">0</span>)
+days = pd.date_range(<span class="s">"2024-01-01"</span>, periods=<span class="n">730</span>, freq=<span class="s">"D"</span>)
+weekly = np.array([-<span class="n">10</span>, -<span class="n">6</span>, -<span class="n">3</span>, <span class="n">0</span>, <span class="n">5</span>, <span class="n">16</span>, <span class="n">4</span>])[days.day_of_week]
+noise = np.zeros(<span class="n">730</span>)
+<span class="k">for</span> t <span class="k">in</span> range(<span class="n">1</span>, <span class="n">730</span>):                          <span class="c"># persistent noise: busy days come in runs</span>
+    noise[t] = <span class="n">0.9</span> * noise[t - <span class="n">1</span>] + rng.normal(<span class="n">0</span>, <span class="n">2.5</span>)
+df = pd.DataFrame({<span class="s">"y"</span>: <span class="n">80</span> + <span class="n">0.06</span> * np.arange(<span class="n">730</span>) + weekly + noise}, index=days)
+
+h = <span class="n">7</span>                                              <span class="c"># forecast 7 days ahead → only lags ≥ 7 are legal</span>
+<span class="k">for</span> k <span class="k">in</span> (<span class="n">7</span>, <span class="n">14</span>, <span class="n">28</span>):
+    df[<span class="s">f"lag_{k}"</span>] = df[<span class="s">"y"</span>].shift(k)
+df[<span class="s">"mean_7"</span>] = df[<span class="s">"y"</span>].shift(h).rolling(<span class="n">7</span>).mean()  <span class="c"># shift FIRST, then roll: no peeking</span>
+df[<span class="s">"dow"</span>] = df.index.day_of_week
+df[<span class="s">"t"</span>] = np.arange(len(df))
+df = df.dropna()
+X, y = df.drop(columns=<span class="s">"y"</span>), df[<span class="s">"y"</span>]
+
+model = HistGradientBoostingRegressor(categorical_features=[<span class="s">"dow"</span>], random_state=<span class="n">0</span>)
+<span class="k">for</span> name, cv <span class="k">in</span> [(<span class="s">"shuffled KFold"</span>, KFold(<span class="n">5</span>, shuffle=<span class="k">True</span>, random_state=<span class="n">0</span>)),
+                 (<span class="s">"TimeSeriesSplit"</span>, TimeSeriesSplit(n_splits=<span class="n">5</span>, test_size=<span class="n">56</span>, gap=h - <span class="n">1</span>))]:
+    mae = -cross_val_score(model, X, y, cv=cv, scoring=<span class="s">"neg_mean_absolute_error"</span>)
+    <span class="k">print</span>(<span class="s">f"{name:16s} MAE {mae.mean():.2f}  per fold {np.round(mae, 2)}"</span>)
+
+snaive = df[<span class="s">"lag_7"</span>].iloc[-<span class="n">56</span>:]                         <span class="c"># the baseline every forecast must beat</span>
+<span class="k">print</span>(<span class="s">"seasonal naive, last 56 days:"</span>, round((y.iloc[-<span class="n">56</span>:] - snaive).abs().mean(), <span class="n">2</span>))</code></pre>
+    <p class="hint">Run it: shuffled KFold reports MAE about <b>3.4</b>, walk-forward about <b>5.4</b>, and seasonal naive scores <b>3.1</b> on the last 56 days. So the boosted model that shuffled CV calls “close to the baseline” is in fact clearly worse than it. The culprit is <code>t</code>: trees can't extrapolate a trend past the training range (Lesson 7.2 fixes that), and shuffled folds hide it because every test day has training days on both sides. For R users, the <code>fable</code> and <code>modeltime</code> packages wrap the same ideas.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Walk-forward vs shuffled k-fold</td><td>Honest: mimics deployment, catches models that interpolate in time</td><td>Fewer training rows in early folds; noisier, often pessimistic scores</td></tr>
+      <tr><td>Expanding vs sliding window (<code>max_train_size</code>)</td><td>Expanding uses all history; sliding adapts faster when the world changes</td><td>Expanding keeps stale patterns; sliding throws data away</td></tr>
+      <tr><td>Direct (one model per horizon) vs recursive (feed predictions back)</td><td>Direct: each horizon gets its own legal features, no error snowball</td><td>Direct: many models to train; recursive: one model, but errors compound step by step</td></tr>
+      <tr><td>Many lags and windows</td><td>Captures persistence and seasonality</td><td>Lose the first rows to NaNs; weak at long horizons; easy to leak with a missing <code>shift</code></td></tr>
+      <tr><td>Calendar features (weekday, holidays)</td><td>Known in advance at any horizon</td><td>Need a holiday calendar per country; rare events have few examples</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Plot the series, compute seasonal naive, and ship a gradient-boosted model with lags, a few windows and calendar features, validated walk-forward at the horizon the business needs. Report skill vs seasonal naive. That is a real forecast in a day.</p></div>
+      <div><h4>At scale</h4><p>Thousands or millions of series (every product × store), backtests across many origins, a feature pipeline that produces exactly the same features in training and serving, holiday calendars per market, and monitoring for drift (Lessons 7.2, 8.5, 8.6). One global model across series usually beats one model per series.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you validate a demand-forecasting model?” A strong answer:</p>
+    <ul>
+      <li>Says <b>walk-forward / rolling-origin backtesting</b>, never shuffled k-fold, and explains why: autocorrelation lets shuffled folds interpolate.</li>
+      <li>Matches validation to the <b>horizon</b> and data delays: only lags ≥ h, a gap if data arrives late, test blocks as long as the real forecast window.</li>
+      <li>Compares against <b>naive and seasonal-naive baselines</b> and reports skill, per horizon.</li>
+      <li>Hunts leakage: windows computed before shifting, features filled in later (final prices, returns), target encoding over the whole history.</li>
+      <li>Mentions breaks: retrain cadence, monitoring, and keeping a holdout period that is truly untouched.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Walmart unit sales, M5</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://github.com/Mcompetitions/M5-methods" target="_blank" rel="noopener">M5 methods, scores and winning code (organizers' repository)</a></div>
+      <p><b>How:</b> 28-day forecasts for 42,840 hierarchical series; the published scores include 24 benchmarks such as naive (WRMSSE 1.752), seasonal naive (0.847) and exponential smoothing (0.671); the winner scored 0.520.</p>
+      <p><b>Why this method:</b> the winning code turns the data into a table of lags, rolling means, price changes, weekday, events and SNAP (food-stamp) days, then fits LightGBM: exactly this lesson's framing, at Walmart scale.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Bike-sharing demand</b> <span class="tag oss">🧰 Open source</span> <a href="https://scikit-learn.org/stable/auto_examples/applications/plot_cyclical_feature_engineering.html" target="_blank" rel="noopener">scikit-learn: time-related feature engineering</a></div>
+      <p><b>How:</b> hourly rentals predicted from calendar features (one-hot, sine/cosine, splines) with gradient boosting and linear models, validated with <code>TimeSeriesSplit</code> and a gap.</p>
+      <p><b>Why this method:</b> shows how much the encoding of “hour” and “weekday” matters, and how to validate without peeking.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Backtesting thousands of series</b> <span class="tag oss">🧰 Open source</span> <a href="https://nixtlaverse.nixtla.io/statsforecast/docs/tutorials/crossvalidation.html" target="_blank" rel="noopener">statsforecast: time series cross-validation</a></div>
+      <p><b>How:</b> <code>sf.cross_validation(df, h, step_size, n_windows)</code> slides a window across the history, forecasts the h steps after each cutoff, and returns every forecast next to the truth, for every series at once.</p>
+      <p><b>Why this method:</b> it is walk-forward validation with the horizon built in, run in parallel across series, so a team can compare models on thousands of products before trusting one.</p>
+    </div>
+</div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a competition won on a laptop-sized budget</span>
+    <p>The M5 Accuracy winner's README says the solution ran on Kaggle notebooks only, <b>CPU, no GPU</b>: 2 cores and at most 16 GB of RAM. The repository holds <b>220 LightGBM model files</b>, recursive and non-recursive models per store, store × category and store × department, combined in a final ensemble. Feature engineering beat hardware.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This is Lesson 0.6's leakage and Lesson 5.1's cross-validation, applied where they bite hardest. Date features come from Lesson 1.5; MAE from Lesson 5.2. Next, Lesson 7.2 adds forecasting-specific models (exponential smoothing, ARIMA) and shows why trees need help with trends; Lesson 8.6 handles the world changing under your model. Autocorrelation is just correlation between a series and its own lag: <a href="../../math-course/phase5/2-correlation.html">Math 5.2: correlation</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://scikit-learn.org/stable/modules/generated/sklearn.model_selection.TimeSeriesSplit.html" target="_blank" rel="noopener">scikit-learn: TimeSeriesSplit</a>. The parameters <code>gap</code>, <code>test_size</code> and <code>max_train_size</code>, with a picture of the folds.</li>
+      <li><span class="kind">Docs</span> <a href="https://scikit-learn.org/stable/auto_examples/applications/plot_cyclical_feature_engineering.html" target="_blank" rel="noopener">scikit-learn: time-related feature engineering</a>. Calendar encodings compared on a real dataset.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.kaggle.com/competitions/m5-forecasting-accuracy" target="_blank" rel="noopener">Kaggle: M5 Forecasting – Accuracy</a>. The data and the winners' write-ups in the discussion forum.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You have 360 daily rows and use <code>TimeSeriesSplit(n_splits=5)</code> with default settings. How many rows does the first fold train on?</div>
+    <div class="opts"><button class="opt">288 (80% of the data)</button><button class="opt" data-ok>60</button><button class="opt">72</button></div>
+    <div class="explain">The default test size is 360 ÷ (5 + 1) = <b>60</b>, and the first fold trains on everything before its test block: rows 0–59. Later folds grow to 120, 180, 240 and 300 rows. Small early folds are why walk-forward scores are noisy.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You must forecast sales 14 days ahead. A teammate's best model uses <code>lag_1</code> and <code>lag_7</code> and has a great validation score. What's wrong?</div>
+    <div class="opts"><button class="opt">Nothing: more recent lags are always better</button><button class="opt" data-ok>At forecast time, yesterday and last week relative to the target day are still in the future; only lags ≥ 14 (and windows ending 14 days back) are legal for a direct 14-day model</button><button class="opt">Lags must always be multiples of 7</button></div>
+    <div class="explain">A feature must exist when the forecast is made. Use lags ≥ h, train one model per horizon (direct), or feed predictions back in (recursive). Validate with the same horizon, for example with <code>gap=13</code>, so the score reflects what you'll really get.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A daily model scores MAE 0.01 in walk-forward CV; seasonal naive scores 3.5. The features include lags 1–6 and <code>df.y.rolling(7).mean()</code>. What do you suspect?</div>
+    <div class="opts"><button class="opt">A breakthrough; ship it</button><button class="opt">The walk-forward folds are too short</button><button class="opt" data-ok>Leakage: the rolling mean includes today's value, so with lags 1–6 the model can solve for today exactly. Use <code>shift(1).rolling(7).mean()</code></button></div>
+    <div class="explain">Walk-forward splitting doesn't protect against a feature computed from the target itself. In Playground 2 the same bug gives a perfect 0.00 in both CVs and 3.56 on the real future. Scores far better than a strong baseline are a reason to audit features, not to celebrate.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Turn a series into a table: past-only lags, rolling windows, calendar and trend features → the value now.</li>
+      <li>Only features known <b>h</b> days earlier are legal; different horizons want different features (often one model per horizon).</li>
+      <li>Always report naive and seasonal-naive baselines and your skill against them; seasonal naive is hard to beat.</li>
+      <li>Validate walk-forward (<code>TimeSeriesSplit</code>, with a gap for the horizon). Shuffled k-fold flatters models that interpolate in time.</li>
+      <li>No split protects against a leaky feature: shift before you roll, and distrust scores that are too good.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/ml.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const f2 = v => (isFinite(v) ? v.toFixed(2) : "–");
+  const mean = a => a.reduce((s, v) => s + v, 0) / (a.length || 1);
+
+  /* ---------- the series: trend + weekly pattern + persistent noise (seeded) ---------- */
+  const W = [-10, -6, -3, 0, 5, 16, 4]; // Mon..Sun (day 0 is a Monday)
+  const y = (() => { const r = ML.rng(7), out = []; let e = 0; for (let t = 0; t < 420; t++) { e = 0.9 * e + 2.5 * ML.randn(r); out.push(80 + 0.06 * t + W[t % 7] + e); } return out; })();
+  const N = y.length, TEST = 56, T0 = N - TEST, START = 63;
+  const testT = ML.range(TEST).map(i => T0 + i), yTest = testT.map(t => y[t]);
+
+  /* ---------- Playground 1 + 3: direct forecaster for horizon h ---------- */
+  function feats(t, h, on) {
+    const s = 7 * Math.ceil(h / 7), f = [];
+    if (on.lag) f.push(y[t - h]);
+    if (on.slag) f.push(y[t - s]);
+    if (on.roll) f.push(mean(y.slice(t - h - 6, t - h + 1)));
+    if (on.dow) for (let d = 0; d < 6; d++) f.push(t % 7 === d ? 1 : 0);
+    if (on.trend) f.push(t / 100);
+    return f;
+  }
+  function forecast(h, on) {
+    const s = 7 * Math.ceil(h / 7), trT = ML.range(T0 - START).map(i => START + i);
+    let pred;
+    if (!Object.values(on).some(Boolean)) { const m = mean(trT.map(t => y[t])); pred = testT.map(() => m); }
+    else { const m = new ML.Linear({ l2: 1e-4 }).fit(trT.map(t => feats(t, h, on)), trT.map(t => y[t])); pred = testT.map(t => m.predict(feats(t, h, on))); }
+    const naive = testT.map(t => y[t - h]), snaive = testT.map(t => y[t - s]);
+    return { pred, snaive, mae: ML.mae(yTest, pred), nMae: ML.mae(yTest, naive), sMae: ML.mae(yTest, snaive) };
+  }
+  const ALL = { lag: true, slag: true, roll: true, dow: true, trend: true }, CAL = { lag: false, slag: false, roll: false, dow: true, trend: true };
+  const onNow = () => ({ lag: $("fLag").checked, slag: $("fSlag").checked, roll: $("fRoll").checked, dow: $("fDow").checked, trend: $("fTrend").checked });
+  let pend1 = false;
+  function render1() {
+    pend1 = false;
+    const h = +$("hz").value, on = onNow(), r = forecast(h, on), skill = 1 - r.mae / r.sMae;
+    $("hzv").textContent = h + (h === 1 ? " day" : " days");
+    $("mMae").textContent = f2(r.mae); $("nMae").textContent = f2(r.nMae); $("sMae").textContent = f2(r.sMae);
+    $("skill").textContent = (100 * skill).toFixed(0) + "%";
+    $("skill").style.color = skill > 0 ? MX.css("--good") : MX.css("--bad");
+    const hit = h === 28 && skill >= 0.25;
+    $("goal1").classList.toggle("hit", hit);
+    $("goal1").textContent = hit ? "🎯 Goal reached: " + (100 * skill).toFixed(0) + "% better than seasonal naive at h = 28 🎉" : "🎯 Goal: at h = 28, beat seasonal naive by at least 25%";
+    const x0 = T0 - 84;
+    Plot.line($("fcChart"), {
+      series: [
+        { label: "actual sales", color: MX.css("--muted"), data: ML.range(N - x0).map(i => [x0 + i, y[x0 + i]]), width: 1.5 },
+        { label: "seasonal naive", color: MX.css("--c-mt"), data: testT.map((t, i) => [t, r.snaive[i]]), dash: [5, 4], width: 1.5 },
+        { label: "model forecast", color: MX.css("--c-pd"), data: testT.map((t, i) => [t, r.pred[i]]), width: 2.5 },
+      ],
+      vlines: [{ x: T0, label: "forecast period →", color: MX.css("--c-bd") }],
+      xMin: x0, xMax: N - 1, yMin: 70, yMax: 140, xLabel: "day", yLabel: "units sold",
+    });
+    const nOn = Object.values(on).filter(Boolean).length;
+    $("fcMsg").innerHTML = !nOn ? "No features at all: the model predicts the training average every day. Even naive beats that."
+      : skill < 0 ? `At h = ${h} this feature set is <b>worse</b> than copying the same weekday from the last known week. Remove features that are stale at this horizon, or keep weekday.`
+      : h === 1 && on.lag ? `At h = 1 yesterday is fresh information: ${(100 * skill).toFixed(0)}% better than seasonal naive. Naive alone (${f2(r.nMae)}) is terrible: it copies Friday into Saturday.`
+      : h >= 21 && (on.lag || on.roll) ? `At h = ${h} the lags are ${h} days old. Try unticking lag, seasonal lag and the 7-day mean: weekday + trend are known exactly at any horizon.`
+      : `h = ${h}: model MAE ${f2(r.mae)} vs seasonal naive ${f2(r.sMae)} (skill ${(100 * skill).toFixed(0)}%).` + (on.dow ? "" : " Without weekday the model must infer the weekly rhythm from lags alone.");
+  }
+  const sched1 = () => { if (!pend1) { pend1 = true; requestAnimationFrame(render1); } };
+  ["fLag", "fSlag", "fRoll", "fDow", "fTrend"].forEach(id => ($(id).onchange = sched1));
+  $("hz").oninput = sched1;
+  render1();
+
+  /* ---------- Playground 2: shuffled k-fold vs walk-forward vs the future ---------- */
+  const rows = ML.range(T0 - START).map(i => START + i);
+  let cvKind = "lin", serving = false;
+  const lags17 = t => [1, 2, 3, 4, 5, 6, 7].map(k => y[t - k]);
+  const dow6 = t => [0, 1, 2, 3, 4, 5].map(d => (t % 7 === d ? 1 : 0));
+  const FEAT = {
+    lin: t => [...lags17(t), mean(y.slice(t - 7, t)), ...dow6(t), t / 100],
+    leak: t => [...lags17(t), serving ? mean(y.slice(t - 7, t)) : mean(y.slice(t - 6, t + 1)), ...dow6(t), t / 100],
+    knn: t => [t / 7, (t % 7) * 3],
+  };
+  const MAKE = { lin: () => new ML.Linear({ l2: 1e-4 }), leak: () => new ML.Linear({ l2: 1e-4 }), knn: () => new ML.KNN({ k: 3, task: "reg" }) };
+  const fitScore = (kind, trT, teT, serve) => {
+    serving = false; const m = MAKE[kind]().fit(trT.map(FEAT[kind]), trT.map(t => y[t]));
+    serving = !!serve; const s = ML.mae(teT.map(t => y[t]), teT.map(t => m.predict(FEAT[kind](t)))); serving = false; return s;
+  };
+  function tssFolds(n, k, gap) { const ts = Math.floor(n / (k + 1)), out = []; for (let f = 0; f < k; f++) { const s = n - (k - f) * ts; out.push({ tr: [0, Math.max(1, s - gap)], te: [s, s + ts], gap: [Math.max(1, s - gap), s] }); } return out; }
+  const segCv = [...$("cvModel").querySelectorAll("button")];
+  segCv.forEach(b => (b.onclick = () => { segCv.forEach(x => x.classList.toggle("on", x === b)); cvKind = b.dataset.v; renderCv(); }));
+  function renderCv() {
+    const k = +$("nsp").value, gap = +$("gap").value, leak = $("leak").checked && cvKind === "lin", kind = leak ? "leak" : cvKind;
+    $("nspv").textContent = k; $("gapv").textContent = gap;
+    $("leak").disabled = cvKind !== "lin";
+    const shuf = ML.kfold(rows.length, k, { seed: 1 }).map(f => fitScore(kind, f.train.map(i => rows[i]), f.test.map(i => rows[i])));
+    const folds = tssFolds(rows.length, k, gap);
+    const wf = folds.map(f => fitScore(kind, rows.slice(f.tr[0], f.tr[1]), rows.slice(f.te[0], f.te[1])));
+    const fut = fitScore(kind, rows, testT, true);
+    const S = mean(shuf), Wf = mean(wf);
+    $("cvShuf").textContent = f2(S); $("cvTss").textContent = f2(Wf); $("cvFut").textContent = f2(fut);
+    $("cvOpt").textContent = S > 0.005 ? "×" + (fut / S).toFixed(2) : "∞ (CV says perfect)";
+    const cells = 60, n = rows.length;
+    $("folds").innerHTML = folds.map((f, i) => `<div class="fold">fold ${i + 1} <div class="strip">${ML.range(cells).map(c => { const r0 = c * n / cells; const cl = r0 >= f.te[0] && r0 < f.te[1] ? "te" : r0 >= f.gap[0] && r0 < f.gap[1] ? "gp" : r0 < f.tr[1] ? "tr" : "no"; return `<i class="${cl}"></i>`; }).join("")}</div></div>`).join("") +
+      `<div class="fold">future <div class="strip">${ML.range(cells).map(() => `<i class="no"></i>`).join("")}${ML.range(11).map(() => `<i class="te"></i>`).join("")}</div></div>`;
+    Plot.bars($("cvChart"), {
+      bars: [
+        { label: "shuffled k-fold", value: S, color: MX.css("--c-c1") },
+        { label: "walk-forward", value: Wf, color: MX.css("--c-mt") },
+        { label: "real future", value: fut, color: MX.css("--c-pd") },
+      ], yMin: 0, yMax: 8, yLabel: "MAE (units)",
+    });
+    $("cvMsg").innerHTML = leak ? "The leaky mean contains today's sales, and with lags 1–6 the model can solve for today exactly: <b>both</b> CVs say 0.00. In the real future the pipeline can only compute the mean up to yesterday, and the score collapses. A split strategy can't catch a leaky feature."
+      : cvKind === "knn" ? `Shuffled folds let k-NN find training days on both sides of each test day, so it interpolates: CV says ${f2(S)}, the future says ${f2(fut)}. Walk-forward (${f2(Wf)}) is cautious but on the right side of the truth.`
+      : `Lags already describe the recent past, so shuffling barely matters here: ${f2(S)} shuffled, ${f2(Wf)} walk-forward, ${f2(fut)} real. Now try k-NN on the date, or tick the leaky feature.` + (gap ? ` The gap drops ${gap} training days before each test block, as if the latest data arrived late.` : "");
+  }
+  ["nsp", "gap"].forEach(id => ($(id).oninput = renderCv));
+  $("leak").onchange = renderCv;
+  renderCv();
+
+  /* ---------- Playground 3: error vs horizon ---------- */
+  let hzRes = null, hzMetric = "mae";
+  function computeHz() {
+    const H = ML.range(28).map(i => i + 1);
+    return H.map(h => { const a = forecast(h, ALL), c = forecast(h, CAL); return { h, all: a.mae, cal: c.mae, naive: a.nMae, snaive: a.sMae }; });
+  }
+  function drawHz() {
+    const R = hzRes, sk = hzMetric === "skill";
+    const val = (r, key) => (sk ? 100 * (1 - r[key] / r.snaive) : r[key]);
+    const series = [
+      { label: "all features", color: MX.css("--c-pd"), data: R.map(r => [r.h, val(r, "all")]), width: 2.5 },
+      { label: "weekday + trend only", color: MX.css("--c-mo"), data: R.map(r => [r.h, val(r, "cal")]), width: 2.5 },
+    ];
+    if (!sk) series.push({ label: "seasonal naive", color: MX.css("--c-mt"), data: R.map(r => [r.h, r.snaive]), dash: [5, 4] }, { label: "naive", color: MX.css("--muted"), data: R.map(r => [r.h, r.naive]), dash: [2, 3] });
+    Plot.line($("hzChart"), { series, xMin: 1, xMax: 28, yMin: sk ? -40 : 0, yMax: sk ? 60 : 10, xLabel: "horizon h (days)", yLabel: sk ? "skill vs seasonal naive (%)" : "test MAE", hlines: sk ? [{ y: 0, label: "no better than seasonal naive", color: MX.css("--c-lo") }] : [] });
+    let cross = 0; for (const r of R) { if (r.all < r.cal) cross = r.h; else break; }
+    $("hzCross").textContent = cross ? "h = " + cross : "never";
+    const b1 = R[0], b28 = R[27];
+    $("hzBest1").textContent = f2(Math.min(b1.all, b1.cal)) + (b1.all < b1.cal ? " (all)" : " (calendar)");
+    $("hzBest28").textContent = f2(Math.min(b28.all, b28.cal)) + (b28.all < b28.cal ? " (all)" : " (calendar)");
+    $("hzMsg").innerHTML = `Lags win at short horizons and fade fast. From about h = ${cross + 1} on, weekday + trend alone is better. Seasonal naive's error jumps every 7 days, when its copy comes from one week further back.`;
+  }
+  $("hzDraw").onclick = () => { hzRes = hzRes || computeHz(); drawHz(); };
+  [...$("hzMetric").querySelectorAll("button")].forEach(b => (b.onclick = () => { [...$("hzMetric").querySelectorAll("button")].forEach(x => x.classList.toggle("on", x === b)); hzMetric = b.dataset.v; if (!hzRes) hzRes = computeHz(); drawHz(); }));
+  Plot.line($("hzChart"), { series: [], xMin: 1, xMax: 28, yMin: 0, yMax: 9, xLabel: "horizon h (days)", yLabel: "test MAE" });
+  $("hzMsg").textContent = "Press 📈 to fit 56 models (two per horizon). It takes a moment.";
+})();
+</script>
+</body>
+</html>

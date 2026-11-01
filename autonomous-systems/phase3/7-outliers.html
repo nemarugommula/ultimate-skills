@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.7 Outliers & robustness: gating, delays & failures · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.strip { width: 100%; aspect-ratio: 7 / 1; height: auto; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .gate-wrap { display: grid; grid-template-columns: minmax(240px, 1.2fr) 1fr; gap: 14px; align-items: start; }
+  @media (max-width: 760px) { .gate-wrap { grid-template-columns: 1fr; } }
+  canvas.sim.square { touch-action: none; cursor: crosshair; }
+</style>
+</head>
+<body data-lesson="s3-7" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 7</div>
+  <h1>Outliers &amp; robustness: gating, delays &amp; failures</h1>
+  <p class="subtitle">Sensors don't just add noise; sometimes they lie. A GPS fix bounces off a glass tower and lands 40 m away, a camera frame arrives late, a sensor freezes. This lesson teaches a filter to ask “is that believable?” before it listens, and to notice when it's the filter itself that's wrong.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Innovation</b>: the measurement minus what the filter predicted it would be, y = <span class="se">z</span> − H<span class="be">x</span>. The surprise (Lesson 3.3).</li>
+      <li><b>Variance</b> <span class="un"><span class="nt">σ</span>²</span> and covariance <span class="un">P</span>: how unsure the filter is; <span class="un">R</span>: how noisy the sensor is. A 2×2 covariance draws as an ellipse (Lessons 3.1, 3.3).</li>
+      <li><b>The GPS + IMU filter</b>: the IMU predicts at a high rate, GPS corrects a few times a second (Lesson 3.6).</li>
+      <li>A refresher on bell curves and how rare “3 σ” is: <a href="../../math-course/phase4/3-distributions.html">distributions</a> in the Math course.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>Your robotaxi's filter is sure of its position to <b class="un">± 2 m</b> (variance 4 m²). A GPS fix arrives, normally also ± 2 m. But this one says the car is <b class="se">40 m</b> to the left, inside an office building: the signal bounced off a glass tower before reaching the antenna (<b>multipath</b>).</p>
+    <p><b>What does a plain Kalman filter do with it?</b> Ignore it? Nudge a meter? Or jump? And what <i>should</i> it do? Guess, then open the box.</p>
+    <p>This isn't rare. PX4's estimator guide says that when GPS accuracy degrades, “transient errors due to multipath, obscuration and interference are more common causes”, and every PX4 drone checks each measurement against a <b>gate</b> before fusing it (<a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4 docs</a>).</p>
+  </div>
+
+  <div class="predict" id="pr0">
+    <b class="q">🧩 Your guess:</b> prediction variance 4 m², GPS variance 4 m², the fix is 40 m off. How far does a plain Kalman filter move?
+    <div><button class="btn small" data-open="pr0">Show the answer</button></div>
+    <div class="ans">It moves <b>20 m</b>. The gain is K = 4 ÷ (4 + 4) = 0.5, so it goes halfway, 0.5 × 40 = 20 m, straight into the building, and then <i>shrinks</i> its uncertainty as if it had learned something. As Lesson 3.3 showed, a plain filter's confidence depends only on the variances, never on how surprising the measurement was. The fix: measure the surprise in units of what was expected, and refuse the absurd ones.</div>
+  </div>
+
+  <h2>Numbers first: how surprising is a measurement?</h2>
+  <p>The filter already knows how big the innovation <i>should</i> be. Its expected variance is the prediction's uncertainty plus the sensor's:</p>
+  <div class="eq">
+    S = H<span class="un">P</span>Hᵀ + <span class="un">R</span> &nbsp;&nbsp;&nbsp; d² = yᵀ S⁻¹ y &nbsp;&nbsp;(1D: d = |y| ÷ √S)
+    <span class="say">S is the innovation's expected spread. d is the innovation measured in “standard deviations of what I expected”: the Mahalanobis distance. Small d: believable. Huge d: something is wrong.</span>
+  </div>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the puzzle, gated</span>
+    <ol>
+      <li><b>Expected spread</b>: S = 4 + 4 = 8 m², so √S = <b>2.83 m</b>. A normal innovation is a few meters.</li>
+      <li><b>The 40 m fix</b>: d = 40 ÷ 2.83 = <b>14.1 σ</b> (d² = 200). For a real bell curve, beyond 5 σ happens less than once in a million; 14 σ means “this is not noise”.</li>
+      <li><b>A normal 3 m fix</b>: d = 3 ÷ 2.83 = <b>1.06 σ</b> (d² = 1.1). Perfectly ordinary.</li>
+      <li><b>The gate</b>: fuse only if d² is below a threshold, say 3.84 (explained below). The 40 m fix is rejected, the 3 m fix accepted. The car stays on the road.</li>
+    </ol>
+  </div>
+
+  <h2>In 2D, “far” depends on direction</h2>
+  <p>Here's where it gets interesting. A car driving down a road is usually very sure of its sideways position (it's in a lane) and less sure how far along the road it is. Its uncertainty is a long, thin ellipse. So a fix 3 m to the side can be <i>more</i> suspicious than one 8 m ahead. Counting meters (Euclidean distance) can't see that; the Mahalanobis distance can, because it measures distance in units of the ellipse.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Drag the GPS fix through the gate</span>
+    <p class="hint">The <b class="be">purple dot</b> is where the filter expects the car; the <b class="un">gold ellipse</b> is the expected innovation spread S (1 σ), long along the road and thin across it. The dashed ellipse is the <b>gate</b>. <b>Drag the blue GPS fix</b> anywhere (or click to drop it).</p>
+    <div class="gate-wrap">
+      <canvas class="sim square" id="m1Sim"></canvas>
+      <div>
+        <div class="controls">
+          <label>gate confidence <select id="m1Conf"><option value="5.991">95% (d² &lt; 5.99)</option><option value="9.210" selected>99% (d² &lt; 9.21)</option><option value="13.816">99.9% (d² &lt; 13.82)</option></select></label>
+        </div>
+        <div class="stat-row">
+          <div class="stat">distance in meters <b id="m1E">–</b></div>
+          <div class="stat">Mahalanobis d <b id="m1D">–</b></div>
+          <div class="stat">d² <b id="m1D2">–</b></div>
+        </div>
+        <div class="verdict" id="m1V"></div>
+        <div class="stat-row"><div class="stat">challenge <b id="m1Chal">–</b></div></div>
+        <div class="controls"><button class="btn" id="m1Reset">↺ Reset the challenge</button></div>
+        <p class="hint">🏆 <b>Challenge:</b> find (1) a fix less than <b>3 m</b> away that the gate <b>rejects</b>, and (2) a fix more than <b>6 m</b> away that it <b>accepts</b>. Both are hiding in plain sight.</p>
+      </div>
+    </div>
+  </div>
+
+  <h2>Where the thresholds come from: chi-square</h2>
+  <p>If the filter is honest (its S is right) and the noise is Gaussian, then d² for a good measurement is a sum of squared standard bell curves, one per measured number. That sum has a known distribution, the <b>chi-square</b> (χ²) distribution, with as many “degrees of freedom” as the measurement has numbers. So you can pick a threshold that a good measurement exceeds only, say, 1% of the time:</p>
+  <table>
+    <tr><th>Measurement</th><th>Degrees of freedom</th><th>95%</th><th>99%</th><th>99.9%</th></tr>
+    <tr><td>Range, height, one coordinate</td><td>1</td><td>3.84</td><td>6.63</td><td>10.83</td></tr>
+    <tr><td>GPS horizontal (x, y)</td><td>2</td><td>5.99</td><td>9.21</td><td>13.82</td></tr>
+    <tr><td>3D position, 3-axis magnetometer</td><td>3</td><td>7.81</td><td>11.34</td><td>16.27</td></tr>
+  </table>
+  <p class="hint">Read “2 dof, 99% → 9.21” as: a good 2D GPS fix has d² below 9.21 ninety-nine times out of a hundred. Values computed from the χ² distribution. For 1 dof, 3.84 is just 1.96² (the familiar “95% within 1.96 σ”).</p>
+  <p>Flight stacks usually express the gate in standard deviations per axis instead. PX4's default gate for GNSS position is <b>5 SD</b> (<code>EKF2_GPS_P_GATE</code>), its magnetometer gate 3 SD; ArduPilot's <code>EK3_POS_I_GATE</code> is a percentage of a standard deviation (300 means 3 SD). The trade-off is the same either way, and ArduPilot's docs say it in one breath: decreasing the gate “makes it more likely that good measurements will be rejected”, increasing it “makes it more likely that bad measurements will be accepted”.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A filter's covariance isn't just a confidence label: it's a <b>prediction of its own surprise</b>. Compare each innovation with that prediction (the Mahalanobis distance), and you get a lie detector for free: <b>gate</b> what's impossibly surprising, and if everything starts looking surprising, the lie is probably in the filter.
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> A Kalman filter trusts every measurement in proportion to its stated noise. One multipath fix 40 m off, with K = 0.5, yanks the car 20 m into a building and makes the filter <i>more</i> confident about it. Real sensors produce such lies regularly: reflections in city canyons, a lidar seeing rain, a camera matching the wrong feature.</li>
+      <li><b>What people tried.</b> <i>Clamp the jump</i> to a fixed number of meters (but 10 m is outrageous for RTK GPS and normal for a phone). <i>Reject anything far from the estimate in meters</i> (ignores direction and how unsure the filter is). <i>Make R huge</i> so outliers barely matter (then the good data barely matters too).</li>
+      <li><b>Why this works.</b> The gate scales itself: it measures surprise in units of the filter's own expected spread S, so a lost filter (big P) accepts big corrections while a confident one refuses them. Prediction 4 m², GPS 4 m² → √S = 2.83 m; a 40 m fix is 14 σ (rejected), a 3 m fix is 1.06 σ (accepted). Chi-square gives a principled threshold: 2D, 99% → 9.21.</li>
+      <li><b>What it costs, when it fails.</b> A gate can't catch a lie smaller than itself (a 12 m multipath error when √S is 4 m sails through). Gate too tight, or the filter overconfident, and it rejects <i>good</i> data; then it drifts, the innovations grow, it rejects even more and <b>locks itself out</b>: divergence. Several bad fixes in a row (a long reflection) can look consistent with each other.</li>
+      <li><b>What came next.</b> <b>Robust losses</b> (Huber, Cauchy) that down-weight instead of reject; <b>consistency checks</b> (NIS) that catch an overconfident filter; <b>resets</b> after repeated rejections (PX4, ArduPilot); multiple filters voting (ArduPilot's one core per IMU); and, in optimization-based estimators, outlier-robust back ends (Lesson 5.3).</li>
+    </ol>
+  </div>
+
+  <h2>Gate a real GPS stream</h2>
+  <p>Time to tune one. The car below drives 120 s at 15 m/s. GPS arrives twice a second with 3 m noise, and eight times it lies: multipath jumps from 15 m to 80 m. You choose how the filter defends itself.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Reject the spikes, keep the truth</span>
+    <p class="hint">Top: every fix's <b>normalized innovation</b> d (in σ). <span class="se">Blue</span> = good fix, accepted. <span class="un">Gold</span> = good fix, <i>wrongly rejected</i>. <span class="ag">Red</span> = spike that got in. <span class="mp">Green</span> = spike rejected. Dashed lines: your gate. Bottom: the filter's position error.</p>
+    <canvas class="chart" id="g2Chart" style="height:230px"></canvas>
+    <canvas class="chart" id="g2Err" style="height:170px"></canvas>
+    <div class="controls">
+      <label>defence <select id="g2Mode"><option value="none" selected>none (plain KF)</option><option value="gate">hard gate</option><option value="huber">Huber (down-weight)</option></select></label>
+      <label>gate size <input type="range" id="g2G" min="1" max="8" step="0.25" value="5"> <b class="mono" id="g2GV"></b></label>
+      <label>filter's R <input type="range" id="g2R" min="-1" max="1" step="0.25" value="0"> <b class="mono" id="g2RV"></b></label>
+      <button class="btn" id="g2Roll">🎲 New noise</button>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="g2Brk"> 🚨 hard brake at 30 s (15 → 0 m/s)</label>
+      <label><input type="checkbox" id="g2Rst"> reset to GPS after 4 rejections in a row</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">spikes rejected <b id="g2Sp">–</b></div>
+      <div class="stat">good fixes rejected <b id="g2Gd">–</b></div>
+      <div class="stat">RMS error <b id="g2E">–</b></div>
+      <div class="stat">average NIS (≈ 1 if honest) <b id="g2N">–</b></div>
+      <div class="stat">challenge <b id="g2Chal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> with the hard gate (no brake), reject <b>all 8 spikes</b> while rejecting <b>zero</b> good fixes. PX4's default of 5 σ isn't quite enough here: why? Then try 🚨 <b>hard brake</b> with a tight gate, and watch the filter lock itself out. What does the reset rule do?</p>
+  </div>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict before you tick 🚨:</b> the car brakes from 15 m/s to a stop in 2 s, but the filter's motion model says “constant speed, with gentle pushes”. With a tight gate, what happens?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">The filter keeps “driving” at 15 m/s. The GPS fixes, which are now <i>correct</i>, fall behind the prediction by more and more meters; they look like outliers and get rejected; with no corrections the prediction races further ahead; every later fix looks even worse. In our runs it ends up <b>well over 100 m</b> off, rejecting most of the good fixes. That's <b>gate lockout</b>, a classic divergence. A gate protects you from bad sensors, but it trusts the model completely. The reset rule (what PX4 and ArduPilot do after rejections persist) breaks the loop.</div>
+  </div>
+
+  <h2>Robust losses: down-weight instead of slam the door</h2>
+  <p>A hard gate is all-or-nothing: at 3.9 σ the fix counts fully, at 4.1 σ not at all. <b>Robust losses</b> soften that. The most common, the <b>Huber</b> loss, treats small innovations normally and, past a threshold <i>c</i>, gives each one a weight of c ÷ d. In filter terms: inflate the measurement noise R by d ÷ c, so a wild fix still nudges the estimate a little.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: Huber on the 40 m fix</span>
+    <ol>
+      <li>Threshold c = 2 σ. The fix has d = 14.1 σ, so its weight is 2 ÷ 14.1 = <b>0.14</b>: R grows from 4 to 4 × 14.1 ÷ 2 ≈ <b>28 m²</b>.</li>
+      <li>Gain: K = 4 ÷ (4 + 28) = <b>0.12</b>. Move: 0.12 × 40 ≈ <b>5 m</b>, instead of the plain filter's 20 m (or the gate's 0 m).</li>
+      <li>The 3 m fix has d = 1.06 &lt; 2, so it's untouched.</li>
+    </ol>
+    <p>Huber never throws information away, which helps when the filter itself is wrong (in the brake scenario it doesn't lock out, it just lags). The price: every outlier still pulls a little, and big ones pull a few meters. That's why optimization-based estimators (GTSAM, Ceres) offer Huber and harsher losses such as Cauchy, which flatten the pull of large errors even more.</p>
+  </div>
+
+  <h2>Is the filter itself honest? NIS</h2>
+  <p>Gates assume S is right. What if the filter is <b>overconfident</b>, with P or R too small? Then every innovation looks surprising and good data gets rejected. The check is the <b>normalized innovation squared</b>, NIS = d² for each update. For an honest filter its average equals the number of measured values: about <b>1</b> for a 1D measurement, <b>2</b> for 2D GPS.</p>
+  <table>
+    <tr><th>Average NIS (2D GPS)</th><th>Meaning</th><th>Typical fix</th></tr>
+    <tr><td>≈ 2</td><td>Honest: the surprises are the size the filter predicts</td><td>Leave it</td></tr>
+    <tr><td>≫ 2 (say 10)</td><td>Overconfident: R or Q too small, a missing bias, or outliers getting in</td><td>Raise R or Q, add a bias state, gate</td></tr>
+    <tr><td>≪ 2 (say 0.5)</td><td>Too timid: R or Q too large; it's throwing away good information</td><td>Lower R or Q</td></tr>
+  </table>
+  <p>Try it in Playground 2: with the hard gate on, drag <b>filter's R</b> down to ×0.1 and the average NIS climbs to about 5 while dozens of good fixes get rejected; drag it up to ×10 and NIS falls to about 0.2 while spikes start slipping through. PX4 shows the same idea as <b>test ratios</b> in its logs: each sensor's innovation compared with its gate, which “should remain below 0.5” in normal flight, with a ratio above 1 meaning the measurement was rejected. (When you can simulate the truth, the matching check on the state error is called <b>NEES</b>.)</p>
+
+  <h2>Late measurements: the fusion horizon</h2>
+  <p>A GPS fix describes where the antenna was when the satellites' signals were measured, but it reaches the flight computer later: PX4's default GNSS delay setting (<code>SENS_GNSS0_DELAY</code>) is <b>110 ms</b>. At 20 m/s, 110 ms is <b>2.2 m</b>: fuse that fix as if it were “now” and you drag the estimate backwards, every time.</p>
+  <p>The cure is bookkeeping. Keep a short history of states and IMU samples. When a fix arrives stamped “measured 110 ms ago”, fuse it into the state from 110 ms ago, then re-run the prediction forward to now. PX4 does a version of this: its EKF runs on a <b>delayed fusion time horizon</b> (up to <code>EKF2_DELAY_MAX</code>, 200 ms by default) where every sensor's buffered data is used “at the correct time”, and a small <b>complementary filter</b> carries that estimate forward to the present using the buffered IMU data (the same blend you tuned in Lesson 3.6).</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Find the hidden GPS delay</span>
+    <p class="hint">A car drives 30 s, speeding up and slowing down (7 to 23 m/s). Wheel speed drives the prediction at 50 Hz; GPS fixes (σ = 1 m) arrive 5 times a second, each delayed by a <b>hidden amount</b>. Set the delay your filter <i>assumes</i>; it fuses each fix that far in the past and replays forward. The chart shows the error. Hint: a delay error makes the estimate lag in the direction of travel, more at high speed.</p>
+    <canvas class="chart" id="d3Chart" style="height:230px"></canvas>
+    <div class="controls">
+      <label>assumed delay <input type="range" id="d3D" min="0" max="500" step="50" value="0"> <b class="mono" id="d3DV"></b></label>
+      <button class="btn" id="d3New">🎲 New receiver (new hidden delay)</button>
+      <button class="btn" id="d3Show">👀 Reveal</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">RMS error <b id="d3E">–</b></div>
+      <div class="stat">average error <b id="d3M">–</b></div>
+      <div class="stat">true delay <b id="d3T">hidden</b></div>
+      <div class="stat">challenge <b id="d3Chal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> get the RMS error under <b>0.4 m</b> without revealing the delay. Watch the average error's sign: it tells you whether you're assuming too little or too much.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Gates, NIS and Huber weights are a few lines of NumPy; write them once. In ROS 2, <b>robot_localization</b> takes per-sensor thresholds “expressed as Mahalanobis distances”, and its example config notes that each “defaults to numeric_limits&lt;double&gt;::max()”: no gating unless you ask. On drones you set the PX4 <code>EKF2_*_GATE</code> or ArduPilot <code>EK3_*_I_GATE</code> parameters and read the test ratios in the flight logs. In optimization back ends, <b>GTSAM</b> and <b>Ceres</b> ship Huber and Cauchy robust losses.</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+
+CHI2_99 = {<span class="n">1</span>: <span class="n">6.63</span>, <span class="n">2</span>: <span class="n">9.21</span>, <span class="n">3</span>: <span class="n">11.34</span>}        <span class="c"># chi-square gates, 99%</span>
+
+<span class="k">def</span> gated_update(x, P, z, H, R, huber_c=<span class="k">None</span>):
+    y = z - H @ x                                   <span class="c"># innovation</span>
+    S = H @ P @ H.T + R                             <span class="c"># its expected spread</span>
+    d2 = <span class="k">float</span>(y @ np.linalg.solve(S, y))          <span class="c"># Mahalanobis distance squared = NIS</span>
+    <span class="k">if</span> huber_c <span class="k">is None</span>:
+        <span class="k">if</span> d2 &gt; CHI2_99[<span class="k">len</span>(z)]:
+            <span class="k">return</span> x, P, d2, <span class="k">False</span>                 <span class="c"># rejected: keep the prediction</span>
+    <span class="k">else</span>:
+        d = np.sqrt(d2)
+        <span class="k">if</span> d &gt; huber_c:                             <span class="c"># Huber: inflate R by d / c</span>
+            R = R * (d / huber_c)
+            S = H @ P @ H.T + R
+    K = P @ H.T @ np.linalg.inv(S)
+    <span class="k">return</span> x + K @ y, (np.eye(<span class="k">len</span>(x)) - K @ H) @ P, d2, <span class="k">True</span>
+
+<span class="c"># Consistency check over a log: the mean NIS should be close to len(z)</span>
+<span class="c"># nis = [d2 for each update];  print(np.mean(nis))   # ≈ 2 for 2D GPS</span></code></pre>
+<pre><code><span class="c"># robot_localization: reject fixes more than 3 Mahalanobis units away</span>
+    odom1: /odometry/gps
+    odom1_pose_rejection_threshold: <span class="n">3.0</span>
+    imu0_angular_velocity_rejection_threshold: <span class="n">5.0</span>
+
+<span class="c"># PX4 (from the nsh shell or QGroundControl): GNSS gates and delay</span>
+param set EKF2_GPS_P_GATE <span class="n">5.0</span>      <span class="c"># position gate, in standard deviations (default 5)</span>
+param set SENS_GNSS0_DELAY <span class="n">110</span>    <span class="c"># receiver delay in ms (default 110)</span></code></pre>
+    <p class="hint">Two classic bugs: gating on Euclidean meters instead of d² (rejects good fixes across the lane, accepts bad ones along it), and an overconfident filter (P or R too small) whose gate slowly rejects everything. Plot the NIS before you tighten a gate.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🛸 Drones (PX4, ArduPilot)</h4><p>Everything in this lesson is in the open here. PX4 EKF2 runs an innovation consistency check on every observation, with a gate in standard deviations per sensor (<code>EKF2_*_GATE</code>; GNSS position and velocity default 5, magnetometer 3), and logs <b>test ratios</b> that should stay below 0.5 in normal flight (above 1 = rejected). It fuses on a <b>delayed time horizon</b> with per-sensor delays (GNSS default 110 ms, horizon up to 200 ms). ArduPilot EKF3 gates GPS in percent of a standard deviation and, past a <b>glitch radius</b> (<code>EK3_GLITCH_RAD</code>), resets its position and velocity to the GPS; with two or more IMUs it runs one filter core per IMU and flies on the most consistent one.</p>
+        <p class="src">Sources: <a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4 EKF2</a>, <a href="https://docs.px4.io/main/en/advanced_config/parameter_reference.html" target="_blank" rel="noopener">PX4 parameters</a>, <a href="https://ardupilot.org/copter/docs/parameters.html" target="_blank" rel="noopener">ArduPilot parameters</a>, <a href="https://ardupilot.org/copter/docs/common-apm-navigation-extended-kalman-filter-overview.html" target="_blank" rel="noopener">ArduPilot EKF</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo hasn't published how its localization rejects bad measurements. What it has said points to the strategy: don't depend on one sensor that can lie. Its maps help the car “navigate places even where GPS struggles, like tunnels or between skyscrapers” (2020), exactly where multipath lives. Its Feb 2026 post on the 6th-generation Driver says that “in conditions where a camera's view may be limited, our lidar and radar provide the necessary redundancy”. Cross-checking different physics (light, laser, radio) is the system-level version of a gate.</p>
+        <p class="src">Sources: <a href="https://waymo.com/blog/2020/09/the-waymo-driver-handbook-mapping/" target="_blank" rel="noopener">Waymo, mapping (2020)</a>, <a href="https://waymo.com/blog/2026/02/ro-on-6th-gen-waymo-driver" target="_blank" rel="noopener">Waymo, Feb 2026</a></p></div>
+      <div><h4>🚘 Tesla</h4><p>Tesla hasn't published its estimator, its gates, or how it handles GPS errors. Publicly, it moved Model 3 and Model Y in North America to cameras only from May 2021 (“Tesla Vision”), and Andrej Karpathy's CVPR 2021 keynote described networks estimating other cars' depth and velocity from video. With one sensor type, consistency has to come from cameras agreeing with each other and over time, but how Tesla checks that isn't public.</p>
+        <p class="src">Sources: <a href="https://www.tesla.com/support/transitioning-tesla-vision" target="_blank" rel="noopener">Tesla support</a>, <a href="https://www.youtube.com/watch?v=g6bOwQdCJrc" target="_blank" rel="noopener">CVPR'21 WAD keynote</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> a drone's estimator is open-source software flown by thousands of hobbyists and companies, so its gates, ratios and resets are documented parameters you tune yourself. A robotaxi company treats its safety logic as proprietary but talks about redundancy: several kinds of sensor, so that one lying is caught by the others. Tesla's single-modality design puts that burden on learned perception, which it describes in talks but not in detail.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Tight gate (e.g. 3 σ)</td><td>Rejects most lies</td><td>Rejects good data: at 3 σ in 1D, 0.27% of perfect fixes (about one every 37 s at 10 Hz); lockout risk</td></tr>
+      <tr><td>Loose gate (e.g. 5 σ, PX4's GNSS default)</td><td>Almost never rejects good data</td><td>Lets medium-sized lies through</td></tr>
+      <tr><td>Huber / robust loss</td><td>No hard cliff; can't lock out</td><td>Every outlier still pulls a little</td></tr>
+      <tr><td>Reset after repeated rejections</td><td>Breaks divergence and lockout</td><td>A long, consistent lie (minutes of multipath) can win</td></tr>
+      <tr><td>Delay compensation (fusion horizon)</td><td>Removes speed × delay errors</td><td>Buffers, replay compute, and you must know each delay</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your localization filter suddenly jumps 30 m in a city. How do you make it robust?” A strong answer:</p>
+    <ul>
+      <li>Names the cause (<b>multipath</b>) and the tool: an innovation gate on the <b>Mahalanobis distance</b> d² = yᵀS⁻¹y, with a χ² threshold and its numbers (2 dof, 99% → 9.21).</li>
+      <li>Knows the failure mode of gates: <b>lockout</b> when the model or covariance is wrong; adds a <b>reset</b> or fallback, and a <b>robust loss</b> where appropriate.</li>
+      <li>Checks <b>consistency</b> with NIS (average ≈ measurement dimension) before tuning gates.</li>
+      <li>Handles <b>time</b>: timestamps at measurement, per-sensor delays, a fusion horizon or replay buffer.</li>
+      <li>Thinks system-level: independent sensors (lidar-to-map, wheels, IMU) to cross-check GPS, and health monitoring that tells the planner when localization is degraded.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>PX4 innovation checks and test ratios</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4: Using the ECL EKF</a></div>
+      <p><b>How:</b> each observation's innovation is compared with a gate in standard deviations; test ratios are logged; data that stays inconsistent long enough triggers a state reset.</p>
+      <p><b>Why this method:</b> cheap, per-sensor, explainable in a log, and it stops one bad GPS or magnetometer reading from flipping a drone.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>ArduPilot EKF3 glitch handling</b> <span class="tag oss">🧰 Open source</span> <a href="https://ardupilot.org/copter/docs/parameters.html" target="_blank" rel="noopener">ArduPilot parameters (EK3_*)</a></div>
+      <p><b>How:</b> GPS innovations are gated (<code>EK3_POS_I_GATE</code>, <code>EK3_VEL_I_GATE</code>); if the disagreement exceeds a glitch radius, position and velocity are reset to the GPS.</p>
+      <p><b>Why this method:</b> the gate rejects short glitches; the reset prevents the lockout you caused in Playground 2.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Mahalanobis rejection in ROS 2</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/cra-ros-pkg/robot_localization" target="_blank" rel="noopener">robot_localization</a></div>
+      <p><b>How:</b> per-sensor <code>*_rejection_threshold</code> parameters in Mahalanobis units for pose, twist and IMU inputs; off by default.</p>
+      <p><b>Why this method:</b> one line of config protects a warehouse robot from a bad wheel-odometry message or a GPS jump.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Robust losses in optimization back ends</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/borglab/gtsam/blob/develop/gtsam/linear/LossFunctions.h" target="_blank" rel="noopener">GTSAM loss functions</a></div>
+      <p><b>How:</b> Huber, Cauchy and other M-estimators re-weight each measurement by its residual (Huber's weight is k ÷ |x| past the threshold k) inside SLAM and calibration solvers.</p>
+      <p><b>Why this method:</b> a SLAM graph may hold thousands of measurements, some wrong (a false loop closure); down-weighting keeps one from bending the whole map (Lesson 5.3).</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · how often a perfect GPS gets thrown out</span>
+    <p>Even a flawless sensor occasionally produces a big honest error, and a gate will reject it. For one Gaussian number, the chance of landing beyond 3 σ is about 0.27%; at 10 fixes a second, that's a wrongly rejected good fix roughly every <b>37 seconds</b>. Beyond 5 σ (PX4's GNSS default) the chance is about 0.00006%: once every <b>48 hours</b> of flight at 10 Hz. (Computed from the normal distribution; real GPS errors have heavier tails, which is exactly why gates exist.)</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This lesson guards the filters of Lessons 3.3 (Kalman), 3.4 (EKF/UKF) and 3.6 (GPS + IMU) against the sensor failures of Phase 2 (multipath in Lesson 2.6, time sync in Lesson 2.7). Particle filters (Lesson 3.5) face the same problem as “particle deprivation” and fix it by injecting random particles, a cousin of the reset rule. The same Mahalanobis gate reappears when a tracker decides which detection belongs to which car (Lesson 6.5), and robust losses protect SLAM from false loop closures (Lesson 5.3). Math: <a href="../../math-course/phase4/3-distributions.html">distributions</a> and <a href="../../math-course/phase4/7-lln-clt.html">the law of large numbers</a> (why an average NIS converges) in the Math course.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4: Using the ECL EKF</a>. Innovation checks, test ratios and real log plots of a GPS going bad.</li>
+      <li><span class="kind">Book</span> <a href="https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python" target="_blank" rel="noopener">Labbe: Kalman and Bayesian Filters in Python</a>. Chapters on filter consistency and tuning, with runnable notebooks.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/cra-ros-pkg/robot_localization" target="_blank" rel="noopener">robot_localization</a>. Read the example <code>ekf.yaml</code>: every rejection threshold and delay option is documented inline.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A 2D GPS fix gives an innovation with d² = 7.5. Your gate is the χ² 99% threshold for 2 degrees of freedom. What happens?</div>
+    <div class="opts"><button class="opt">Rejected: 7.5 is above the 95% value of 5.99</button><button class="opt" data-ok>Accepted: 7.5 is below the 99% threshold of 9.21</button><button class="opt">Rejected: anything above 3 σ is an outlier</button></div>
+    <div class="explain">The 2-dof 99% threshold is <b>9.21</b>, and 7.5 is below it, so the fix is fused. At a 95% gate (5.99) it would be rejected: the choice of confidence is the trade-off between rejecting lies and rejecting truth. Remember d² is squared and summed over both axes, so don't compare it with “3”.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After a tuning change, your robot rejects nearly every GPS fix, its average NIS is around 40, and its position drifts away. What's the most likely cause?</div>
+    <div class="opts"><button class="opt">The gate is too loose</button><button class="opt" data-ok>The filter is overconfident: R (or Q) is now far too small, so honest innovations look huge and get gated out</button><button class="opt">The GPS receiver is broken</button></div>
+    <div class="explain">An average NIS of 40 for a 2D measurement (honest ≈ 2) means the filter's predicted spread S is far too small. Good fixes then fail the gate, the filter drifts, and it locks itself out. Restore honest noise values (check R against the sensor's datasheet or a stationary log) before touching the gate.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A drone flies at 15 m/s and its GPS fixes arrive 200 ms after they were measured, but the filter fuses them as if they were current. Roughly how big is the systematic error?</div>
+    <div class="opts"><button class="opt">0.2 m</button><button class="opt" data-ok>About 3 m, pulling the estimate behind the drone</button><button class="opt">None: Kalman filters average delays out</button></div>
+    <div class="explain">Speed × delay = 15 m/s × 0.2 s = <b>3 m</b>, always in the same direction (behind), so it doesn't average out. Fuse each fix at its measurement time (a fusion horizon or replay buffer), as PX4 does with its per-sensor delay parameters.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>A plain KF swallows lies: a 40 m multipath fix with K = 0.5 moves it 20 m.</li>
+      <li>Measure surprise with the <b>Mahalanobis distance</b> d² = yᵀS⁻¹y; <b>gate</b> with χ² thresholds (1 dof 95% → 3.84; 2 dof 99% → 9.21; 3 dof 95% → 7.81) or σ gates (PX4 GNSS default 5 σ).</li>
+      <li>Gates fail when the <i>filter</i> is wrong: overconfidence or a bad model → <b>lockout</b>. Add resets, robust losses (<b>Huber</b>: weight c ÷ d), and check <b>NIS</b> (average ≈ measurement dimension).</li>
+      <li>Delays cost speed × delay (110 ms at 20 m/s = 2.2 m): fuse at the measurement time (PX4's fusion horizon).</li>
+      <li>Drones document all of this (PX4, ArduPilot); Waymo talks about sensor redundancy; Tesla hasn't published its approach.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+
+  // ---------- Playground 1: Mahalanobis gate, drag the fix ----------
+  const th = MX.rad(30), c = Math.cos(th), s = Math.sin(th);
+  const Rot = [[c, -s], [s, c]], Pd = [[20, 0], [0, 0.3]];
+  const Pm = MX.matmul(MX.matmul(Rot, Pd), MX.transpose(Rot));
+  const S1 = MX.madd(Pm, [[0.2, 0], [0, 0.2]]), Si = MX.inv(S1);
+  let fix = [6, -2], found = { near: false, far: false };
+  const W1 = new Sim($("m1Sim"), {
+    xRange: [-15, 15], yRange: [-15, 15],
+    onPointer(type, p) { if (type === "down" || type === "drag") { fix = [MX.clamp(p[0], -14.5, 14.5), MX.clamp(p[1], -14.5, 14.5)]; upd1(); } },
+  });
+  const d2Of = p => p[0] * (Si[0][0] * p[0] + Si[0][1] * p[1]) + p[1] * (Si[1][0] * p[0] + Si[1][1] * p[1]);
+  W1.render(w => {
+    w.clear();
+    const L = 16, dir = [c, s];
+    w.line([[-L * dir[0] - 2.2 * -s, -L * dir[1] - 2.2 * c], [L * dir[0] - 2.2 * -s, L * dir[1] - 2.2 * c]], { color: "--line", width: 1.5 });
+    w.line([[-L * dir[0] + 2.2 * -s, -L * dir[1] + 2.2 * c], [L * dir[0] + 2.2 * -s, L * dir[1] + 2.2 * c]], { color: "--line", width: 1.5 });
+    w.line([[-L * dir[0], -L * dir[1]], [L * dir[0], L * dir[1]]], { color: "--line", width: 1, dash: [6, 6] });
+    w.text([11.5 * dir[0] - 3.5 * -s, 11.5 * dir[1] - 3.5 * c], "road →", { color: "--muted", size: 11 });
+    for (let r = 3; r <= 12; r += 3) w.circle(0, 0, r, { stroke: "--line", width: 1, alpha: 0.6 });
+    w.text([0.4, 3.4], "3 m", { color: "--muted", size: 10, align: "left" });
+    const thr = +$("m1Conf").value;
+    w.ellipse([0, 0], S1, { k: 1, color: "--c-un", fill: true, width: 2 });
+    w.ellipse([0, 0], S1, { k: Math.sqrt(thr), color: "--text", width: 1.5, dash: [6, 4] });
+    w.dot([0, 0], { color: "--c-be", r: 6 });
+    const ok = d2Of(fix) < thr;
+    w.line([[0, 0], fix], { color: ok ? "--good" : "--bad", width: 1.5, dash: [3, 3] });
+    w.dot(fix, { color: "--c-se", r: 8, ring: ok ? "--good" : "--bad" });
+    w.text([fix[0], fix[1] + 1.2], "GPS", { color: "--c-se", size: 11, bold: true });
+  });
+  function upd1() {
+    const thr = +$("m1Conf").value, d2 = d2Of(fix), e = Math.hypot(fix[0], fix[1]), ok = d2 < thr;
+    $("m1E").textContent = fmt(e, 2) + " m"; $("m1D").textContent = fmt(Math.sqrt(d2), 2) + " σ"; $("m1D2").textContent = fmt(d2, 2);
+    $("m1V").innerHTML = ok ? `<span class="badge-win">✅ accepted</span> <span class="muted">d² ${fmt(d2, 2)} &lt; ${thr}</span>` : `<span class="badge-lose">⛔ rejected</span> <span class="muted">d² ${fmt(d2, 2)} ≥ ${thr}</span>`;
+    if (e < 3 && !ok) found.near = true;
+    if (e > 6 && ok) found.far = true;
+    $("m1Chal").innerHTML = found.near && found.far ? `<span class="badge-win">✅ Both found: meters lie, Mahalanobis doesn't</span>`
+      : `<span class="muted">${found.near ? "✅" : "⬜"} close but rejected · ${found.far ? "✅" : "⬜"} far but accepted</span>`;
+    W1.render();
+  }
+  $("m1Conf").onchange = upd1;
+  $("m1Reset").onclick = () => { found = { near: false, far: false }; fix = [6, -2]; upd1(); };
+  upd1();
+
+  // ---------- Playground 2: GPS spikes ----------
+  const SPK = { 40: 15, 62: -18, 81: 22, 95: -28, 121: 35, 150: -45, 171: 60, 190: -80 };
+  let seed2 = 2;
+  function sim2() {
+    const r = Sim.rng(seed2), dt = 0.1, N = 1200, sg = 3, sa = 0.5, q = sa * sa;
+    const mode = $("g2Mode").value, g = +$("g2G").value, rmul = Math.pow(10, +$("g2R").value);
+    const brake = $("g2Brk").checked, reset = $("g2Rst").checked ? 4 : 0, R = sg * sg * rmul;
+    let pt = 0, vt = 15, x = [0, 15], P = [[9, 0], [0, 1]], fixN = 0, run = 0;
+    const o = { pts: { ga: [], gr: [], sa: [], sr: [] }, err: [], spk: 0, spkRej: 0, good: 0, goodRej: 0, nis: [], se: 0, resets: 0 };
+    for (let i = 1; i <= N; i++) {
+      const t = i * dt; let a = 0;
+      if (brake) { if (t >= 30 && t < 32) a = -7.5; else if (t >= 42 && t < 47) a = 3; }
+      pt += vt * dt + 0.5 * a * dt * dt; vt += a * dt;
+      x = [x[0] + x[1] * dt, x[1]];
+      P = [[P[0][0] + dt * (P[1][0] + P[0][1]) + dt * dt * P[1][1] + q * dt ** 4 / 4, P[0][1] + dt * P[1][1] + q * dt ** 3 / 2],
+           [P[1][0] + dt * P[1][1] + q * dt ** 3 / 2, P[1][1] + q * dt * dt]];
+      if (i % 5 === 0) {
+        fixN++;
+        const isS = SPK[fixN] !== undefined, z = pt + sg * Sim.randn(r) + (isS ? SPK[fixN] : 0);
+        const y = z - x[0], S = P[0][0] + R, d = y / Math.sqrt(S);
+        let use = true, Reff = R;
+        if (mode === "gate" && Math.abs(d) > g) use = false;
+        if (mode === "huber" && Math.abs(d) > 2) Reff = R * Math.abs(d) / 2;
+        if (!use) { run++; if (reset && run >= reset) { x = [z, x[1]]; P = [[R, 0], [0, 25]]; run = 0; o.resets++; } }
+        else run = 0;
+        const key = (isS ? "s" : "g") + (use ? "a" : "r");
+        o.pts[key].push([t, MX.clamp(d, -14, 14)]);
+        if (isS) { o.spk++; if (!use) o.spkRej++; } else { o.good++; if (!use) o.goodRej++; }
+        if (use) {
+          o.nis.push(y * y / S);
+          const S2 = P[0][0] + Reff, K = [P[0][0] / S2, P[1][0] / S2];
+          x = [x[0] + K[0] * y, x[1] + K[1] * y];
+          P = [[P[0][0] - K[0] * P[0][0], P[0][1] - K[0] * P[0][1]], [P[1][0] - K[1] * P[0][0], P[1][1] - K[1] * P[0][1]]];
+        }
+      }
+      const e = x[0] - pt; o.se += e * e;
+      if (i % 2 === 0) o.err.push([t, e]);
+    }
+    o.rms = Math.sqrt(o.se / N); o.nisMean = o.nis.length ? MX.mean(o.nis) : NaN;
+    return o;
+  }
+  function draw2() {
+    const mode = $("g2Mode").value, g = +$("g2G").value;
+    $("g2GV").textContent = fmt(g, 2) + " σ";
+    $("g2RV").textContent = "×" + fmt(Math.pow(10, +$("g2R").value), +$("g2R").value < 0 ? 2 : 1);
+    $("g2G").disabled = mode !== "gate";
+    const o = sim2();
+    const hl = [{ y: 0 }];
+    if (mode === "gate") hl.push({ y: g, color: MX.css("--muted"), label: "gate" }, { y: -g, color: MX.css("--muted") });
+    if (mode === "huber") hl.push({ y: 2, color: MX.css("--muted"), label: "Huber c = 2" }, { y: -2, color: MX.css("--muted") });
+    Plot.line($("g2Chart"), {
+      series: [
+        { label: "good, accepted", color: MX.css("--c-se"), data: o.pts.ga, dotsOnly: true },
+        { label: "good, rejected", color: MX.css("--c-un"), data: o.pts.gr, dotsOnly: true },
+        { label: "spike accepted", color: MX.css("--c-ag"), data: o.pts.sa, dotsOnly: true },
+        { label: "spike rejected", color: MX.css("--c-mp"), data: o.pts.sr, dotsOnly: true },
+      ], xMin: 0, xMax: 120, yMin: -15, yMax: 15, xLabel: "time (s)", yLabel: "innovation d (σ)", hlines: hl,
+    });
+    const lim = Math.min(200, Math.max(10, 1.15 * Math.max(...o.err.map(p => Math.abs(p[1])))));
+    Plot.line($("g2Err"), { series: [{ label: "position error", color: MX.css("--c-be"), data: o.err, width: 2 }], xMin: 0, xMax: 120, yMin: -lim, yMax: lim, xLabel: "time (s)", yLabel: "error (m)", hlines: [{ y: 0 }] });
+    $("g2Sp").textContent = `${o.spkRej} / ${o.spk}`;
+    $("g2Gd").textContent = `${o.goodRej} / ${o.good}` + (o.resets ? ` · ${o.resets} reset${o.resets > 1 ? "s" : ""}` : "");
+    $("g2E").textContent = fmt(o.rms, 2) + " m";
+    $("g2N").textContent = fmt(o.nisMean, 2);
+    const win = mode === "gate" && !$("g2Brk").checked && o.spkRej === o.spk && o.goodRej === 0;
+    $("g2Chal").innerHTML = win ? `<span class="badge-win">✅ 8/8 spikes out, 0 good fixes lost</span>`
+      : $("g2Brk").checked && o.rms > 20 ? `<span class="badge-lose">🔒 Locked out: ${fmt(o.rms, 0)} m RMS</span>` : `<span class="muted">target: 8/8 and 0</span>`;
+  }
+  ["g2G", "g2R"].forEach(id => ($(id).oninput = draw2));
+  ["g2Mode", "g2Brk", "g2Rst"].forEach(id => ($(id).onchange = draw2));
+  $("g2Roll").onclick = () => { seed2++; draw2(); };
+  draw2();
+
+  // ---------- Playground 3: hidden GPS delay ----------
+  let seed3 = 4, Dtrue = 300, revealed = false;
+  function sim3() {
+    const r = Sim.rng(seed3), dt = 0.02, N = 1500, sg = 1, sv = 0.5, q = (sv * dt) ** 2;
+    const vt = t => 15 + 8 * Math.sin(0.4 * t);
+    const truth = [0], vm = [0];
+    for (let i = 1; i <= N; i++) { const t = i * dt; truth.push(truth[i - 1] + vt(t) * dt); vm.push(vt(t) + sv * Sim.randn(r)); }
+    const every = 10, D = Math.round(Dtrue / 1000 / dt), d = Math.round(+$("d3D").value / 1000 / dt), meas = [];
+    for (let i = every; i <= N; i += every) meas.push({ arr: i + D, z: truth[i] + sg * Sim.randn(r) });
+    const X = [0], P = [1]; let mi = 0, se = 0, sm = 0, n = 0; const err = [];
+    for (let i = 1; i <= N; i++) {
+      X[i] = X[i - 1] + vm[i] * dt; P[i] = P[i - 1] + q;
+      while (mi < meas.length && meas[mi].arr <= i) {
+        const m = meas[mi++], k = Math.max(0, i - d), S = P[k] + sg * sg, K = P[k] / S;
+        X[k] += K * (m.z - X[k]); P[k] *= 1 - K;
+        for (let j = k + 1; j <= i; j++) { X[j] = X[j - 1] + vm[j] * dt; P[j] = P[j - 1] + q; }
+      }
+      const e = X[i] - truth[i];
+      if (i * dt > 3) { se += e * e; sm += e; n++; }
+      if (i % 5 === 0) err.push([i * dt, e]);
+    }
+    return { err, rms: Math.sqrt(se / n), mean: sm / n };
+  }
+  function draw3() {
+    $("d3DV").textContent = $("d3D").value + " ms";
+    const o = sim3();
+    Plot.line($("d3Chart"), { series: [{ label: "position error (+ = estimate ahead of the car)", color: MX.css("--c-be"), data: o.err, width: 2 }], xMin: 0, xMax: 30, yMin: -10, yMax: 10, xLabel: "time (s)", yLabel: "error (m)", hlines: [{ y: 0 }] });
+    $("d3E").textContent = fmt(o.rms, 2) + " m";
+    $("d3M").textContent = fmt(Math.abs(o.mean), 2) + " m " + (o.mean < 0 ? "behind" : "ahead");
+    $("d3T").textContent = revealed ? Dtrue + " ms" : "hidden";
+    const win = o.rms < 0.4;
+    $("d3Chal").innerHTML = win && !revealed ? `<span class="badge-win">✅ ${fmt(o.rms, 2)} m: you found ${Dtrue} ms</span>` : win ? `<span class="muted">matched (after a peek)</span>` : `<span class="muted">target: &lt; 0.4 m</span>`;
+  }
+  $("d3D").oninput = draw3;
+  $("d3New").onclick = () => { seed3++; const r = Sim.rng(seed3 * 13); Dtrue = 100 + 50 * Math.floor(r() * 8); revealed = false; $("d3D").value = 0; draw3(); };
+  $("d3Show").onclick = () => { revealed = true; draw3(); };
+  draw3();
+})();
+</script>
+</body>
+</html>

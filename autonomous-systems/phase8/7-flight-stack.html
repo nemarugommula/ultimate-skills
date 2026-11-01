@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.7 Cascaded flight control & the PX4 / ArduPilot stack · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.strip { width: 100%; aspect-ratio: 7 / 1; height: auto; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  canvas.side { width: 100%; aspect-ratio: 5 / 1; height: auto; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  svg.flow { width: 100%; height: auto; display: block; }
+</style>
+</head>
+<body data-lesson="s8-7" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8 · Lesson 7</div>
+  <h1>Cascaded flight control: loops inside loops, and the PX4 / ArduPilot stack</h1>
+  <p class="subtitle">A drone autopilot isn't one controller. It's four, nested like Russian dolls, each one faster than the one outside it. Slow the innermost one down and a perfectly tuned drone shakes itself out of the sky. Here's why the nesting works, how PX4 and ArduPilot build it, and how your own code plugs in from a companion computer.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>PID</b>: push in proportion to the error (P), its pile-up over time (I) and its rate of change (D); <b>overshoot</b> and <b>settling time</b> grade a step response (Lesson 8.1).</li>
+      <li><b>A quadrotor moves sideways by tilting</b>: horizontal acceleration ≈ g·tan(tilt), and it changes tilt by spinning one side's rotors faster (Lesson 8.6).</li>
+      <li>The controller reads a <b class="be">state estimate</b> (attitude, velocity, position) from a filter such as PX4's EKF2, an extended Kalman filter (Lessons 3.3 and 3.4).</li>
+      <li><b>Delay</b> is poison for feedback: if you react to old news, you push at the wrong moment. You saw it with the D filter in 8.1.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>You already know how to write a PID. So why not one PID from <b class="pl">“I want to be 5 m to the left”</b> straight to the four motor speeds? Why does every serious autopilot instead stack <b>four</b> controllers, and run them at wildly different speeds?</p>
+    <p>Look at the numbers PX4 actually uses. Its gyros are read and filtered at their full raw rate, commonly <b>8 kHz</b>. The innermost loop, the one that controls how fast the drone is <i>rotating</i>, runs at the rate set by <code>IMU_GYRO_RATEMAX</code>: <b>400 Hz by default</b>, configurable from 100 Hz to 2 kHz. The EKF2 state estimator updates every <b>10 ms</b> (100 Hz). And a companion computer flying the drone in Offboard mode only has to prove it's alive <b>2 times a second</b> (<a href="https://docs.px4.io/main/en/advanced_config/parameter_reference.html" target="_blank" rel="noopener">PX4 parameter reference</a>, <a href="https://docs.px4.io/main/en/flight_modes/offboard.html" target="_blank" rel="noopener">PX4 Offboard mode</a>). A 4000× spread in speed, inside one small flight controller. By the end of this lesson you'll know why each number is what it is, and you'll have broken a drone by changing just one of them.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Slow the inner loop (predict first)</span>
+    <p class="hint">One axis of a drone: <b>roll</b>. The outer <b>attitude loop</b> turns “roll to 20°” into a <span class="pl">desired rotation speed</span>; the inner <b>rate loop</b> turns that into a <span class="ct">torque command</span> for the motors (which respond with a 20 ms lag). The rate loop works on samples: it reads the gyro, computes, and its answer reaches the motors one sample later. First, <b>guess</b>: with these gains, how slow can the rate loop run before the 20° step overshoots by more than 10%?</p>
+    <div class="controls">
+      <label>my guess <input type="range" id="guess" min="0" max="8" step="1" value="5"> <b class="mono" id="guessV"></b></label>
+      <button class="btn primary" id="lock">🔒 Lock in my guess</button>
+    </div>
+    <div class="verdict" id="guessVerdict"></div>
+    <canvas class="chart" id="rollChart" style="height:240px"></canvas>
+    <div class="controls" id="p1sliders" style="opacity:.45; pointer-events:none">
+      <label>rate loop <input type="range" id="fr" min="0" max="8" step="1" value="7"> <b class="mono" id="frV"></b></label>
+      <label>rate gain <input type="range" id="kr" min="5" max="60" step="5" value="40"> <b class="mono" id="krV"></b></label>
+      <label>attitude gain <input type="range" id="ka" min="2" max="12" step="1" value="8"> <b class="mono" id="kaV"></b></label>
+      <button class="btn" id="p1reset">↺ Stock gains</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">delay in the loop <b id="s1d">–</b></div>
+      <div class="stat">overshoot <b id="s1o">–</b></div>
+      <div class="stat">settling (5%) <b id="s1t">–</b></div>
+      <div class="stat">challenge <b id="s1c">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> your flight controller is overloaded and can only run the rate loop at <b>50 Hz or slower</b>. Retune so the 20° step still has <b>under 5% overshoot</b> and settles in <b>under 0.5 s</b>. (Hint: lowering only the rate gain isn't enough. Why?)</p>
+  </div>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> at 50 Hz you lower the <i>rate</i> gain from 40 to 15 and the overshoot barely improves. Why doesn't taming the inner loop fix it?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">Because now the inner loop is <b>slow</b>, and the outer attitude loop is still asking for rotation as eagerly as before. The outer loop assumes “when I ask for a rotation speed, I get it almost instantly”. A sluggish inner loop breaks that promise, so the outer loop keeps pushing after it should have eased off, and overshoots. The fix is to lower <b>both</b>: rate gain around 15–20 and attitude gain around 5–6. Each loop must stay several times slower than the one inside it.</div>
+  </div>
+
+  <h2>Numbers first: why delay eats stability</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what a slow sample costs</span>
+    <p>A sampled loop reacts, on average, about <b>1.5 samples late</b>: half a sample because the command is held between updates, plus one sample to compute and send it.</p>
+    <table>
+      <tr><th>Rate loop</th><th>One sample</th><th>Average delay (1.5 samples)</th><th>Phase lost at 40 rad/s (≈ 6.4 Hz)</th></tr>
+      <tr><td>400 Hz (PX4 default)</td><td>2.5 ms</td><td>3.75 ms</td><td>40 × 0.00375 = 0.15 rad ≈ <b>9°</b></td></tr>
+      <tr><td>50 Hz</td><td>20 ms</td><td>30 ms</td><td>40 × 0.030 = 1.2 rad ≈ <b>69°</b></td></tr>
+    </table>
+    <p>What's “phase”? Think of pushing a child on a swing. Push at the right moment and the swing settles where you want; push late and you're adding energy at the wrong time. A feedback loop has a budget of lateness before it turns from damping into pumping. The 20 ms motor lag already eats part of that budget, and the drone's inertia (torque makes rotation speed build up gradually) eats more. At 400 Hz the sample delay costs 9°, small change. At 50 Hz it costs 69°, and the budget is gone: the drone pumps energy into its own wobble. That's what you watched in Playground 1.</p>
+    <p>The only cure for a slow loop is to <b>ask less of it</b>: lower its gain until the frequencies where it acts are slow enough that 30 ms doesn't matter. A slower inner loop means a slower drone.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A cascade splits one hard problem into a ladder of easy ones. Each loop controls <b>one quantity</b> and hands a <b>setpoint</b> to the loop inside it: position → velocity → attitude → rotation rate → motors. It works because each inner loop is <b>much faster</b> than the loop outside it, so from the outside it looks like a perfect, instant actuator. The rule of thumb: keep each loop roughly <b>3 to 10 times faster</b> than the one it serves. The innermost loop must run fastest because rotation is the fastest thing a drone does.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a restaurant kitchen</span>
+    <p>The owner decides the menu for the month (position: slow, big picture). The head chef calls out orders every minute (velocity). The line cook adjusts the heat every few seconds (attitude). The cook's hand keeps the pan level every fraction of a second (rate). The owner never tells the hand what to do; she trusts the chef, who trusts the cook, who trusts the hand. If the hand were slow, no menu could save dinner. And if the owner changed the menu every minute, the kitchen would thrash.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not one big controller)</span>
+    <ol>
+      <li><b>The problem before.</b> A drone's position depends on its velocity, which depends on its tilt, which depends on its rotation rate, which depends on four motor speeds: four integrations deep, in three dimensions, with a fast unstable rotation at the bottom. One PID from position error to motors would need a single gain that is both gentle enough for position and aggressive enough for rotation. No such gain exists.</li>
+      <li><b>What people tried.</b> <i>A single loop on angle</i> (early hobby stabilizers): fine for hovering, but no position or velocity control. <i>Hand-flying everything</i> with a pilot as the outer loops (classic RC helicopters: hard to learn). <i>One big state-feedback controller</i> such as LQR (Lesson 8.4) on the full model: elegant, but hard to tune per axis, hard to limit (tilt, climb rate) and hard to debug in the field.</li>
+      <li><b>Why the cascade works.</b> Each loop sees a simple, nearly first-order system, because the loop inside it makes its setpoint happen quickly. You tune from the inside out: rate first (it should snap to commands), then attitude, then velocity, then position. Limits drop in naturally between loops: cap the velocity setpoint, cap the tilt (PX4's <code>MPC_TILTMAX_AIR</code>, 45° by default). Tiny example: rate loop crossover ~40 rad/s, attitude gain 8 /s (5× slower), velocity gain 3 /s, position gain 1.25 /s. That chain moves 5 m in under 2 s with about 1% overshoot (Playground 2).</li>
+      <li><b>What it costs, when it fails.</b> Every outer loop must be slower than the one inside, so the outermost loop ends up slow: performance is capped by the inner loops and their delays. The cascade ignores couplings between loops (aggressive position moves can saturate the motors, then every loop is wrong at once). It needs good feedback at every level: a bad velocity estimate (Lesson 3.6) wrecks position hold no matter how well the rate loop is tuned.</li>
+      <li><b>What came next.</b> <b>Feedforward</b> between loops (PX4 passes the trajectory's acceleration and rate setpoints down, not just errors), <b>reference models</b> that smooth setpoints, <b>control allocation</b> that handles motor saturation, <b>auto-tuning</b> (PX4 and ArduPilot both have it), and in research, <b>MPC</b> (Lesson 8.5) that replaces the outer loops with an optimizer while a fast rate loop stays underneath.</li>
+    </ol>
+  </div>
+
+  <h2>The ladder, rung by rung</h2>
+  <p>PX4 describes its multicopter controller as “a standard cascaded control architecture” and says the controllers are “a mix of P and PID controllers” (<a href="https://docs.px4.io/main/en/flight_stack/controller_diagrams.html" target="_blank" rel="noopener">PX4 controller diagrams</a>). ArduPilot's copter has the same shape. Here are the real parameter names you'd tune:</p>
+  <table>
+    <tr><th>Loop</th><th>Takes → gives</th><th>Controller</th><th>PX4 parameters</th><th>ArduPilot parameters</th></tr>
+    <tr><td><span class="pl">Position</span></td><td>position error → velocity setpoint</td><td>P</td><td><code>MPC_XY_P</code>, <code>MPC_Z_P</code> (1.0 m/s per m by default)</td><td><code>PSC_NE_POS_P</code>, <code>PSC_D_POS_P</code></td></tr>
+    <tr><td><span class="pl">Velocity</span></td><td>velocity error → acceleration (→ thrust and tilt)</td><td>PID, integrator clamped</td><td><code>MPC_XY_VEL_P_ACC</code>/<code>_I_ACC</code>/<code>_D_ACC</code>, <code>MPC_Z_VEL_*_ACC</code>, tilt cap <code>MPC_TILTMAX_AIR</code></td><td><code>PSC_NE_VEL_P</code>/<code>I</code>/<code>D</code>, <code>PSC_D_VEL_*</code>, plus a vertical acceleration loop <code>PSC_D_ACC_*</code></td></tr>
+    <tr><td><span class="be">Attitude</span></td><td>angle error → rotation-rate setpoint</td><td>P (on a smoothed reference)</td><td><code>MC_ROLL_P</code>, <code>MC_PITCH_P</code>, <code>MC_YAW_P</code></td><td><code>ATC_ANG_RLL_P</code>, <code>ATC_ANG_PIT_P</code>, <code>ATC_ANG_YAW_P</code></td></tr>
+    <tr><td><span class="ct">Rate</span></td><td>rotation-rate error → torque command</td><td>PID with a global gain K, integrator limited</td><td><code>MC_ROLLRATE_P</code>/<code>I</code>/<code>D</code>/<code>K</code>, <code>MC_RR_INT_LIM</code></td><td><code>ATC_RAT_RLL_P</code>/<code>I</code>/<code>D</code>/<code>IMAX</code>, same for <code>PIT</code>, <code>YAW</code></td></tr>
+    <tr><td><span class="ct">Allocation</span></td><td>thrust + 3 torques → each motor</td><td>matrix from the frame geometry</td><td><code>control_allocator</code>, <code>CA_ROTOR*</code></td><td><code>FRAME_CLASS</code>, <code>FRAME_TYPE</code></td></tr>
+  </table>
+  <p>And the speeds: the PX4 rate loop and motor outputs run at <code>IMU_GYRO_RATEMAX</code> (400 Hz default). The estimator updates at 100 Hz, so the outer loops get fresh position and velocity about that often; PX4's docs note that higher-level modules such as the navigator “run considerably slower” (<a href="https://docs.px4.io/main/en/concept/architecture.html" target="_blank" rel="noopener">PX4 architecture</a>). ArduPilot runs its main loop at <code>SCHED_LOOP_RATE</code>, 50 to 400 Hz, and calls values above 400 “highly experimental” (<a href="https://ardupilot.org/copter/docs/parameters.html" target="_blank" rel="noopener">ArduPilot parameters</a>).</p>
+  <p class="hint">Two more PX4 details worth knowing: the rate PID's <code>MC_ROLLRATE_K</code> multiplies all three terms, so P = 1 gives the “ideal” form and K = 1 the “parallel” form; and both the rate and velocity loops limit their integrators to prevent windup (the velocity loop by clamping), exactly the fix from Lesson 8.1.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · The bandwidth ladder</span>
+    <p class="hint">Now the whole sideways chain: <span class="pl">position</span> P → <span class="pl">velocity</span> P → tilt (capped at 45°, like <code>MPC_TILTMAX_AIR</code>) → an attitude loop that reaches its tilt with time constant <span class="nt">τ</span>. The drone must move <b>5 m</b> to the right. The bar chart compares the three loops' speeds (all in 1/s): a healthy ladder has each bar several times taller than the one before. Press <b>▶ Fly</b> to watch it.</p>
+    <canvas class="side" id="side"></canvas>
+    <div class="controls">
+      <button class="btn primary" id="fly">▶ Fly</button>
+      <label><span class="pl">position gain</span> <input type="range" id="kp" min="0.25" max="4" step="0.25" value="3"> <b class="mono" id="kpV"></b></label>
+      <label><span class="pl">velocity gain</span> <input type="range" id="kv" min="0.5" max="8" step="0.5" value="2"> <b class="mono" id="kvV"></b></label>
+      <label><span class="be">attitude <span class="nt">τ</span></span> <input type="range" id="tau" min="0.05" max="0.6" step="0.05" value="0.15"> <b class="mono" id="tauV"></b></label>
+    </div>
+    <div class="two-col">
+      <canvas class="chart" id="posChart" style="height:220px"></canvas>
+      <canvas class="chart" id="ladder" style="height:220px"></canvas>
+    </div>
+    <div class="stat-row">
+      <div class="stat">overshoot <b id="s2o">–</b></div>
+      <div class="stat">settled within 10 cm at <b id="s2t">–</b></div>
+      <div class="stat">max tilt <b id="s2m">–</b></div>
+      <div class="stat">challenge <b id="s2c">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> with <span class="nt">τ</span> = 0.15 s, move 5 m with <b>under 5% overshoot</b>, settled within 10 cm in <b>under 3 s</b>. The defaults overshoot by 24%: the position loop is faster than the velocity loop under it. Then try <span class="nt">τ</span> = 0.6 s (a big, sluggish drone): how fast can you go now?</p>
+  </div>
+  <p>What you should find: the default position gain (3 /s) is <i>bigger</i> than the velocity gain (2 /s), an upside-down ladder, so the drone overshoots by a quarter. Drop position to about 1.25 and raise velocity to about 3 and it glides in under 2 s. With a sluggish attitude loop (<span class="nt">τ</span> = 0.6 s) the same gains overshoot again, and the best you can do is roughly 6 to 7 seconds: <b>the inner loop's speed caps the whole drone</b>. That is why racing drones push their rate loops to kilohertz and use stiff frames and fast motors.</p>
+
+  <h2>Mixer, flight modes and uORB</h2>
+  <p>At the bottom of the ladder, the <b>mixer</b>, which PX4 now calls <b>control allocation</b>, turns “this much total thrust plus these three torques” into four motor commands using a matrix built from the frame's geometry (Lesson 8.6 built one by hand). PX4's <code>control_allocator</code> replaced the old mixer files after v1.13 and also handles motor failures (<a href="https://docs.px4.io/main/en/concept/control_allocation.html" target="_blank" rel="noopener">PX4 control allocation</a>). When the demand is impossible, say full climb <i>and</i> a hard roll, some motor hits 100% and the allocator has to decide what to give up.</p>
+  <p>A <b>flight mode</b> just decides <i>which rung the pilot or computer grabs</i>:</p>
+  <table>
+    <tr><th>What you command</th><th>PX4 mode</th><th>ArduPilot mode</th><th>Loops the autopilot runs</th></tr>
+    <tr><td>Rotation rates (sticks = spin speed)</td><td>Acro</td><td>Acro</td><td><span class="ct">rate</span></td></tr>
+    <tr><td>Tilt angles, throttle by hand</td><td>Stabilized</td><td>Stabilize</td><td><span class="be">attitude</span> + <span class="ct">rate</span></td></tr>
+    <tr><td>Tilt angles, altitude held</td><td>Altitude</td><td>Alt Hold</td><td>+ vertical <span class="pl">position/velocity</span></td></tr>
+    <tr><td>Velocity (centre the sticks and it stops)</td><td>Position</td><td>Loiter, PosHold</td><td>all four loops</td></tr>
+    <tr><td>Waypoints, return home</td><td>Mission, Return</td><td>Auto, RTL</td><td>all four, setpoints from the navigator</td></tr>
+    <tr><td>Setpoints from your own computer</td><td>Offboard</td><td>Guided</td><td>whichever rung you send (position, velocity, attitude or rates)</td></tr>
+  </table>
+  <p>Inside PX4, every module talks over <b>uORB</b>, a publish-subscribe message bus: the gyro driver publishes <code>vehicle_angular_velocity</code>, EKF2 publishes the attitude and local position, each controller subscribes to what it needs and publishes the next setpoint. PX4's docs describe the system as reactive: modules run when new data arrives, so “the drivers define how fast a module updates”, and <code>uorb top</code> shows every topic's live rate (<a href="https://docs.px4.io/main/en/concept/architecture.html" target="_blank" rel="noopener">PX4 architecture</a>, <a href="https://docs.px4.io/main/en/middleware/uorb.html" target="_blank" rel="noopener">uORB</a>).</p>
+
+  <h2>Plugging in your own code: Offboard</h2>
+  <p>Your autonomy software (planning from Phase 7, avoidance from Lesson 8.8) usually runs on a <b>companion computer</b>, such as a Jetson or a Raspberry Pi, next to the flight controller. It sends setpoints for one rung of the ladder and lets PX4 run everything below. Two routes:</p>
+  <ul>
+    <li><b>ROS 2 via uXRCE-DDS</b>: a client inside PX4 and an agent on the companion bridge uORB topics into ROS 2 topics such as <code>/fmu/in/offboard_control_mode</code> and <code>/fmu/in/trajectory_setpoint</code>. The message types come from the <code>px4_msgs</code> package, whose branches match PX4 releases. PX4 recommends ROS 2 Jazzy on Ubuntu 24.04, with Humble as an alternative (<a href="https://docs.px4.io/main/en/ros2/user_guide.html" target="_blank" rel="noopener">PX4 ROS 2 guide</a>).</li>
+    <li><b>MAVLink via MAVSDK</b>: a library that speaks MAVLink to PX4 or ArduPilot. Heads-up for October 2026: the gRPC-based Python wrapper was renamed from <code>mavsdk</code> to <b><code>mavsdk-grpc</code></b> (imported as <code>mavsdk_grpc</code>); the name <code>mavsdk</code> on PyPI now refers to a native binding with a different API (<a href="https://github.com/mavlink/MAVSDK-Python" target="_blank" rel="noopener">MAVSDK-Python README</a>).</li>
+  </ul>
+  <p>Either way, PX4 insists on a <b>proof of life</b>: a continuous stream of at least 2 Hz. If it stops for longer than <code>COM_OF_LOSS_T</code> (1.0 s by default), PX4 leaves Offboard and runs the failsafe set in <code>COM_OBL_RC_ACT</code>. With ROS 2, the keep-alive is the <code>OffboardControlMode</code> message; PX4's docs warn that it does <i>not</i> fail over if only the setpoints stop, so keep sending those too.</p>
+
+  <div class="predict" id="pr2">
+    <b class="q">🧩 Predict:</b> your Wi-Fi link to the drone drops 30% of messages. You stream at the minimum 2 Hz with the default 1 s timeout. Over a 40-second flight, how often will PX4 wrongly decide your computer is dead?
+    <div><button class="btn small" data-open="pr2">Show the answer</button></div>
+    <div class="ans">Often. At 2 Hz a gap longer than 1 s needs only two lost messages in a row, and with 30% loss that happens 9% of the time at each message: about 5 or 6 false alarms in 80 messages. The fixes pull in opposite directions: a longer timeout means fewer false alarms but slower reaction to a real crash of your computer; a faster stream gives many more chances for a message to get through. Playground 3 lets you find the balance.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Keep the link alive (and still notice when it dies)</span>
+    <p class="hint">The stack, as data flows through it: press <b>📨 Send a setpoint</b> to watch one travel from your ROS 2 node down to the motors (agent to client over UDP or serial; inside PX4 every arrow is a uORB topic). Below it, a 45-second flight log: each tick is a heartbeat that <b>arrived</b>. At <b>t = 40 s</b> your companion computer really crashes. Red marks are <b>false failsafes</b> (PX4 gave up on a computer that was still alive); the gold mark is when PX4 noticed the real crash. The stats test your settings on <b>20 different random links</b>.</p>
+    <svg id="stack"></svg>
+    <div class="controls">
+      <button class="btn" id="send">📨 Send a setpoint</button>
+      <button class="btn" id="reroll">🎲 Show another link</button>
+    </div>
+    <canvas class="strip" id="hb"></canvas>
+    <div class="controls">
+      <label>stream rate <input type="range" id="hz" min="0" max="7" step="1" value="1"> <b class="mono" id="hzV"></b></label>
+      <label>packet loss <input type="range" id="loss" min="0" max="60" step="5" value="30"> <b class="mono" id="lossV"></b></label>
+      <label>timeout <code>COM_OF_LOSS_T</code> <input type="range" id="to" min="0.2" max="3" step="0.1" value="1"> <b class="mono" id="toV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">links with a false failsafe <b id="s3f">–</b></div>
+      <div class="stat">worst time to notice the crash <b id="s3d">–</b></div>
+      <div class="stat">messages per second <b id="s3b">–</b></div>
+      <div class="stat">challenge <b id="s3c">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> with <b>30% loss or worse</b>, get <b>zero</b> false failsafes on all 20 links <i>and</i> notice the real crash within <b>0.6 s</b> every time. Use as few messages per second as you can.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Tuning happens in <b>QGroundControl</b> (PX4) or <b>Mission Planner</b> (ArduPilot), with logs in <b>Flight Review</b> or <b>UAV Log Viewer</b>; both stacks have auto-tune (<a href="https://docs.px4.io/main/en/config/autotune_mc.html" target="_blank" rel="noopener">PX4</a>, <a href="https://ardupilot.org/copter/docs/autotune.html" target="_blank" rel="noopener">ArduPilot</a>). For your own code, the PX4 ROS 2 example looks like this (trimmed from <a href="https://github.com/PX4/px4_ros_com/blob/main/src/examples/offboard_py/offboard_control.py" target="_blank" rel="noopener">px4_ros_com's offboard_control.py</a>):</p>
+<pre><code><span class="k">import</span> rclpy
+<span class="k">from</span> rclpy.node <span class="k">import</span> Node
+<span class="k">from</span> rclpy.qos <span class="k">import</span> QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
+<span class="k">from</span> px4_msgs.msg <span class="k">import</span> OffboardControlMode, TrajectorySetpoint
+
+<span class="k">class</span> Hover(Node):
+    <span class="k">def</span> __init__(self):
+        super().__init__(<span class="s">'hover'</span>)
+        qos = QoSProfile(reliability=ReliabilityPolicy.BEST_EFFORT, durability=DurabilityPolicy.TRANSIENT_LOCAL,
+                         history=HistoryPolicy.KEEP_LAST, depth=<span class="n">1</span>)
+        self.mode_pub = self.create_publisher(OffboardControlMode, <span class="s">'/fmu/in/offboard_control_mode'</span>, qos)
+        self.sp_pub = self.create_publisher(TrajectorySetpoint, <span class="s">'/fmu/in/trajectory_setpoint'</span>, qos)
+        self.create_timer(<span class="n">0.1</span>, self.tick)                 <span class="c"># 10 Hz: well above the 2 Hz minimum</span>
+
+    <span class="k">def</span> tick(self):
+        now = int(self.get_clock().now().nanoseconds / <span class="n">1000</span>)  <span class="c"># PX4 timestamps are in microseconds</span>
+        m = OffboardControlMode(); m.position = <span class="k">True</span>; m.timestamp = now
+        self.mode_pub.publish(m)                         <span class="c"># the proof of life: which rung we command</span>
+        sp = TrajectorySetpoint(); sp.position = [<span class="n">0.0</span>, <span class="n">0.0</span>, <span class="n">-5.0</span>]   <span class="c"># NED: z = −5 means 5 m up</span>
+        sp.yaw = <span class="n">0.0</span>; sp.timestamp = now
+        self.sp_pub.publish(sp)                          <span class="c"># the setpoint itself</span>
+
+rclpy.init(); rclpy.spin(Hover())
+<span class="c"># Run the bridge on the companion first:  MicroXRCEAgent udp4 -p 8888</span>
+<span class="c"># Then arm and switch to Offboard (VehicleCommand on /fmu/in/vehicle_command, or from QGroundControl).</span></code></pre>
+<pre><code><span class="c"># The same idea over MAVLink with MAVSDK (gRPC wrapper, renamed Oct 2026):  pip install mavsdk-grpc</span>
+<span class="k">from</span> mavsdk_grpc <span class="k">import</span> System
+<span class="k">from</span> mavsdk_grpc.offboard <span class="k">import</span> VelocityNedYaw
+
+<span class="k">async def</span> fly():
+    drone = System(); <span class="k">await</span> drone.connect(system_address=<span class="s">"udpin://0.0.0.0:14540"</span>)
+    <span class="k">await</span> drone.action.arm()
+    <span class="k">await</span> drone.offboard.set_velocity_ned(VelocityNedYaw(<span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>))   <span class="c"># a setpoint must exist first</span>
+    <span class="k">await</span> drone.offboard.start()
+    <span class="k">await</span> drone.offboard.set_velocity_ned(VelocityNedYaw(<span class="n">2.0</span>, <span class="n">0</span>, <span class="n">-1.0</span>, <span class="n">90</span>))  <span class="c"># north 2 m/s, up 1 m/s, face east</span></code></pre>
+    <p class="hint">Notice which rung each snippet grabs: the ROS 2 one sends <span class="pl">positions</span> (PX4 runs all four loops), the MAVSDK one sends <span class="pl">velocities</span> (PX4 runs velocity, attitude and rate). Sending rates yourself is possible but means your companion computer, over a USB or Wi-Fi link, becomes part of a fast loop: rarely a good idea, as Playground 1 showed.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🛸 Drones (PX4, ArduPilot)</h4><p>Exactly this lesson, in the open: position P → velocity PID → attitude P → rate PID → control allocation, with the rate loop at the gyro rate (PX4: 400 Hz default, up to 2 kHz) and integrators limited against windup. Offboard or Guided mode lets a companion computer, running ROS 2 or MAVSDK, command any rung while the autopilot keeps the fast loops and the failsafes. Commercial drones such as Skydio's build their own autonomy on top of the same layering, with obstacle avoidance feeding the outer loops (Lesson 8.8).</p>
+        <p class="src">Sources: <a href="https://docs.px4.io/main/en/flight_stack/controller_diagrams.html" target="_blank" rel="noopener">PX4 controller diagrams</a>, <a href="https://ardupilot.org/copter/docs/parameters.html" target="_blank" rel="noopener">ArduPilot parameters</a>, <a href="https://docs.px4.io/main/en/flight_modes/offboard.html" target="_blank" rel="noopener">PX4 Offboard</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo hasn't published its control loops, but the layering principle shows up in its hardware. Its Waymo Driver page lists a <b>redundant steering</b> system with “a redundant secondary drive motor system with independent controllers and separate power supplies”, a full secondary braking system and backup power for each critical system. The fast inner loops (steering motor, brake pressure) live in dedicated controllers, doubled for safety, while the planner above them sends trajectories.</p>
+        <p class="src">Sources: <a href="https://waymo.com/waymo-driver/" target="_blank" rel="noopener">Waymo Driver</a></p></div>
+      <div><h4>🚘 Tesla</h4><p>Tesla's FSD v12 release notes (early 2024) said it “upgrades the city-streets driving stack to a single end-to-end neural network trained on millions of video clips, replacing over 300k lines of explicit C++ code”. Tesla hasn't published how the network's output reaches the actuators, so whether a classic inner loop still turns its commands into steering torque and brake pressure isn't public. Any car still has fast, dedicated steering and brake controllers underneath.</p>
+        <p class="src">Sources: <a href="https://www.notateslaapp.com/software-updates/version/2023.44.30.11/release-notes" target="_blank" rel="noopener">FSD v12 release notes (third-party archive of Tesla's notes)</a>, <a href="https://www.tesla.com/fsd" target="_blank" rel="noopener">Tesla FSD (Supervised)</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> a multicopter is unstable: let go of the rate loop for a fraction of a second and it flips, so the cascade and its timing are non-negotiable and fully exposed for tuning. A car is stable on its own (let go of the wheel and it keeps rolling), so its fast loops can hide inside steering and brake units, and the interesting fight is over the slow outer layers: modular planners (Waymo) versus one learned network (Tesla).</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Faster rate loop (e.g. 400 Hz → 2 kHz)</td><td>Less delay, so higher gains and a snappier, steadier drone</td><td>More CPU; needs fast ESC protocols and good filtering; gyro noise and frame vibration matter more</td></tr>
+      <tr><td>Cascade of P/PID loops</td><td>Tune and limit each loop alone; easy to debug from logs; robust</td><td>Outer loops must be slow; ignores couplings; performance capped by the inner loops</td></tr>
+      <tr><td>One big optimal controller (LQR, MPC)</td><td>Handles couplings; can be optimal for the model</td><td>Needs a good model; harder to tune and certify; usually still sits on a fast rate loop</td></tr>
+      <tr><td>Offboard position setpoints</td><td>PX4 keeps all control loops; the link can be slow and lossy</td><td>Your planner can't use aggressive manoeuvres the position loop smooths away</td></tr>
+      <tr><td>Offboard rate or attitude setpoints</td><td>Full authority for agile flight (racing, research)</td><td>The link's delay and jitter land inside a fast loop; a crash of your code is a crash of the drone</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“A drone holds position fine in calm air but oscillates slowly in a gentle wind. Walk me through how you'd debug it.” A strong answer:</p>
+    <ul>
+      <li>Names the <b>cascade</b> and debugs <b>from the inside out</b>: does the rate loop track its setpoint in the log? Then attitude, then velocity, then position.</li>
+      <li>Knows the <b>bandwidth rule</b>: a slow oscillation in position with good inner tracking means the position or velocity gains are too high for the inner loops, or the estimate is lagging (check EKF2 delays and the GPS rate).</li>
+      <li>Checks <b>integrators and limits</b>: wind needs the velocity I term; a too-small integrator limit or a tilt cap can't hold the drone against the wind.</li>
+      <li>Mentions <b>delay</b>: loop rate, filtering (the D-term and gyro low-pass filters add lag), ESC protocol. And for offboard setups, the companion link's rate and loss.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>PX4 multicopter controller</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.px4.io/main/en/flight_stack/controller_diagrams.html" target="_blank" rel="noopener">PX4 controller diagrams</a></div>
+      <p><b>How:</b> P position → PID velocity (with clamped integrator) → P attitude on a smoothed reference → K-PID rate at the gyro rate → control allocation, all talking over uORB.</p>
+      <p><b>Why this method:</b> every rung can be tuned, limited and logged on its own, which matters across thousands of different airframes built by different people.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>ArduPilot AutoTune</b> <span class="tag oss">🧰 Open source</span> <a href="https://ardupilot.org/copter/docs/autotune.html" target="_blank" rel="noopener">ArduPilot AutoTune</a></div>
+      <p><b>How:</b> the copter twitches each axis in flight and measures the response to set the rate and angle gains (<code>ATC_RAT_*</code>, <code>ATC_ANG_*</code>), inner loop first.</p>
+      <p><b>Why this method:</b> the cascade makes inside-out tuning possible one axis and one loop at a time, so a machine can do what a skilled tuner does.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>ROS 2 offboard control</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.px4.io/main/en/ros2/user_guide.html" target="_blank" rel="noopener">PX4 ROS 2 user guide</a></div>
+      <p><b>How:</b> a companion computer runs perception and planning in ROS 2 and sends trajectory setpoints through uXRCE-DDS; PX4 runs the loops below.</p>
+      <p><b>Why this method:</b> heavy, slow, crash-prone autonomy code stays off the flight controller, and PX4's failsafes catch it when it dies.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Redundant steering and braking</b> <span class="tag av">🚗 AV</span> <a href="https://waymo.com/waymo-driver/" target="_blank" rel="noopener">Waymo Driver</a></div>
+      <p><b>How:</b> secondary steering motors with independent controllers and power, a full second braking system and backup power for each critical system.</p>
+      <p><b>Why this method:</b> with no human driver, the innermost actuator loops must survive a single failure, just as a drone's allocator must survive a weak motor.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the 8 kHz gyro</span>
+    <p>PX4 reads and filters gyro data at the sensor's full raw rate, “commonly 8 kHz”, even though the rate controller runs slower (<a href="https://docs.px4.io/main/en/advanced_config/parameter_reference.html" target="_blank" rel="noopener">PX4 <code>IMU_GYRO_RATEMAX</code></a>). Why oversample? So the filters can remove motor vibration, hundreds of hertz on a small drone, before it gets aliased into fake slow wobbles the controller would chase. The innermost loop of the innermost loop is a filter.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Each rung is a controller from this phase: PID (8.1) at every level, with the quadrotor physics of 8.6 at the bottom and the mixer you built there. LQR (8.4) and MPC (8.5) can replace the outer rungs; the planners of Phase 7 and the avoidance of Lesson 8.8 feed the top through Offboard. The state estimate every loop consumes comes from EKF2 (Lessons 3.3 to 3.6), and its delay is part of the delay budget you fought in Playground 1. The math of “phase” behind it is the derivative of a sine: see <a href="../../math-course/phase3/1-derivatives.html">derivatives</a> in the Math course.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.px4.io/main/en/flight_stack/controller_diagrams.html" target="_blank" rel="noopener">PX4: Controller diagrams</a>. The full cascade, block by block, with every parameter.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.px4.io/main/en/config_mc/pid_tuning_guide_multicopter.html" target="_blank" rel="noopener">PX4: Multicopter PID tuning guide</a>. Inside-out tuning, with what good and bad logs look like.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/PX4/px4_ros_com/blob/main/src/examples/offboard_py/offboard_control.py" target="_blank" rel="noopener">px4_ros_com offboard example</a>. Takeoff, hover and land from ROS 2, about 150 lines.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A rate loop runs at 100 Hz and reacts about 1.5 samples late. How much phase does that cost at 40 rad/s?</div>
+    <div class="opts"><button class="opt">About 2°</button><button class="opt" data-ok>About 34°</button><button class="opt">About 90°</button></div>
+    <div class="explain">One sample is 10 ms, so the delay is 15 ms; 40 × 0.015 = 0.6 rad ≈ <b>34°</b>. That's a big bite out of the stability budget, which is why PX4 defaults to 400 Hz (3.75 ms, about 9°).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You raise the position gain until the drone reaches its waypoints fast, and it starts overshooting every one. The rate and attitude logs look perfect. What's wrong?</div>
+    <div class="opts"><button class="opt">The rate loop needs more D</button><button class="opt" data-ok>The position loop is now too fast for the velocity loop under it: lower the position gain or speed up the velocity loop</button><button class="opt">The mixer is misconfigured</button></div>
+    <div class="explain">A cascade only works if each loop is several times slower than the one inside it. The inner loops are healthy, so the problem is the ladder's top rung outrunning the one below, as in Playground 2's default settings.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your ROS 2 node sends PX4 position setpoints over a lossy Wi-Fi link and PX4 keeps dropping out of Offboard mode, although your node is running fine. What's the best first fix?</div>
+    <div class="opts"><button class="opt">Send attitude setpoints instead, so PX4 has less to do</button><button class="opt">Set COM_OF_LOSS_T to 60 s so it never triggers</button><button class="opt" data-ok>Stream OffboardControlMode and setpoints faster (e.g. 10–20 Hz) and size the timeout so a few lost messages can't trip it</button></div>
+    <div class="explain">False failsafes come from gaps longer than the timeout. A faster stream makes long gaps very unlikely without slowing down detection of a real failure. A 60 s timeout would leave a drone flying blind for a minute after your computer really dies.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Autopilots cascade loops: position (P) → velocity (PID) → attitude (P) → rate (PID) → control allocation → motors.</li>
+      <li>It works because each inner loop is several times faster, so it looks instant from outside. Tune inside-out.</li>
+      <li>Delay eats stability: 1.5 samples at 50 Hz cost 69° at 40 rad/s versus 9° at 400 Hz (PX4's default <code>IMU_GYRO_RATEMAX</code>). A slow inner loop forces lower gains everywhere.</li>
+      <li>Real names: PX4 <code>MPC_XY_P</code>, <code>MPC_*_VEL_*_ACC</code>, <code>MC_ROLL_P</code>, <code>MC_ROLLRATE_P/I/D/K</code>; ArduPilot <code>PSC_*</code>, <code>ATC_ANG_*</code>, <code>ATC_RAT_*</code>.</li>
+      <li>Offboard: ROS 2 over uXRCE-DDS with <code>px4_msgs</code>, or MAVSDK (Python now <code>mavsdk-grpc</code>); keep a ≥ 2 Hz proof of life; <code>COM_OF_LOSS_T</code> (1 s) triggers the failsafe.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/sim.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+
+  // ---------- Playground 1: roll cascade with a sampled rate loop ----------
+  const RATES = [20, 30, 50, 75, 100, 150, 250, 400, 1000];
+  function rollSim(fr, Kr, Ka) {
+    const dt = 1e-4, Tr = 1 / fr, Ta = 1 / Math.min(fr, 250), sp = 20 * Math.PI / 180, T = 2;
+    let th = 0, w = 0, a = 0, cmd = 0, cmdNext = 0, wsp = 0, nextR = 0, nextA = 0, maxTh = 0, blown = false;
+    const pts = [], errs = [];
+    for (let i = 0; i * dt < T; i++) {
+      const t = i * dt;
+      if (t >= nextA - 1e-12) { wsp = MX.clamp(Ka * (sp - th), -4, 4); nextA += Ta; }
+      if (t >= nextR - 1e-12) { cmd = cmdNext; cmdNext = MX.clamp(Kr * (wsp - w), -60, 60); nextR += Tr; } // answer lands one sample later
+      a += (cmd - a) * dt / 0.02; w += a * dt; th += w * dt;
+      if (Math.abs(th) > 3) { blown = true; }
+      maxTh = Math.max(maxTh, th);
+      if (i % 20 === 0) pts.push([t, MX.clamp(th * 180 / Math.PI, -30, 70)]);
+      errs.push([t, Math.abs(th - sp)]);
+      if (blown) break;
+    }
+    let ts = 0; errs.forEach(([t, e]) => { if (e > 0.05 * sp) ts = t; });
+    const tailBad = errs.slice(-3000).some(e => e[1] > 0.3 * sp);
+    return { pts, ov: blown ? Infinity : (maxTh - sp) / sp * 100, ts: blown ? Infinity : ts, unstable: blown || tailBad };
+  }
+  let locked = false;
+  function guessLabel() { $("guessV").textContent = RATES[+$("guess").value] + " Hz"; }
+  function drawRoll() {
+    const fr = RATES[+$("fr").value], Kr = +$("kr").value, Ka = +$("ka").value;
+    $("frV").textContent = fr + " Hz"; $("krV").textContent = Kr + " /s"; $("kaV").textContent = Ka + " /s";
+    const r = rollSim(fr, Kr, Ka);
+    Plot.line($("rollChart"), {
+      series: [
+        { label: `roll angle (rate loop ${fr} Hz)`, color: MX.css("--c-be"), data: r.pts, width: 3 },
+        { label: "target 20°", color: MX.css("--c-pl"), data: [[0, 20], [2, 20]], width: 2, dash: [6, 4] },
+      ], xMin: 0, xMax: 2, yMin: -30, yMax: 70, xLabel: "time (s)", yLabel: "roll (°)",
+    });
+    $("s1d").textContent = fmt(1.5 * 1000 / fr, 1) + " ms";
+    $("s1o").textContent = r.unstable && !isFinite(r.ov) ? "💥 diverged" : fmt(Math.max(0, r.ov), 1) + "%" + (r.unstable ? " (still shaking)" : "");
+    $("s1t").textContent = isFinite(r.ts) && !r.unstable ? fmt(r.ts, 2) + " s" : "never";
+    const win = locked && fr <= 50 && r.ov < 5 && r.ts < 0.5 && !r.unstable;
+    $("s1c").innerHTML = win ? `<span class="badge-win">✅ Flies at ${fr} Hz</span>` : `<span class="muted">${fr <= 50 ? "keep tuning" : "slow it to ≤ 50 Hz"}</span>`;
+    return r;
+  }
+  $("lock").onclick = () => {
+    if (!locked) {
+      locked = true;
+      const g = +$("guess").value; // true answer: 100 Hz is the slowest stock setting with under 10% overshoot (75 Hz gives about 8%, 50 Hz about 27%)
+      const ok = [RATES[g]].map(f => rollSim(f, 40, 8)).map(r => r.ov < 10 && !r.unstable)[0];
+      const near = RATES[g] === 75 || RATES[g] === 100;
+      $("guessVerdict").innerHTML = (near ? `<span class="badge-win">🎯 Spot on</span> ` : `<span class="badge-lose">${ok ? "Too cautious" : "Too optimistic"}</span> `) +
+        `With stock gains, 100 Hz is still clean, 75 Hz just squeaks under 10%, 50 Hz overshoots by about 27% and 30 Hz shakes itself apart. Now drag the rate-loop slider yourself.`;
+      $("p1sliders").style.opacity = 1; $("p1sliders").style.pointerEvents = "auto";
+      $("lock").textContent = "↺ Guess again";
+    } else {
+      locked = false; $("guessVerdict").innerHTML = ""; $("lock").textContent = "🔒 Lock in my guess";
+      $("p1sliders").style.opacity = 0.45; $("p1sliders").style.pointerEvents = "none";
+    }
+    drawRoll();
+  };
+  $("guess").oninput = guessLabel;
+  ["fr", "kr", "ka"].forEach(id => ($(id).oninput = drawRoll));
+  $("p1reset").onclick = () => { $("kr").value = 40; $("ka").value = 8; drawRoll(); };
+  guessLabel(); drawRoll();
+
+  // ---------- Playground 2: position → velocity → tilt → attitude ----------
+  const G = 9.81;
+  function latSim(Kp, Kv, tau) {
+    const dt = 2e-3, T = 8, lim = 45 * Math.PI / 180;
+    let x = 0, v = 0, phi = 0, phisp = 0, next = 0, maxX = 0, maxTilt = 0;
+    const xs = [], tilts = [];
+    for (let i = 0; i * dt < T; i++) {
+      const t = i * dt;
+      if (t >= next - 1e-12) { const vsp = MX.clamp(Kp * (5 - x), -5, 5); phisp = MX.clamp(Math.atan(Kv * (vsp - v) / G), -lim, lim); next += 0.02; } // outer loops at 50 Hz
+      phi += (phisp - phi) * dt / tau; v += G * Math.tan(phi) * dt; x += v * dt;
+      maxX = Math.max(maxX, x); maxTilt = Math.max(maxTilt, Math.abs(phi));
+      if (i % 10 === 0) { xs.push([t, x]); tilts.push([t, phi * 180 / Math.PI]); }
+    }
+    let ts = 0; xs.forEach(([t, xx]) => { if (Math.abs(xx - 5) > 0.1) ts = t; });
+    return { xs, tilts, ov: (maxX - 5) / 5 * 100, ts, settled: ts < T - 0.05, maxTilt: maxTilt * 180 / Math.PI };
+  }
+  let lat = null, frame2 = null;
+  const S = new Sim($("side"), { xRange: [-1.5, 7.5], yRange: [-0.4, 1.4] });
+  S.render(w => {
+    w.clear();
+    if (!lat) return;
+    w.line([[-1.5, 0], [7.5, 0]], { color: "--line", width: 1 });
+    [0, 5].forEach(m => { w.line([[m, -0.05], [m, 0.08]], { color: "--muted", width: 1.5 }); w.text([m, -0.25], m === 0 ? "start" : "target 5 m", { color: m ? "--c-pl" : "--muted", size: 11 }); });
+    const i = frame2 == null ? lat.xs.length - 1 : frame2, x = lat.xs[i][1], ph = lat.tilts[i][1] * Math.PI / 180;
+    const c = [x, 0.75], hw = 0.45, dx = hw * Math.cos(-ph), dy = hw * Math.sin(-ph);
+    w.line([[c[0] - dx, c[1] - dy], [c[0] + dx, c[1] + dy]], { color: "--c-be", width: 4 });
+    [[-1], [1]].forEach(([s]) => { const p = [c[0] + s * dx, c[1] + s * dy]; w.line([[p[0] - 0.12, p[1] + 0.06], [p[0] + 0.12, p[1] + 0.06]], { color: "--c-ct", width: 3 }); });
+    w.arrow(c, [c[0] + 0.35 * Math.sin(ph), c[1] + 0.35 * Math.cos(ph)], { color: "--c-ct", width: 2, head: 7 });
+    w.text([c[0], 1.25], `x = ${fmt(x, 2)} m · tilt ${fmt(lat.tilts[i][1], 0)}°`, { color: "--muted", size: 11 });
+  });
+  function drawLat() {
+    const Kp = +$("kp").value, Kv = +$("kv").value, tau = +$("tau").value;
+    $("kpV").textContent = Kp + " /s"; $("kvV").textContent = Kv + " /s"; $("tauV").textContent = tau.toFixed(2) + " s";
+    S.stop(); frame2 = null; lat = latSim(Kp, Kv, tau); S.render();
+    Plot.line($("posChart"), {
+      series: [
+        { label: "position (m)", color: MX.css("--c-be"), data: lat.xs, width: 3 },
+        { label: "target ± 10 cm", color: MX.css("--c-pl"), data: [[0, 5.1], [8, 5.1]], width: 1.5, dash: [5, 4] },
+        { label: "", color: MX.css("--c-pl"), data: [[0, 4.9], [8, 4.9]], width: 1.5, dash: [5, 4] },
+      ], xMin: 0, xMax: 8, yMin: 0, yMax: 8, xLabel: "time (s)", yLabel: "x (m)",
+    });
+    Plot.bars($("ladder"), { bars: [
+      { label: "position", value: Kp, color: MX.css("--c-pl") },
+      { label: "velocity", value: Kv, color: MX.css("--c-pl") },
+      { label: "attitude 1/τ", value: 1 / tau, color: MX.css("--c-be") },
+    ], yMin: 0, yMax: 21, yLabel: "loop speed (1/s)" });
+    $("s2o").textContent = fmt(Math.max(0, lat.ov), 1) + "%";
+    $("s2t").textContent = lat.settled ? fmt(lat.ts, 2) + " s" : "not in 8 s";
+    $("s2m").textContent = fmt(lat.maxTilt, 0) + "°";
+    const win = Math.abs(tau - 0.15) < 1e-9 && lat.ov < 5 && lat.settled && lat.ts < 3;
+    $("s2c").innerHTML = win ? `<span class="badge-win">✅ Smooth in ${fmt(lat.ts, 2)} s</span>` : `<span class="muted">${Math.abs(tau - 0.15) < 1e-9 ? "keep tuning" : "challenge uses τ = 0.15 s"}</span>`;
+  }
+  ["kp", "kv", "tau"].forEach(id => ($(id).oninput = drawLat));
+  $("fly").onclick = () => { frame2 = 0; S.run(() => { frame2 = Math.min(lat.xs.length - 1, frame2 + 2); return frame2 < lat.xs.length - 1; }); };
+  drawLat();
+
+  // ---------- Playground 3: the stack diagram + heartbeat game ----------
+  const F = new Flow($("stack"), { width: 760, height: 210 });
+  F.node("ros", { x: 70, y: 50, w: 120, h: 46, label: "Your ROS 2 node", sub: "companion", kind: "pl" })
+   .node("agent", { x: 215, y: 50, w: 120, h: 46, label: "DDS agent", sub: "companion", kind: "pl" })
+   .node("client", { x: 365, y: 50, w: 120, h: 46, label: "DDS client", sub: "inside PX4", kind: "ct" })
+   .node("pos", { x: 520, y: 50, w: 130, h: 46, label: "Position + velocity", sub: "~100 Hz", kind: "ct" })
+   .node("att", { x: 680, y: 50, w: 110, h: 46, label: "Attitude", sub: "P loop", kind: "ct" })
+   .node("rate", { x: 680, y: 160, w: 110, h: 46, label: "Rate", sub: "400 Hz", kind: "ct" })
+   .node("alloc", { x: 520, y: 160, w: 130, h: 46, label: "Control allocator", sub: "mixer", kind: "ct" })
+   .node("esc", { x: 365, y: 160, w: 120, h: 46, label: "ESCs + motors", sub: "4 props", kind: "ct" })
+   .node("ekf", { x: 215, y: 160, w: 120, h: 46, label: "EKF2", sub: "100 Hz", kind: "be" })
+   .node("imu", { x: 70, y: 160, w: 120, h: 46, label: "IMU, GPS, baro", sub: "gyro ~8 kHz raw", kind: "se" })
+   .edge("ros", "agent").edge("agent", "client").edge("client", "pos")
+   .edge("pos", "att").edge("att", "rate").edge("rate", "alloc").edge("alloc", "esc")
+   .edge("imu", "ekf").edge("ekf", "pos", { dashed: true }).render();
+  $("send").onclick = async () => { $("send").disabled = true; try { await F.packet(["ros", "agent", "client", "pos", "att", "rate", "alloc", "esc"], { color: "--c-pl", dur: 450 }); } finally { $("send").disabled = false; } };
+
+  const HZ = [1, 2, 5, 10, 20, 30, 50, 100], CUT = 40;
+  function link(f, loss, to, seed) {
+    const r = Sim.rng(seed), arr = [];
+    for (let k = 0; k * (1 / f) < CUT; k++) { const t = k / f; if (r() >= loss / 100) arr.push(t); }
+    let prev = 0; const falses = [];
+    arr.forEach(t => { if (t - prev > to) falses.push(prev + to); prev = t; });
+    return { arr, falses, detect: prev + to - CUT };
+  }
+  let showSeed = 1, L = null;
+  const HB = new Sim($("hb"), { xRange: [-0.5, 45.5], yRange: [-1.4, 2.2] });
+  HB.render(w => {
+    w.clear(); if (!L) return;
+    w.rect(-0.5, -0.4, 46, 1.4, { fill: "--panel", alpha: 1 });
+    for (let s = 0; s <= 45; s += 5) w.text([s, -0.95], s + " s", { color: "--muted", size: 10 });
+    L.arr.forEach(t => w.line([[t, -0.2], [t, 0.8]], { color: "--c-se", width: 1, alpha: 0.7 }));
+    w.rect(CUT, -0.4, 5.5, 1.4, { fill: "--c-ag", alpha: 0.12 });
+    w.text([45.3, 1.6], "computer crashed at 40 s", { color: "--c-ag", size: 11, align: "right" });
+    L.falses.forEach(t => { w.line([[t, -0.4], [t, 1.3]], { color: "--bad", width: 3 }); });
+    if (L.falses.length) w.text([Math.min(L.falses[0] + 0.3, 30), 1.6], "✗ false failsafe", { color: "--bad", size: 11, align: "left" });
+    const d = CUT + L.detect; w.line([[d, -0.4], [d, 1.3]], { color: "--c-un", width: 3 });
+  });
+  function drawHB() {
+    const f = HZ[+$("hz").value], loss = +$("loss").value, to = +$("to").value;
+    $("hzV").textContent = f + " Hz"; $("lossV").textContent = loss + "%"; $("toV").textContent = to.toFixed(1) + " s";
+    L = link(f, loss, to, showSeed); HB.render();
+    let bad = 0, worst = 0;
+    for (let s = 1; s <= 20; s++) { const k = link(f, loss, to, 1000 + s); if (k.falses.length) bad++; worst = Math.max(worst, k.detect); }
+    $("s3f").textContent = bad + " / 20";
+    $("s3d").textContent = fmt(worst, 2) + " s";
+    $("s3b").textContent = f + (f < 2 ? " ⚠️ below PX4's 2 Hz minimum" : "");
+    const win = loss >= 30 && f >= 2 && bad === 0 && worst <= 0.6;
+    $("s3c").innerHTML = win ? `<span class="badge-win">✅ Robust at ${f} Hz</span>` : `<span class="muted">${bad ? "false alarms" : worst > 0.6 ? "too slow to notice" : loss < 30 ? "needs ≥ 30% loss" : "keep going"}</span>`;
+  }
+  ["hz", "loss", "to"].forEach(id => ($(id).oninput = drawHB));
+  $("reroll").onclick = () => { showSeed++; drawHB(); };
+  drawHB();
+})();
+</script>
+</body>
+</html>

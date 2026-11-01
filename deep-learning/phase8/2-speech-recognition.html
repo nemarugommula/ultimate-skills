@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.2 Speech recognition: CTC and Whisper · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .frames { display: flex; flex-wrap: wrap; gap: 4px; margin: 10px 0; }
+  .frames button { width: 40px; height: 46px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); font: 700 1.05rem var(--mono); cursor: pointer; position: relative; }
+  .frames button.blank { color: var(--muted); }
+  .frames button small { position: absolute; left: 0; right: 0; bottom: 1px; font: 400 .6rem var(--mono); color: var(--muted); }
+  .brush { display: inline-flex; gap: 4px; }
+  .brush button { min-width: 34px; font-family: var(--mono); }
+  .pipe { font-family: var(--mono); font-size: .95rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 6px 0; overflow-x: auto; white-space: nowrap; }
+  .pipe .tag2 { color: var(--muted); font-size: .75rem; margin-right: 8px; font-family: var(--font); }
+  .wer-in { width: 100%; font: inherit; padding: 6px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); margin: 3px 0 8px; }
+  .walign { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .walign span { padding: 3px 8px; border-radius: 6px; border: 1px solid var(--line); font-size: .9rem; background: var(--bg2); }
+  .walign .ws { border-color: var(--c-w); background: color-mix(in srgb, var(--c-w) 18%, var(--bg2)); }
+  .walign .wd { border-color: var(--c-dead); background: color-mix(in srgb, var(--c-dead) 16%, var(--bg2)); text-decoration: line-through; }
+  .walign .wi { border-color: var(--c-x); background: color-mix(in srgb, var(--c-x) 16%, var(--bg2)); }
+  .walign small { display: block; font-size: .65rem; color: var(--muted); }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 8px 0; }
+  .chips span { font: 600 .82rem var(--mono); padding: 3px 8px; border-radius: 6px; background: color-mix(in srgb, var(--c-at) 18%, var(--bg2)); border: 1px solid color-mix(in srgb, var(--c-at) 45%, var(--line)); }
+  .chips span.txt { background: color-mix(in srgb, var(--c-y) 15%, var(--bg2)); border-color: color-mix(in srgb, var(--c-y) 45%, var(--line)); }
+</style>
+</head>
+<body data-lesson="d8-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8 · Lesson 2</div>
+  <h1>Speech recognition: CTC and Whisper</h1>
+  <p class="subtitle">One second of speech is 100 spectrogram frames and maybe a dozen letters, and nobody tells the model which frame says which letter. Two ideas solved that: a blank token that lets the model “say nothing”, and a transformer that writes the transcript like a translator.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>A log-mel spectrogram: 80 rows, 100 frames per second (Lesson 8.1).</li>
+      <li>Softmax turns a layer's scores into probabilities over a vocabulary (Lesson 0.6); cross-entropy is the loss on them (Lesson 1.1).</li>
+      <li>An encoder–decoder transformer reads one sequence and writes another, one token at a time (Lessons 5.4 and 6.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2022 OpenAI trained <b>Whisper</b> on 680,000 hours of audio scraped from the web, with whatever transcripts happened to come with it. Nobody cleaned them by hand. In the paper's own table, English error rate fell from <b>30.5%</b> with 3,405 hours of that data to <b>9.9%</b> with all 681,070 hours, same recipe, more data.</p>
+    <p>Two years later, researchers auditing Whisper found that roughly <b>1% of transcriptions</b> contained whole phrases or sentences that were never said, often during silences. A model that learned to write fluent transcripts from the web had also learned to <i>make things up</i> when there was nothing to hear.</p>
+    <p>Speech recognition (ASR, automatic speech recognition) runs captions, meeting notes, call-center analytics, medical dictation and every voice assistant. <b>How do you train a model when you don't know which sound frame goes with which letter, and why do the two big answers (CTC and Whisper-style decoders) fail in such different ways?</b></p>
+  </div>
+
+  <h2>Numbers first: the alignment problem</h2>
+  <p>Someone says “hello” in half a second. The spectrogram has <b>50 frames</b>. The transcript has <b>5 letters</b>. To train with plain cross-entropy you'd need a label for every frame: frames 1–7 are silence, 8–14 are “h”, 15–19 are “e”… Nobody has those labels for 680,000 hours of audio, and the boundaries are fuzzy anyway (where exactly does “e” turn into “l”?).</p>
+  <table>
+    <tr><th></th><th>Input length</th><th>Output length</th><th>Ratio</th></tr>
+    <tr><td>“hello”, 0.5 s</td><td class="x">50 frames</td><td class="y">5 letters</td><td>10 : 1</td></tr>
+    <tr><td>A 30 s Whisper window</td><td class="x">3,000 frames</td><td class="y">≈ 100 words</td><td>30 : 1 per word</td></tr>
+    <tr><td>Same words, spoken slowly</td><td class="x">twice as many frames</td><td class="y">same letters</td><td>varies every time</td></tr>
+  </table>
+  <p>So we need a loss that takes the frames and the transcript and works out the alignment by itself. That's what CTC does.</p>
+
+  <h2>CTC: let the model say “nothing”</h2>
+  <p><b>CTC</b> (connectionist temporal classification; Graves, Fernández, Gomez and Schmidhuber, 2006) lets the network output one symbol <b>per frame</b>, from the alphabet plus one extra symbol, the <b>blank</b> (written _). Then a fixed rule turns the frame-by-frame string into text:</p>
+  <ol>
+    <li><b>Merge repeats:</b> <span class="mono">hhh</span> → <span class="mono">h</span>. A sound that lasts several frames becomes one letter.</li>
+    <li><b>Drop blanks.</b></li>
+  </ol>
+  <div class="calc">_ h h e _ l l _ l o o _ &nbsp;→ merge → &nbsp;_ h e _ l _ l o _ &nbsp;→ drop _ → &nbsp;<b class="y">hello</b></div>
+  <p>Notice the blank between the two l's. Without it, “ll” would be merged into one “l”. The blank does two jobs: it fills frames where nothing new is being said (silence, the middle of a long vowel), and it separates genuinely doubled letters.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">CTC loss</span></span>
+    <ol>
+      <li><b>The problem before</b> Frame-level cross-entropy needs a label for every frame (50 per “hello”). Getting them meant hand segmentation or a separate alignment model (the old hidden-Markov-model pipelines), and errors in those labels became errors in the network.</li>
+      <li><b>What people tried</b> Hybrid systems: a neural network predicts sound classes per frame, and an HMM (hidden Markov model) plus a pronunciation dictionary does the alignment and decoding. Powerful, but many separately trained parts.</li>
+      <li><b>Why this works</b> CTC says: <i>any</i> frame string that collapses to the transcript is a correct answer. The loss is −log of the <b>sum of the probabilities of all of them</b>. There are a lot (8,008 ways to spell “hello” in 12 frames, as you'll see), but a dynamic program, the same table trick as edit distance, adds them up in time proportional to frames × letters. Gradients then push up whichever alignments the network already finds plausible, so the alignment is learned, not given.</li>
+      <li><b>What it costs, when it fails</b> CTC assumes each frame's output is <b>independent</b> of the others given the audio. It can't learn spelling or grammar by itself (“their/there” must come from the sound), so it's usually paired with an external language model at decoding time. Output can't be longer than the number of frames.</li>
+      <li><b>What refined it</b> RNN-T (Graves, 2012) adds a network that sees previous outputs, removing the independence assumption; attention-based encoder–decoders like Whisper drop alignment from the loss entirely. CTC is still everywhere because it's fast and streams well (below).</li>
+    </ol>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">The blank token</span></span>
+    <ol>
+      <li><b>The problem before</b> If every frame must output a letter, a 50-frame “hello” must stretch 5 letters over 50 frames, and there is no way to tell “helo” said slowly from “hello”.</li>
+      <li><b>What people tried</b> Predicting letter durations or a special “repeat” flag; both need frame-level labels again.</li>
+      <li><b>Why this works</b> A blank means “nothing new here”. Silence, pauses and the steady middle of a sound become blanks, so the model only has to be confident at a few frames: trained CTC models famously output sharp “spikes” of letters separated by long runs of blank. And “l _ l” vs “l l” is exactly the difference between “ll” and “l”.</li>
+      <li><b>What it costs, when it fails</b> Most frames are blank, so the model's useful outputs are sparse spikes and timing is only approximate (a spike can land a little before or after the sound). Forgetting the blank between doubled letters is a classic bug in hand-written decoders.</li>
+      <li><b>What refined it</b> Transducers (RNN-T, TDT) use a blank-like “move to the next frame” symbol too; TDT (token-and-duration transducer) also predicts how many frames to skip, which makes decoding faster.</li>
+    </ol>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> how many different 12-frame strings collapse to “hello”? Ten? A hundred? More? And what's the <b>fewest</b> frames that can possibly spell “hello”?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Spell it with CTC</span>
+    <p class="hint">Pick a brush, then click frames to paint them. The two steps of the collapse rule update live. The counter below uses CTC's dynamic program to count every frame string that collapses to the target, the set CTC's loss sums over.</p>
+    <div class="goals"><span class="goal" id="gHello">🎯 Spell “hello”</span><span class="goal" id="gHelo">🎯 Make the classic bug: aim for hello, get “helo”</span><span class="goal" id="gMin">🎯 “hello” in the fewest frames possible</span></div>
+    <div class="controls">
+      <span class="brush" id="brush"></span>
+      <label>frames <input type="range" id="nT" min="4" max="16" step="1" value="12"> <b class="mono" id="nTV"></b></label>
+      <button class="btn" id="cBlank">All blank</button>
+      <button class="btn" id="cRand">🎲 Random path</button>
+    </div>
+    <div class="frames" id="frames"></div>
+    <div class="pipe"><span class="tag2">frames</span><span id="p0"></span></div>
+    <div class="pipe"><span class="tag2">1 · merge repeats</span><span id="p1"></span></div>
+    <div class="pipe"><span class="tag2">2 · drop blanks</span><b class="y" id="p2"></b></div>
+    <div class="controls"><label>count alignments for <input class="wer-in" style="width:140px" id="tgt" value="hello"></label></div>
+    <div class="stat-row">
+      <div class="stat">frame strings that collapse to it <b class="ls" id="nPaths">–</b></div>
+      <div class="stat">fewest frames needed <b id="minT">–</b></div>
+      <div class="stat">all possible strings (6 symbols) <b id="allP">–</b></div>
+    </div>
+    <p class="hint" id="cMsg"></p>
+  </div>
+  <p><b>What you should see:</b> “hello” has <b>8,008</b> valid 12-frame spellings out of 6¹² ≈ 2.2 billion possible strings (the counter uses this playground's six symbols: blank, space, h, e, l, o). At 6 frames there's exactly <b>one</b>: <span class="mono">h e l _ l o</span>, because the doubled l forces a blank. At 5 frames it's impossible. Paint <span class="mono">h e l l o</span> with no blank and you get “helo”. With 50 frames (half a second) the count passes <b>23 billion</b>; that's why CTC needs a dynamic program and can't list them.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: all the ways to say “cat” in 4 frames</span>
+    <p>Four frames, three letters, so exactly one frame is “spare”. It can be a blank in any of 4 places or a repeat of any of the 3 letters:</p>
+    <div class="calc">_cat · c_at · ca_t · cat_ · ccat · caat · catt &nbsp;=&nbsp; <b>7 paths</b></div>
+    <p>If the network gives each path some probability, CTC's loss is −log(p₁ + p₂ + … + p₇). Suppose after some training the paths have probabilities 0.20, 0.05, 0.05, 0.10, 0.15, 0.05, 0.10: the sum is <b>0.70</b>, so the loss is −ln 0.70 ≈ <b>0.36</b>. The gradient raises all seven, weighted by how likely each already is; the network gradually commits to the alignment that matches the audio.</p>
+  </div>
+
+  <h3>Decoding: greedy and beam search</h3>
+  <p>At test time, <b>greedy CTC decoding</b> takes the most likely symbol at every frame, then collapses. It's one argmax per frame: fast enough to run on a phone while you talk. <b>Beam search</b> keeps the best few partial transcripts instead and can add a language model's score, which fixes errors like “wreck a nice beach” vs “recognize speech” that sound alike. Greedy decoding picks the single best path, which isn't always the most likely <i>text</i> (several mediocre paths for one text can outweigh one good path for another), but in practice it's close.</p>
+
+  <h2>Pretraining without transcripts: wav2vec 2.0</h2>
+  <p>Labelled speech is rare in most languages. <b>wav2vec 2.0</b> (Baevski et al., Meta, 2020) learns from audio alone, the way BERT learns from unlabelled text (Lesson 6.7): a CNN turns the raw waveform into latent frames (about 20 ms each), some spans are <b>masked</b>, and a transformer must pick the true (quantized) latent for each masked frame out of distractors, a contrastive task. Then a small CTC head is fine-tuned on transcripts.</p>
+  <table>
+    <tr><th>Labelled data used for fine-tuning</th><th>Unlabelled pretraining</th><th>Word error rate, LibriSpeech clean / other</th></tr>
+    <tr><td>10 minutes (48 recordings)</td><td>53,000 hours</td><td><b>4.8% / 8.2%</b></td></tr>
+  </table>
+  <p class="muted">From the paper's abstract. Ten minutes of transcripts reaching single-digit error rates is what made self-supervised speech models the default starting point for low-resource languages.</p>
+
+  <h3>Transducers and Conformers, in one paragraph</h3>
+  <p>An <b>RNN-T</b> (recurrent neural network transducer; Graves, 2012) keeps CTC's frame-by-frame view but adds a small <b>prediction network</b> that sees the letters already emitted, so outputs can depend on each other (no independence assumption), and it still streams: it emits text while audio arrives, which is why on-device dictation uses transducers. The encoder is often a <b>Conformer</b> (Gulati et al., Google, 2020): a transformer block with a convolution module inside, because attention is good at <i>global</i> context and convolution at <i>local</i> patterns like a single phoneme. Its 118M-parameter model reached <b>2.1% / 4.3%</b> on LibriSpeech without a language model. The 2025 paper behind Hugging Face's Open ASR Leaderboard (which compares 86 open and proprietary systems) found that <b>Conformer encoders with transformer decoders give the best average error, while CTC and TDT decoders are the fastest</b>. In 2026 the open models near the top include NVIDIA's Parakeet and Canary families, Qwen3-ASR, IBM's Granite Speech and Cohere Transcribe; rankings change every few months, so check the leaderboard.</p>
+
+  <h2>Whisper: speech recognition as translation</h2>
+  <p>Whisper skips alignment tricks altogether. It's a standard <b>encoder–decoder transformer</b> (Lesson 6.5), the same shape as a machine-translation model:</p>
+  <ol>
+    <li>The <b>encoder</b> reads the 80 × 3,000 log-mel picture of a 30-second window. Two 1D convolutions (the second with stride 2) turn it into <b>1,500</b> positions; transformer layers add context.</li>
+    <li>The <b>decoder</b> writes text tokens one at a time, attending to the encoder output with cross-attention (Lesson 5.4), exactly like GPT writing the next word, but “looking at” the audio.</li>
+    <li>The first few decoder tokens are <b>instructions</b>: which language, transcribe or translate, timestamps or not. One model does many tasks; the playground below builds that prefix.</li>
+  </ol>
+  <p>Cross-attention learns the alignment implicitly: when the decoder writes “kitchen”, its attention points at the frames where “kitchen” was said. The cost is the opposite of CTC's: outputs depend on each other (good spelling, punctuation, casing for free), but nothing forces each word to come from the audio. That's the seed of hallucination.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Whisper's weak supervision at scale</span></span>
+    <ol>
+      <li><b>The problem before</b> Models trained on one clean dataset (LibriSpeech: audiobooks, about 1,000 hours) scored superhuman-looking error rates on that dataset and fell apart on phone calls, accents or noise. Self-supervised models like wav2vec 2.0 needed fine-tuning per dataset.</li>
+      <li><b>What people tried</b> Bigger clean datasets (expensive), heavy augmentation, fine-tuning a pretrained encoder for each new domain.</li>
+      <li><b>Why this works</b> Trade quality for quantity: 680,000 hours of web audio with its existing, imperfect transcripts (“weak” labels), filtered with heuristics (for example removing transcripts that look machine-generated), including 117,000 hours in 96 other languages and 125,000 hours of translation into English. The model sees so many voices, microphones and rooms that it works <b>zero-shot</b> on new datasets. In the paper's data-scaling table, English error drops from 30.5% (3,405 hours) to 9.9% (681,070 hours).</li>
+      <li><b>What it costs, when it fails</b> Training cost (the large model has 1.55 billion parameters), 30-second windows that need stitching for long audio, slow autoregressive decoding, and a decoder that writes fluent text even when the audio is silent or unclear: it can repeat itself or <b>hallucinate</b> whole sentences.</li>
+      <li><b>What refined it</b> large-v3 (128 mel bins, trained on 1 million hours of weakly labelled plus 4 million hours of pseudo-labelled audio), turbo (the same model with the decoder cut from 32 layers to 4, about 8× faster), and the encoder-plus-LLM models of Lesson 8.4.</li>
+    </ol>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> you have a 10-minute French interview and want English subtitles with timings. Which instruction tokens does Whisper need, and how many 30-second windows will it process?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Build Whisper's instructions</span>
+    <p class="hint">Choose what you want. The gold chips are the special tokens the decoder starts with (exact names from Whisper's tokenizer); green is where it starts writing. Timestamps are tokens too, in 0.02 s steps.</p>
+    <div class="goals"><span class="goal" id="gFr">🎯 French audio → English subtitles with timings</span><span class="goal" id="gTurbo">🎯 Find the turbo gotcha</span></div>
+    <div class="controls">
+      <span class="seg" id="wModel"><button data-v="large-v3" class="on">large-v3</button><button data-v="turbo">turbo</button></span>
+      <span class="seg" id="wLang"><button data-v="auto" class="on">auto-detect</button><button data-v="en">English</button><button data-v="fr">French</button><button data-v="hi">Hindi</button></span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="wTask"><button data-v="transcribe" class="on">transcribe</button><button data-v="translate">translate → English</button></span>
+      <span class="seg" id="wTs"><button data-v="no" class="on">no timestamps</button><button data-v="yes">timestamps</button></span>
+      <label>audio length <input type="range" id="wLen" min="5" max="3600" step="5" value="600"> <b class="mono" id="wLenV"></b></label>
+    </div>
+    <div class="chips" id="wChips"></div>
+    <div class="stat-row">
+      <div class="stat">30 s windows <b id="wWin">–</b></div>
+      <div class="stat">mel frames per window <b class="x">3,000</b></div>
+      <div class="stat">encoder positions in total <b id="wPos">–</b></div>
+      <div class="stat">decoder layers <b id="wDec">–</b></div>
+    </div>
+    <p class="hint" id="wMsg"></p>
+  </div>
+  <p><b>What you should see:</b> French → English with timings is <span class="mono">&lt;|startoftranscript|&gt; &lt;|fr|&gt; &lt;|translate|&gt;</span> and then a timestamp token such as <span class="mono">&lt;|0.00|&gt;</span> instead of <span class="mono">&lt;|notimestamps|&gt;</span>. Ten minutes is 20 windows, 30,000 encoder positions. With auto-detect, the model first predicts the language token itself: language identification is just one more next-token prediction. And the gotcha: OpenAI's README says turbo <b>was not trained for translation</b> and returns the original language even when you ask it to translate.</p>
+
+  <h2>Measuring it: word error rate</h2>
+  <p>To score a transcript, line it up against the reference with the smallest number of edits (the same edit distance used for spell-checkers), counting <span class="mono">S</span> substituted words, <span class="mono">D</span> deleted words and <span class="mono">I</span> inserted words. Then:</p>
+  <div class="calc">WER = (S + D + I) ÷ N &nbsp;&nbsp; (N = number of words in the reference)</div>
+  <p>It's a rate of errors, not of correct words, so lower is better, and insertions can push it <b>above 100%</b>. Two transcripts with the same WER can be very different: one wrong word in “turn <b>off</b> the oven” is 20% WER and a dangerous meaning flip.</p>
+  <p class="predict">🔮 <b>Predict:</b> reference “Turn on the kitchen lights.”, transcript “turn off the kitchen light please”. What's the WER, and does it change if you ignore capitals and punctuation?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · WER calculator</span>
+    <p class="hint">Edit either line. The alignment shows <span class="mono">S</span> substitutions (orange), <span class="mono">D</span> deletions (red, struck out) and <span class="mono">I</span> insertions (blue). Normalization lowercases and strips punctuation, which is what leaderboards do before scoring.</p>
+    <div class="goals"><span class="goal" id="gW20">🎯 Exactly 20% WER that flips the meaning</span><span class="goal" id="gW100">🎯 WER above 100%</span><span class="goal" id="gNorm">🎯 Normalization cuts WER by ≥ 20 points</span></div>
+    <label class="hint">reference (what was said)</label><input class="wer-in" id="ref" value="Turn on the kitchen lights.">
+    <label class="hint">hypothesis (what the model wrote)</label><input class="wer-in" id="hyp" value="turn off the kitchen light please">
+    <div class="controls"><span class="seg" id="normSeg"><button data-v="off" class="on">raw text</button><button data-v="on">normalized</button></span><button class="btn" id="wSwap">Try: silence hallucination</button></div>
+    <div class="walign" id="align"></div>
+    <div class="stat-row">
+      <div class="stat">S <b class="w" id="vS">–</b></div>
+      <div class="stat">D <b class="dead" id="vD">–</b></div>
+      <div class="stat">I <b class="x" id="vI">–</b></div>
+      <div class="stat">N <b id="vN">–</b></div>
+      <div class="stat">WER <b class="ls" id="vW">–</b></div>
+    </div>
+    <p class="hint" id="vMsg"></p>
+  </div>
+  <p><b>What you should see:</b> raw, the WER is <b>80%</b> (4 errors in 5 words: “Turn/turn” and “lights./light” count as substitutions). Normalized, it's <b>60%</b>: on → off, lights → light, plus the inserted “please”. When papers or leaderboards report WER they normalize first, so always compare numbers computed the same way. Try the hallucination button: a two-word reference with a confidently invented sentence gives a WER of several hundred percent.</p>
+
+  <h2>When Whisper writes what nobody said</h2>
+  <p>The Whisper paper itself lists failure modes: getting stuck in repeat loops, skipping the first or last words of a window, and “complete hallucination” of a transcript unrelated to the audio. In 2024 Koenecke et al. (“Careless Whisper”) ran 13,140 audio segments through OpenAI's Whisper API (spring 2023) and found <b>roughly 1%</b> contained entire hallucinated phrases or sentences, and <b>38%</b> of those included explicit harms such as invented violence or false authority. Hallucinations were more common for speakers with long pauses, such as people with aphasia.</p>
+  <p>Why silence? The decoder is a language model trained to produce plausible transcripts of web audio. With no speech to attend to, nothing in the audio constrains it, so its text habits take over; the Careless Whisper authors suggest that this reliance on language modelling is what produces the invented sentences. Practical fixes: cut silence first with a <b>VAD</b> (voice activity detection), use the model's no-speech probability, check timestamps for text inside silent regions, and for high-stakes use, compare with a CTC or transducer model, which can't easily emit long text without matching audio frames.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>PyTorch has <code>nn.CTCLoss</code> built in. This toy runs in a second on CPU: it learns frame-by-frame logits for “hello” from scratch, then greedy-decodes.</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn
+torch.manual_seed(<span class="n">0</span>)
+vocab = [<span class="s">"_"</span>, <span class="s">"h"</span>, <span class="s">"e"</span>, <span class="s">"l"</span>, <span class="s">"o"</span>]                <span class="c"># index 0 = blank</span>
+T, N, C = <span class="n">12</span>, <span class="n">1</span>, len(vocab)                      <span class="c"># 12 frames, batch of 1</span>
+logits = torch.randn(T, N, C, requires_grad=<span class="k">True</span>)  <span class="c"># stands in for a network's output</span>
+target = torch.tensor([[<span class="n">1</span>, <span class="n">2</span>, <span class="n">3</span>, <span class="n">3</span>, <span class="n">4</span>]])          <span class="c"># h e l l o</span>
+ctc = nn.CTCLoss(blank=<span class="n">0</span>)
+opt = torch.optim.Adam([logits], lr=<span class="n">0.1</span>)
+<span class="k">for</span> step <span class="k">in</span> range(<span class="n">200</span>):
+    opt.zero_grad()
+    loss = ctc(logits.log_softmax(-<span class="n">1</span>), target, torch.tensor([T]), torch.tensor([<span class="n">5</span>]))
+    loss.backward(); opt.step()
+best = logits.argmax(-<span class="n">1</span>)[:, <span class="n">0</span>].tolist()             <span class="c"># greedy: best symbol per frame</span>
+out, prev = [], <span class="k">None</span>
+<span class="k">for</span> i <span class="k">in</span> best:                                   <span class="c"># merge repeats, drop blanks</span>
+    <span class="k">if</span> i != prev <span class="k">and</span> i != <span class="n">0</span>: out.append(vocab[i])
+    prev = i
+print(f<span class="s">"loss {loss.item():.3f}"</span>, <span class="s">"".join(vocab[i] for i in best)</span>, <span class="s">"->"</span>, <span class="s">""</span>.join(out))
+<span class="c"># What we got (torch 2.8, CPU):  loss 0.006 _he_ll_loo__ -> hello</span></code></pre>
+    <p>For real transcription, Hugging Face <code>transformers</code> wraps Whisper in a pipeline. This one <b>downloads about 1.6 GB of weights</b> on first run, so we didn't run it here; argument names are from the official model card.</p>
+<pre><code><span class="k">from</span> transformers <span class="k">import</span> pipeline
+asr = pipeline(<span class="s">"automatic-speech-recognition"</span>, model=<span class="s">"openai/whisper-large-v3-turbo"</span>)
+print(asr(<span class="s">"meeting.wav"</span>, return_timestamps=<span class="k">True</span>)[<span class="s">"text"</span>])
+<span class="c"># translation needs a model trained for it, e.g. "openai/whisper-large-v3":</span>
+<span class="c"># asr(audio, generate_kwargs={"language": "french", "task": "translate"})</span></code></pre>
+    <p class="hint">Gotchas: <code>nn.CTCLoss</code> wants <b>log</b>-probabilities shaped (time, batch, classes), not raw logits. Input lengths must be at least the target length plus the number of doubled letters, or the loss is infinite (set <code>zero_infinity=True</code> to survive bad samples). For a CTC model with pretrained weights, see <code>Wav2Vec2ForCTC</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Approach</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>CTC (wav2vec 2.0, Parakeet-CTC)</td><td>Fast greedy decoding, streams, output tied to frames (hard to hallucinate long text)</td><td>Independent per-frame outputs: weaker spelling and punctuation; often needs an LM</td></tr>
+      <tr><td>Transducer (RNN-T, TDT)</td><td>Streams, outputs depend on previous outputs, the on-device standard</td><td>Harder to train; more memory in the loss</td></tr>
+      <tr><td>Attention encoder–decoder (Whisper)</td><td>Fluent text with casing and punctuation, multitask (language ID, translation, timestamps)</td><td>Autoregressive and slower; works on 30 s windows; can hallucinate during silence</td></tr>
+      <tr><td>Weak supervision at scale</td><td>Robust zero-shot across accents, noise, domains</td><td>Huge training cost; inherits the habits of noisy web transcripts</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How does CTC work, and when would you pick it over a Whisper-style model?” A strong answer:</p>
+    <ul>
+      <li>States the alignment problem (frames ≫ letters, no frame labels) and the collapse rule (merge repeats, drop blanks), including why the blank is needed for doubled letters.</li>
+      <li>Says the loss sums over all alignments with a dynamic program, and names the cost: conditional independence between frames.</li>
+      <li>Contrasts with encoder–decoder attention: better text, multitask, but slower and able to hallucinate; mentions transducers for streaming.</li>
+      <li>Talks about WER with normalization, and mitigations for hallucination (VAD, no-speech probability, timestamp checks).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The original CTC</b> <span class="tag hist">📜 History · 2006</span> <a href="https://www.cs.toronto.edu/~graves/icml_2006.pdf" target="_blank" rel="noopener">Graves et al.: Connectionist Temporal Classification (ICML 2006)</a></div>
+      <p><b>How:</b> an RNN outputs label probabilities per frame plus an extra unit for “blank”; a forward–backward algorithm sums over all alignments.</p>
+      <p><b>Why this method:</b> it trained phoneme recognizers directly on unsegmented speech, without the pre-segmented data or HMM alignment earlier neural systems needed.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Ten minutes of transcripts</b> <span class="tag co">🏢 Meta · 2020</span> <a href="https://arxiv.org/abs/2006.11477" target="_blank" rel="noopener">Baevski et al.: wav2vec 2.0</a></div>
+      <p><b>How:</b> masked contrastive pretraining on 53,000 hours of unlabelled audio, then CTC fine-tuning.</p>
+      <p><b>Why this method:</b> most of the world's languages have little transcribed speech but plenty of audio; 10 minutes of labels reached 4.8% / 8.2% WER on LibriSpeech.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Whisper</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/openai/whisper" target="_blank" rel="noopener">openai/whisper on GitHub</a></div>
+      <p><b>How:</b> encoder–decoder transformer on log-mel windows, multitask special tokens, sizes from 39M to 1.55B parameters, plus turbo (809M).</p>
+      <p><b>Why this method:</b> one open model that handles many languages, noise and domains zero-shot became the default starting point for transcription products and research.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Measuring the field</b> <span class="tag res">🧪 Research · 2025</span> <a href="https://arxiv.org/abs/2510.06961" target="_blank" rel="noopener">Open ASR Leaderboard paper</a> · <a href="https://huggingface.co/spaces/hf-audio/open_asr_leaderboard" target="_blank" rel="noopener">live leaderboard</a></div>
+      <p><b>How:</b> standardized text normalization, WER and inverse real-time factor (RTFx: seconds of audio processed per second of compute) across many datasets and toolkits.</p>
+      <p><b>Why this method:</b> WER numbers are only comparable with identical normalization; the paper also shows the accuracy (Conformer + transformer decoder) vs speed (CTC, TDT) split.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Auditing hallucinations</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2402.08021" target="_blank" rel="noopener">Koenecke et al.: Careless Whisper</a></div>
+      <p><b>How:</b> compared Whisper API transcripts with ground truth for AphasiaBank speakers and a control group.</p>
+      <p><b>Why this method:</b> WER alone hides invented sentences; they found about 1% of transcripts contained them, more often for speakers with longer pauses.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · spikes</span>
+    <p>The 2006 CTC paper noticed that its network “predicts only the sequence of phonemes (typically as a series of spikes, separated by ‘blanks’)”. A trained CTC model is almost always saying “blank”, and fires a letter for one or two frames when it's sure. You can see it in the toy above: the learned best path <span class="mono">_he_ll_loo__</span> is mostly blanks and short bursts.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The input is Lesson 8.1's log-mel picture. CTC's dynamic program is the same table idea as edit distance and the forward algorithm; its loss is a cross-entropy over a <i>set</i> of answers (<a href="../../math-course/phase6/3-cross-entropy.html">math 6.3</a>). Whisper is the encoder–decoder of Lesson 6.5 with Lesson 5.4's cross-attention; wav2vec 2.0 is masked pretraining (6.7) for audio. Next, 8.3 runs the pipeline backwards (text to sound), and 8.4 replaces Whisper's text decoder with a full LLM. For using hosted speech-to-text APIs and voice-agent latency, see <a href="../../ai-engineer/phase8/4-multimodal.html">AI Engineer 8.4</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Article</span> <a href="https://distill.pub/2017/ctc/" target="_blank" rel="noopener">Hannun: Sequence Modeling with CTC (Distill)</a>. The best visual explanation of CTC's alignments and dynamic program.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2212.04356" target="_blank" rel="noopener">Whisper paper (2022)</a>. Readable; sections 2.3 (the multitask format) and 4.5 (decoding tricks) are the practical ones.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.CTCLoss.html" target="_blank" rel="noopener">torch.nn.CTCLoss</a>. Shapes, lengths and the <code>zero_infinity</code> flag.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A CTC model outputs the frame string <span class="mono">_ b b _ o o _ o k k _</span>. What text does it decode to?</div>
+    <div class="opts"><button class="opt">book (with the blank kept between the o's)</button><button class="opt" data-ok>book</button><button class="opt">bok</button></div>
+    <div class="explain">Merge repeats: _ b _ o _ o k _ (the two “oo” runs stay separate because a blank sits between them). Drop blanks: <b>book</b>. If the model had written <span class="mono">o o o</span> with no blank, you'd get “bok”. Blanks are never part of the output text.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Reference: “call mom at five” (4 words). Hypothesis: “call my mom at nine o'clock”. What's the WER?</div>
+    <div class="opts"><button class="opt">25%</button><button class="opt">50%</button><button class="opt" data-ok>75%</button></div>
+    <div class="explain">Best alignment: call = call, <b>insert</b> “my”, mom = mom, at = at, five → nine is a <b>substitution</b>, <b>insert</b> “o'clock”. S = 1, D = 0, I = 2, so WER = 3 ÷ 4 = <b>75%</b>. Insertions count even though every reference word except one is right.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A clinic's Whisper-based note taker sometimes adds sentences like “Thank you for watching” or invented medication names during long pauses. What's the best first fix?</div>
+    <div class="opts"><button class="opt">Fine-tune on more medical vocabulary; the model doesn't know the drug names</button><button class="opt" data-ok>Cut silence with voice activity detection before transcribing, check the no-speech probability and timestamps, and flag text that appears in silent regions</button><button class="opt">Switch off timestamps so the model has fewer tokens to predict</button></div>
+    <div class="explain">The pattern (text during pauses, web-caption phrases) is decoder hallucination when there's no speech to attend to, not missing vocabulary. Removing silent stretches and using Whisper's own no-speech signal attacks the cause; a CTC or transducer model as a cross-check helps for high-stakes notes. Timestamps actually help you <i>detect</i> it.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>ASR's core problem is alignment: 100 frames a second, a few letters, no frame labels.</li>
+      <li>CTC outputs a symbol per frame plus a blank; decode by merging repeats then dropping blanks (a blank is required between doubled letters). The loss sums over every valid alignment with a dynamic program. Fast and streamable; outputs are independent per frame.</li>
+      <li>wav2vec 2.0 pretrains on unlabelled audio (masked, contrastive), then fine-tunes with CTC: 10 minutes of labels → 4.8% / 8.2% WER. Transducers add dependence on previous outputs and stream; Conformers mix convolution and attention.</li>
+      <li>Whisper is an encoder–decoder transformer trained on 680,000 hours of weakly labelled web audio; special tokens choose language, task and timestamps. Robust zero-shot, but it can hallucinate during silence.</li>
+      <li>WER = (S + D + I) ÷ N, after normalization; it can exceed 100% and hides meaning flips.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const fmt = v => (v >= 1e15 ? v.toExponential(2) : Math.round(v).toLocaleString("en-US"));
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); return () => bs.find(b => b.classList.contains("on")).dataset.v; };
+
+  /* ---------- 1. CTC collapse ---------- */
+  const SYMS = ["_", "␣", "h", "e", "l", "o"];
+  let brush = "h", T = 12, path = "_hhee_______".split("");
+  $("brush").innerHTML = SYMS.map(s => `<button class="btn small${s === brush ? " primary" : ""}" data-s="${s}">${s === "_" ? "_ blank" : s === "␣" ? "␣ space" : s}</button>`).join("");
+  [...$("brush").querySelectorAll("button")].forEach(b => (b.onclick = () => { brush = b.dataset.s; [...$("brush").querySelectorAll("button")].forEach(x => x.classList.toggle("primary", x === b)); }));
+  const collapse = p => { const m = p.filter((c, i) => i === 0 || c !== p[i - 1]); return { merged: m, text: m.filter(c => c !== "_").join("").replace(/␣/g, " ") }; };
+  function countPaths(label, T) {
+    const ext = ["_"]; for (const c of label) ext.push(c, "_");
+    const S = ext.length; let a = new Array(S).fill(0); a[0] = 1; if (S > 1) a[1] = 1;
+    for (let t = 1; t < T; t++) { const b = new Array(S).fill(0);
+      for (let s = 0; s < S; s++) { let v = a[s] + (s > 0 ? a[s - 1] : 0); if (s > 1 && ext[s] !== "_" && ext[s] !== ext[s - 2]) v += a[s - 2]; b[s] = v; }
+      a = b; }
+    return label.length ? a[S - 1] + a[S - 2] : 1;
+  }
+  const minFrames = l => l.length + [...l].filter((c, i) => i > 0 && c === l[i - 1]).length;
+  function drawCTC() {
+    $("nTV").textContent = T;
+    while (path.length < T) path.push("_"); path = path.slice(0, T);
+    $("frames").innerHTML = path.map((c, i) => `<button data-i="${i}" class="${c === "_" ? "blank" : ""}">${c}<small>${i + 1}</small></button>`).join("");
+    [...$("frames").querySelectorAll("button")].forEach(b => (b.onclick = () => { path[+b.dataset.i] = brush; drawCTC(); }));
+    const { merged, text } = collapse(path);
+    $("p0").textContent = path.join(" "); $("p1").textContent = merged.join(" "); $("p2").textContent = text ? `“${text}”` : "(nothing)";
+    const tgt = $("tgt").value.toLowerCase().replace(/[^a-z ]/g, "").replace(/ /g, "␣").slice(0, 12), shown = tgt.replace(/␣/g, " ");
+    const n = countPaths([...tgt], T);
+    $("nPaths").textContent = tgt ? `${fmt(n)} (in ${T} frames)` : "–";
+    $("minT").textContent = tgt ? minFrames([...tgt]) : "–";
+    $("allP").textContent = fmt(Math.pow(SYMS.length, T));
+    win("gHello", text === "hello"); win("gHelo", text === "helo"); win("gMin", text === "hello" && T === 6);
+    $("cMsg").textContent = text === "helo" ? "The two l's merged. Put a blank between them." :
+      text === "hello" && T === 6 ? "Six frames, one possible path: the doubled l forces the blank." :
+      text === "hello" ? `One of ${fmt(countPaths([..."hello"], T))} paths for “hello” in ${T} frames. CTC's loss adds up the probability of all of them.` :
+      T < minFrames([..."hello"]) ? `“hello” is impossible in ${T} frames: it needs at least 6 (5 letters + 1 blank between the l's).` : "";
+  }
+  $("nT").oninput = () => { T = +$("nT").value; drawCTC(); };
+  $("cBlank").onclick = () => { path = Array(T).fill("_"); drawCTC(); };
+  const rr = NN.rng(8);
+  $("cRand").onclick = () => { path = Array.from({ length: T }, () => SYMS[rr.u() < 0.45 ? 0 : 2 + rr.int(4)]); drawCTC(); };
+  $("tgt").oninput = drawCTC;
+  drawCTC();
+
+  /* ---------- 2. Whisper instruction tokens ---------- */
+  let wm = "large-v3", wl = "auto", wt = "transcribe", ws = "no";
+  const LN = { en: "English", fr: "French", hi: "Hindi" };
+  function drawW() {
+    const len = +$("wLen").value, wins = Math.ceil(len / 30);
+    $("wLenV").textContent = len >= 60 ? `${Math.floor(len / 60)} min ${len % 60 ? (len % 60) + " s" : ""}` : `${len} s`;
+    const chips = ["<|startoftranscript|>", wl === "auto" ? "(model predicts <|xx|>)" : `<|${wl}|>`, `<|${wt}|>`, ws === "yes" ? "<|0.00|>" : "<|notimestamps|>"];
+    const sample = wt === "translate" && !(wm === "turbo") ? "Good morning, thank you for coming." : wl === "fr" || (wl === "auto") ? "Bonjour, merci d'être venus." : wl === "hi" ? "नमस्ते, आने के लिए धन्यवाद।" : "Good morning, thank you for coming.";
+    const out = (ws === "yes" ? [sample, "<|2.40|>", "…"] : [sample, "…", "<|endoftext|>"]);
+    $("wChips").innerHTML = chips.map(c => `<span>${c.replace(/</g, "&lt;")}</span>`).join("") + out.map(c => `<span class="${c.startsWith("<|") ? "" : "txt"}">${c.replace(/</g, "&lt;")}</span>`).join("");
+    $("wWin").textContent = wins.toLocaleString("en-US");
+    $("wPos").textContent = (wins * 1500).toLocaleString("en-US");
+    $("wDec").textContent = wm === "turbo" ? "4 (turbo, 809M params)" : "32 (large-v3, 1.55B)";
+    win("gFr", wl === "fr" && wt === "translate" && ws === "yes" && wm === "large-v3");
+    win("gTurbo", wm === "turbo" && wt === "translate");
+    $("wMsg").textContent = wm === "turbo" && wt === "translate" ? "Gotcha: turbo wasn't trained for translation. It ignores the request and writes French. Use large-v3 (or medium) to translate." :
+      wl === "auto" ? "Auto-detect: the decoder first predicts the language token, then you can keep or override it." :
+      wt === "translate" ? `Speech in ${LN[wl]}, text in English: one model, one different token.` : `Transcribe ${LN[wl]} speech into ${LN[wl]} text.`;
+  }
+  seg("wModel", v => { wm = v; drawW(); }); seg("wLang", v => { wl = v; drawW(); }); seg("wTask", v => { wt = v; drawW(); }); seg("wTs", v => { ws = v; drawW(); });
+  $("wLen").oninput = drawW;
+  drawW();
+
+  /* ---------- 3. WER ---------- */
+  let norm = false, normDropSeen = false;
+  const words = s => (norm ? s.toLowerCase().replace(/[^\p{L}\p{N}\s']/gu, " ") : s).split(/\s+/).filter(Boolean);
+  function align(R, H) {
+    const n = R.length, m = H.length, D = Array.from({ length: n + 1 }, (_, i) => Array.from({ length: m + 1 }, (_, j) => (i === 0 ? j : j === 0 ? i : 0)));
+    for (let i = 1; i <= n; i++) for (let j = 1; j <= m; j++) D[i][j] = Math.min(D[i - 1][j - 1] + (R[i - 1] === H[j - 1] ? 0 : 1), D[i - 1][j] + 1, D[i][j - 1] + 1);
+    const ops = []; let i = n, j = m;
+    while (i > 0 || j > 0) {
+      if (i > 0 && j > 0 && D[i][j] === D[i - 1][j - 1] + (R[i - 1] === H[j - 1] ? 0 : 1)) { ops.push(R[i - 1] === H[j - 1] ? ["=", R[i - 1]] : ["S", H[j - 1], R[i - 1]]); i--; j--; }
+      else if (i > 0 && D[i][j] === D[i - 1][j] + 1) { ops.push(["D", R[i - 1]]); i--; }
+      else { ops.push(["I", H[j - 1]]); j--; }
+    }
+    return ops.reverse();
+  }
+  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+  function werOf(r, h) { const R = words(r), ops = align(R, words(h)), c = k => ops.filter(o => o[0] === k).length; return { R, ops, S: c("S"), D: c("D"), I: c("I"), w: R.length ? (c("S") + c("D") + c("I")) / R.length : 0 }; }
+  function drawWER() {
+    const r = $("ref").value, h = $("hyp").value, A = werOf(r, h);
+    const save = norm; norm = !save; const B = werOf(r, h); norm = save;     // the other setting, for the normalization goal
+    $("align").innerHTML = A.ops.map(o => o[0] === "=" ? `<span>${esc(o[1])}</span>` : o[0] === "S" ? `<span class="ws">${esc(o[1])}<small>was “${esc(o[2])}”</small></span>` : o[0] === "D" ? `<span class="wd">${esc(o[1])}<small>deleted</small></span>` : `<span class="wi">${esc(o[1])}<small>inserted</small></span>`).join("");
+    $("vS").textContent = A.S; $("vD").textContent = A.D; $("vI").textContent = A.I; $("vN").textContent = A.R.length;
+    $("vW").textContent = (100 * A.w).toFixed(0) + "%";
+    const neg = /\b(not|no|never|off|don't|dont)\b/i, flip = A.ops.some(o => o[0] === "S" && (neg.test(o[1]) !== neg.test(o[2]) || /^(off|on)$/i.test(o[1]) && /^(off|on)$/i.test(o[2])));
+    win("gW20", Math.abs(A.w - 0.2) < 1e-9 && flip);
+    win("gW100", A.w > 1);
+    const raw = norm ? B.w : A.w, nw = norm ? A.w : B.w;
+    if (raw - nw >= 0.2 - 1e-9 && norm) normDropSeen = true;
+    win("gNorm", normDropSeen);
+    $("vMsg").textContent = A.w > 1 ? "Over 100%: insertions are unbounded. A transcript can be worse than writing nothing at all (which would score exactly 100%)." :
+      Math.abs(A.w - 0.2) < 1e-9 && flip ? "Only 20% WER, and the instruction now means the opposite. WER counts words, not meaning." :
+      !norm && raw - nw >= 0.2 - 1e-9 ? `Raw ${(100 * raw).toFixed(0)}% vs normalized ${(100 * nw).toFixed(0)}%: switch to normalized to see the difference.` : "";
+  }
+  seg("normSeg", v => { norm = v === "on"; drawWER(); });
+  $("ref").oninput = drawWER; $("hyp").oninput = drawWER;
+  $("wSwap").onclick = () => { $("ref").value = "um okay"; $("hyp").value = "Thank you for watching. Please subscribe to my channel for more videos."; drawWER(); };
+  drawWER();
+})();
+</script>
+</body>
+</html>

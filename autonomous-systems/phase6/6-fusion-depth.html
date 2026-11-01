@@ -1,0 +1,455 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.6 Early vs late fusion & monocular depth · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { border: 0; background: var(--bg2); color: var(--text); padding: 5px 12px; font: inherit; font-size: .88rem; cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  table.fz td, table.fz th { font-size: .85rem; padding: 3px 8px; }
+  table.fz td.ok { color: var(--good); font-weight: 700; } table.fz td.no { color: var(--bad); font-weight: 700; }
+</style>
+</head>
+<body data-lesson="s6-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 6</div>
+  <h1>Early vs late fusion &amp; monocular depth</h1>
+  <p class="subtitle">A camera knows <i>what</i> things are but has to guess <i>how far</i>. A lidar knows exactly how far but barely knows what. Radar knows how fast. Where you combine them, early, in the middle or at the end, decides what survives when one of them is blinded. And Tesla's bet is that a network can learn the missing depth from pictures alone.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The pinhole model</b>: an object of height H at distance Z appears f·H/Z pixels tall (Lesson 2.1). Height and distance are tangled together.</li>
+      <li><b>Lidar points</b> get sparse with distance (about 1/Z²) and dark objects return fewer of them (Lesson 2.3). <b>Radar</b> measures range and radial speed directly through the Doppler effect, in rain and fog (Lesson 2.4).</li>
+      <li><b>Extrinsic calibration</b>: the exact pose of each sensor on the car; time sync: every measurement stamped on one clock (Lesson 2.7).</li>
+      <li><b>BEV</b>, the top-down grid every sensor can be projected into (Lesson 6.2), and painting points with class scores (PointPainting, below).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>A photo shows a car exactly 120 pixels tall. Is it a <b>real car 12.5 m away</b> or a <b>toy car 2.5 m away</b>? Both give exactly the same picture (do the arithmetic: 1,000 × 1.5 ÷ 12.5 = 1,000 × 0.3 ÷ 2.5 = 120). <b>So how can any network get depth from one image?</b></p>
+    <p>And yet in June 2021, Andrej Karpathy, then Tesla's head of AI, told the CVPR autonomous-driving workshop that Tesla had started shipping cars with <b>no radar</b> three weeks earlier, quoting Elon Musk: when radar and vision disagree, which one do you believe? Vision “has much more precision, so better to double down on vision than do sensor fusion” (<a href="https://www.youtube.com/watch?v=g6bOwQdCJrc" target="_blank" rel="noopener">CVPR'21 WAD keynote</a>). Waymo, meanwhile, describes fusing camera, lidar and radar “over time” in its driver (<a href="https://waymo.com/blog/2025/12/demonstrably-safe-ai-for-autonomous-driving" target="_blank" rel="noopener">Waymo, Dec 2025</a>). This lesson gives you the tools to judge both bets.</p>
+  </div>
+
+  <h2>What each sensor brings</h2>
+  <table>
+    <tr><th></th><th>📷 Camera</th><th>🔦 Lidar</th><th>📡 Radar</th></tr>
+    <tr><td>Best at</td><td>Class, color, text, lights, lane paint</td><td>Exact range and 3D shape (±cm)</td><td>Radial speed directly; works in rain, fog, darkness</td></tr>
+    <tr><td>Weak at</td><td>Depth (a guess), glare, night, dirty lens</td><td>Class; far and dark objects (few points); heavy rain and fog</td><td>Resolution: poor shape and height (a bridge vs a car)</td></tr>
+    <tr><td>Typical failure</td><td>Sun glare blinds a region</td><td>A black car returns 2 points at 30 m</td><td>Ghost reflections, stationary clutter</td></tr>
+  </table>
+  <p>Fusion is how you combine their strengths. The big design decision is <b>when</b>: at the raw data, at learned features, or at the final objects.</p>
+
+  <h2>Three places to fuse</h2>
+  <table>
+    <tr><th>Level</th><th>What's combined</th><th>Example</th><th>Strength</th><th>Weakness</th></tr>
+    <tr><td><b>Early / raw</b></td><td>Raw measurements: project lidar points into the image and attach pixel information</td><td><b>PointPainting</b> (2020): append the image segmentation network's class scores to each lidar point, then run any lidar detector</td><td>Rich: each point carries class; few points suffice</td><td>Needs precise calibration and time sync; if the camera is blind, the points arrive unpainted</td></tr>
+    <tr><td><b>Feature / middle</b></td><td>Learned features from each sensor, in a shared space (usually BEV)</td><td><b>BEVFusion</b> (2022), Waymo's 4D-Net (camera + lidar over time) and CramNet (camera + radar)</td><td>Combines weak evidence from both; can be trained to survive a missing sensor (“modality dropout”)</td><td>One big jointly trained network: heavier, harder to debug and validate</td></tr>
+    <tr><td><b>Late / object</b></td><td>Each sensor's finished detections or tracks</td><td>Classic AV stacks: match camera boxes and lidar boxes, fuse in a tracker (Lesson 6.5)</td><td>Modular, each pipeline tested alone; one sensor failing still leaves the others' objects</td><td>Throws away what each sensor alone wasn't sure of; attributes come from whichever sensor saw it</td></tr>
+  </table>
+  <p>BEVFusion's authors put the early-fusion problem crisply: projecting camera features onto lidar points “throws away the semantic density of camera features”, because a camera image has far more pixels than there are lidar points. Fusing in BEV keeps both. The deep-learning internals are in <span class="dlref" data-href="phase4/8-3d-vision.html">the Deep Learning course, Phase 4 (3D vision)</span>.</p>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> a black car 30 m ahead returns only <b>2 lidar points</b> (too few for the lidar detector, which needs 5), and the camera sees it clearly but guesses its distance 9% short. Which fusion level gets both its class <i>and</i> its range right?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans"><b>Feature-level.</b> Late fusion only gets the camera's object (right class, wrong range), because the lidar never produced an object to match. Early fusion needs at least ~3 points to paint and detect. Feature-level fusion adds weak lidar evidence (2 points, but exact range) to strong camera evidence in the same BEV cell, and gets both. Combining <i>uncertain</i> evidence is what middle fusion is for. Check it in the playground.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Fuse early, in the middle, or late</span>
+    <p class="hint">Six objects ahead of the car. Stand-in sensors: the <span class="se">camera</span> gives class, bearing and a learned depth guess (off by 4–14%, worse far away); the <span class="se">lidar</span> gives exact range from points (fewer for far and dark objects). An object counts as <b>right</b> only if its class is right <i>and</i> its range is within 5%. Break the sensors and compare the three fusion levels. (Rules are simplified stand-ins for each level's typical behaviour, not real networks.)</p>
+    <canvas class="sim" id="fzCanvas"></canvas>
+    <div class="controls">
+      <span class="seg" id="fzLevel"><button id="fzEarly" data-l="early">early (raw)</button><button id="fzFeat" data-l="feature">feature (BEV)</button><button id="fzLate" data-l="late" class="on">late (objects)</button></span>
+      <label><input type="checkbox" id="fzGlare"> ☀️ sun glare (camera blind 2°–10° left)</label>
+      <label><input type="checkbox" id="fzRain"> 🌧️ heavy rain (half the lidar points)</label>
+      <label>calibration error <input type="range" id="fzCal" min="0" max="2" step="0.1" value="0"> <b class="mono" id="fzCalV"></b></label>
+    </div>
+    <table class="fz" id="fzTable"></table>
+    <div class="stat-row">
+      <div class="stat">objects right (class + range) <b id="fzOk">–</b></div>
+      <div class="stat">objects detected at all <b id="fzDet">–</b></div>
+      <div class="stat">challenge <b id="fzChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> turn on sun glare <b>and</b> set a 1.0° calibration error (a bumped bracket). Find the fusion level that still gets at least <b>4 of 6</b> objects right. Then look at <i>detected at all</i>: which level never loses an object entirely in clear weather, even when it gets the details wrong?</p>
+  </div>
+  <p>What you should find: late fusion detects everything in clear weather but often with the wrong range or no class, because each sensor's doubts are thrown away before combining. Early fusion is precise until calibration drifts: a 1° error moves a painted point 0.8 m sideways at 45 m, off a cyclist entirely. Feature fusion combines weak evidence and tolerates small misalignment, which is why it leads the benchmarks; its cost is that it's one big learned system you must validate as a whole.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    The earlier you fuse, the more information survives, and the more you depend on <b>perfect alignment</b> and on every sensor being healthy. The later you fuse, the more <b>independent and debuggable</b> each pipeline is, but each one's uncertainty is thrown away before the others can help. Middle (BEV feature) fusion is the modern compromise: learned alignment, combined weak evidence, and training with sensors randomly switched off so the network learns to cope when one is blinded.
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Each sensor fails differently: cameras guess depth and go blind in glare; lidar gets sparse with range and darkness, and can't read a traffic light; radar sees speed but blurs shape. One sensor alone has holes a car can drive into.</li>
+      <li><b>What people tried.</b> <i>Late fusion</i> (match each sensor's boxes): modular and robust to one sensor dying, but an object neither pipeline was sure of disappears, and attributes are whichever sensor reported them. <i>Early fusion</i> (paint points, project features): rich, but hostage to calibration and timing; a 1° error is 0.8 m at 45 m.</li>
+      <li><b>Why this works.</b> Fusing learned features in a shared BEV grid lets weak evidence add up: 2 lidar points (exact range) plus a confident camera class gives a correct object neither sensor could report alone. The network learns small misalignments, and training with sensors randomly dropped (as Waymo's CramNet does with “sensor modality dropout”) keeps it working when one goes dark.</li>
+      <li><b>What it costs, when it fails.</b> More sensors cost money, power and calibration effort; every sensor must stay calibrated and synchronized. Joint networks are large and must be validated as a whole; disagreement between sensors (radar sees a car under a bridge, vision doesn't) must be resolved somehow, which is exactly the argument Tesla gave for dropping radar.</li>
+      <li><b>What came next.</b> Temporal fusion over many frames (Waymo's Sensor Fusion Encoder fuses “over time”), camera–radar fusion for cheaper cars (CramNet), foundation-model encoders, and on the other side, vision-only stacks that learn depth and velocity from enormous auto-labeled video datasets (Tesla) and monocular depth models trained on tens of millions of images (Depth Anything).</li>
+    </ol>
+  </div>
+
+  <h2>Monocular depth: learning to guess distance</h2>
+  <p>Back to the puzzle. Geometry alone can't separate a toy car at 2.5 m from a real one at 12.5 m: that's <b>scale ambiguity</b>. A network that predicts depth from one image (monocular depth) gets around it with <i>learned cues</i>, each of which can fail:</p>
+  <ul>
+    <li><b>Size priors</b>: cars are about 1.5 m tall, people about 1.7 m. Works until the object isn't typical (a toy, a truck, a child).</li>
+    <li><b>Ground contact</b>: where the object touches the ground, plus the known camera height, gives depth, exactly IPM from Lesson 6.2. Works until the ground isn't flat (a hill crest).</li>
+    <li><b>Context and texture</b>: road texture gets finer with distance, lanes converge, things far away are hazier and partly hidden by nearer ones.</li>
+    <li><b>Motion</b>: as the car moves, near things slide across the image faster than far things (motion parallax), which is why video helps.</li>
+  </ul>
+  <div class="eq">
+    image height <span class="se">h<sub>px</sub></span> = f · <span class="be">H</span> ÷ <span class="be">Z</span> &nbsp;&nbsp;⇒&nbsp;&nbsp; (H, Z) and (k·H, k·Z) give the same image for any k
+    <span class="say">One equation, two unknowns. Every monocular depth method breaks the tie with a prior: an assumed size, an assumed ground, or patterns learned from millions of images.</span>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Which cue would you trust?</span>
+    <p class="hint">Side view: the <span class="se">camera</span> is 1.4 m up (f = 1,000 px). Four test objects. For each, choose how to turn its image into a distance: the <b>size prior</b> (assume a car is 1.5 m tall: Z = f · 1.5 ÷ h<sub>px</sub>) or the <b>ground contact</b> cue (assume flat ground: Z = f · 1.4 ÷ pixels below the horizon). The faint outline shows what else would produce exactly the same image.</p>
+    <canvas class="sim" id="mdCanvas"></canvas>
+    <div class="controls">
+      <span class="seg" id="mdObj"><button data-o="0" class="on">toy car</button><button data-o="1">car on a hill crest</button><button data-o="2">big truck</button><button data-o="3">ordinary car</button></span>
+      <span class="seg" id="mdCue"><button id="mdSize" data-c="size" class="on">size prior</button><button id="mdGround" data-c="ground">ground contact</button></span>
+    </div>
+    <div class="stat-row">
+      <div class="stat">image height <b id="mdH">–</b></div>
+      <div class="stat">estimate / truth <b id="mdE">–</b></div>
+      <div class="stat">solved within 5% <b id="mdS">–</b></div>
+      <div class="stat">challenge <b id="mdChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> get <b>all four</b> objects within 5% by choosing the right cue for each. Notice that no single cue works for all four: a learned depth network has to know when each cue lies, which is why they're trained on huge, diverse datasets.</p>
+  </div>
+
+  <h2>MiDaS and Depth Anything: depth models trained on everything</h2>
+  <p>Two research lines made monocular depth practical:</p>
+  <ul>
+    <li><b>MiDaS</b> (Ranftl et al., 2019) trained on a mix of datasets, including 3D films, with a loss that's <b>invariant to depth range and scale</b>. It predicts <i>relative</i> depth (this is twice as far as that) rather than meters, which sidesteps the scale ambiguity instead of solving it.</li>
+    <li><b>Depth Anything</b> (2024) built a “data engine” that auto-annotated about <b>62 million unlabeled images</b> with a teacher model, then trained a student on them; fine-tuned on metric datasets (NYUv2 indoors, KITTI driving) it outputs meters. <b>Depth Anything V2</b> replaced labeled real images with synthetic ones, scaled the teacher, and released models from 25 million to 1.3 billion parameters.</li>
+  </ul>
+  <p>Relative depth is fine for many robotics tasks; <b>metric</b> depth (meters) is what a car's planner needs, and it's only as good as the training data's cameras and scenes match yours. Learned depth also degrades with distance: errors of several percent of range are typical. The self-supervised tricks behind these models are in <span class="dlref" data-href="phase9/1-self-supervised.html">the Deep Learning course, Phase 9 (self-supervised learning)</span>.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Depth error vs range: stereo, mono, lidar</span>
+    <p class="hint">How the 1σ depth error grows with distance. <b>Stereo</b> (two cameras a baseline B apart) has error ≈ Z² · σ<sub>d</sub> ÷ (f · B): quadruples when distance doubles. The <b>learned mono</b> curve is a stand-in at 8% of range. <b>Lidar</b> is a few centimeters at any range it gets returns from.</p>
+    <canvas class="chart" id="deChart" style="height:240px"></canvas>
+    <div class="controls">
+      <label>stereo baseline B <input type="range" id="deB" min="0.05" max="0.6" step="0.01" value="0.12"> <b class="mono" id="deBV"></b></label>
+      <label>disparity noise <span class="un"><span class="nt">σ</span><sub>d</sub></span> <input type="range" id="deS" min="0.25" max="1" step="0.05" value="0.5"> <b class="mono" id="deSV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">stereo error at 60 m <b id="de60">–</b></div>
+      <div class="stat">mono (stand-in) at 60 m <b id="deM">4.8 m</b></div>
+      <div class="stat">range where stereo beats mono <b id="deX">–</b></div>
+      <div class="stat">challenge <b id="deChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> design a stereo pair with error under <b>2 m at 60 m</b>, with a baseline of at most <b>0.5 m</b> (it must fit behind a windshield) and realistic sub-pixel matching (<span class="nt">σ</span><sub>d</sub> ≥ 0.25 px). f = 1,000 px.</p>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: where depth error comes from</span>
+    <ol>
+      <li><b>Stereo</b>, f = 1,000 px, B = 0.3 m, σ<sub>d</sub> = 0.25 px: at 20 m, error = 20² × 0.25 ÷ (1,000 × 0.3) = 100 ÷ 300 = <b>0.33 m</b>; at 60 m, 3,600 × 0.25 ÷ 300 = <b>3.0 m</b>. Nine times worse at three times the distance.</li>
+      <li><b>Monocular with a size prior</b>: a car that's really 1.6 m tall, assumed 1.5 m: every distance is off by 1.5 ÷ 1.6, about <b>6%</b>: 3.8 m at 60 m, no matter how sharp the image.</li>
+      <li><b>Calibration</b> for fusion: 1° of extrinsic error moves a projected point by tan(1°) × Z ≈ 0.0175 × 45 m = <b>0.79 m</b> at 45 m. More than a cyclist's half-width.</li>
+    </ol>
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: three witnesses at a trial</span>
+    <p>One witness had great eyesight but no sense of distance (camera), one measured everything with a tape but was colour-blind (lidar), one only noticed how fast things moved (radar). Late fusion reads their written statements and picks bits from each. Early fusion makes them watch the same tape together, but if their clocks or seats were mismatched they argue about different moments. Feature fusion lets the jury hear everyone's hunches before anyone writes a statement. The vision-only bet is to train one witness so well, on so many cases, that you no longer need the others.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Painting lidar points (early fusion) is a projection plus an array lookup. Monocular depth models are one call in Hugging Face Transformers. <b>BEVFusion</b> (MIT) and <b>MMDetection3D</b> have feature-level fusion models.</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+
+<span class="k">def</span> paint_points(pts_lidar, seg_scores, K, T_cam_from_lidar):
+    <span class="s">"""PointPainting: append the image segmentation scores at each lidar point's pixel.
+    pts_lidar (N, 3) · seg_scores (H, W, C) class probabilities · K 3×3 · T 4×4 lidar→camera"""</span>
+    P = np.c_[pts_lidar, np.ones(len(pts_lidar))] @ T_cam_from_lidar.T     <span class="c"># into the camera frame (z forward)</span>
+    front = P[:, <span class="n">2</span>] &gt; <span class="n">0.5</span>
+    uv = (P[front, :<span class="n">3</span>] @ K.T)
+    uv = (uv[:, :<span class="n">2</span>] / uv[:, <span class="n">2</span>:]).round().astype(int)                          <span class="c"># pixel coordinates</span>
+    H, W, C = seg_scores.shape
+    inside = (uv[:, <span class="n">0</span>] &gt;= <span class="n">0</span>) &amp; (uv[:, <span class="n">0</span>] &lt; W) &amp; (uv[:, <span class="n">1</span>] &gt;= <span class="n">0</span>) &amp; (uv[:, <span class="n">1</span>] &lt; H)
+    scores = np.zeros((len(pts_lidar), C))
+    idx = np.flatnonzero(front)[inside]
+    scores[idx] = seg_scores[uv[inside, <span class="n">1</span>], uv[inside, <span class="n">0</span>]]
+    <span class="k">return</span> np.c_[pts_lidar, scores]          <span class="c"># (N, 3 + C): feed to any lidar detector</span>
+
+<span class="c"># Monocular depth with Depth Anything V2 (relative depth; metric checkpoints also exist)</span>
+<span class="k">from</span> transformers <span class="k">import</span> pipeline
+<span class="k">from</span> PIL <span class="k">import</span> Image
+pipe = pipeline(task=<span class="s">"depth-estimation"</span>, model=<span class="s">"depth-anything/Depth-Anything-V2-Small-hf"</span>)
+depth = pipe(Image.open(<span class="s">"frame.jpg"</span>))[<span class="s">"depth"</span>]       <span class="c"># a PIL image of relative depth</span></code></pre>
+    <p class="hint">Painting is only as good as <code>T_cam_from_lidar</code> and the timestamps: project a few frames and look before trusting it (Lesson 2.7). Relative depth maps need a scale (from lidar, a known camera height, or a metric model) before a planner can use them.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚘 Tesla</h4><p>Vision only, by choice. Radar was removed from Model 3 and Model Y in North America from May 2021. At CVPR 2021 Karpathy argued radar's depth and velocity can be learned from video, and that working on “the radar stack and the sensor fusion stack” was a distraction; he showed vision depth and velocity tracking a lead car. At CVPR 2022 Tesla said its system used eight cameras and no radar, lidar, ultrasonics or HD maps. Depth comes from networks trained on auto-labeled video (Lessons 6.2, 6.3, 6.7).</p>
+        <p class="src">Sources: <a href="https://www.youtube.com/watch?v=g6bOwQdCJrc" target="_blank" rel="noopener">CVPR'21 WAD keynote</a>, <a href="https://www.tesla.com/support/transitioning-tesla-vision" target="_blank" rel="noopener">Tesla Vision</a>, <a href="https://www.youtube.com/watch?v=jPCV4GKX9Dw" target="_blank" rel="noopener">CVPR'22 keynote</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Multi-sensor by design. Its 6th-generation driver (rider-only from February 2026) pairs cameras with lidar and an imaging radar improved for rain and snow; its Dec 2025 post describes a <b>Sensor Fusion Encoder</b> that “fuses camera, lidar, and radar inputs over time”. Its research covers feature fusion of lidar and camera over time (<b>4D-Net</b>, better on distant objects) and camera–radar fusion that keeps working when a sensor fails (<b>CramNet</b>).</p>
+        <p class="src">Sources: <a href="https://waymo.com/blog/2025/12/demonstrably-safe-ai-for-autonomous-driving" target="_blank" rel="noopener">Waymo, Dec 2025</a>, <a href="https://waymo.com/blog/2026/02/ro-on-6th-gen-waymo-driver" target="_blank" rel="noopener">Waymo, Feb 2026</a>, <a href="https://arxiv.org/abs/2109.01066" target="_blank" rel="noopener">4D-Net</a>, <a href="https://arxiv.org/abs/2210.09267" target="_blank" rel="noopener">CramNet</a></p></div>
+      <div><h4>🛸 Drones</h4><p>Weight decides. Skydio's X10 uses six navigation cameras for 360° vision plus an onboard Jetson Orin; its ThermalBoost mode fuses color and thermal imagery into one view to reveal people and vehicles. Depth for obstacle avoidance comes from its multi-camera vision. Flight controllers like PX4 fuse IMU, GNSS, barometer and optical flow in an EKF (Lesson 3.3): classic state fusion rather than perception fusion.</p>
+        <p class="src">Sources: <a href="https://www.skydio.com/x10" target="_blank" rel="noopener">Skydio X10</a>, <a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4 EKF</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> Waymo runs a fleet of purpose-built robotaxis where the safety case comes first and sensor cost is spread over many rides, so it buys redundancy: when one sensor is blinded another still measures. Tesla sells millions of consumer cars where every dollar and every disagreement between sensors matters, and bets that data plus learning closes the depth gap. A drone can't carry the weight or power of lidar and radar arrays, so it fuses cameras with each other and with thermal.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Early (raw) fusion</td><td>Most information; few points suffice with painted class</td><td>Hostage to calibration and time sync; a blind camera leaves points unpainted</td></tr>
+      <tr><td>Feature (BEV) fusion</td><td>Weak evidence adds up; learned alignment; modality dropout robustness</td><td>Big joint network; harder to validate and debug</td></tr>
+      <tr><td>Late (object) fusion</td><td>Modular; independent validation; one dead sensor doesn't kill the rest</td><td>Discards uncertain evidence; attributes from one sensor at a time</td></tr>
+      <tr><td>Vision only + learned depth</td><td>Cheapest hardware; one team, one stack; no sensor disagreements</td><td>Depth is inferred (scale ambiguity, error grows with range); glare and night are single points of failure</td></tr>
+      <tr><td>Stereo cameras</td><td>Metric depth by geometry; cheap</td><td>Error ∝ Z²/B; needs texture and careful calibration</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Should our robotaxi fuse early or late?” A strong answer:</p>
+    <ul>
+      <li>Defines <b>early / feature / late</b> with an example of each (PointPainting, BEVFusion, box-level matching in a tracker).</li>
+      <li>Walks through <b>failure cases</b> with numbers: 1° calibration error = 0.8 m at 45 m; a dark car with 2 lidar points; sun glare on one camera.</li>
+      <li>Mentions <b>robustness engineering</b>: modality dropout in training, health monitoring of each sensor, a late-fusion safety layer that still works if the learned fusion misbehaves.</li>
+      <li>Explains <b>monocular depth</b>: scale ambiguity, the cues networks learn, relative vs metric depth, and why error grows with range.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>PointPainting</b> <span class="tag res">🧪 Research · 2019</span> <a href="https://arxiv.org/abs/1911.10150" target="_blank" rel="noopener">Vora et al.</a></div>
+      <p><b>How:</b> project lidar points into an image segmentation output and append its class scores to each point; run any lidar detector.</p>
+      <p><b>Why this method:</b> at the time lidar-only detectors beat fusion methods on benchmarks; painting improved PointRCNN, VoxelNet and PointPillars with almost no change to them.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>BEVFusion</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2205.13542" target="_blank" rel="noopener">Liu et al. (MIT)</a> · <a href="https://github.com/mit-han-lab/bevfusion" target="_blank" rel="noopener">code</a></div>
+      <p><b>How:</b> camera features lifted to BEV (Lesson 6.2) and lidar features in BEV are concatenated and fused; an optimized BEV pooling cut that step's latency by more than 40×.</p>
+      <p><b>Why this method:</b> one shared space keeps both geometry and camera semantics, and supports detection and map segmentation alike.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Waymo's sensor fusion</b> <span class="tag av">🚗 AV</span> <a href="https://waymo.com/blog/2025/12/demonstrably-safe-ai-for-autonomous-driving" target="_blank" rel="noopener">Waymo, Dec 2025</a></div>
+      <p><b>How:</b> a Sensor Fusion Encoder fuses camera, lidar and radar over time into objects, semantics and embeddings, alongside a driving vision-language model for harder reasoning.</p>
+      <p><b>Why this method:</b> each sensor covers the others' blind spots; fusing over time adds motion cues.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Depth Anything V2</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/DepthAnything/Depth-Anything-V2" target="_blank" rel="noopener">GitHub</a></div>
+      <p><b>How:</b> a large teacher trained on synthetic labeled images pseudo-labels real images; students from 25M to 1.3B parameters; metric fine-tunes for indoor and outdoor scenes.</p>
+      <p><b>Why this method:</b> real depth labels are scarce and noisy; scale comes from data and distillation.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · learning depth from 3D movies</span>
+    <p>MiDaS added an unusual training source: <b>3D films</b>. The left and right views of a stereo movie encode depth up to an unknown scale and shift, exactly what a scale-invariant loss can learn from (<a href="https://arxiv.org/abs/1907.01341" target="_blank" rel="noopener">Ranftl et al.</a>). Hollywood's stereo rigs became a depth sensor.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The sensors are Phase 2 (camera 2.1, lidar 2.3, radar 2.4, calibration and sync 2.7). Feature fusion happens in the BEV of 6.2; late fusion often lives inside the tracker of 6.5, which blends measurements by trust like <a href="../phase3/3-kalman-filter.html">Lesson 3.3</a>'s Kalman filter. Monocular depth from the ground-contact cue is 6.2's IPM; occupancy (6.3) is depth's 3D cousin. Tesla's vs Waymo's sensor choice is the debate of Lessons 0.4 and 0.5, and 9.2 revisits it end to end. The trust-weighted blend is <a href="../../math-course/phase4/2-bayes.html">Bayes' rule</a> in the Math course.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2205.13542" target="_blank" rel="noopener">BEVFusion (2022)</a>. The clearest argument for fusing in BEV, with latency numbers.</li>
+      <li><span class="kind">Talk</span> <a href="https://www.youtube.com/watch?v=g6bOwQdCJrc" target="_blank" rel="noopener">Karpathy, CVPR 2021 WAD keynote</a>. The vision-only argument in Tesla's own words.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2406.09414" target="_blank" rel="noopener">Depth Anything V2 (2024)</a>. How a monocular depth model is trained at scale.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A stereo camera has f = 800 px, baseline 0.2 m and disparity noise 0.25 px. What's its 1σ depth error at 40 m?</div>
+    <div class="opts"><button class="opt">0.25 m</button><button class="opt">1 m</button><button class="opt" data-ok>2.5 m</button></div>
+    <div class="explain">Error ≈ Z² · σ<sub>d</sub> ÷ (f · B) = 1,600 × 0.25 ÷ (800 × 0.2) = 400 ÷ 160 = <b>2.5 m</b>. At 80 m it would be 10 m: stereo depth degrades with distance squared.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After a minor fender-bender, your early-fusion (PointPainting) detector starts missing cyclists beyond 40 m, while lidar-only detection of cars is fine. Most likely cause?</div>
+    <div class="opts"><button class="opt">The lidar lost half its beams</button><button class="opt" data-ok>The camera–lidar extrinsic calibration shifted: painted class scores now land beside small far objects (1° ≈ 0.7 m at 40 m)</button><button class="opt">The segmentation network forgot the cyclist class</button></div>
+    <div class="explain">Calibration errors grow with distance and hurt narrow objects first. Re-calibrate (and monitor calibration online); feature-level fusion with learned alignment is more tolerant of small shifts.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A monocular depth network says a car is 20 m away. It's actually a 4 m-tall delivery truck at 53 m. Which cue most likely misled it?</div>
+    <div class="opts"><button class="opt">Motion parallax</button><button class="opt" data-ok>A size prior: an object of that image height “should” be a 1.5 m car at 20 m (1.5 ÷ 4 × 53 ≈ 20)</button><button class="opt">Ground contact</button></div>
+    <div class="explain">Scale ambiguity: f·H/Z is the same for (1.5 m, 20 m) and (4 m, 53 m). If the network leans on a car-sized prior it gets the scale wrong; ground contact or class recognition (“that's a truck”) would fix it.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Cameras give class, lidar gives range, radar gives speed in bad weather; each fails differently.</li>
+      <li>Early fusion (PointPainting) is rich but needs perfect calibration and a healthy camera; late fusion is modular but discards uncertain evidence; feature (BEV) fusion combines weak evidence and can be trained to survive a missing sensor.</li>
+      <li>Calibration matters with distance: 1° ≈ 0.8 m at 45 m. Stereo error ≈ Z²σ<sub>d</sub>/(fB).</li>
+      <li>Monocular depth is ambiguous in scale (f·H/Z); networks use size priors, ground contact, context and motion, each with failure cases. MiDaS learns relative depth; Depth Anything scales with 62M auto-labeled images.</li>
+      <li>Tesla: vision only since 2021, depth and velocity learned from video. Waymo: camera + lidar + radar fused over time. Drones: multi-camera plus thermal, within tight weight limits.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+  const segBind = (id, key, cb) => $(id).querySelectorAll("button").forEach(b => (b.onclick = () => { $(id).querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset[key]); }));
+
+  // ---------- Playground 1: fusion levels ----------
+  // ==MODEL66==
+  const OBJS=[ // r range (m), b bearing (deg, + = left), c class, rho lidar reflectivity, half width (m), e = the camera depth net's error on it
+    {nm:"car",c:"car",r:15,b:-10,rho:1.0,hw:0.9,e:-0.04},
+    {nm:"pedestrian",c:"pedestrian",r:25,b:8,rho:0.7,hw:0.3,e:0.07},
+    {nm:"black car",c:"car",r:30,b:-3,rho:0.25,hw:0.9,e:-0.09},
+    {nm:"cyclist",c:"cyclist",r:45,b:3,rho:0.8,hw:0.4,e:0.11},
+    {nm:"far car",c:"car",r:70,b:-1,rho:1.0,hw:0.9,e:-0.14},
+    {nm:"truck",c:"truck",r:40,b:-15,rho:1.0,hw:1.25,e:0.06}];
+  const LIDAR_K=8000;
+  function sensors(sc){return OBJS.map(o=>{
+    const n=Math.round(LIDAR_K*o.rho*(sc.rain?0.5:1)/(o.r*o.r));
+    const cam=!(sc.glare&&Math.abs(o.b-6)<=4);   // sun glare blinds the camera 2°–10° left of center
+    return {...o,n,cam};});}
+  function fuse(level,sc){const S=sensors(sc),d=sc.calib||0,out=[];
+    for(const o of S){let det=false,cls=null,rng=null,why="";
+      const lat=Math.abs(d*Math.PI/180*o.r);           // lateral misalignment from a calibration error of d degrees
+      if(level==="late"){
+        const lid=o.n>=5,cam=o.cam;
+        if(lid&&cam&&d<=2){det=true;cls=o.c;rng=o.r;why="both sensors, matched";}
+        else if(lid){det=true;cls=null;rng=o.r;why="lidar only: no class";}
+        else if(cam){det=true;cls=o.c;rng=o.r*(1+o.e);why="camera only: guessed depth";}
+        else why="neither sensor alone was sure";
+      }else if(level==="early"){
+        const painted=o.cam&&lat<o.hw;
+        if(painted&&o.n>=3){det=true;cls=o.c;rng=o.r;why="points painted with the class";}
+        else if(o.n>=5){det=true;cls=null;rng=o.r;why=o.cam?"paint missed the points (calibration)":"no paint (camera blind)";}
+        else why=o.n<3?"too few lidar points to paint":"paint missed the points (calibration)";
+      }else{ // feature-level (BEV fusion) stand-in
+        const camOK=o.cam&&lat<1.5,ev=Math.min(1,o.n/5)+(camOK?0.6:0);
+        if(ev>=0.8){det=true;cls=camOK?o.c:null;rng=o.n>=1?o.r:o.r*(1+o.e);why=camOK?(o.n>=1?"weak evidence combined in BEV":"camera evidence, guessed depth"):"lidar evidence only: no class";}
+        else why="evidence too weak in BEV";
+      }
+      const ok=det&&cls===o.c&&Math.abs(rng-o.r)/o.r<=0.05;
+      out.push({o,det,cls,rng,ok,why});}
+    return out;}
+  // ==END66==
+  let level = "late", fz = null;
+  const FW = new Sim($("fzCanvas"), { xRange: [-4, 76], yRange: [-13, 13] });
+  FW.render(w => {
+    if (!fz) return;
+    w.clear();
+    const sc = { glare: $("fzGlare").checked, rain: $("fzRain").checked, calib: +$("fzCal").value };
+    if (sc.glare) { const pts = [[0, 0]]; for (let a = 2; a <= 10; a += 1) pts.push([80 * Math.cos(a * Math.PI / 180), 80 * Math.sin(a * Math.PI / 180)]); w.line(pts, { fill: "--c-un", alpha: 0.18, close: true }); w.text([60, 8.8], "☀️ glare", { color: "--c-un", size: 11 }); }
+    w.car({ x: -3, y: 0, th: 0 }, { color: "--c-be", L: 2.6 });
+    const S = sensors(sc);
+    fz.forEach((r, i) => {
+      const o = r.o, b = o.b * Math.PI / 180, x = o.r * Math.cos(b), y = o.r * Math.sin(b), s = S[i];
+      for (let k = 0; k < s.n; k++) w.dot([x - 0.6 + 1.2 * ((k * 0.37) % 1), y - o.hw + 2 * o.hw * ((k * 0.61) % 1)], { color: "--c-se", r: 2 });
+      w.rect(x, y, o.c === "truck" ? 7 : o.c === "car" ? 4.5 : 1.2, 2 * o.hw, { center: true, stroke: r.ok ? "--good" : r.det ? "--c-un" : "--bad", width: 2, angle: b });
+      if (r.det && r.rng) { const xr = r.rng * Math.cos(b), yr = r.rng * Math.sin(b); if (Math.abs(r.rng - o.r) > 0.5) w.line([[x, y], [xr, yr]], { color: "--c-un", width: 2, dash: [3, 3] }); w.dot([xr, yr], { color: r.ok ? "--good" : "--c-un", r: 4 }); }
+      w.text([x, y + o.hw + 1.6], o.n + (r.cls ? " · " + r.cls : r.det ? " · ?" : ""), { color: r.ok ? "--good" : r.det ? "--c-un" : "--bad", size: 10 });
+    });
+    w.text([-3, 12], "box: green = right, gold = detected but wrong, red = missed · number = lidar points", { color: "--muted", size: 10, align: "left" });
+  });
+  function refreshFz() {
+    const sc = { glare: $("fzGlare").checked, rain: $("fzRain").checked, calib: +$("fzCal").value };
+    $("fzCalV").textContent = sc.calib.toFixed(1) + "°";
+    fz = fuse(level, sc);
+    const S = sensors(sc);
+    let html = "<tr><th>object</th><th>range</th><th>lidar pts</th><th>camera</th><th>result</th><th>why</th></tr>";
+    fz.forEach((r, i) => { html += `<tr><td>${r.o.nm}</td><td>${r.o.r} m</td><td>${S[i].n}</td><td>${S[i].cam ? "sees it" : "blind"}</td><td class="${r.ok ? "ok" : "no"}">${r.ok ? "✓ right" : r.det ? "≈ " + (r.cls || "?") + (r.rng ? ", " + fmt(r.rng, 1) + " m" : "") : "✗ missed"}</td><td class="muted">${r.why}</td></tr>`; });
+    $("fzTable").innerHTML = html;
+    const ok = fz.filter(r => r.ok).length, det = fz.filter(r => r.det).length;
+    $("fzOk").textContent = ok + " of 6"; $("fzDet").textContent = det + " of 6";
+    const hard = sc.glare && sc.calib >= 1.0 - 1e-9;
+    $("fzChal").innerHTML = hard && ok >= 4 ? `<span class="badge-win">✅ ${level} fusion: ${ok}/6 under glare + ${fmt(sc.calib, 1)}°</span>` : hard ? `<span class="badge-lose">${ok}/6 with ${level} fusion</span>` : `<span class="muted">turn on glare and set ≥ 1.0° to play</span>`;
+    FW.render();
+  }
+  segBind("fzLevel", "l", l => { level = l; refreshFz(); });
+  ["fzGlare", "fzRain"].forEach(id => ($(id).onchange = refreshFz));
+  $("fzCal").oninput = refreshFz;
+  refreshFz();
+
+  // ---------- Playground 2: scale ambiguity ----------
+  const F = 1000, CH = 1.4;
+  const MO = [ // H height, Z distance, hill = ground height under the object
+    { name: "toy car", H: 0.3, Z: 2.5, hill: 0 }, { name: "car on a hill crest", H: 1.5, Z: 30, hill: 1.2 },
+    { name: "big truck", H: 3.5, Z: 25, hill: 0 }, { name: "ordinary car", H: 1.5, Z: 18, hill: 0 }];
+  let mo = 0, cue = "size";
+  const solved = [null, null, null, null];
+  function estimate(o, c) {
+    const top = o.hill + o.H - CH, bot = o.hill - CH;              // heights relative to the camera
+    const vt = F * -top / o.Z, vb = F * -bot / o.Z, hpx = vb - vt;  // pixels below the horizon (down = +)
+    const Z = c === "size" ? F * 1.5 / hpx : vb > 0 ? F * CH / vb : Infinity;
+    return { hpx, vb, Z };
+  }
+  const MW = new Sim($("mdCanvas"), { xRange: [-2, 36], yRange: [-1.0, 5.4] });
+  MW.render(w => {
+    w.clear();
+    const o = MO[mo], e = estimate(o, cue);
+    const g = x => (o.hill && x > 18 ? Math.min(o.hill, (x - 18) * 0.12) : 0);
+    const gp = []; for (let x = -2; x <= 36; x += 0.5) gp.push([x, g(x)]);
+    w.line(gp, { color: "--c-mp", width: 3 });
+    w.rect(-0.3, 0, 0.6, CH, { fill: "--muted", alpha: 0.5 }); w.dot([0, CH], { color: "--c-se", r: 6 }); w.text([0.2, CH + 0.45], "camera", { color: "--c-se", size: 10 });
+    const draw = (Z, H, base, col, alpha, dash) => { if (Z > 36) return; w.rect(Z, base, Math.min(4.5, H * 3), H, { stroke: col, fill: dash ? null : col, alpha, width: 2 }); };
+    draw(o.Z, o.H, o.hill, "--c-ag", 0.8, false);
+    // same-image twin: the size the camera would assume, at the scaled distance
+    const k = 1.5 / o.H; if (o.hill === 0) draw(o.Z * k, o.H * k, 0, "--muted", 0.8, true);
+    const far = 36; [o.hill + o.H, o.hill].forEach(hh => { const s = (hh - CH) / o.Z; w.line([[0, CH], [far, CH + s * far]], { color: "--c-se", width: 1, dash: [4, 4], alpha: 0.7 }); });
+    if (isFinite(e.Z) && e.Z < 36) { w.line([[e.Z, -0.6], [e.Z, 5]], { color: "--c-un", width: 2, dash: [6, 4] }); w.text([e.Z, 5.1], "estimate", { color: "--c-un", size: 10 }); }
+    else w.text([34, 5.1], "estimate → " + (isFinite(e.Z) ? fmt(e.Z, 0) + " m" : "∞"), { color: "--c-un", size: 10, align: "right" });
+    w.text([o.Z, -0.6], "truth " + o.Z + " m", { color: "--c-ag", size: 10 });
+  });
+  function refreshMd() {
+    const o = MO[mo], e = estimate(o, cue), err = Math.abs(e.Z - o.Z) / o.Z;
+    if (err <= 0.05) solved[mo] = cue;
+    $("mdH").textContent = fmt(e.hpx, 0) + " px";
+    $("mdE").textContent = (isFinite(e.Z) ? fmt(e.Z, 1) : "∞") + " m / " + o.Z + " m" + (isFinite(e.Z) ? " (" + (err <= 0.05 ? "✓" : fmt(100 * err, 0) + "% off") + ")" : "");
+    const n = solved.filter(Boolean).length;
+    $("mdS").textContent = n + " of 4" + (n ? " (" + MO.map((m, i) => solved[i] ? m.name.split(" ")[0] + ": " + solved[i] : null).filter(Boolean).join(", ") + ")" : "");
+    $("mdChal").innerHTML = n === 4 ? `<span class="badge-win">✅ all four: you picked the right cue each time</span>` : `<span class="muted">${n} of 4 solved</span>`;
+    MW.render();
+  }
+  segBind("mdObj", "o", v => { mo = +v; refreshMd(); });
+  segBind("mdCue", "c", v => { cue = v; refreshMd(); });
+  refreshMd();
+
+  // ---------- Playground 3: depth error vs range ----------
+  function refreshDe() {
+    const B = +$("deB").value, sd = +$("deS").value, f = 1000;
+    $("deBV").textContent = B.toFixed(2) + " m"; $("deSV").textContent = sd.toFixed(2) + " px";
+    const zs = MX.linspace(1, 100, 100), st = z => z * z * sd / (f * B);
+    Plot.line($("deChart"), { series: [
+      { label: "stereo", color: MX.css("--c-se"), data: zs.map(z => [z, Math.min(12, st(z))]), width: 3 },
+      { label: "learned mono (8% stand-in)", color: MX.css("--c-be"), data: zs.map(z => [z, 0.08 * z]), width: 2.5, dash: [6, 4] },
+      { label: "lidar (±3 cm)", color: MX.css("--c-mp"), data: zs.map(z => [z, 0.03]), width: 2.5 },
+    ], xMin: 0, xMax: 100, yMin: 0, yMax: 12, xLabel: "distance (m)", yLabel: "1σ depth error (m)", hlines: [{ y: 2, label: "2 m", color: MX.css("--c-un") }] });
+    const e60 = st(60), cross = 0.08 * f * B / sd;
+    $("de60").textContent = fmt(e60, 2) + " m"; $("deX").textContent = "below " + fmt(cross, 0) + " m";
+    $("deChal").innerHTML = e60 < 2 && B <= 0.5 ? `<span class="badge-win">✅ ${fmt(e60, 2)} m at 60 m with B = ${B.toFixed(2)} m</span>` : `<span class="badge-lose">${fmt(e60, 1)} m at 60 m</span>`;
+  }
+  ["deB", "deS"].forEach(id => ($(id).oninput = refreshDe));
+  refreshDe();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.2 Cameras to bird's-eye view: Lift-Splat & BEVFormer · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  @media (max-width: 760px) { .pair { grid-template-columns: 1fr; } }
+  .cap { font-size: .8rem; color: var(--muted); margin: 2px 0 0; text-align: center; }
+  canvas.strip6 { width: 100%; aspect-ratio: 6 / 1.25; height: auto; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+</style>
+</head>
+<body data-lesson="s6-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 2</div>
+  <h1>Cameras to bird's-eye view: Lift-Splat &amp; BEVFormer</h1>
+  <p class="subtitle">A car plans on the ground, like a chess player on a board. Cameras see a squashed perspective picture. Turning eight such pictures into one top-down map is where camera-based self-driving starts, and where a simple trick, inverse perspective mapping, falls off a hill.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The pinhole model</b>: a 3D point at depth Z and height Y below the camera lands at image row v = c<sub>y</sub> + f·Y/Z, with f the focal length in pixels (Lesson 2.1). Depth is divided away: that's why one image can't tell you distance.</li>
+      <li><b>Intrinsics and extrinsics</b>: f and the image center are the camera's <i>intrinsics</i>; where it sits and which way it points on the car (height, pitch, yaw) are its <i>extrinsics</i> (Lesson 2.2).</li>
+      <li><b>Bird's-eye view (BEV)</b>: a top-down grid around the car, x forward, y left, usually 0.5 m cells. Lesson 6.1 built one from lidar.</li>
+      <li><b>Attention</b>, in one sentence: each output “asks a question” and pulls a weighted mix of the inputs that best answer it. Details: <span class="dlref" data-href="phase6/1-self-attention.html">the Deep Learning course, Phase 6 (self-attention)</span>.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>A front camera sits 1.5 m above the road. One pixel row near the bottom of the image covers about <b>2 cm</b> of road 5 m ahead. <b>How much road does one pixel row cover 50 m ahead?</b> 20 cm? 50 cm? Lock in a number, then read on.</p>
+    <p>Answer: about <b>1.7 m</b> (for a typical 1,000-pixel focal length). A hundred times more. In the image, the whole distant world is squashed into a few rows near the horizon, while a planner needs a map where 1 m is 1 m everywhere.</p>
+    <p>At Tesla AI Day 2021, Andrej Karpathy, then head of AI, described this exact problem: early Autopilot made predictions per camera, in image space, and fusing them was “incredibly difficult”; one big truck could span <b>five of the eight cameras</b>. Tesla's fix was a network that predicts directly in a top-down “vector space” (<a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a>). This lesson is how that works.</p>
+  </div>
+
+  <h2>Why bird's-eye view at all?</h2>
+  <p>Numbers first. For a camera 1.5 m up with focal length 1,000 px, here's how much road one pixel row spans:</p>
+  <table>
+    <tr><th>Distance ahead</th><th>5 m</th><th>10 m</th><th>20 m</th><th>50 m</th></tr>
+    <tr><td>Road covered by one pixel row</td><td>1.8 cm</td><td>6.9 cm</td><td>27 cm</td><td><b>1.7 m</b></td></tr>
+  </table>
+  <p>Image space is <b>wildly uneven</b>: near things get thousands of pixels, far things a handful. A planner cares about meters and seconds: “is there 30 m of free lane ahead?”, “will that car's path cross mine?”. Those questions live on the <span class="mp">ground plane</span>, so modern stacks convert every camera into one shared BEV grid where:</p>
+  <ul>
+    <li>distances are true meters everywhere (0.5 m cells, say);</li>
+    <li>eight cameras land in <i>one</i> map, so an object crossing from one camera to the next is still one object;</li>
+    <li>lidar, radar and the map can be stacked on the same grid (Lesson 6.6), and the planner reads it directly (Phase 7).</li>
+  </ul>
+
+  <h2>The classic trick: inverse perspective mapping</h2>
+  <p>If the road is a <b>flat plane</b> and you know the camera's height and pitch, every pixel below the horizon has exactly one ground point: shoot a ray out of the camera through that pixel and see where it hits the plane. That's <b>inverse perspective mapping (IPM)</b>. For a camera looking straight ahead (pitch 0):</p>
+  <div class="eq">
+    distance ahead <span class="be">X</span> = f · <span class="mp">h</span> ÷ (v − c<sub>y</sub>) &nbsp;&nbsp;&nbsp; sideways <span class="be">Y</span> = −(u − c<sub>x</sub>) · <span class="be">X</span> ÷ f
+    <span class="say">The lower a pixel sits below the horizon row c<sub>y</sub>, the closer the ground it shows. Height h and focal length f set the scale. Pitch the camera and the horizon row moves, so every distance changes.</span>
+  </div>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: IPM by hand</span>
+    <p>Camera at h = 1.5 m, f = 800 px, image 640 × 360, horizon at c<sub>y</sub> = 180.</p>
+    <ol>
+      <li>A car's tyres touch the road at row v = 210: X = 800 × 1.5 ÷ (210 − 180) = 1,200 ÷ 30 = <b>40 m</b>.</li>
+      <li>A lane line at the same row, column u = 250 (70 px left of center): Y = 70 × 40 ÷ 800 = <b>3.5 m</b> left.</li>
+      <li>Now the car brakes and its nose dips by just <b>1°</b>. The whole scene shifts up the image by about f·tan(1°) ≈ 14 px, but IPM still assumes the horizon is at row 180, so the tyres now appear only about 16 px below it: X ≈ 1,200 ÷ 16 = <b>75 m</b>. A 1° pitch error nearly doubled the distance.</li>
+      <li>Or the road climbs a gentle 4% hill starting 20 m ahead: the tyres at 40 m are 0.8 m higher, and IPM, believing the road is flat, puts the car at about <b>86 m</b>.</li>
+    </ol>
+    <p>IPM is exact on a perfectly flat road with perfect calibration, and fragile everywhere else. That's what the playground lets you feel.</p>
+  </div>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> on an uphill road, will IPM make the lane lines far away look <i>converging</i> (narrower lane), <i>parallel</i>, or <i>splaying apart</i> (wider lane)?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans"><b>Splaying apart.</b> Uphill road appears higher in the image, so IPM thinks it's farther away. Sideways distance is computed as pixel offset × distance ÷ f, so overestimating distance stretches the lane sideways too: the 3.5 m lane looks 7 m wide at 40 m. Downhill does the opposite: lanes pinch together. Seeing lane lines splay in an IPM image is a classic hint that the road isn't flat (or that the pitch is off).</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · IPM, a braking car and a hill</span>
+    <p class="hint">Left: the simulated <span class="se">front camera</span> view of a straight 3-lane road with a car 40 m ahead. Right: the BEV map built by IPM (<span class="se">blue</span> = where IPM puts the lane lines, <span class="ag">red</span> = where it puts the car) over the truth (grey). The BEV's sideways axis is stretched about 2× so lane errors are visible.</p>
+    <div class="pair">
+      <div><canvas class="sim" id="camCanvas"></canvas><p class="cap">camera image (640 × 360 px)</p></div>
+      <div><canvas class="sim" id="bevCanvas"></canvas><p class="cap">BEV: forward 0–100 m →, sideways ±12 m</p></div>
+    </div>
+    <div class="controls">
+      <label>IPM's assumed pitch <input type="range" id="ipA" min="-3" max="3" step="0.05" value="0"> <b class="mono" id="ipAV"></b></label>
+      <label>hill grade after 20 m <input type="range" id="ipG" min="-8" max="8" step="0.5" value="0"> <b class="mono" id="ipGV"></b></label>
+      <label><input type="checkbox" id="ipLift"> use a depth-aware “lift” (stand-in for a learned depth network)</label>
+      <button class="btn" id="ipReveal">👀 Reveal the true pitch</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">range to the car (true 40 m) <b id="ipR">–</b></div>
+      <div class="stat">lane width at 10 m (true 3.5) <b id="ipW10">–</b></div>
+      <div class="stat">lane width at 40 m (true 3.5) <b id="ipW40">–</b></div>
+      <div class="stat">challenge <b id="ipChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge 1:</b> the car is loaded in the trunk, so the camera secretly pitches down by an unknown angle. With the road flat, tune <b>IPM's assumed pitch</b> until both lane widths are within <b>0.1 m</b> of 3.5 m and the car's range is within <b>1 m</b>. <b>Challenge 2 (the lesson):</b> now set the hill to +4%. Can any pitch make the near lanes, the far lanes and the car all right at once? Then tick the depth-aware lift.</p>
+  </div>
+  <p>What you should find: on a flat road there's one pitch that makes everything right (that's calibration: lanes should be parallel). On a hill, no single pitch works: fix the car's range and the near lanes go wrong, fix the near lanes and the car flies off to 80+ m. The flat-ground assumption is baked in. Tesla gave this as its reason for not using a fixed projection: “the road surface could be sloping up or sloping down”, and things can be occluded (AI Day 2021). The fix is to stop assuming the ground and <i>estimate depth per pixel</i>.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Camera networks made predictions per image: lane lines as pixels, cars as 2D boxes. Planning needs one metric top-down map. Gluing per-camera outputs together broke at camera boundaries (a truck in five cameras) and at distance, where one pixel row covers 1.7 m of road.</li>
+      <li><b>What people tried.</b> <i>IPM</i>: warp each image onto a flat ground plane. Exact on flat roads, but a 1° pitch change or a 4% hill turns a car at 40 m into one at 75–86 m, and anything above the ground (car bodies, poles) gets smeared into long streaks. <i>Per-camera depth, then project</i>: depth maps are noisy far away and each camera disagrees at the seams.</li>
+      <li><b>Why this works.</b> Learned view transforms let the network decide where each pixel's content belongs in 3D. <b>Lift-Splat</b> predicts, for every pixel, a probability over depths (for instance 1 m bins from 4 to 45 m) and spreads the pixel's features along its ray by those probabilities, then sums all cameras into one BEV grid. <b>BEVFormer</b> flips it: each BEV cell asks the images for evidence through attention. Either way, a hill just changes where the evidence lands, instead of breaking an assumption.</li>
+      <li><b>What it costs, when it fails.</b> These are big networks trained on lots of labeled 3D data (or lidar used as a teacher). Depth from one camera is still a guess, so far objects smear along their rays, and accuracy falls with distance. They need good intrinsics and extrinsics, a GPU-class chip, and memory that grows with the number of depth bins × pixels × cameras.</li>
+      <li><b>What came next.</b> Temporal BEV (stacking past frames, as BEVFormer and Tesla's video module do), BEV fusion with lidar and radar (BEVFusion, Lesson 6.6), predicting full 3D <b>occupancy</b> instead of a flat map (Lesson 6.3), and vector outputs such as lane graphs straight out of BEV (Lesson 6.4).</li>
+    </ol>
+  </div>
+
+  <h2>Lift, Splat, Shoot: guess every depth at once</h2>
+  <p><b>Lift-Splat-Shoot</b> (Philion &amp; Fidler, NVIDIA, ECCV 2020) is the cleanest idea in this field:</p>
+  <ol>
+    <li><b>Lift.</b> For each pixel, the network outputs two things: a feature vector (what's here: road, car, curb…) and a <span class="un">probability for each depth bin</span> along the pixel's ray. The paper uses bins from 4 m to 45 m spaced 1 m. Multiply the two and you get a little “frustum” of features: confident depths get most of the feature.</li>
+    <li><b>Splat.</b> Every frustum point has a known 3D position (from the camera's intrinsics and extrinsics), so drop it into its BEV cell and sum. The paper's grid is −50 m to 50 m at 0.5 m cells: <b>200 × 200</b>. All cameras splat into the same grid, so seams disappear.</li>
+    <li><b>Shoot.</b> For planning, score a set of template trajectories against a cost map read off the BEV.</li>
+  </ol>
+  <p>It ran at <b>35 Hz on a Titan V GPU</b> and, because it's trained across the whole rig, it was robust to calibration errors. The deep idea: <i>don't pick one depth; keep the uncertainty</i>. If a pixel could be a car's edge at 40 m or the wall behind it at 55 m, LSS splats a bit of feature in both places, and the BEV network sorts it out with context. Averaging the two would put a ghost at 48 m, in empty space.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Lift one pixel, splat it into BEV</span>
+    <p class="hint">One pixel on a car 40 m ahead and one on a truck 62 m ahead. A stand-in for LSS's depth head gives each pixel a bell-shaped belief over the depth bins, about ±5% of the distance wide (a stand-in, not a real network). Bars show the probability per bin; the BEV strip shows where the pixel's feature gets splatted. Change the <b>bin layout</b> and watch range, memory and sharpness trade off.</p>
+    <canvas class="chart" id="lssChart" style="height:220px"></canvas>
+    <canvas class="sim" id="lssBev" style="aspect-ratio: 6 / 1"></canvas>
+    <div class="controls">
+      <label>max depth <input type="range" id="lsMax" min="30" max="90" step="1" value="45"> <b class="mono" id="lsMaxV"></b></label>
+      <label>bin spacing <input type="range" id="lsStep" min="0.5" max="4" step="0.25" value="1"> <b class="mono" id="lsStepV"></b></label>
+      <label><input type="checkbox" id="lsAmb"> ambiguous pixel (car edge at 40 m or the wall at 55 m?)</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">depth bins <b id="lsN">–</b></div>
+      <div class="stat">frustum memory (6 cameras, illustrative) <b id="lsMem">–</b></div>
+      <div class="stat">car: feature within ±2 m / expected depth <b id="lsCar">–</b></div>
+      <div class="stat">truck: feature within ±2 m <b id="lsTruck">–</b></div>
+      <div class="stat">challenge <b id="lsChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> the default is LSS's own layout (4–45 m, 1 m bins), and the truck at 62 m simply doesn't exist for it. Make the truck visible while keeping the frustum under <b>48 MB</b> and bins no coarser than <b>1.5 m</b>. Then tick the ambiguous pixel and compare the expected depth with where the probability actually is. Memory assumes 6 cameras × a 16 × 44 feature map × 64 channels × 4 bytes per bin (illustrative).</p>
+  </div>
+  <p>Notice two things. Every bin you add costs memory for <i>every pixel of every camera</i>, so long range is expensive, which is one reason camera BEV models struggle beyond ~50 m. And with the ambiguous pixel the <b>expected depth lands in the empty gap</b> between car and wall, while the splatted feature stays honest about both options.</p>
+
+  <h2>BEVFormer: let the map ask the cameras</h2>
+  <p>Lift-Splat pushes pixels out into the world. <b>BEVFormer</b> (Li et al., ECCV 2022) pulls instead. It starts from a grid of learnable <b>BEV queries</b>, one per cell (200 × 200 in the paper, covering about ±51 m). Each query:</p>
+  <ul>
+    <li>is lifted into a short vertical pillar of <b>4 reference points at different heights</b>, so it can find evidence on the ground and higher up;</li>
+    <li>projects those points into the cameras that can see them (the “hit views”) using the known calibration, and samples image features around those spots: <b>spatial cross-attention</b>;</li>
+    <li>also looks at <b>the previous frame's BEV</b>, shifted for the car's motion: <b>temporal self-attention</b>, a memory of what was there a moment ago.</li>
+  </ul>
+  <p>It reached <b>56.9% NDS</b> on the nuScenes test set (NDS, the nuScenes detection score, blends position, size, heading, velocity and class accuracy), 9 points above the previous best camera method and on par with some lidar baselines. Tesla described the same pull-style design at AI Day 2021: a raster of the output space tiled with positional encodings becomes the queries, and the image features provide keys and values (“hey, I'm part of a pillar in roughly this location”). The architecture details live in <span class="dlref" data-href="phase4/5-vit.html">the Deep Learning course, Phase 4 (vision transformers)</span>; here, picture each map cell sending out four little scouts.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Which cameras does a BEV cell ask?</span>
+    <p class="hint">An illustrative six-camera rig (front, two front-corners, two rear-corners, rear). <b>Click</b> anywhere on the BEV map to place a query cell: its 4 reference points (0.5, 1.5, 2.5, 3.5 m high) are projected into every camera that sees them (marks in the strip below). <b>Drag the red truck</b> (12 m long) and see how many cameras it appears in.</p>
+    <canvas class="sim" id="qBev"></canvas>
+    <canvas class="strip6" id="qStrip"></canvas>
+    <div class="stat-row">
+      <div class="stat">query cell <b id="qCell">–</b></div>
+      <div class="stat">cameras it attends to (hit views) <b id="qHit">–</b></div>
+      <div class="stat">cameras the truck appears in <b id="qTruck">–</b></div>
+      <div class="stat">challenge <b id="qChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> put the truck where it shows up in <b>3 cameras at once</b>: exactly the case per-camera detectors fumbled. Then place a query in a camera overlap zone so it pulls evidence from 2 views.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    The camera-to-BEV step is a question of <b>where each pixel's content lives in 3D</b>. IPM answers with an assumption (flat ground). Lift-Splat answers with a learned <i>probability over depth</i> per pixel and pushes features out. BEVFormer answers by letting each map cell <i>pull</i> evidence from the views that see it, across time. The output is the same: one metric top-down grid all cameras agree on, ready for detection, lanes and planning.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: rebuilding a room from witnesses</span>
+    <p>Six people stood around a room and each made a sketch from where they stood. IPM assumes everything they drew is on the floor: fine for the rug, absurd for the lamp. Lift-Splat asks each witness “how far away was each thing you drew? give odds” and pencils each item along their line of sight, darker where they were surer. BEVFormer walks around the floor plan square by square asking “who could see this square, and what did you see there?”, and remembers what was there a second ago.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>For a quick, honest IPM on a flat-ish road (parking, lane-keeping demos), OpenCV warps an image with a 3×3 homography from four point pairs. For learned BEV, start from the official repos: <b>lift-splat-shoot</b> (NVIDIA) and <b>BEVFormer</b> (with configs for nuScenes); <b>MMDetection3D</b> also has camera BEV models.</p>
+<pre><code><span class="k">import</span> cv2, numpy <span class="k">as</span> np
+
+<span class="c"># 4 road points in the image (pixels) and where they belong in a top-down image (pixels, 10 px = 1 m)</span>
+src = np.float32([[<span class="n">250</span>, <span class="n">210</span>], [<span class="n">390</span>, <span class="n">210</span>], [<span class="n">600</span>, <span class="n">350</span>], [<span class="n">40</span>, <span class="n">350</span>]])
+dst = np.float32([[<span class="n">165</span>, <span class="n">0</span>], [<span class="n">235</span>, <span class="n">0</span>], [<span class="n">235</span>, <span class="n">400</span>], [<span class="n">165</span>, <span class="n">400</span>]])
+H = cv2.getPerspectiveTransform(src, dst)              <span class="c"># 3×3 homography, valid only for the plane</span>
+bev = cv2.warpPerspective(frame, H, (<span class="n">400</span>, <span class="n">400</span>))           <span class="c"># everything off the road plane smears</span>
+
+<span class="c"># The same idea as geometry: shoot a pixel's ray and hit the plane z = 0</span>
+<span class="k">def</span> pixel_to_ground(u, v, K, R_cam_to_world, cam_height):
+    ray_cam = np.linalg.inv(K) @ np.array([u, v, <span class="n">1.0</span>])   <span class="c"># camera frame: z forward, x right, y down</span>
+    ray = R_cam_to_world @ ray_cam                         <span class="c"># world frame: x forward, y left, z up</span>
+    <span class="k">if</span> ray[<span class="n">2</span>] &gt;= <span class="n">0</span>: <span class="k">return</span> <span class="k">None</span>                            <span class="c"># at or above the horizon: never hits the ground</span>
+    t = cam_height / -ray[<span class="n">2</span>]
+    <span class="k">return</span> t * ray[:<span class="n">2</span>]                                   <span class="c"># (x forward, y left) in meters</span></code></pre>
+    <p class="hint">Check the homography by warping a frame with known lane width: if lanes splay or pinch in the BEV, the road isn't flat or the four points (the extrinsics) are off. The lab implements <code>pixel_to_ground</code> and its failure on a slope.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚘 Tesla</h4><p>BEV is the center of Tesla's publicly described stack. At AI Day 2021 it said: eight cameras feed a network that outputs a 3D “vector space” (lines, curbs, signs, lights, cars with position, orientation, depth, velocity); a transformer re-represents image features into the top-down output space, because a fixed projection fails on sloped roads and occlusion; a <b>feature queue</b> and a <b>video module</b> remember the scene over time and distance (pushing features every ~27 ms and every fixed distance travelled). Later talks put an occupancy network under it (Lesson 6.3).</p>
+        <p class="src">Sources: <a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a>, <a href="https://www.tesla.com/AI" target="_blank" rel="noopener">tesla.com/AI</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo doesn't need to guess depth from pixels alone: lidar measures it. Its Dec 2025 post describes a <b>Sensor Fusion Encoder</b> that fuses camera, lidar and radar over time into objects, semantics and rich embeddings for the rest of the driver. It also drives with its own detailed maps as prior knowledge. Its exact internal representation (BEV or otherwise) isn't published.</p>
+        <p class="src">Sources: <a href="https://waymo.com/blog/2025/12/demonstrably-safe-ai-for-autonomous-driving" target="_blank" rel="noopener">Waymo, Dec 2025</a>, <a href="https://waymo.com/blog/2020/09/the-waymo-driver-handbook-mapping" target="_blank" rel="noopener">Waymo maps (2020)</a></p></div>
+      <div><h4>🛸 Drones</h4><p>A drone has no ground plane to rely on: it flies over roofs, under bridges and through trees, so flat-ground IPM is rarely useful except for a downward camera over flat terrain. Skydio's X10 uses six navigation cameras for 360° coverage and, per Skydio, constantly maps its surroundings in 3D onboard rather than a 2D BEV. How its networks fuse views isn't published.</p>
+        <p class="src">Sources: <a href="https://www.skydio.com/x10" target="_blank" rel="noopener">Skydio X10</a>, <a href="https://www.skydio.com/autonomy" target="_blank" rel="noopener">Skydio autonomy</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> a camera-only car must <i>learn</i> geometry, so the view transform is the heart of its network. A lidar car gets geometry measured and uses BEV as a convenient common grid for fusion. A drone lives in full 3D, so a flat map is the wrong shape: it needs volumetric maps.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>IPM (flat ground)</td><td>No training, microseconds, exact on flat roads</td><td>Breaks with pitch, hills, bumps; anything above the road smears</td></tr>
+      <tr><td>Lift-Splat (push, depth distribution)</td><td>Keeps depth uncertainty; fuses any camera rig; simple to train</td><td>Memory ∝ bins × pixels × cameras; far objects smear along rays</td></tr>
+      <tr><td>BEVFormer (pull, attention)</td><td>Each cell picks its evidence; temporal memory; strong accuracy (56.9% NDS)</td><td>Heavier compute; needs good calibration for reference points</td></tr>
+      <tr><td>More depth bins / longer range</td><td>See farther, sharper depth</td><td>Memory and latency grow linearly with bins</td></tr>
+      <tr><td>Temporal BEV (past frames)</td><td>Remembers occluded objects; better velocity</td><td>Needs ego-motion; latency; errors can persist</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How do you get a bird's-eye view from cameras, and what breaks?” A strong answer:</p>
+    <ul>
+      <li>Explains why BEV (metric, shared across cameras, what the planner needs) with a number like “1 pixel row ≈ 1.7 m at 50 m”.</li>
+      <li>Derives <b>IPM</b> from the pinhole model and names its assumptions: flat ground, known pitch; quantifies a 1° pitch error at 40 m.</li>
+      <li>Contrasts <b>push</b> (Lift-Splat: per-pixel depth distribution, splat) with <b>pull</b> (BEVFormer: BEV queries, spatial cross-attention, temporal self-attention).</li>
+      <li>Mentions costs and checks: calibration drift, far-range smear, memory per depth bin, evaluation by distance band, and a lidar teacher for depth supervision.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Tesla's multi-camera vector space</b> <span class="tag co">🏢 Tesla · 2021</span> <a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">AI Day 2021</a></div>
+      <p><b>How:</b> image backbones per camera, a transformer that maps features into a top-down raster, a feature queue and spatial RNN video module.</p>
+      <p><b>Why this method:</b> per-camera predictions were “incredibly difficult” to fuse; a single top-down output space can be driven on directly.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Lift-Splat-Shoot</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/2008.05711" target="_blank" rel="noopener">Philion &amp; Fidler (NVIDIA)</a></div>
+      <p><b>How:</b> per-pixel categorical depth × features → frustum → sum-pool into a 200×200 BEV grid → BEV segmentation and planning cost maps.</p>
+      <p><b>Why this method:</b> works for an arbitrary camera rig, keeps depth uncertainty, and is end-to-end trainable.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>BEVFormer</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2203.17270" target="_blank" rel="noopener">Li et al.</a> · <a href="https://github.com/fundamentalvision/BEVFormer" target="_blank" rel="noopener">code</a></div>
+      <p><b>How:</b> grid-shaped BEV queries; spatial cross-attention into hit camera views; temporal self-attention with the previous BEV.</p>
+      <p><b>Why this method:</b> pull-style attention lets each map cell choose evidence; temporal memory sharpened velocity and recall in low visibility.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>IPM in lane-keeping and parking</b> <span class="tag hist">📜 History</span> <a href="https://docs.opencv.org/4.x/da/d54/group__imgproc__transform.html" target="_blank" rel="noopener">OpenCV geometric transforms</a></div>
+      <p><b>How:</b> a fixed homography warps the road into a top view; lane fitting happens there.</p>
+      <p><b>Why this method:</b> cheap and exact enough on flat highways and parking lots with a calibrated camera; its hill and pitch failures are why learned BEV took over.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 12-bit raw and 36 frames a second</span>
+    <p>In the same AI Day 2021 talk, Karpathy said the early networks processed each camera's 1280 × 960 image as <b>12-bit integers streaming at roughly 36 Hz</b> (<a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a>). Tesla later said its occupancy network takes <b>raw 12-bit photon counts</b> instead of processed images, for 16× more dynamic range (AI Day 2022): the network's view of the world starts before the image is even “pretty”.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>IPM is the pinhole model (2.1) run backwards with extrinsics (2.2); its fragility is why calibration and time sync (2.7) matter so much. The BEV grid is the same canvas lidar used in 6.1; 6.3 adds height to make it 3D occupancy, 6.4 reads lanes out of it, 6.5 tracks objects across its frames, and 6.6 stacks lidar and radar onto it. The matrix maths is <a href="../../math-course/phase2/2-matmul.html">matrix multiplication</a>; the attention in BEVFormer is <a href="../../math-course/phase8/4-attention.html">attention</a> in the Math course.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2008.05711" target="_blank" rel="noopener">Lift, Splat, Shoot (2020)</a>. The clearest paper on camera-to-BEV; section 3 is the whole trick.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2203.17270" target="_blank" rel="noopener">BEVFormer (2022)</a>. Figure 2 shows the reference-point pillars you just played with.</li>
+      <li><span class="kind">Talk</span> <a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a>. The vision section (about 49 min in) explains the move from per-camera to vector space.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A camera 1.2 m above a flat road has f = 1,000 px and looks straight ahead. A cone's base appears 40 px below the horizon row. How far away is it by IPM?</div>
+    <div class="opts"><button class="opt">12 m</button><button class="opt" data-ok>30 m</button><button class="opt">48 m</button></div>
+    <div class="explain">X = f · h ÷ (v − c<sub>y</sub>) = 1,000 × 1.2 ÷ 40 = <b>30 m</b>. If the camera were secretly pitched down by 1° (a 17 px shift at this focal length), the cone would appear only about 22 px below row c<sub>y</sub> and IPM would read about 53 m: always check the pitch.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your IPM lane detector works on the highway but in a hilly town the lanes in the top-down view splay outward and cars ahead appear much farther than radar says. Most likely cause?</div>
+    <div class="opts"><button class="opt">The camera's focal length changed</button><button class="opt" data-ok>The flat-ground assumption: uphill road appears higher in the image, so IPM overestimates distance and stretches the lanes sideways</button><button class="opt">The lane lines are painted wider in town</button></div>
+    <div class="explain">Uphill road sits higher in the image, so IPM reads it as farther, and sideways distance scales with that wrong distance. Fixes: estimate road slope or pitch online, or use a learned depth-aware view transform (Lift-Splat, BEVFormer) instead of a fixed homography.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A pixel could be the edge of a car at 40 m or the wall behind it at 55 m, with equal probability. What does Lift-Splat do with it?</div>
+    <div class="opts"><button class="opt">Puts the feature at the expected depth, about 47.5 m</button><button class="opt" data-ok>Spreads the feature along the ray by the predicted probabilities, so some lands near 40 m and some near 55 m, and later layers resolve it with context</button><button class="opt">Discards pixels with uncertain depth</button></div>
+    <div class="explain">LSS multiplies the feature by the depth distribution and splats every bin. The expected depth would put a ghost in the empty gap between car and wall; keeping both options is the point of a distribution.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Planning happens on the ground plane; images are perspective-squashed (1 pixel row ≈ 2 cm at 5 m but 1.7 m at 50 m). So convert every camera into one metric BEV grid.</li>
+      <li>IPM: X = f·h ÷ (v − c<sub>y</sub>). Exact on a flat road with known pitch; a 1° pitch error or a 4% hill turns 40 m into 75–86 m and splays lanes.</li>
+      <li>Lift-Splat: per-pixel depth distribution × features → splat into a 200×200, 0.5 m BEV; keeps uncertainty; memory grows with depth bins.</li>
+      <li>BEVFormer: BEV queries with 4-height reference pillars pull features from hit camera views (spatial cross-attention) and from the previous BEV (temporal self-attention); 56.9% NDS.</li>
+      <li>Tesla (AI Day 2021) predicts directly in a multi-camera vector space with a transformer and video module; Waymo fuses cameras with lidar and radar; drones need 3D maps, not flat BEV.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+  const DEG = Math.PI / 180;
+
+  // ---------- Playground 1: IPM ----------
+  // ==MODEL62==
+  const CAM={F:800,cx:320,cy:180,W:640,H:360};
+  function roadZ(x,g){const s=g.start;return x<=s?0:(g.grade*(x-s));}
+  function basis(phi){return {f:[Math.cos(phi),0,-Math.sin(phi)],r:[0,-1,0],d:[-Math.sin(phi),0,-Math.cos(phi)]};}
+  const dot3=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+  function project(P,h,phi){const B=basis(phi),d=[P[0],P[1],P[2]-h],zc=dot3(d,B.f);if(zc<0.1)return null;return [CAM.cx+CAM.F*dot3(d,B.r)/zc,CAM.cy+CAM.F*dot3(d,B.d)/zc];}
+  function ipm(uv,h,phi){const B=basis(phi),a=(uv[0]-CAM.cx)/CAM.F,b=(uv[1]-CAM.cy)/CAM.F,dir=[0,1,2].map(k=>B.f[k]+a*B.r[k]+b*B.d[k]);if(dir[2]>=-1e-6)return null;const t=h/(-dir[2]);return [t*dir[0],t*dir[1]];}
+  function ipmOf(x,y,s){const uv=project([x,y,roadZ(x,s.hill)],s.h,s.pitch);if(!uv||uv[1]<0||uv[1]>CAM.H)return null;return ipm(uv,s.h,s.assumed);}
+  function evalIPM(s){
+    const car=ipmOf(s.carX,0,s), w=X=>{const a=ipmOf(X,1.75,s),b=ipmOf(X,-1.75,s);return a&&b?Math.hypot(a[0]-b[0],a[1]-b[1]):null;};
+    return {carRange:car?car[0]:Infinity, w10:w(10), w40:w(40), w25:w(25)};
+  }
+  // ==END62==
+  const TRUE_PITCH = 1.2 * DEG;    // hidden: the loaded trunk tips the camera down
+  let revealed = false, ipS = null;
+  const state = () => ({ h: 1.5, carX: 40, pitch: TRUE_PITCH, assumed: +$("ipA").value * DEG, hill: { start: 20, grade: +$("ipG").value / 100 } });
+  const lift = () => $("ipLift").checked;
+  // depth-aware stand-in: knows each pixel's true depth up to ±3% noise (seeded)
+  const lr = Sim.rng(5), liftNoise = Array.from({ length: 400 }, () => 1 + 0.03 * Sim.randn(lr));
+  function estimate(x, y, s, k) { if (!lift()) return ipmOf(x, y, s); const n = liftNoise[k % 400]; return [x * n, y * n]; }
+  const CW = new Sim($("camCanvas"), { xRange: [0, 640], yRange: [0, 360] });
+  const toImg = uv => [uv[0], CAM.H - uv[1]];
+  CW.render(w => {
+    if (!ipS) return;
+    const s = ipS; w.clear();
+    // sky and ground split at the true horizon row
+    const hz = CAM.cy - CAM.F * Math.tan(s.pitch);
+    w.rect(0, CAM.H - hz, 640, hz, { fill: "--c-se", alpha: 0.08 });
+    w.rect(0, 0, 640, CAM.H - hz, { fill: "--c-mp", alpha: 0.08 });
+    const xs = []; for (let x = 3; x <= 160; x += x < 30 ? 0.5 : 2) xs.push(x);
+    const edge = y => xs.map(x => project([x, y, roadZ(x, s.hill)], s.h, s.pitch)).filter(Boolean).map(toImg);
+    const L = edge(5.25), R = edge(-5.25);
+    if (L.length > 1 && R.length > 1) w.line([...L, ...R.reverse()], { fill: "--muted", alpha: 0.28, close: true });
+    [5.25, -5.25].forEach(y => w.line(edge(y), { color: "--text", width: 2, alpha: 0.8 }));
+    [1.75, -1.75].forEach(y => { for (let x = 4; x < 150; x += 9) { const a = project([x, y, roadZ(x, s.hill)], s.h, s.pitch), b = project([x + 3, y, roadZ(x + 3, s.hill)], s.h, s.pitch); if (a && b) w.line([toImg(a), toImg(b)], { color: "--text", width: 2 }); } });
+    // the car: a 4.5 x 1.8 x 1.5 box sitting on the road at x = 40
+    const z0 = roadZ(40, s.hill), P = (x, y, z) => project([x, y, z0 + z], s.h, s.pitch);
+    const back = [P(40, 0.9, 0), P(40, -0.9, 0), P(40, -0.9, 1.5), P(40, 0.9, 1.5)];
+    if (back.every(Boolean)) {
+      const top = [P(40, 0.9, 1.5), P(40, -0.9, 1.5), P(44.5, -0.9, 1.5), P(44.5, 0.9, 1.5)];
+      if (top.every(Boolean)) w.line(top.map(toImg), { fill: "--c-ag", alpha: 0.35, close: true });
+      w.line(back.map(toImg), { fill: "--c-ag", alpha: 0.75, close: true });
+      const c = P(40, 0, 0); if (c) w.dot(toImg(c), { color: "--c-un", r: 4 });
+    }
+        w.line([[0, CAM.H - hz], [640, CAM.H - hz]], { color: "--muted", width: 1, dash: [4, 4] });
+  });
+  const BW = new Sim($("bevCanvas"), { xRange: [0, 100], yRange: [-12, 12], grid: 10 });
+  BW.render(w => {
+    if (!ipS) return;
+    const s = ipS; w.clear();
+    [5.25, 1.75, -1.75, -5.25].forEach(y => w.line([[0, y], [100, y]], { color: "--muted", width: 1.5, dash: y === 5.25 || y === -5.25 ? [] : [6, 6], alpha: 0.8 }));
+    w.rect(40, -0.9, 4.5, 1.8, { stroke: "--muted", width: 1.5 });
+    let k = 0;
+    [5.25, 1.75, -1.75, -5.25].forEach(y => { for (let x = 4; x <= 80; x += 2) { const e = estimate(x, y, s, k++); if (e && e[0] < 100 && Math.abs(e[1]) < 12) w.dot([e[0], e[1]], { color: "--c-se", r: 2.2 }); } });
+    const c = estimate(40, 0, s, 7);
+    if (c && c[0] < 100) { w.rect(c[0], c[1] - 0.9, 4.5, 1.8, { fill: "--c-ag", alpha: 0.55 }); }
+    else w.text([95, 0], "car → beyond 100 m", { color: "--c-ag", size: 11, align: "right", bold: true });
+    w.car({ x: -1.2, y: 0, th: 0 }, { color: "--c-be", L: 2.4 });
+    if (s.hill.grade) { w.line([[20, -12], [20, 12]], { color: "--c-un", width: 1.5, dash: [3, 4] }); w.text([21, 10.8], (s.hill.grade > 0 ? "uphill" : "downhill") + " starts", { color: "--c-un", size: 10, align: "left" }); }
+  });
+  function refreshIPM() {
+    ipS = state();
+    $("ipAV").textContent = (+$("ipA").value).toFixed(2) + "°" + (revealed ? " (true 1.20°)" : "");
+    $("ipGV").textContent = (+$("ipG").value > 0 ? "+" : "") + $("ipG").value + "%";
+    let r = evalIPM(ipS);
+    if (lift()) r = { carRange: 40 * liftNoise[7], w10: 3.5 * liftNoise[11], w40: 3.5 * liftNoise[23] };
+    const show = (v, d) => (v == null || !isFinite(v) ? "off the image" : v > 300 ? "> 300 m" : fmt(v, d) + " m");
+    $("ipR").textContent = show(r.carRange, 1); $("ipW10").textContent = show(r.w10, 2); $("ipW40").textContent = show(r.w40, 2);
+    const ok = r.carRange != null && Math.abs(r.carRange - 40) <= 1 && r.w10 != null && Math.abs(r.w10 - 3.5) <= 0.1 && r.w40 != null && Math.abs(r.w40 - 3.5) <= 0.1;
+    const g = +$("ipG").value;
+    $("ipChal").innerHTML = ok
+      ? (lift() ? `<span class="badge-win">✅ learned depth: no ground assumption</span>` : g === 0 ? `<span class="badge-win">✅ calibrated: lanes parallel, car at ${fmt(r.carRange, 1)} m</span>` : `<span class="badge-win">✅ IPM got lucky on this hill</span>`)
+      : `<span class="badge-lose">${g !== 0 && !lift() ? "flat-ground IPM on a hill" : "not calibrated yet"}</span>`;
+    CW.render(); BW.render();
+  }
+  ["ipA", "ipG"].forEach(id => ($(id).oninput = refreshIPM));
+  $("ipLift").onchange = refreshIPM;
+  $("ipReveal").onclick = () => { revealed = true; refreshIPM(); };
+  refreshIPM();
+
+  // ---------- Playground 2: Lift-Splat bins ----------
+  // ==MODEL62B==
+  function lssBins(dmin,dmax,step){const b=[];for(let d=dmin;d<dmax-1e-9;d+=step)b.push(+d.toFixed(3));return b;}   // like arange(dmin, dmax, step)
+  function lssDist(bins,dTrue,sigma){
+    const w=bins.map(d=>Math.exp(-0.5*((d-dTrue)/sigma)**2)),s=w.reduce((a,b)=>a+b,0)||1;return w.map(v=>v/s);}
+  function mixDist(bins,mix){const w=bins.map(d=>mix.reduce((a,[m,wt])=>a+wt*Math.exp(-0.5*((d-m)/(0.05*m))**2),0)),s=w.reduce((a,b)=>a+b,0)||1;return w.map(v=>v/s);}
+  function lssEval(o){
+    const bins=lssBins(4,o.dmax,o.step);
+    const obj=(o.ambig?[{name:"car",d:40,mix:[[40,0.5],[55,0.5]]}]:[{name:"car",d:40},{name:"truck",d:62}]).map(t=>{
+      const inRange=t.d<=bins[bins.length-1]+o.step/2, sig=0.05*t.d, p=t.mix?mixDist(bins,t.mix):lssDist(bins,t.d,sig);
+      const band=inRange?bins.reduce((a,d,i)=>a+(Math.abs(d-t.d)<=2?p[i]:0),0):0;
+      const exp=bins.reduce((a,d,i)=>a+d*p[i],0);
+      return {...t,p,band,exp,inRange};});
+    const memMB=6*16*44*bins.length*64*4/1e6;
+    return {bins,obj,memMB,nb:bins.length};
+  }
+  // ==END62B==
+  let ls = null;
+  const LB = new Sim($("lssBev"), { xRange: [-2, 92], yRange: [-3, 4.8] });
+  LB.render(w => {
+    if (!ls) return;
+    w.clear();
+    w.car({ x: -1.5, y: 0, th: 0 }, { color: "--c-be", L: 2.2 });
+    const draw = (o, y, col) => {
+      const mx = Math.max(...o.p);
+      ls.bins.forEach((d, i) => w.rect(d - ls.step / 2, y - 0.45, ls.step, 0.9, { fill: col, alpha: 0.08 + 0.9 * o.p[i] / mx }));
+      if (!o.mix) w.line([[o.d, y - 0.8], [o.d, y + 0.8]], { color: "--text", width: 2 });
+      else o.mix.forEach(([m]) => w.line([[m, y - 0.8], [m, y + 0.8]], { color: "--text", width: 2 }));
+      w.dot([o.exp, y], { color: "--c-un", r: 5 });
+    };
+    w.line([[ls.bins[ls.bins.length - 1] + ls.step / 2, -2.8], [ls.bins[ls.bins.length - 1] + ls.step / 2, 4.5]], { color: "--bad", width: 1.5, dash: [4, 4] });
+    w.text([ls.bins[ls.bins.length - 1] + ls.step / 2 + 0.8, 4.0], "max depth", { color: "--bad", size: 10, align: "left" });
+    draw(ls.obj[0], 2.4, "--c-be"); w.text([1, 2.4], ls.obj[0].mix ? "edge pixel" : "car pixel", { color: "--muted", size: 10, align: "left" });
+    if (ls.obj[1]) { draw(ls.obj[1], -0.6, "--c-be"); w.text([1, -0.6], "truck pixel", { color: "--muted", size: 10, align: "left" }); }
+    w.text([46, -2.4], "black tick = true depth · gold dot = expected depth · darker = more feature splatted", { color: "--muted", size: 10 });
+  });
+  function refreshLSS() {
+    const dmax = +$("lsMax").value, step = +$("lsStep").value, ambig = $("lsAmb").checked;
+    $("lsMaxV").textContent = dmax + " m"; $("lsStepV").textContent = step.toFixed(2) + " m";
+    ls = lssEval({ dmax, step, ambig }); ls.step = step;
+    const series = ls.obj.map((o, i) => ({ label: o.mix ? "ambiguous pixel" : o.name + " pixel (true " + o.d + " m)", color: MX.css(i ? "--c-ag" : "--c-be"), data: ls.bins.map((d, k) => [d, o.p[k]]), width: 2.5, dots: true }));
+    Plot.line($("lssChart"), { series, xMin: 0, xMax: 92, yMin: 0, xLabel: "depth bin (m)", yLabel: "probability" });
+    $("lsN").textContent = ls.nb; $("lsMem").textContent = fmt(ls.memMB, 1) + " MB";
+    const c = ls.obj[0];
+    $("lsCar").textContent = fmt(100 * c.band, 0) + "% / " + fmt(c.exp, 1) + " m";
+    const t = ls.obj[1];
+    $("lsTruck").innerHTML = !t ? "–" : t.inRange ? fmt(100 * t.band, 0) + "%" : "❌ out of range";
+    const win = t && t.inRange && ls.memMB <= 48 && step <= 1.5;
+    $("lsChal").innerHTML = ambig ? `<span class="muted">expected depth ${fmt(c.exp, 1)} m is empty space</span>` : win ? `<span class="badge-win">✅ truck seen, ${fmt(ls.memMB, 1)} MB</span>`
+      : `<span class="badge-lose">${!t.inRange ? "truck out of range" : ls.memMB > 48 ? "over 48 MB" : "bins too coarse"}</span>`;
+    LB.render();
+  }
+  ["lsMax", "lsStep"].forEach(id => ($(id).oninput = refreshLSS));
+  $("lsAmb").onchange = refreshLSS;
+  refreshLSS();
+
+  // ---------- Playground 3: BEV query → camera views ----------
+  const CAMS = [ // illustrative 6-camera rig: yaw (deg), horizontal FOV (deg), mount point on the car
+    { name: "front", yaw: 0, fov: 70, at: [1.5, 0] }, { name: "front-left", yaw: 55, fov: 70, at: [1.2, 0.8] }, { name: "front-right", yaw: -55, fov: 70, at: [1.2, -0.8] },
+    { name: "rear-left", yaw: 110, fov: 70, at: [-1.0, 0.8] }, { name: "rear-right", yaw: -110, fov: 70, at: [-1.0, -0.8] }, { name: "rear", yaw: 180, fov: 110, at: [-2.0, 0] }];
+  const HEIGHTS = [0.5, 1.5, 2.5, 3.5], CAMH = 1.6;
+  let query = [14, 6], truck = { x: 18, y: -6, th: 0 }, dragT = null;
+  function seen(c, p) { // returns [u in 0..1, v in 0..1] if camera c sees ground point p at height z
+    const dx = p[0] - c.at[0], dy = p[1] - c.at[1], a = Sim.wrap(Math.atan2(dy, dx) - c.yaw * DEG), half = c.fov * DEG / 2;
+    const fwd = Math.hypot(dx, dy) * Math.cos(a);
+    if (Math.abs(a) > half || fwd < 0.5) return null;
+    const u = 0.5 - Math.tan(a) / (2 * Math.tan(half)), v = 0.5 - ((p[2] ?? 0) - CAMH) / fwd * (0.5 / Math.tan(half)) * 1.6;
+    return v < 0 || v > 1 ? null : [u, v];
+  }
+  const truckCorners = () => { const c = Math.cos(truck.th), s = Math.sin(truck.th); const out = []; [[-6, -1.25], [6, -1.25], [6, 1.25], [-6, 1.25], [0, -1.25], [0, 1.25], [-3, 1.25], [3, 1.25], [-3, -1.25], [3, -1.25]].forEach(([u, v]) => [0.2, 3].forEach(z => out.push([truck.x + u * c - v * s, truck.y + u * s + v * c, z]))); return out; };
+  const QB = new Sim($("qBev"), { xRange: [-32, 32], yRange: [-18, 18], grid: 5, onPointer(type, [x, y]) {
+    if (type === "down") { if (Math.hypot(x - truck.x, y - truck.y) < 4) dragT = [truck.x - x, truck.y - y]; else { query = [x, y]; refreshQ(); } }
+    else if (type === "drag" && dragT) { truck.x = x + dragT[0]; truck.y = y + dragT[1]; refreshQ(); }
+    else if (type === "up") dragT = null;
+  } });
+  QB.render(w => {
+    w.clear();
+    CAMS.forEach((c, i) => { const r = 30, a0 = (c.yaw - c.fov / 2) * DEG, a1 = (c.yaw + c.fov / 2) * DEG, pts = [c.at]; for (let k = 0; k <= 12; k++) { const a = a0 + (a1 - a0) * k / 12; pts.push([c.at[0] + r * Math.cos(a), c.at[1] + r * Math.sin(a)]); }
+      w.line(pts, { fill: "--c-se", alpha: 0.07, close: true }); w.line(pts, { color: "--c-se", width: 1, alpha: 0.35, close: true });
+      w.text([c.at[0] + 24 * Math.cos(c.yaw * DEG), c.at[1] + 24 * Math.sin(c.yaw * DEG)], c.name, { color: "--c-se", size: 10 }); });
+    w.car({ x: -2.2, y: 0, th: 0 }, { color: "--c-be", L: 3.4, width: 1.9 });
+    const tc = truckCorners();
+    w.rect(truck.x, truck.y, 12, 2.5, { fill: "--c-ag", alpha: 0.7, center: true, angle: truck.th });
+    w.text([truck.x, truck.y + 2.6], "truck (drag me)", { color: "--c-ag", size: 10 });
+    w.rect(query[0], query[1], 1.2, 1.2, { fill: "--c-un", alpha: 0.9, center: true });
+    w.text([query[0], query[1] - 1.6], "query", { color: "--c-un", size: 10, bold: true });
+  });
+  const QS = new Sim($("qStrip"), { xRange: [0, 6], yRange: [0, 1.25] });
+  QS.render(w => {
+    w.clear();
+    const tc = truckCorners();
+    CAMS.forEach((c, i) => {
+      w.rect(i + 0.03, 0.03, 0.94, 0.94, { stroke: "--line", width: 1 });
+      w.text([i + 0.5, 1.1], c.name, { color: "--c-se", size: 11 });
+      w.line([[i + 0.03, 0.5], [i + 0.97, 0.5]], { color: "--muted", width: 1, dash: [3, 3], alpha: 0.6 });
+      const tp = tc.map(p => seen(c, p)).filter(Boolean);
+      if (tp.length) { const us = tp.map(q => q[0]), vs = tp.map(q => q[1]); w.rect(i + 0.03 + 0.94 * Math.min(...us), 1 - (0.03 + 0.94 * Math.max(...vs)), 0.94 * (Math.max(...us) - Math.min(...us)) + 0.01, 0.94 * (Math.max(...vs) - Math.min(...vs)) + 0.01, { fill: "--c-ag", alpha: 0.5 }); }
+      HEIGHTS.forEach(z => { const q = seen(c, [query[0], query[1], z]); if (q) w.dot([i + 0.03 + 0.94 * q[0], 1 - (0.03 + 0.94 * q[1])], { color: "--c-un", r: 4 }); });
+    });
+  });
+  function refreshQ() {
+    const hits = CAMS.filter(c => HEIGHTS.some(z => seen(c, [query[0], query[1], z])));
+    const tc = truckCorners(), tcams = CAMS.filter(c => tc.some(p => seen(c, p)));
+    $("qCell").textContent = `x ${fmt(query[0], 1)} m, y ${fmt(query[1], 1)} m`;
+    $("qHit").textContent = hits.length ? hits.length + " (" + hits.map(c => c.name).join(", ") + ")" : "0: blind spot";
+    $("qTruck").textContent = tcams.length + (tcams.length ? " (" + tcams.map(c => c.name).join(", ") + ")" : "");
+    const win = tcams.length >= 3;
+    $("qChal").innerHTML = win ? `<span class="badge-win">✅ truck in ${tcams.length} cameras${hits.length >= 2 ? ", query in 2+ views" : ""}</span>` : `<span class="muted">truck in ${tcams.length} camera${tcams.length === 1 ? "" : "s"}</span>`;
+    QB.render(); QS.render();
+  }
+  refreshQ();
+})();
+</script>
+</body>
+</html>

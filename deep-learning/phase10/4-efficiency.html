@@ -1,0 +1,462 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10.4 Efficiency: quantization, pruning, distillation · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  canvas.qh { width: 100%; height: 220px; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  .dbars { display: grid; gap: 6px; font-size: .86rem; }
+  .dbar { display: grid; grid-template-columns: 64px 1fr 190px; gap: 8px; align-items: center; }
+  .dbar .tr { position: relative; height: 22px; background: var(--panel); border-radius: 6px; overflow: hidden; }
+  .dbar .tr i { position: absolute; left: 0; height: 50%; display: block; border-radius: 0 4px 4px 0; }
+  .dbar .tr i.t { top: 0; background: var(--c-y); } .dbar .tr i.s { bottom: 0; background: var(--c-ac); }
+  .dbar .num { font-family: var(--mono); font-size: .8rem; color: var(--muted); }
+</style>
+</head>
+<body data-lesson="d10-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 10 · Lesson 4</div>
+  <h1>Efficiency: quantization, pruning, distillation</h1>
+  <p class="subtitle">Three ways to make a trained model smaller and faster: store its numbers in fewer bits, delete the weights it doesn't need, or teach a small model to imitate it. Each one has a sweet spot and a cliff.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>LLM decoding is <b>memory-bound</b>: speed ≈ bytes of weights read per token ÷ bandwidth (Lesson 10.1).</li>
+      <li>Floats trade range for precision; scaling factors move a tensor into a format's sweet spot (Lesson 10.2).</li>
+      <li>Softmax with a temperature T: divide the logits by T before softmax; higher T means flatter probabilities (Lesson 0.6, <a href="../../math-course/phase8/2-softmax.html">math 8.2</a>).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Fine-tuning a 65-billion-parameter model normally needs more than <b>780 GB</b> of GPU memory. In 2023 the QLoRA paper did it on <b>a single 48 GB GPU</b>, “while preserving full 16-bit finetuning task performance”, by storing the frozen model in a new 4-bit format.</p>
+    <p>A year earlier, GPTQ compressed 175B-parameter GPT models to <b>3 or 4 bits per weight</b> in about four GPU-hours with negligible accuracy loss. And in 2019, DistilBERT made BERT <b>40% smaller and 60% faster</b> while keeping 97% of its language-understanding scores.</p>
+    <p>Every phone keyboard, on-device photo search and cheap LLM API you use relies on tricks like these. <b>How can you throw away 75% of the bits, or half the weights, and lose almost nothing?</b> And when do you lose everything?</p>
+  </div>
+
+  <h2>Numbers first: bytes are speed</h2>
+  <table>
+    <tr><th>A 70B model's weights in…</th><th>Memory</th><th>Fits on</th><th>Relative decoding speed (memory-bound)</th></tr>
+    <tr><td>bf16 (2 bytes)</td><td>140 GB</td><td>2 × 80 GB GPUs</td><td>1×</td></tr>
+    <tr><td>int8 (1 byte)</td><td>70 GB</td><td>1 × 80 GB</td><td>up to ≈ 2×</td></tr>
+    <tr><td>int4 (½ byte)</td><td>35 GB</td><td>1 × 48 GB, or a big laptop</td><td>up to ≈ 4×</td></tr>
+  </table>
+  <p>Because generating one token reads every weight once (Lesson 10.1), halving the bytes roughly halves the time per token, as long as the kernels can unpack the small numbers fast. The challenge is doing it without destroying the model.</p>
+
+  <h2>1. Quantization: round to a small grid</h2>
+  <p>To store a weight in 8 bits, pick a <b>scale</b> s and store the integer q = round(<span class="w">w</span> / s), clamped to −128…127. To use it, multiply back: <span class="w">w</span> ≈ q · s. With symmetric quantization, s = max |w| ÷ 127, so the biggest weight maps to 127. (Asymmetric quantization adds a <b>zero-point</b> offset so a range like 0…6 uses all 256 levels; it's common for activations after ReLU.)</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: four weights to int8 and int4</span>
+    <p>Weights [0.50, −0.12, 0.03, −0.81]. Largest magnitude 0.81.</p>
+    <table>
+      <tr><th></th><th>Scale s</th><th>Integers</th><th>Back to floats</th><th>Worst error</th></tr>
+      <tr><td>int8 (−127…127)</td><td>0.81 / 127 = 0.00638</td><td>[78, −19, 5, −127]</td><td>[0.498, −0.121, 0.032, −0.810]</td><td class="ev">0.002</td></tr>
+      <tr><td>int4 (−7…7)</td><td>0.81 / 7 = 0.116</td><td>[4, −1, 0, −7]</td><td>[0.463, −0.116, 0, −0.810]</td><td class="dead">0.037; 0.03 became 0</td></tr>
+    </table>
+    <p>Now imagine one weight in the tensor is 4.0 instead. The int4 scale becomes 0.57, and <b>every</b> weight smaller than 0.29 rounds to zero. One outlier ruins its whole group. That's the central problem of quantization.</p>
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: one ruler for the whole class photo</span>
+    <p>Measure everyone in a class with a ruler marked only every 10 cm and the kids blur together. Now add the basketball coach to the photo and re-mark the ruler to reach his height: the kids all read “0 to 1 mark”. The fix is to give each row of kids its own ruler (per-channel), or every small group its own ruler (per-group).</p>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> the matrix below has 8 output channels with very different spreads, plus two outlier weights. At 4 bits with a <b>single</b> scale for the whole tensor, how many distinct levels do you think the smallest channel gets?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Quantizer: bits, groups and outliers</span>
+    <p class="hint">8 channels × 64 weights (seeded). The histogram shows one channel's weights; the vertical lines are the levels its quantizer can output. The error is the average over channels of ‖w − q‖ / ‖w‖, so small channels count as much as big ones. Scales are stored as 16-bit numbers and counted in “effective bits”.</p>
+    <div class="goals"><span class="goal" id="gQ8">🎯 int8 below 1% error</span><span class="goal" id="gQ4">🎯 4-bit with outliers, error under 10%</span><span class="goal" id="gQbad">🎯 Watch a channel collapse to a single level</span></div>
+    <div class="controls">
+      <label>bits <input type="range" id="qB" min="2" max="8" step="1" value="4"> <b class="mono" id="qBV"></b></label>
+      <span class="seg" id="qMode"><button data-v="tensor" class="on">per-tensor</button><button data-v="channel">per-channel</button><button data-v="group">per-group (16 weights)</button></span>
+      <label><input type="checkbox" id="qOut" checked> 2 outlier weights</label>
+    </div>
+    <div class="controls">
+      <label>show channel <input type="range" id="qC" min="1" max="8" step="1" value="1"> <b class="mono" id="qCV"></b></label>
+    </div>
+    <canvas class="qh" id="qCan"></canvas>
+    <div class="stat-row">
+      <div class="stat">distinct values left in this channel <b id="qLv">–</b></div>
+      <div class="stat">this channel's error <b id="qCe">–</b></div>
+      <div class="stat">average error <b id="qE">–</b></div>
+      <div class="stat">effective bits / weight <b id="qEb" class="w">–</b></div>
+      <div class="stat">a 7B model would take <b id="qMem">–</b></div>
+    </div>
+    <p class="hint" id="qMsg"></p>
+  </div>
+  <p><b>What you should see:</b> per-tensor 4-bit with the outliers: about <b>65% average error</b>, and channel 1 (the smallest) lands entirely on the level 0. Per-channel: 13%. Per-group of 16: <b>9%</b>, at the price of 5 effective bits instead of 4 (one 16-bit scale per 16 weights; real kernels use groups of 64–128 to pay only 0.1–0.25 extra bits). At 8 bits even per-channel is under 1%. This is why int8 is “almost free” and int4 needs clever grouping.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Quantization (int8 / int4, per-channel and per-group)</span></span>
+    <ol>
+      <li><b>The problem before</b> A 70B model in bf16 is 140 GB, and decoding speed is limited by reading those bytes. Phones and laptops have a few GB to spare.</li>
+      <li><b>What people tried</b> Smaller models (worse quality); per-tensor int8 for CNNs, which worked for many vision models. Jacob et al. (Google, 2017) showed integer-only inference on phones and <b>training with simulated quantization</b> to recover accuracy.</li>
+      <li><b>Why this works</b> Trained weights are mostly bell-shaped and the network tolerates small noise, so 256 levels per channel lose very little (our playground: under 1%). Finer groups give each slice its own ruler. For LLMs, <b>LLM.int8()</b> keeps the rare outlier feature dimensions (which appear in all layers from about 6.7B parameters) in 16-bit; <b>GPTQ</b> rounds weights one at a time and nudges the not-yet-rounded ones to cancel the error, using second-order (curvature) information; <b>AWQ</b> finds the ~1% of salient weight channels from activation statistics and scales them up before rounding; <b>SmoothQuant</b> moves activation outliers into the weights so both can be int8.</li>
+      <li><b>What it costs, when it fails</b> Below 4 bits quality drops fast; outliers, small models and activations are harder than big models' weights. Speed-ups need kernels for the format (otherwise you just dequantize and save only memory). Post-training quantization (PTQ) needs a small calibration set; quantization-aware training (QAT) recovers more accuracy but costs a training run.</li>
+      <li><b>What refined it</b> 4-bit NormalFloat (NF4, QLoRA), whose levels are spaced for normally distributed weights, plus “double quantization” of the scales (about 0.37 bits per parameter saved); hardware block formats (MXFP4, NVFP4, Lesson 10.2); and quantized LLM serving in practice (<a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a>).</li>
+    </ol>
+  </div>
+
+  <table>
+    <tr><th>Method</th><th>When</th><th>Key idea</th></tr>
+    <tr><td>PTQ, round to nearest</td><td>after training, minutes</td><td>pick scales from the weights (and calibration data for activations)</td></tr>
+    <tr><td>QAT (quantization-aware training)</td><td>during training/fine-tuning</td><td>simulate rounding in the forward pass so the weights learn to tolerate it</td></tr>
+    <tr><td>LLM.int8()</td><td>LLMs, int8 inference</td><td>outlier feature dimensions kept in 16-bit</td></tr>
+    <tr><td>GPTQ</td><td>LLMs, 3–4-bit weights</td><td>round one weight at a time, update the rest to compensate (second-order)</td></tr>
+    <tr><td>AWQ</td><td>LLMs, 4-bit weights</td><td>protect salient channels found from activations by scaling</td></tr>
+    <tr><td>QLoRA (NF4)</td><td>fine-tuning big models on small GPUs</td><td>frozen 4-bit base + 16-bit LoRA adapters</td></tr>
+  </table>
+
+  <h2>2. Pruning: delete the weights that don't matter</h2>
+  <p>Many weights are close to zero. <b>Magnitude pruning</b> zeroes the smallest ones and (usually) fine-tunes the rest to recover. The question is <i>which pattern</i> of zeros, because hardware only runs faster for some patterns:</p>
+  <ul>
+    <li><b>Unstructured</b>: any weights can be zero. Most accurate for a given sparsity, but a dense GPU kernel still multiplies the zeros. Saves storage (with sparse formats), rarely time.</li>
+    <li><b>Structured</b>: remove whole output channels, attention heads or layers. The matmul literally gets smaller, so it's faster everywhere, but it hurts accuracy more.</li>
+    <li><b>2:4 semi-structured</b>: in every group of 4 consecutive weights, exactly 2 are zero. NVIDIA's Sparse Tensor Cores (A100 onward) skip them: twice the math throughput of dense, with accuracy kept by their retraining workflow.</li>
+  </ul>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Prune a layer three ways</span>
+    <p class="hint">An 8 × 8 weight matrix (orange/blue = sign and size; grey = pruned). Output error is measured on 200 random inputs <i>before</i> any fine-tuning. Speed-up is what typical GPU hardware can actually turn into time.</p>
+    <div class="goals"><span class="goal" id="gP1">🎯 Remove half the weights with the least error</span><span class="goal" id="gP2">🎯 Get the 2× sparse-tensor-core speed-up</span><span class="goal" id="gP3">🎯 Make the matmul itself 2× smaller</span></div>
+    <div class="controls">
+      <span class="seg" id="pMode"><button data-v="unstr" class="on">Unstructured (smallest |w|)</button><button data-v="24">2:4 semi-structured</button><button data-v="rows">Structured (whole rows)</button></span>
+      <label>sparsity <input type="range" id="pS" min="0" max="0.875" step="0.125" value="0.5"> <b class="mono" id="pSV"></b></label>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="sq" id="pCan"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">weights zeroed <b id="pZ">–</b></div>
+          <div class="stat">weight “energy” kept (Σw²) <b id="pK">–</b></div>
+          <div class="stat">output error, before fine-tuning <b id="pE" class="dead">–</b></div>
+          <div class="stat">GPU speed-up <b id="pSp" class="ev">–</b></div>
+        </div>
+        <p class="hint" id="pMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> at 50% sparsity, unstructured pruning keeps 97% of the weight energy and gives a 17% output error; 2:4 gives 25% (it can't choose freely within each group of 4) but runs up to 2× faster on sparse tensor cores; removing 4 whole rows gives 34% and a matmul that's genuinely half the size. Accuracy, speed and flexibility pull in different directions. (Fine-tuning after pruning recovers much of the error in real models.)</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Structured and 2:4 pruning</span></span>
+    <ol>
+      <li><b>The problem before</b> Unstructured pruning can remove 90% of weights (Han et al.'s Deep Compression pipeline pruned AlexNet's connections 9× and cut its storage 35×, from 240 MB to 6.9 MB, with no accuracy loss), but GPUs run dense matmuls: scattered zeros save storage and little time.</li>
+      <li><b>What people tried</b> Sparse matrix kernels, which only win at very high sparsity and lose arithmetic intensity (Lesson 10.1).</li>
+      <li><b>Why this works</b> Removing whole channels or heads leaves a smaller <i>dense</i> model, which every library speeds up. The 2:4 pattern is a hardware deal: a fixed, regular pattern the Sparse Tensor Cores skip, giving 2× math throughput while NVIDIA's workflow (prune, then retrain) kept accuracy across many tasks.</li>
+      <li><b>What it costs, when it fails</b> Structured pruning hurts accuracy more per removed weight; 2:4 is capped at exactly 50% and needs retraining and supported kernels; savings in matmuls don't shrink memory-bound parts. For LLMs, quantization usually gives more speed per point of quality lost.</li>
+      <li><b>What refined it</b> The lottery ticket hypothesis (below) explains why sparse subnetworks can train well; one-shot LLM pruning methods; and distillation to recover accuracy after structured pruning.</li>
+    </ol>
+  </div>
+
+  <div class="box research">
+    <span class="label">🧪 The lottery ticket hypothesis</span>
+    <p>Frankle and Carbin (2019) pruned trained networks, then <b>reset the surviving weights to their original initial values</b> and retrained only that sparse subnetwork. It trained as well as the full network, often faster. They consistently found such “winning tickets” at 10–20% (or less) of the original size for the MNIST and CIFAR-10 networks they studied. Give the same sparse network fresh random initial values and it learns slower and ends up far worse: the lucky initialization matters.</p>
+  </div>
+
+  <h2>3. Distillation: a small student learns from a big teacher</h2>
+  <p>The third trick changes the model's size directly: train a <b>small student</b> to imitate a <b>big teacher</b>. The key insight (Hinton, Vinyals and Dean, 2015) is to imitate the teacher's <i>full probability list</i>, not just its top answer. Their example: an image of a BMW has only a tiny chance of being mistaken for a garbage truck, but that's still many times more likely than mistaking it for a carrot. Those tiny ratios encode what the teacher knows about which classes are similar, knowledge nicknamed “dark knowledge”.</p>
+  <p>At temperature 1 those small probabilities are nearly invisible: they are so close to zero that they barely affect the loss. Raising the temperature T softens the distribution and lets them speak.</p>
+  <p class="predict">🔮 <b>Predict:</b> the teacher sees a cat. At T = 1 it says “cat” with 94%. As you raise T, which class gains the most: dog, or the four others equally?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Temperature reveals dark knowledge</span>
+    <p class="hint">Green = the teacher's soft targets softmax(z / T); purple = a small student's predictions at the same T. The hard label is just “cat = 1, everything else 0”. The loss combines both: α · CE(label, student) + (1 − α) · T² · KL(teacher ‖ student).</p>
+    <div class="goals"><span class="goal" id="gD1">🎯 Non-cat classes carry ≥ 40% while cat stays on top</span><span class="goal" id="gD2">🎯 Too hot: targets nearly uniform (≥ 95% of max entropy)</span><span class="goal" id="gD3">🎯 See the raw KL shrink while T²·KL holds up</span></div>
+    <div class="controls">
+      <label>temperature T <input type="range" id="dT" min="0.5" max="20" step="0.5" value="1"> <b class="mono" id="dTV"></b></label>
+    </div>
+    <div class="dbars" id="dBars"></div>
+    <div class="stat-row">
+      <div class="stat">probability on non-cat classes <b id="dRest" class="y">–</b></div>
+      <div class="stat">entropy of soft targets <b id="dH">–</b></div>
+      <div class="stat">“dog is __× likelier than truck” <b id="dRatio">–</b></div>
+      <div class="stat">KL(teacher ‖ student) <b id="dKL" class="ls">–</b></div>
+      <div class="stat">T² · KL <b id="dKL2" class="ls">–</b></div>
+    </div>
+    <p class="hint" id="dMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at T = 1 the non-cat classes share only 6%, almost nothing for the student to learn from beyond the hard label. At T = 4 they carry 53%: dog 22%, fox 17%, and the vehicles and banana about 3–6% each. The teacher is now saying “cats look like dogs and foxes, not like trucks”. At T = 20 everything flattens toward 1/6 and the signal fades again. The raw KL also shrinks as T grows (gradients scale as 1/T²), which is why Hinton et al. multiply the soft loss by T².</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Knowledge distillation with soft targets</span></span>
+    <ol>
+      <li><b>The problem before</b> The best models are huge ensembles or giant networks, too slow to serve. Training a small model on the same hard labels gives a worse model: a one-hot label carries about one number of information per example.</li>
+      <li><b>What people tried</b> Caruana and colleagues compressed ensembles into one model by matching its logits; or just training smaller models longer.</li>
+      <li><b>Why this works</b> The teacher's soft probabilities give the student a rich target for every example: which wrong answers are “nearly right”. Raising T reveals those small probabilities; multiplying the soft loss by T² keeps its gradient on the same scale as the hard loss. DistilBERT applied it during pre-training: 40% fewer parameters, 60% faster, 97% of BERT's GLUE score.</li>
+      <li><b>What it costs, when it fails</b> You need the teacher (and its forward passes) during training. A student far smaller than its teacher can't absorb everything. T and α are extra hyperparameters to tune.</li>
+      <li><b>What refined it</b> Feature and attention-map distillation (match hidden states), self-distillation, and for LLMs, training small models on a big model's generated text or full token distributions (<a href="../../ai-engineer/phase7/2-preference-distillation.html">AI Engineer 7.2</a>).</li>
+    </ol>
+  </div>
+
+  <h2>Which one when?</h2>
+  <table>
+    <tr><th>Goal</th><th>First try</th><th>Why</th></tr>
+    <tr><td>LLM fits in less memory, faster decoding</td><td>4-bit or 8-bit weight quantization (GPTQ/AWQ, or a library default)</td><td>Decoding is memory-bound; minutes of work, small quality loss</td></tr>
+    <tr><td>Fine-tune a big model on one GPU</td><td>QLoRA (NF4 base + LoRA)</td><td>Frozen 4-bit weights, tiny trainable adapters</td></tr>
+    <tr><td>CNN on a phone or microcontroller</td><td>int8 PTQ, then QAT if accuracy drops</td><td>Integer hardware everywhere; QAT recovers the last points</td></tr>
+    <tr><td>Much faster model, retraining budget available</td><td>Distillation into a smaller architecture</td><td>Biggest speed-ups; costs a training run</td></tr>
+    <tr><td>Throughput on A100/H100 with retraining</td><td>2:4 sparsity (+ quantization)</td><td>Up to 2× math on sparse tensor cores</td></tr>
+    <tr><td>Remove whole heads/layers</td><td>Structured pruning + distillation</td><td>Real speed on any hardware; distillation patches the damage</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Quantization, pruning and a distillation loss by hand (ran on a laptop CPU in under a second):</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn, torch.nn.functional <span class="k">as</span> F
+<span class="k">import</span> torch.nn.utils.prune <span class="k">as</span> prune
+
+torch.manual_seed(<span class="n">0</span>)
+W = torch.randn(<span class="n">256</span>, <span class="n">512</span>) * torch.linspace(<span class="n">0.01</span>, <span class="n">0.3</span>, <span class="n">256</span>)[:, <span class="k">None</span>]   <span class="c"># rows with very different scales</span>
+W[<span class="n">3</span>, <span class="n">7</span>] = <span class="n">4.0</span>                                                            <span class="c"># one outlier weight</span>
+
+<span class="k">def</span> fake_quant(w, bits, dim=<span class="k">None</span>):
+    qmax = <span class="n">2</span> ** (bits - <span class="n">1</span>) - <span class="n">1</span>
+    amax = w.abs().amax() <span class="k">if</span> dim <span class="k">is None else</span> w.abs().amax(dim=dim, keepdim=<span class="k">True</span>)
+    scale = amax / qmax
+    <span class="k">return</span> (w / scale).round().clamp(-qmax - <span class="n">1</span>, qmax) * scale
+
+<span class="k">def</span> rel_err(w, q):   <span class="c"># average over output channels of ||w - q|| / ||w||</span>
+    <span class="k">return</span> ((w - q).norm(dim=<span class="n">1</span>) / w.norm(dim=<span class="n">1</span>)).mean().item()
+
+<span class="k">for</span> bits <span class="k">in</span> (<span class="n">8</span>, <span class="n">4</span>):
+    print(<span class="s">f"int{bits}  per-tensor: {rel_err(W, fake_quant(W, bits)):.3f}   "</span>
+          <span class="s">f"per-channel: {rel_err(W, fake_quant(W, bits, dim=1)):.3f}"</span>)
+
+lin = nn.Linear(<span class="n">512</span>, <span class="n">256</span>)
+prune.l1_unstructured(lin, name=<span class="s">"weight"</span>, amount=<span class="n">0.5</span>)       <span class="c"># zero the 50% smallest |w|</span>
+print(<span class="s">"sparsity:"</span>, (lin.weight == <span class="n">0</span>).float().mean().item())
+
+<span class="k">def</span> kd_loss(student_logits, teacher_logits, labels, T=<span class="n">4.0</span>, alpha=<span class="n">0.5</span>):
+    soft = F.kl_div(F.log_softmax(student_logits / T, dim=-<span class="n">1</span>),
+                    F.softmax(teacher_logits / T, dim=-<span class="n">1</span>), reduction=<span class="s">"batchmean"</span>) * T * T
+    hard = F.cross_entropy(student_logits, labels)
+    <span class="k">return</span> alpha * soft + (<span class="n">1</span> - alpha) * hard
+
+<span class="c"># Output (torch 2.8, CPU):</span>
+<span class="c"># int8  per-tensor: 0.105   per-channel: 0.008</span>
+<span class="c"># int4  per-tensor: 0.844   per-channel: 0.135</span>
+<span class="c"># sparsity: 0.5</span></code></pre>
+    <p>In production: <b>torchao</b> is PyTorch's quantization library now (the old <code>torch.ao.quantization</code> is being retired in its favour): <code>quantize_(model, Int4WeightOnlyConfig(group_size=32))</code>. For Hugging Face models, <code>transformers</code> loads GPTQ, AWQ, bitsandbytes (NF4) and torchao checkpoints directly. Phone deployment: Lesson 10.5.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Technique</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>int8 quantization</td><td>2× smaller, near-lossless for most models</td><td>Activations/outliers need care (LLM.int8, SmoothQuant)</td></tr>
+      <tr><td>int4 / NF4 weights</td><td>4× smaller, big decoding speed-ups</td><td>Needs per-group scales and good kernels; quality drops below 4 bits</td></tr>
+      <tr><td>Unstructured pruning</td><td>High sparsity with little accuracy loss</td><td>Little speed on GPUs without special formats</td></tr>
+      <tr><td>Structured / 2:4 pruning</td><td>Real speed-ups</td><td>More accuracy loss; retraining; 2:4 needs A100+ and supported kernels</td></tr>
+      <tr><td>Distillation</td><td>Largest speed-ups (a genuinely smaller model)</td><td>A full training run with the teacher; capacity gap limits it</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you cut the serving cost of a 13B model by 4×?” A strong answer:</p>
+    <ul>
+      <li>Starts from the bottleneck: decoding is memory-bound, so <b>bytes per weight</b> matter most: 4-bit weight-only quantization (GPTQ/AWQ, group size ~128) gives ~4× less memory traffic.</li>
+      <li>Explains scales, per-channel/per-group, and why outliers break per-tensor schemes; mentions checking quality on the real eval set, not just perplexity.</li>
+      <li>Adds batching and KV-cache savings (Lessons 10.5, 6.9); considers distilling into a smaller model if quality allows.</li>
+      <li>Knows pruning's catch: unstructured zeros don't speed up dense GPU kernels; 2:4 or structured do.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Fine-tune 65B on one GPU</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">Dettmers et al.: QLoRA</a></div>
+      <p><b>How:</b> a frozen base in 4-bit NormalFloat (NF4) with double-quantized scales; gradients flow into small 16-bit LoRA adapters; paged optimizers absorb memory spikes.</p>
+      <p><b>Why this method:</b> memory falls from over 780 GB to under 48 GB with no loss versus 16-bit fine-tuning in their experiments.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>175B weights at 3–4 bits</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2210.17323" target="_blank" rel="noopener">Frantar et al.: GPTQ</a></div>
+      <p><b>How:</b> one-shot post-training quantization using approximate second-order information, layer by layer.</p>
+      <p><b>Why this method:</b> about four GPU-hours for a 175B model with negligible accuracy loss; no retraining.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Protect the 1% that matters</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2306.00978" target="_blank" rel="noopener">Lin et al.: AWQ</a></div>
+      <p><b>How:</b> uses activation statistics to find salient weight channels and scales them before 4-bit rounding.</p>
+      <p><b>Why this method:</b> protecting only about 1% of weights greatly reduces quantization error, with a hardware-friendly uniform format.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A smaller, faster BERT</b> <span class="tag co">🏢 Hugging Face · 2019</span> <a href="https://arxiv.org/abs/1910.01108" target="_blank" rel="noopener">Sanh et al.: DistilBERT</a></div>
+      <p><b>How:</b> distillation during pre-training with a triple loss (language modelling, distillation, cosine distance between hidden states).</p>
+      <p><b>Why this method:</b> 40% fewer parameters and 60% faster while retaining 97% of BERT's language understanding (GLUE).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>2:4 sparsity in hardware</b> <span class="tag co">🏢 NVIDIA · 2021</span> <a href="https://arxiv.org/abs/2104.08378" target="_blank" rel="noopener">Mishra et al.: Accelerating Sparse Deep Neural Networks</a></div>
+      <p><b>How:</b> Sparse Tensor Cores in the Ampere architecture skip the zeros of a 2-out-of-4 pattern.</p>
+      <p><b>Why this method:</b> twice the math throughput of dense matrix units, with a prune-and-retrain workflow that maintains accuracy.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · outliers appear at a size threshold</span>
+    <p>Dettmers et al. found that transformers grow a few huge-magnitude “outlier features” in their hidden states, and that at around <b>6.7B parameters</b> these suddenly appear in all layers. Plain 8-bit quantization works below that size and falls apart above it. That observation is why LLM.int8() handles those few dimensions in 16-bit, and why later methods (SmoothQuant, AWQ) are all, at heart, about outliers.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Bytes vs FLOPs: 10.1. Float formats and block scales: 10.2. LoRA and QLoRA in practice: <a href="../../ai-engineer/phase7/1-fine-tuning.html">AI Engineer 7.1</a>; quantized serving: <a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a>; distilling LLMs: <a href="../../ai-engineer/phase7/2-preference-distillation.html">AI Engineer 7.2</a>. Softmax temperature: 0.6 and <a href="../../math-course/phase8/2-softmax.html">math 8.2</a>; KL divergence: <a href="../../math-course/phase6/4-kl.html">math 6.4</a>. Next: exporting the small model and serving it (10.5).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://huggingface.co/docs/transformers/main/en/quantization/overview" target="_blank" rel="noopener">Hugging Face: Quantization overview</a>. Which method to pick and how to load it.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/ao/stable/index.html" target="_blank" rel="noopener">torchao</a>. PyTorch-native quantization, sparsity and float8 training.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1503.02531" target="_blank" rel="noopener">Hinton, Vinyals &amp; Dean: Distilling the Knowledge in a Neural Network (2015)</a>. Short, clear, and the source of temperature and T².</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You quantize a weight group symmetrically to int4 (levels −7…7). Its largest magnitude is 1.4. What is the scale, and what does a weight of 0.08 become?</div>
+    <div class="opts"><button class="opt">Scale 0.1; 0.08 → 0.1</button><button class="opt" data-ok>Scale 0.2; 0.08 rounds to level 0, so it becomes 0</button><button class="opt">Scale 1.4; 0.08 stays 0.08</button></div>
+    <div class="explain">Scale = max |w| / 7 = 1.4 / 7 = 0.2. Then 0.08 / 0.2 = 0.4, which rounds to 0. Small weights in a group with a large one get wiped out, which is why groups are kept small (64–128 weights) and outliers get special handling.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You prune 60% of a model's weights (unstructured, smallest magnitude), fine-tune, and accuracy is unchanged. On your GPU the model runs at exactly the same speed. Why?</div>
+    <div class="opts"><button class="opt">The pruning didn't work</button><button class="opt" data-ok>Dense GPU kernels still multiply the zeros; only structured patterns (smaller matrices, or 2:4 on sparse tensor cores) turn sparsity into speed</button><button class="opt">Pruning only speeds up training, not inference</button></div>
+    <div class="explain">Scattered zeros are stored in the same dense matrix, so the matmul does the same work. To get speed you need a pattern the hardware or library exploits: removing whole channels/heads (a smaller dense matrix) or the 2:4 pattern that sparse tensor cores skip.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. When distilling, your student learns no better than with hard labels. You used T = 1. What's the most likely fix?</div>
+    <div class="opts"><button class="opt" data-ok>Raise T (try values like 2–5) so the teacher's small probabilities on similar classes become visible, and scale the soft loss by T²</button><button class="opt">Lower T to 0.5 to make the teacher more confident</button><button class="opt">Drop the soft loss and use only the hard labels</button></div>
+    <div class="explain">At T = 1 a confident teacher puts ~94% on the top class, so its soft targets are almost the hard label. Higher T reveals the “dark knowledge” in the other classes. Because the soft-loss gradients shrink as 1/T², multiply by T² to keep the balance with the hard loss.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li><b>Quantization</b>: q = round(w / s), w ≈ q·s. int8 is nearly free; int4 needs per-group scales. Outliers stretch the scale and wipe out small weights: per-channel/per-group, LLM.int8, GPTQ, AWQ, SmoothQuant, NF4 all fight that.</li>
+      <li>PTQ is quick (calibrate scales); QAT simulates rounding during training for the last points of accuracy.</li>
+      <li><b>Pruning</b>: unstructured is accurate but rarely faster; structured (channels/heads) and 2:4 (2× on sparse tensor cores) give real speed. Lottery tickets: sparse subnetworks at 10–20% size can train from their original init.</li>
+      <li><b>Distillation</b>: a student matches the teacher's softmax at temperature T (soft loss × T²) plus the hard label. DistilBERT: 40% smaller, 60% faster, 97% of BERT.</li>
+      <li>For LLM serving, quantize first (bytes are speed); for big speed-ups with a training budget, distill.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const setup = c => { const d = window.devicePixelRatio || 1, w = c.clientWidth || 600, h = c.clientHeight || 220; c.width = w * d; c.height = h * d; const x = c.getContext("2d"); x.setTransform(d, 0, 0, d, 0, 0); x.clearRect(0, 0, w, h); x.font = "11px " + css("--font"); return { x, w, h }; };
+  const pct = v => (100 * v).toFixed(v < 0.01 ? 2 : 1) + "%";
+
+  /* ---------- 1. quantizer ---------- */
+  const STD = [0.01, 0.02, 0.03, 0.05, 0.08, 0.12, 0.2, 0.3], C = 64;
+  const r = NN.rng(7), BASE = STD.map(s => Array.from({ length: C }, () => s * r.n()));
+  let qMode = "tensor";
+  const W = () => { const M = BASE.map(row => row.slice()); if ($("qOut").checked) { M[2][5] = 2.5; M[5][40] = -2.0; } return M; };
+  function qGroup(v, bits) { const qmax = 2 ** (bits - 1) - 1, mx = Math.max(...v.map(Math.abs)) || 1, s = mx / qmax; return { q: v.map(x => Math.max(-qmax - 1, Math.min(qmax, Math.round(x / s))) * s), s, qmax }; }
+  function quantize(M, bits) {
+    if (qMode === "tensor") { const g = qGroup(M.flat(), bits); return { Q: M.map((row, i) => g.q.slice(i * C, (i + 1) * C)), scales: M.map(() => [g.s]), nScales: 1 }; }
+    if (qMode === "channel") { const gs = M.map(row => qGroup(row, bits)); return { Q: gs.map(g => g.q), scales: gs.map(g => [g.s]), nScales: M.length }; }
+    const Q = [], scales = [];
+    M.forEach(row => { const q = [], ss = []; for (let j = 0; j < C; j += 16) { const g = qGroup(row.slice(j, j + 16), bits); q.push(...g.q); ss.push(g.s); } Q.push(q); scales.push(ss); });
+    return { Q, scales, nScales: M.length * C / 16 };
+  }
+  function quant() {
+    const bits = +$("qB").value, ch = +$("qC").value - 1, M = W(), { Q, scales, nScales } = quantize(M, bits);
+    const err = M.map((row, i) => Math.sqrt(row.reduce((s, x, j) => s + (x - Q[i][j]) ** 2, 0) / row.reduce((s, x) => s + x * x, 0)));
+    const avg = err.reduce((a, b) => a + b) / err.length, used = new Set(Q[ch].map(v => v.toFixed(9))).size;
+    const eff = bits + (16 * nScales) / (M.length * C);
+    $("qBV").textContent = bits; $("qCV").textContent = ch + 1 + " (spread " + STD[ch] + ")";
+    $("qLv").textContent = qMode === "group" ? used + " (4 groups × up to " + 2 ** bits + ")" : used + " of " + 2 ** bits; $("qCe").textContent = pct(err[ch]); $("qE").textContent = pct(avg);
+    $("qEb").textContent = eff.toFixed(2); $("qMem").textContent = (7e9 * eff / 8 / 1e9).toFixed(1) + " GB (bf16: 14 GB)";
+    // draw histogram of this channel + its quantization levels
+    const { x, w, h } = setup($("qCan")), row = M[ch], lim = Math.max(...row.map(Math.abs)) * 1.15, lo = -lim, hi = lim, nb = 48, m = { l: 10, r: 10, t: 14, b: 22 };
+    const X = v => m.l + (v - lo) / (hi - lo) * (w - m.l - m.r), bins = NN.histogram(row, nb, lo, hi), mx = Math.max(1, ...bins);
+    const s = scales[ch][0], qmax = 2 ** (bits - 1) - 1;
+    x.strokeStyle = css("--c-w"); x.globalAlpha = 0.55; x.lineWidth = 1.5;
+    for (let k = -qmax - 1; k <= qmax; k++) { const v = k * s; if (v >= lo && v <= hi) { x.beginPath(); x.moveTo(X(v), m.t); x.lineTo(X(v), h - m.b); x.stroke(); } }
+    x.globalAlpha = 1;
+    bins.forEach((c, i) => { const bh = (c / mx) * (h - m.t - m.b - 6); x.fillStyle = css("--c-x"); x.fillRect(X(lo + i * (hi - lo) / nb) + 1, h - m.b - bh, (w - m.l - m.r) / nb - 2, bh); });
+    x.fillStyle = css("--muted"); x.textAlign = "left";
+    x.fillText(`channel ${ch + 1}: blue = its 64 weights · orange lines = levels its quantizer can output` + (qMode === "group" ? " (first group of 16)" : ""), m.l, 11);
+    x.textAlign = "center"; x.fillText(lo.toFixed(3), X(lo) + 20, h - 6); x.fillText("0", X(0), h - 6); x.fillText(hi.toFixed(3), X(hi) - 20, h - 6);
+    const outl = $("qOut").checked;
+    win("gQ8", bits === 8 && avg < 0.01);
+    win("gQ4", bits === 4 && outl && avg < 0.1);
+    win("gQbad", used === 1);
+    $("qMsg").textContent = used === 1 ? `Every weight in channel ${ch + 1} rounds to the same level: the shared scale (set by the largest weight) is far bigger than anything in this channel.` :
+      qMode === "tensor" && outl ? "One scale for everything: the outliers stretch the grid, and small channels get only a few levels. Try per-channel." :
+      qMode === "channel" && outl && bits <= 4 ? "Per-channel helps a lot, but the two channels that contain an outlier still suffer. Smaller groups isolate it." :
+      qMode === "group" ? `Each 16 weights get their own scale: outliers only hurt their own group. Cost: ${(eff - bits).toFixed(2)} extra bits per weight for the scales.` : "";
+  }
+  $("qB").oninput = quant; $("qC").oninput = quant; $("qOut").onchange = quant;
+  seg("qMode", v => { qMode = v; quant(); });
+
+  /* ---------- 2. pruning ---------- */
+  const r2 = NN.rng(3), n = 8;
+  const PW = Array.from({ length: n }, (_, i) => Array.from({ length: n }, () => r2.n() * (0.4 + 0.15 * i) * (r2.u() < 0.15 ? 2.5 : 1)));
+  const XS = Array.from({ length: 200 }, () => Array.from({ length: n }, () => r2.n()));
+  let pMode = "unstr";
+  function prune() {
+    let s = +$("pS").value;
+    if (pMode === "24") { s = 0.5; $("pS").value = 0.5; }
+    const Mk = PW.map(row => row.map(() => 1));
+    if (pMode === "unstr") { const all = PW.flat().map((v, k) => [Math.abs(v), k]).sort((a, b) => a[0] - b[0]); for (let t = 0; t < Math.round(s * n * n); t++) { const k = all[t][1]; Mk[Math.floor(k / n)][k % n] = 0; } }
+    if (pMode === "24") PW.forEach((row, i) => { for (let j = 0; j < n; j += 4) { const g = [0, 1, 2, 3].map(k => [Math.abs(row[j + k]), k]).sort((a, b) => a[0] - b[0]); Mk[i][j + g[0][1]] = 0; Mk[i][j + g[1][1]] = 0; } });
+    if (pMode === "rows") { const nr = PW.map((row, i) => [Math.hypot(...row), i]).sort((a, b) => a[0] - b[0]); for (let t = 0; t < Math.round(s * n); t++) Mk[nr[t][1]] = Mk[nr[t][1]].map(() => 0); }
+    let e2 = 0, k2 = 0, num = 0, den = 0;
+    PW.forEach((row, i) => row.forEach((v, j) => { e2 += v * v; k2 += Mk[i][j] * v * v; }));
+    for (const xv of XS) for (let i = 0; i < n; i++) { let y = 0, yp = 0; for (let j = 0; j < n; j++) { y += PW[i][j] * xv[j]; yp += PW[i][j] * Mk[i][j] * xv[j]; } num += (y - yp) ** 2; den += y * y; }
+    const zeros = Mk.flat().filter(v => v === 0).length / (n * n), err = Math.sqrt(num / den);
+    NN.heat($("pCan"), PW.map((row, i) => row.map((v, j) => (Mk[i][j] ? v : NaN))), { cmap: "div", gap: 2 });
+    $("pSV").textContent = Math.round(100 * s) + "%";
+    $("pZ").textContent = Math.round(100 * zeros) + "%"; $("pK").textContent = pct(k2 / e2); $("pE").textContent = pct(err);
+    const sp = pMode === "unstr" ? "≈ 1× (dense kernels still multiply the zeros)" : pMode === "24" ? "up to 2× math (sparse tensor cores, A100+)" : (1 / Math.max(0.125, 1 - zeros)).toFixed(1) + "× smaller matmul";
+    $("pSp").textContent = zeros === 0 ? "1×" : sp;
+    win("gP1", zeros === 0.5 && pMode === "unstr");
+    win("gP2", pMode === "24");
+    win("gP3", pMode === "rows" && zeros >= 0.5);
+    $("pMsg").textContent = pMode === "unstr" ? "Unstructured: removes exactly the smallest weights anywhere. Best accuracy per zero, but the matrix shape doesn't change." :
+      pMode === "24" ? "2:4: in every group of 4 weights along a row, the 2 smallest go. Exactly 50%, regular enough for hardware to skip." :
+      "Structured: whole output rows (neurons) with the smallest norms are deleted. Big error before fine-tuning, but the layer is literally smaller.";
+  }
+  seg("pMode", v => { pMode = v; prune(); });
+  $("pS").oninput = () => { if (pMode === "24") { $("pS").value = 0.5; } prune(); };
+
+  /* ---------- 3. distillation temperature ---------- */
+  const CLS = ["cat", "dog", "fox", "car", "truck", "banana"], TZ = [10, 7, 6, 1.5, 1, -1], SZ = [6, 2, 3, 1, 1.5, 0];
+  let klAt1 = null;
+  function distill() {
+    const T = +$("dT").value, p = MX.softmax(TZ, T), q = MX.softmax(SZ, T);
+    const kl = p.reduce((s, v, i) => s + v * Math.log(v / q[i]), 0), H = MX.entropy(p), Hmax = Math.log2(6);
+    if (klAt1 == null) klAt1 = MX.softmax(TZ, 1).reduce((s, v, i) => s + v * Math.log(v / MX.softmax(SZ, 1)[i]), 0);
+    $("dTV").textContent = T.toFixed(1);
+    $("dBars").innerHTML = CLS.map((c, i) => `<div class="dbar"><b>${c}</b><div class="tr"><i class="t" style="width:${100 * p[i]}%"></i><i class="s" style="width:${100 * q[i]}%"></i></div><span class="num">teacher ${(100 * p[i]).toFixed(1)}% · student ${(100 * q[i]).toFixed(1)}%</span></div>`).join("");
+    $("dRest").textContent = pct(1 - p[0]);
+    $("dH").textContent = H.toFixed(2) + " of " + Hmax.toFixed(2) + " bits";
+    $("dRatio").textContent = (p[1] / p[4]).toFixed(p[1] / p[4] > 100 ? 0 : 1) + "×";
+    $("dKL").textContent = kl.toFixed(3); $("dKL2").textContent = (T * T * kl).toFixed(3);
+    win("gD1", 1 - p[0] >= 0.4 && p[0] === Math.max(...p));
+    win("gD2", H >= 0.95 * Hmax);
+    win("gD3", T >= 8 && kl < klAt1 && T * T * kl > klAt1);
+    $("dMsg").textContent = T <= 1 ? "Nearly a hard label: the student learns little beyond ‘it's a cat’." :
+      H >= 0.95 * Hmax ? "Too hot: every class looks alike, the teacher's opinions wash out." :
+      1 - p[0] >= 0.4 ? "Now the targets say what a cat resembles: dog and fox, not trucks or bananas. Notice the student wrongly prefers fox over dog: the soft loss will correct that." :
+      "Raise T to let the small probabilities speak.";
+  }
+  $("dT").oninput = distill;
+  window.addEventListener("resize", () => { quant(); prune(); });
+  window.addEventListener("themechange", () => { quant(); prune(); });
+  quant(); prune(); distill();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.2 Object detectors: R-CNN → YOLO → DETR · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.boxc { width: 100%; max-width: 420px; aspect-ratio: 1 / 1; height: auto; display: block; margin: 0 auto; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; touch-action: none; cursor: crosshair; }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .vecout { font-family: var(--mono); font-size: .85rem; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 6px 10px; }
+  .shares { display: grid; gap: 6px; font-size: .85rem; }
+  .shares .sh { display: grid; grid-template-columns: 170px 1fr 64px; gap: 8px; align-items: center; }
+  .shares .meterbar > i { background: var(--c-ls); }
+  table.cost { border-collapse: collapse; font-family: var(--mono); font-size: .9rem; }
+  table.cost td, table.cost th { padding: 5px 10px; border: 1px solid var(--line); text-align: center; }
+  table.cost td.c { cursor: pointer; }
+  table.cost td.c:hover { background: var(--panel); }
+  table.cost td.pick { background: color-mix(in srgb, var(--c-at) 35%, var(--bg2)); font-weight: 800; }
+</style>
+</head>
+<body data-lesson="d4-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 2</div>
+  <h1>Object detectors: R-CNN → YOLO → DETR</h1>
+  <p class="subtitle">Twelve years of detectors in one story: each generation found one expensive thing the last one did and stopped doing it. Running a CNN 2,000 times per image, then outside proposal tools, then the second stage, then anchors, then NMS.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Boxes, IoU, anchors, NMS and mAP (Lesson 4.1). A detector over-predicts candidate boxes; NMS removes the duplicates.</li>
+      <li>A CNN backbone turns an image into <span class="ac">feature maps</span> at strides 8, 16, 32 (Lessons 3.3 and 3.4); pretrained backbones transfer (Lesson 3.5).</li>
+      <li>Cross-entropy punishes confident mistakes (Lesson 1.1). Attention and transformers get their own phase (6.1); here you only need “every token can look at every other token”.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook: from 13 seconds to under 2 milliseconds</span>
+    <p>In 2014, <b>R-CNN</b> computed its CNN features in about <b>13 seconds per image on a GPU</b> (53 on a CPU), because it ran the network separately on about 2,000 cropped regions. In 2015, <b>YOLO</b> processed <b>45 images per second</b> with one network pass. In January 2026, Ultralytics' smallest <b>YOLO26</b> runs in <b>1.7 ms</b> on an NVIDIA T4 with TensorRT (different hardware, so this is a story, not a benchmark).</p>
+    <p>Today detectors count cars at intersections, find defects on production lines, spot weeds for farm robots, and blur faces in street imagery. Most of them are descendants of three ideas you'll build here.</p>
+    <p><b>What did each generation stop doing to get thousands of times faster, and why did accuracy go up instead of down?</b></p>
+  </div>
+
+  <h2>The family tree in one table</h2>
+  <table>
+    <tr><th>Year</th><th>Detector</th><th>What it stopped doing</th><th>Key number</th></tr>
+    <tr><td>2014</td><td>R-CNN</td><td>hand-made features (used a CNN on ~2,000 proposals)</td><td>VOC 2012 mAP 53.3%; 13 s/image (GPU) for features</td></tr>
+    <tr><td>2015</td><td>Fast R-CNN</td><td>running the CNN once per region</td><td>213× faster than R-CNN at test time</td></tr>
+    <tr><td>2015</td><td>Faster R-CNN</td><td>external proposal algorithms (learned RPN)</td><td>5 fps with VGG-16, 300 proposals</td></tr>
+    <tr><td>2015</td><td>YOLO v1</td><td>the second stage: one pass, a grid</td><td>45 fps (Fast YOLO: 155)</td></tr>
+    <tr><td>2016</td><td>SSD</td><td>single-scale prediction (boxes from several feature maps)</td><td>72.1% VOC2007 at 58 fps (300 × 300)</td></tr>
+    <tr><td>2017</td><td>RetinaNet</td><td>letting easy background drown the loss (focal loss)</td><td>one-stage accuracy beats two-stage</td></tr>
+    <tr><td>2020</td><td>DETR</td><td>anchors and NMS (set prediction)</td><td>on par with Faster R-CNN; trained 500 epochs</td></tr>
+    <tr><td>2023–26</td><td>RT-DETR, YOLOv8 → YOLO26, D-FINE, RF-DETR</td><td>anchors (YOLOv8), NMS (YOLOv10, YOLO26), slow DETR training</td><td>real time, 40–60 COCO AP</td></tr>
+  </table>
+
+  <h2>Two-stage: first guess where, then ask what</h2>
+  <p><b>R-CNN</b> (2014) borrowed a classic trick: a fast, hand-made algorithm (selective search) proposes about <b>2,000 regions</b> that “look like objects”. Each region is cropped, warped to a fixed size, pushed through a CNN pretrained on ImageNet, and classified. It was slow, but it beat the previous best on PASCAL VOC 2012 by more than 30% relative (53.3% mAP), the moment CNNs took over detection.</p>
+  <p><b>Fast R-CNN</b> (2015) ran the CNN <b>once</b> on the whole image and cut each region out of the <span class="ac">feature map</span> instead of the pixels (“RoI pooling”, region-of-interest pooling, turns any region into a fixed 7 × 7 grid of features). 213× faster at test time. Now the slowest part was the proposal algorithm itself.</p>
+  <p><b>Faster R-CNN</b> (2015) made proposals a learned layer: the <b>region proposal network</b> (RPN) slides over the shared feature map and, at each position, scores <b>k = 9 anchors</b> (3 sizes × 3 aspect ratios) for “object or not” and nudges their coordinates. The best 300 go to the second stage for classification and refinement.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how many anchors?</span>
+    <p>The Faster R-CNN paper says a typical feature map has about W × H ≈ <b>2,400</b> positions (for example 60 × 40, stride 16 on a ~1000 × 600 image).</p>
+    <div class="calc">2,400 positions × 9 anchors = <b>21,600 anchors</b> scored per image → keep ~300 proposals → classify each one</div>
+    <p>Of those 21,600, an image with 3 objects has maybe a few dozen anchors with IoU ≥ 0.7 to some object (the RPN's “positive” rule). Everything else is background. Hold that ratio in mind: it becomes the central problem of one-stage detectors.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Region proposals (R-CNN → Faster R-CNN's RPN)</span></span>
+    <ol>
+      <li><b>The problem before</b> Sliding a classifier over every position, scale and aspect ratio means hundreds of thousands of windows per image. With a CNN as the classifier, that's far too slow; with cheap hand-made features (pre-2012), accuracy had plateaued.</li>
+      <li><b>What people tried</b> Sliding windows with a CNN (OverFeat, 2013), and generic “objectness” algorithms that propose likely regions without knowing the class (selective search, used by R-CNN).</li>
+      <li><b>Why this works</b> Split the job: a cheap step narrows 100,000+ possible windows to ~2,000 (later 300) likely ones, and the expensive classifier only looks at those. Faster R-CNN's RPN learns the narrowing step on the same features, so proposals cost almost nothing and get better with training. Two stages also mean the second stage sees a balanced, cleaned-up set of candidates.</li>
+      <li><b>What it costs, when it fails</b> Two networks in sequence: more latency (5 fps for Faster R-CNN with VGG-16), more hyperparameters (anchor sizes, proposal counts, two sets of IoU rules), and anchors that must be hand-tuned to the dataset's object shapes. Objects the RPN misses can never be recovered.</li>
+      <li><b>What refined it</b> Feature Pyramid Networks (FPN, 2017) for objects at many scales; Mask R-CNN (2017) added a mask head (Lesson 4.3). One-stage detectors (next) dropped the second stage entirely; two-stage designs live on where accuracy matters more than latency.</li>
+    </ol>
+  </div>
+
+  <h2>One-stage: YOLO's grid</h2>
+  <p><b>YOLO</b> (“You Only Look Once”, 2015) asked: why not predict boxes directly? Resize the image to 448 × 448, run one CNN, and read the answer off an <b>S × S grid</b> (S = 7). The rule that makes it trainable: <i>the grid cell that contains an object's <b>center</b> is responsible for that object.</i> Each cell predicts B = 2 boxes (x, y, w, h, confidence) and one set of C class probabilities.</p>
+  <div class="calc">output = S × S × (B · 5 + C) = 7 × 7 × (2 · 5 + 20) = 7 × 7 × 30 = <b>1,470 numbers</b> for PASCAL VOC's 20 classes</div>
+  <p class="predict">🔮 <b>Predict:</b> a person stands right behind a bicycle, so their centers are close. What goes wrong in the 7 × 7 grid, and what does a 13 × 13 grid change?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Which cell is responsible?</span>
+    <p class="hint">Drag the center dots of the three objects. The highlighted cell is responsible for each one; below is the training target that cell must learn to output. Switch the grid size.</p>
+    <div class="goals"><span class="goal" id="gCollide">🎯 Put two objects in one cell (a collision)</span><span class="goal" id="gFix">🎯 Keep them that close and resolve it with the grid size</span><span class="goal" id="gEdge">🎯 Find an x offset above 0.95 (center at a cell's edge)</span></div>
+    <div class="controls"><span class="seg" id="gS"><button data-v="7" class="on">7 × 7 (YOLO v1)</button><button data-v="13">13 × 13 (YOLO v2)</button><button data-v="4">4 × 4</button></span></div>
+    <div class="pg-cols">
+      <div><canvas class="boxc" id="gridC"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">output tensor <b id="gOut" class="y">–</b></div>
+          <div class="stat">collisions <b id="gCol" class="dead">–</b></div>
+        </div>
+        <p class="hint">Targets (x, y = center inside its cell, 0–1; w, h = share of the image; YOLO v1 actually regresses √w and √h):</p>
+        <div class="vecout" id="gVec"></div>
+        <p class="hint" id="gMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> each object's target lives in exactly one cell; the other 48 cells learn “no object here”. Drag the person's center into the bicycle's cell and the collision counter turns red: in YOLO v1 a cell has one set of class probabilities, so it can't say “person” and “bicycle” at once; the paper itself warns that each grid cell “can only have one class” and that YOLO “struggles with small objects that appear in groups, such as flocks of birds”. A 13 × 13 grid (with anchors, YOLO v2) gives close objects separate cells. Modern YOLOs go further: three grids (80 × 80, 40 × 40, 20 × 20 at 640 pixels), and an object can be assigned to several nearby cells.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">One-stage detection (YOLO, SSD)</span></span>
+    <ol>
+      <li><b>The problem before</b> Two-stage detectors ran a proposal network and then a per-region classifier: 5 fps for Faster R-CNN with VGG-16. Too slow for video, robots or phones.</li>
+      <li><b>What people tried</b> Faster backbones and fewer proposals in two-stage designs, and dense sliding-window CNNs (OverFeat).</li>
+      <li><b>Why this works</b> Detection becomes plain regression: one forward pass outputs a fixed-size tensor, every cell in parallel, so speed is just the backbone's speed (YOLO v1: 45 fps). The network sees the whole image when it decides, so its authors found YOLO v1 “far less likely to predict false detections where nothing exists” than the best detectors of the day. SSD (2016) added predictions from several feature maps, so small objects use the fine maps and large ones the coarse maps.</li>
+      <li><b>What it costs, when it fails</b> Early one-stage detectors were less accurate, especially on small, crowded objects (one class per cell, coarse grid) and on precise localization. Worse, they score every one of their thousands of cells, almost all background, which swamps the training signal (next section).</li>
+      <li><b>What refined it</b> Anchors and multi-scale grids (YOLO v2/v3, SSD), focal loss (RetinaNet, next), anchor-free heads (YOLOv8), and NMS-free training (YOLOv10, YOLO26).</li>
+    </ol>
+  </div>
+
+  <h2>The background problem and focal loss</h2>
+  <p><b>Numbers first.</b> RetinaNet's authors note a one-stage detector evaluates about <b>100,000 candidate locations</b> per image. Suppose 100,000 are easy background the model already gets right with probability 0.99, and 100 are hard (real objects or tricky background) it gets right with only 0.3. Cross-entropy per example: −ln 0.99 = 0.010, −ln 0.3 = 1.20. Totals: 100,000 × 0.010 = <b>1,005</b> from easy background vs 100 × 1.20 = <b>120</b> from the hard ones.</p>
+  <p>So <b>~80%</b> of the training signal says “keep calling background background”, which the model already does. <b>Focal loss</b> multiplies each example's cross-entropy by (1 − p<sub>t</sub>)<sup>γ</sup>, where p<sub>t</sub> is the probability the model gives the <b>correct</b> answer. Confident, correct examples get a factor near 0; mistakes keep almost their full loss.</p>
+  <div class="calc">FL(p<sub>t</sub>) = −(1 − p<sub>t</sub>)<sup>γ</sup> · ln(p<sub>t</sub>)  ·  γ = 0 is plain cross-entropy · with γ = 2: p<sub>t</sub> = 0.99 → × 0.0001, p<sub>t</sub> = 0.3 → × 0.49</div>
+  <p class="predict">🔮 <b>Predict:</b> what's the smallest γ at which the 100 hard examples produce more than half of the total loss? 0.5? 1? 2?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Turn the focal knob</span>
+    <p class="hint">One image's worth of candidates: 100,000 easy background (p<sub>t</sub> = 0.99), 1,000 medium (0.9), 100 hard (0.3). Slide γ and watch who gets the training signal. The curve shows loss per example: dashed = cross-entropy, solid = focal loss at your γ.</p>
+    <div class="goals"><span class="goal" id="gHalf">🎯 Hard examples ≥ 50% of the loss</span><span class="goal" id="gEasy">🎯 Easy background under 1% of the loss</span><span class="goal" id="g10k">🎯 Shrink an easy example's loss 10,000×</span></div>
+    <div class="controls"><label>focusing γ <input type="range" id="fG" min="0" max="5" step="0.25" value="0"> <b class="mono" id="fGV"></b></label></div>
+    <div class="pg-cols">
+      <div>
+        <div class="shares" id="fShares"></div>
+        <div class="stat-row">
+          <div class="stat">easy example's loss shrinks <b id="fShrink" class="ls">–</b></div>
+          <div class="stat">hard example keeps <b id="fKeep" class="ls">–</b></div>
+        </div>
+      </div>
+      <div><canvas class="chart" id="fChart" style="height:210px"></canvas></div>
+    </div>
+    <p class="hint" id="fMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at γ = 0 (cross-entropy) easy background takes 82% of the loss. At γ = 0.5 the hard examples reach 43%; at γ = 1 they take 80%; at <b>γ = 2</b>, the value the RetinaNet paper found best, they take 98%, an easy example's loss is 10,000× smaller, and a hard example keeps 49% of its loss. Push γ to 5 and even medium examples vanish; the paper reports RetinaNet is fairly robust for γ from 0.5 to 5.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Focal loss (RetinaNet, 2017)</span></span>
+    <ol>
+      <li><b>The problem before</b> One-stage detectors trailed two-stage ones in accuracy. The RetinaNet paper found the “central cause”: extreme foreground–background imbalance. With ~100,000 candidates and a handful of objects, easy negatives dominate the gradient (82% of the loss in your playground at γ = 0).</li>
+      <li><b>What people tried</b> Two-stage designs (proposals remove most background before classification), and in one-stage ones, sampling a fixed mini-batch of anchors (e.g., 256) or hard-example mining (keep only the worst-scored negatives).</li>
+      <li><b>Why this works</b> Instead of throwing examples away, re-weight all of them smoothly: (1 − p<sub>t</sub>)<sup>γ</sup> is near 0 for well-classified examples and near 1 for mistakes. With γ = 2, p<sub>t</sub> = 0.9 has 100× less loss and p<sub>t</sub> ≈ 0.968 has 1,000× less (the paper's own examples), while a misclassified example's loss shrinks by at most 4×. RetinaNet applies it to all ~100k anchors and matched the speed of one-stage detectors while beating the accuracy of all two-stage detectors of its time.</li>
+      <li><b>What it costs, when it fails</b> Two more knobs (γ, plus a class weight α; the paper uses α = 0.25 with γ = 2). It focuses on hard examples, and label noise looks hard, so wrong labels get <i>more</i> attention. It's a training fix only: it does nothing for latency or NMS.</li>
+      <li><b>What refined it</b> Focal loss spread far beyond detection: SAM trains its masks with a focal + Dice combination (Lesson 4.4). Generalized Focal Loss (2020) merged box quality into the score and introduced Distribution Focal Loss (DFL) for boxes, used by YOLOv8 and YOLO11; YOLO26 removes DFL to simplify the head.</li>
+    </ol>
+  </div>
+
+  <h2>The YOLO lineage to 2026</h2>
+  <p>“YOLO” is now a family name used by several groups. The main line, as of late 2026:</p>
+  <table>
+    <tr><th>Version</th><th>Year</th><th>By</th><th>What changed (the one thing to remember)</th></tr>
+    <tr><td>YOLO v1</td><td>2015</td><td>Redmon et al.</td><td>Detection as one regression on a 7 × 7 grid</td></tr>
+    <tr><td>YOLO v2 (YOLO9000), v3</td><td>2016, 2018</td><td>Redmon &amp; Farhadi</td><td>Anchor boxes, finer grids, predictions at 3 scales</td></tr>
+    <tr><td>YOLOv4</td><td>2020</td><td>Bochkovskiy et al.</td><td>A tuned “bag of tricks” for training and architecture</td></tr>
+    <tr><td>YOLOv5</td><td>June 2020</td><td>Ultralytics</td><td>PyTorch implementation and tooling (no paper)</td></tr>
+    <tr><td>YOLOv8</td><td>January 2023</td><td>Ultralytics</td><td><b>Anchor-free</b> split head; one API for detect / segment / pose</td></tr>
+    <tr><td>YOLOv10</td><td>May 2024</td><td>Wang et al.</td><td><b>NMS-free</b> training with consistent dual assignments</td></tr>
+    <tr><td>YOLO11</td><td>September 2024</td><td>Ultralytics</td><td>Refined backbone and head; widely used default</td></tr>
+    <tr><td>YOLO12</td><td>early 2025</td><td>Tian et al.</td><td>Attention-centric design at YOLO speed</td></tr>
+    <tr><td>YOLO26</td><td>January 2026</td><td>Ultralytics</td><td>Native end-to-end (NMS-free) inference, DFL removed, MuSGD optimizer; 40.9–57.5 COCO mAP at 1.7–11.8 ms (T4, TensorRT)</td></tr>
+  </table>
+  <p class="muted">Ultralytics' docs list a YOLO27 as “coming soon” with no launch date (checked November 2026). Version numbers are names, not a strict ranking: always compare models on your own data at your own latency budget.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Anchor-free heads (YOLOv8 and most modern detectors)</span></span>
+    <ol>
+      <li><b>The problem before</b> Anchors are hand-chosen template shapes (9 per position in Faster R-CNN). They must match the dataset (tall pedestrians vs wide cars), multiply the number of predictions, and add matching rules and hyperparameters.</li>
+      <li><b>What people tried</b> Clustering the training boxes to pick anchor shapes automatically (YOLO v2 used k-means on box sizes).</li>
+      <li><b>Why this works</b> Predict the box directly from each feature-map cell: “the object's edges are this far left, right, up and down from me”. Strong backbones and good label-assignment rules made templates unnecessary. One prediction per cell instead of 9 means fewer outputs and less tuning: YOLO26 at 640 × 640 has 8,400 candidates (80² + 40² + 20²).</li>
+      <li><b>What it costs, when it fails</b> The assignment rule (which cells are “positive” for an object) now carries the weight the anchors used to carry; poor rules hurt small or crowded objects, which is why YOLO26 adds a small-target-aware assignment (STAL).</li>
+      <li><b>What refined it</b> NMS-free one-to-one heads (YOLOv10, YOLO26) and DETR-style set prediction, next.</li>
+    </ol>
+  </div>
+
+  <h2>DETR: detection as a set</h2>
+  <p><b>DETR</b> (“DEtection TRansformer”, 2020) threw out anchors and NMS together. A CNN makes a feature map; a transformer encoder lets every location look at every other one; then a decoder takes <b>N = 100 learned “object queries”</b>, slots that each output one box and one class, or the special class “∅ no object”. The output is a <b>set</b>: no duplicates allowed, no NMS needed.</p>
+  <p>The training trick is <b>bipartite (Hungarian) matching</b>: before computing the loss, find the one-to-one assignment of predictions to true objects with the lowest total cost (class cost + box L1 + GIoU). Matched queries learn to fit their object; every unmatched query learns “∅”. A query that duplicates another's object gets matched to nothing, so it's trained to stay quiet: duplicates are punished <i>inside</i> the loss.</p>
+  <p class="predict">🔮 <b>Predict:</b> the simplest matching is greedy: repeatedly take the cheapest remaining pair. Will greedy always find the lowest total cost?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Be the Hungarian algorithm</span>
+    <p class="hint">5 predictions (Q1–Q5) and 3 true objects (A, B, C). Each cell is the matching cost (box L1 distance + 1 − probability of the right class; lower = better). Click one cell per column, at most one per row, to build a matching. Then compare with greedy and the optimal (Hungarian) answer.</p>
+    <div class="goals"><span class="goal" id="gMatch">🎯 Find the optimal matching yourself</span><span class="goal" id="gGreedy">🎯 Watch greedy lose</span></div>
+    <div class="pg-cols">
+      <div><canvas class="boxc" id="hC"></canvas></div>
+      <div>
+        <table class="cost" id="hT"></table>
+        <div class="stat-row">
+          <div class="stat">your total cost <b id="hYou" class="ls">–</b></div>
+          <div class="stat">optimal <b id="hOpt">?</b></div>
+        </div>
+        <div class="controls"><button class="btn" id="hGreedy">Run greedy</button><button class="btn primary" id="hHung">Run Hungarian</button><button class="btn" id="hClear">↺ Clear</button></div>
+        <p class="hint" id="hMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> greedy grabs Q3 → C (0.75) and then Q2 → A (1.25), the next-cheapest cell. That leaves B with only bad options (Q4 at 3.0): total <b>5.00</b>. The optimal matching gives A to Q1 (1.80) so Q2 can take B (1.35): total <b>3.90</b>. Q4 and Q5 are matched to nothing and learn “∅ no object”. The Hungarian algorithm finds the optimum in polynomial time (about n³ steps), which is cheap for 100 queries.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">DETR's set prediction with Hungarian matching</span></span>
+    <ol>
+      <li><b>The problem before</b> Every detector so far needed hand-made parts outside the network: anchor shapes, IoU rules to decide which predictions are positives, and NMS at the end (a hard threshold that fails in crowds, Lesson 4.1). The network was never trained on what was actually output.</li>
+      <li><b>What people tried</b> Better NMS (Soft-NMS), learned NMS, tuning assignment rules per dataset.</li>
+      <li><b>Why this works</b> Treat the answer as a <b>set</b> and train with a loss that's the same whatever order the predictions come in: a one-to-one matching, then per-pair losses. Exactly one query is rewarded per object, so the model itself learns not to duplicate (attention lets queries “see” each other and divide the work). No anchors, no NMS; DETR matched a well-tuned Faster R-CNN on COCO and extends naturally to panoptic segmentation.</li>
+      <li><b>What it costs, when it fails</b> <b>Slow training</b>: the paper's long schedule is 500 epochs (and 300 epochs takes 3 days on 16 V100 GPUs), because matching is unstable early on and global attention learns slowly. It was weaker on <b>small objects</b> and heavy at high resolution (attention cost grows with the square of the number of feature-map positions).</li>
+      <li><b>What refined it</b> Deformable DETR (2020) attends to a few sampling points and needs 10× fewer epochs. RT-DETR (2023) was the first real-time end-to-end DETR (53.1 AP at 108 fps on a T4 for its ResNet-50 version); RT-DETRv2 (2024), D-FINE (2024, 54.0 AP at 124 fps for the L model), DEIM (2024, faster convergence) and RF-DETR (2025, the first real-time detector its authors report above 60 AP on COCO). One-to-one matching also inspired YOLOv10's and YOLO26's NMS-free heads.</li>
+    </ol>
+  </div>
+
+  <h2>Choosing a detector in 2026</h2>
+  <table>
+    <tr><th>You need</th><th>Reasonable first try</th><th>Why</th></tr>
+    <tr><td>Real time on an edge device or CPU</td><td>A small YOLO (YOLO26n/s, YOLO11n/s)</td><td>Tiny, fast, exportable; YOLO26 can skip NMS</td></tr>
+    <tr><td>Best accuracy at real-time speed on a GPU</td><td>A real-time DETR (RT-DETRv2, D-FINE, DEIM, RF-DETR) or a large YOLO</td><td>Set prediction, strong pretrained backbones</td></tr>
+    <tr><td>Classes you never trained on</td><td>Open-vocabulary detectors (Lesson 4.6)</td><td>Type the class name as text</td></tr>
+    <tr><td>Masks per object, research flexibility</td><td>Mask R-CNN family (Lesson 4.3), YOLO segmentation models</td><td>Mature, well understood</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Ultralytics (YOLO, RT-DETR), torchvision's detection models, and Hugging Face Transformers (DETR, RT-DETR, D-FINE, Grounding DINO). Pretrained weights download on first use. The code below builds a randomly initialized Faster R-CNN (nothing downloaded), runs focal loss and Hungarian matching on this lesson's numbers:</p>
+<pre><code><span class="k">import</span> torch
+<span class="k">from</span> torchvision.models.detection <span class="k">import</span> fasterrcnn_resnet50_fpn
+<span class="k">from</span> torchvision.ops <span class="k">import</span> sigmoid_focal_loss
+<span class="k">from</span> scipy.optimize <span class="k">import</span> linear_sum_assignment
+
+torch.manual_seed(<span class="n">0</span>)
+<span class="c"># A two-stage detector, randomly initialized (weights=None: nothing is downloaded)</span>
+model = fasterrcnn_resnet50_fpn(weights=<span class="k">None</span>, weights_backbone=<span class="k">None</span>, num_classes=<span class="n">3</span>).eval()
+print(<span class="s">f"{sum(p.numel() for p in model.parameters()):,} parameters"</span>)
+<span class="k">with</span> torch.no_grad():
+    out = model([torch.rand(<span class="n">3</span>, <span class="n">480</span>, <span class="n">640</span>)])              <span class="c"># a list of images in, a list of dicts out</span>
+print({k: tuple(v.shape) <span class="k">for</span> k, v <span class="k">in</span> out[<span class="n">0</span>].items()})
+
+<span class="c"># Focal loss on 3 easy negatives and 1 hard positive (logits)</span>
+logits = torch.tensor([-<span class="n">4.6</span>, -<span class="n">4.6</span>, -<span class="n">4.6</span>, -<span class="n">0.85</span>])
+target = torch.tensor([<span class="n">0.</span>, <span class="n">0.</span>, <span class="n">0.</span>, <span class="n">1.</span>])
+print(sigmoid_focal_loss(logits, target, alpha=-<span class="n">1</span>, gamma=<span class="n">0.0</span>))   <span class="c"># gamma 0 = plain cross-entropy</span>
+print(sigmoid_focal_loss(logits, target, alpha=-<span class="n">1</span>, gamma=<span class="n">2.0</span>))   <span class="c"># easy ones shrink ~10,000x</span>
+
+<span class="c"># DETR-style matching: rows = predictions, columns = ground-truth objects</span>
+cost = torch.tensor([[<span class="n">1.8</span>, <span class="n">4.2</span>, <span class="n">10.2</span>], [<span class="n">1.25</span>, <span class="n">1.35</span>, <span class="n">8.6</span>], [<span class="n">9.1</span>, <span class="n">6.7</span>, <span class="n">0.75</span>], [<span class="n">5.4</span>, <span class="n">3.0</span>, <span class="n">4.7</span>], [<span class="n">10.55</span>, <span class="n">12.95</span>, <span class="n">12.55</span>]])
+rows, cols = linear_sum_assignment(cost.numpy())
+print(rows, cols, cost[rows, cols].sum().item())
+
+<span class="c"># What we got (torch 2.8, torchvision 0.23, CPU):</span>
+<span class="c"># 41,357,406 parameters</span>
+<span class="c"># {'boxes': (100, 4), 'labels': (100,), 'scores': (100,)}</span>
+<span class="c"># tensor([0.0100, 0.0100, 0.0100, 1.2059])</span>
+<span class="c"># tensor([9.9055e-07, 9.9055e-07, 9.9055e-07, 5.9183e-01])</span>
+<span class="c"># [0 1 2] [0 1 2] 3.9000000953674316</span></code></pre>
+    <p>With Ultralytics, building YOLO26n from its config (random weights, no download) and running it on a random 640 × 640 image shows both heads. Loading <code>"yolo26n.pt"</code> instead downloads COCO-pretrained weights.</p>
+<pre><code><span class="k">from</span> ultralytics <span class="k">import</span> YOLO
+model = YOLO(<span class="s">"yolo26n.yaml"</span>)                  <span class="c"># config only; YOLO("yolo26n.pt") downloads pretrained weights</span>
+model.info()                                   <span class="c"># YOLO26n summary: 260 layers, 2,572,280 parameters, 6.1 GFLOPs</span>
+<span class="c"># raw outputs on torch.rand(1, 3, 640, 640): one-to-one head (1, 300, 6) = 300 boxes × (x1, y1, x2, y2, score, class)</span>
+<span class="c">#   one-to-many head: boxes (1, 4, 8400), scores (1, 80, 8400) from feature maps 80×80, 40×40, 20×20</span>
+
+<span class="c"># With pretrained weights (downloads on first use):</span>
+<span class="c"># results = YOLO("yolo26n.pt").predict("street.jpg", nms=False)   # NMS-free one-to-one head</span>
+<span class="c"># YOLO("yolo26n.pt").train(data="my_data.yaml", epochs=50, imgsz=640)</span></code></pre>
+    <p class="hint">Gotcha: torchvision's detectors take a <b>list</b> of 0–1 float tensors and return boxes in <code>xyxy</code> pixels; YOLO label files use normalized <code>cxcywh</code>. Fine-tuning a pretrained detector on a few hundred labelled images of your own beats training from scratch (Lesson 3.5).</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Family</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Two-stage (Faster/Mask R-CNN)</td><td>Accurate, flexible (masks, keypoints), well understood</td><td>Slower, more hyperparameters, anchors and NMS</td></tr>
+      <tr><td>One-stage YOLO-style</td><td>Very fast, tiny models, huge tooling and export support</td><td>Assignment rules and (often) NMS to tune; small crowded objects are hard</td></tr>
+      <tr><td>DETR-style</td><td>No anchors, no NMS, a clean set loss; strong with good backbones</td><td>Original DETR trained slowly and struggled on small objects; real-time variants fixed much of it</td></tr>
+      <tr><td>Focal loss</td><td>Handles extreme class imbalance without sampling</td><td>Extra knobs; amplifies noisy labels</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Compare two-stage, one-stage and DETR detectors.” A strong answer:</p>
+    <ul>
+      <li>Two-stage: proposals (RPN with anchors) then per-region classification with RoI pooling; accurate, slower.</li>
+      <li>One-stage: dense predictions from grid cells in one pass; the class-imbalance problem and focal loss; anchor-free heads; NMS.</li>
+      <li>DETR: object queries, Hungarian matching, a set loss that makes NMS unnecessary; slow convergence and small-object weakness of the original, fixed by deformable attention and real-time variants.</li>
+      <li>Picks by constraint: latency budget, hardware, object sizes, crowding, and whether the classes are fixed. Mentions NMS-free YOLOs (v10, 26) as the convergence of both lines.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The current YOLO</b> <span class="tag oss">🧰 Open source · 2026</span> <a href="https://docs.ultralytics.com/models/yolo26/" target="_blank" rel="noopener">Ultralytics YOLO26 documentation</a></div>
+      <p><b>How:</b> five sizes (n to x) for detection, instance and semantic segmentation, classification, pose and oriented boxes; a dual head with an NMS-free one-to-one path.</p>
+      <p><b>Why this method:</b> one network pass, simple export to edge hardware, and predictable latency without a post-processing step; the docs report up to 43% faster CPU ONNX inference for YOLO26n than YOLO11n.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Competition-winning two-stage detection</b> <span class="tag hist">📜 History · 2015</span> <a href="https://arxiv.org/abs/1506.01497" target="_blank" rel="noopener">Ren et al.: Faster R-CNN</a></div>
+      <p><b>How:</b> the RPN shares convolutional features with the detection network, making proposals nearly free.</p>
+      <p><b>Why this method:</b> learned proposals were both faster and better than hand-made ones; Faster R-CNN and RPN were the foundations of several 1st-place entries in the ILSVRC and COCO 2015 competitions.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Real-time transformers beat YOLOs</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2304.08069" target="_blank" rel="noopener">Zhao et al.: DETRs Beat YOLOs on Real-time Object Detection (RT-DETR)</a></div>
+      <p><b>How:</b> an efficient hybrid encoder for multi-scale features and “uncertainty-minimal query selection” for the decoder; speed can be tuned by dropping decoder layers without retraining.</p>
+      <p><b>Why this method:</b> the authors observed NMS hurts YOLO's speed and accuracy; an end-to-end DETR fast enough for real time avoids it (53.1% AP at 108 fps on a T4).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A specialist DETR for any dataset</b> <span class="tag co">🏢 Roboflow · 2025</span> <a href="https://arxiv.org/abs/2511.09554" target="_blank" rel="noopener">Robinson et al.: RF-DETR</a></div>
+      <p><b>How:</b> fine-tunes a pretrained base network on the target dataset, then uses weight-sharing neural architecture search to pick accuracy–latency trade-offs without retraining.</p>
+      <p><b>Why this method:</b> big open-vocabulary models often fail on real-world classes outside their pre-training; a light specialist transfers better. RF-DETR (nano) reaches 48.0 AP on COCO, 5.3 above D-FINE (nano) at similar latency.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · YOLO goes to the museum</span>
+    <p>The original YOLO paper tested detectors trained on natural photos on <b>artwork</b>: the Picasso and People-Art datasets. YOLO beat all other methods, including R-CNN, “by a wide margin” when generalizing to paintings. Seeing the whole image at once taught it shapes and layouts, not just textures, so a cubist person still looked like a person.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Boxes, IoU, NMS and mAP are Lesson 4.1. The backbones are Phase 3's CNNs (3.4), usually pretrained (3.5). DETR's encoder and decoder are transformers (6.1 self-attention, 6.5 encoder–decoder); the matching cost uses GIoU from 4.1. Next: masks instead of boxes (4.3, where Mask R-CNN extends Faster R-CNN), and detection from text prompts (4.6). Detection over time is tracking (4.7). Detectors in self-driving perception stacks: the <a href="../../autonomous-systems/index.html">Autonomous Systems course</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://lilianweng.github.io/posts/2017-12-31-object-recognition-part-3/" target="_blank" rel="noopener">Lilian Weng: Object Detection for Dummies Part 3 (R-CNN family)</a> and <a href="https://lilianweng.github.io/posts/2018-12-27-object-recognition-part-4/" target="_blank" rel="noopener">Part 4 (fast detectors: YOLO, SSD, RetinaNet)</a>. Clear diagrams of every stage.</li>
+      <li><span class="kind">Book</span> <a href="https://d2l.ai/chapter_computer-vision/rcnn.html" target="_blank" rel="noopener">Dive into Deep Learning: Region-based CNNs</a>. R-CNN to Mask R-CNN with code.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/facebookresearch/detr" target="_blank" rel="noopener">facebookresearch/detr</a>. The original DETR; the README has a famously short inference demo.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A YOLO v1-style detector uses a 13 × 13 grid, 3 boxes per cell, and 80 classes. How many numbers does it output?</div>
+    <div class="opts"><button class="opt">13 × 13 × 83 = 14,027</button><button class="opt" data-ok>13 × 13 × (3 · 5 + 80) = 16,055</button><button class="opt">13 × 13 × 3 × 80 = 40,560</button></div>
+    <div class="explain">Each cell outputs B boxes × 5 numbers (x, y, w, h, confidence) plus one set of C class probabilities: 3 · 5 + 80 = 95 per cell, × 169 cells = <b>16,055</b>. (Later YOLOs predict classes per box instead, so the formula changes.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You train a one-stage detector for tiny cracks on a conveyor belt. Each image has 0–2 cracks and ~50,000 candidate locations. The loss falls quickly, but the model predicts “no crack” everywhere. What's the first fix to try?</div>
+    <div class="opts"><button class="opt">Remove the score threshold so every box is kept</button><button class="opt" data-ok>Use focal loss (γ ≈ 2, with α), so the flood of easy background stops dominating the gradient</button><button class="opt">Lower the NMS threshold</button></div>
+    <div class="explain">A loss that falls while recall stays at zero is the class-imbalance signature: “everything is background” is nearly right for 49,998 of 50,000 locations. Focal loss down-weights those easy negatives so the rare hard positives drive learning. NMS and thresholds act after the model has already failed.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A team trains the original DETR on their dataset for 50 epochs and gets far worse mAP than a Faster R-CNN trained for the same 50 epochs. Most likely explanation?</div>
+    <div class="opts"><button class="opt">DETR needs NMS and they forgot it</button><button class="opt">Hungarian matching is too slow to run every step</button><button class="opt" data-ok>Original DETR converges slowly (its paper trains up to 500 epochs); use a faster-converging variant (Deformable DETR, RT-DETR, D-FINE, DEIM) or train much longer</button></div>
+    <div class="explain">DETR has no NMS by design, and matching 100 queries is cheap. Its known weakness is convergence: unstable early matching and slow-learning global attention. Deformable DETR needed 10× fewer epochs, and the real-time DETRs train in normal schedules.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>R-CNN: CNN on ~2,000 proposals (slow). Fast R-CNN: one CNN pass, crop features (RoI pooling). Faster R-CNN: learned proposals with 9 anchors per position (RPN).</li>
+      <li>YOLO: one pass, the cell containing an object's center is responsible; 7 × 7 × 30 outputs in v1. SSD adds multiple scales.</li>
+      <li>Dense detectors face ~100k candidates, almost all easy background; focal loss (1 − p<sub>t</sub>)<sup>γ</sup> with γ = 2 shrinks easy losses 10,000× and lets one-stage beat two-stage.</li>
+      <li>YOLO line: anchors (v2) → anchor-free (v8, 2023) → NMS-free (v10, 2024) → YOLO26 (Jan 2026: end-to-end, no DFL).</li>
+      <li>DETR: object queries + Hungarian matching = a set with no duplicates, no anchors, no NMS; slow to train at first. RT-DETR, D-FINE, DEIM and RF-DETR made it real-time.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const fit = c => { const d = window.devicePixelRatio || 1, w = c.clientWidth || 400, h = c.clientHeight || 400;
+    if (c.width !== Math.round(w * d)) { c.width = Math.round(w * d); c.height = Math.round(h * d); }
+    const x = c.getContext("2d"); x.setTransform(d, 0, 0, d, 0, 0); x.clearRect(0, 0, w, h); return { x, w, h }; };
+  const alpha = (c, a) => { const t = document.createElement("canvas").getContext("2d"); t.fillStyle = c; const v = t.fillStyle;
+    if (v[0] === "#") { const n = parseInt(v.slice(1), 16); return `rgba(${n >> 16},${(n >> 8) & 255},${n & 255},${a})`; } return v.replace("rgb(", "rgba(").replace(")", `,${a})`); };
+
+  /* ---------- 1. YOLO grid assigner (coordinates 0..1, y down) ---------- */
+  const OBJ = [{ name: "dog", c: [0.24, 0.66], s: [0.30, 0.36], col: "--c-w" }, { name: "bicycle", c: [0.60, 0.62], s: [0.34, 0.34], col: "--c-x" }, { name: "person", c: [0.78, 0.40], s: [0.18, 0.56], col: "--c-ac" }];
+  let S = 7, gDrag = -1, everCollided = false;
+  const cellOf = o => [Math.min(S - 1, Math.floor(o.c[1] * S)), Math.min(S - 1, Math.floor(o.c[0] * S))];
+  function drawGrid() {
+    const { x, w } = fit($("gridC")), k = w;
+    x.strokeStyle = css("--line"); x.lineWidth = 1;
+    for (let i = 1; i < S; i++) { x.beginPath(); x.moveTo(i * k / S, 0); x.lineTo(i * k / S, k); x.moveTo(0, i * k / S); x.lineTo(k, i * k / S); x.stroke(); }
+    const cells = OBJ.map(cellOf), key = c => c.join(","), count = {};
+    cells.forEach(c => (count[key(c)] = (count[key(c)] || 0) + 1));
+    OBJ.forEach((o, i) => { const [r, c] = cells[i], col = css(o.col);
+      x.fillStyle = alpha(count[key(cells[i])] > 1 ? css("--c-dead") : col, 0.3); x.fillRect(c * k / S, r * k / S, k / S, k / S);
+      x.strokeStyle = col; x.lineWidth = 2.5; x.strokeRect((o.c[0] - o.s[0] / 2) * k, (o.c[1] - o.s[1] / 2) * k, o.s[0] * k, o.s[1] * k);
+      x.font = "600 12px " + css("--font"); x.fillStyle = col; x.fillText(o.name, (o.c[0] - o.s[0] / 2) * k + 4, (o.c[1] - o.s[1] / 2) * k + 14);
+      x.beginPath(); x.arc(o.c[0] * k, o.c[1] * k, 7, 0, 7); x.fill(); x.strokeStyle = "#fff"; x.lineWidth = 2; x.stroke(); });
+    const collisions = Object.values(count).filter(n => n > 1).length;
+    if (collisions) everCollided = true;
+    $("gOut").textContent = `${S} × ${S} × 30 = ${(S * S * 30).toLocaleString()}`;
+    $("gCol").textContent = collisions;
+    $("gVec").innerHTML = OBJ.map((o, i) => { const [r, c] = cells[i], ox = o.c[0] * S - c, oy = o.c[1] * S - r;
+      return `<span style="color:${css(o.col)}">${o.name}</span> → cell (row ${r}, col ${c}): x ${ox.toFixed(2)}, y ${oy.toFixed(2)}, w ${o.s[0].toFixed(2)}, h ${o.s[1].toFixed(2)}, conf 1, class “${o.name}”`; }).join("<br>") +
+      `<br><span class="muted">the other ${S * S - new Set(cells.map(key)).size} cells: conf 0 (“no object”)</span>`;
+    const minD = Math.min(...[[0, 1], [0, 2], [1, 2]].map(([a, b]) => Math.hypot(OBJ[a].c[0] - OBJ[b].c[0], OBJ[a].c[1] - OBJ[b].c[1])));
+    win("gCollide", collisions > 0);
+    win("gFix", everCollided && collisions === 0 && minD < 1 / 7 && S === 13);
+    win("gEdge", OBJ.some((o, i) => o.c[0] * S - cells[i][1] > 0.95));
+    $("gMsg").textContent = collisions ? "Collision! One cell, two objects: YOLO v1 has one set of class probabilities per cell, so one object can't be represented. Try a finer grid." :
+      S === 4 ? "A 4 × 4 grid: big cells, so collisions are easy. Coarse grids are cheap but can't separate close objects." : "Each object has its own responsible cell.";
+  }
+  const C1 = $("gridC"), rel = e => { const r = C1.getBoundingClientRect(); return [(e.clientX - r.left) / r.width, (e.clientY - r.top) / r.height]; };
+  C1.addEventListener("pointerdown", e => { const [mx, my] = rel(e); let bd = 0.05; gDrag = -1; OBJ.forEach((o, i) => { const d = Math.hypot(o.c[0] - mx, o.c[1] - my); if (d < bd) { bd = d; gDrag = i; } }); if (gDrag >= 0) { C1.setPointerCapture(e.pointerId); e.preventDefault(); } });
+  C1.addEventListener("pointermove", e => { if (gDrag < 0) return; const [mx, my] = rel(e), o = OBJ[gDrag]; o.c = [Math.max(0.01, Math.min(0.99, mx)), Math.max(0.01, Math.min(0.99, my))]; drawGrid(); });
+  C1.addEventListener("pointerup", () => (gDrag = -1));
+  seg("gS", v => { S = +v; drawGrid(); });
+  drawGrid();
+
+  /* ---------- 2. focal loss ---------- */
+  const POP = [{ n: 100000, pt: 0.99, name: "100,000 easy background" }, { n: 1000, pt: 0.9, name: "1,000 medium" }, { n: 100, pt: 0.3, name: "100 hard" }];
+  const fl = (pt, g) => -Math.pow(1 - pt, g) * Math.log(pt);
+  function drawFocal() {
+    const g = +$("fG").value, L = POP.map(p => p.n * fl(p.pt, g)), T = L.reduce((a, b) => a + b, 0), sh = L.map(v => v / T);
+    $("fGV").textContent = g.toFixed(2);
+    $("fShares").innerHTML = POP.map((p, i) => `<div class="sh"><span>${p.name} (p<sub>t</sub> ${p.pt})</span><div class="meterbar"><i style="width:${(100 * sh[i]).toFixed(1)}%"></i></div><b class="mono">${(100 * sh[i]).toFixed(1)}%</b></div>`).join("");
+    const shrink = fl(0.99, 0) / fl(0.99, g), keep = fl(0.3, g) / fl(0.3, 0);
+    $("fShrink").textContent = shrink >= 1e4 ? shrink.toExponential(0) + "×" : Math.round(shrink).toLocaleString() + "×";
+    $("fKeep").textContent = (100 * keep).toFixed(0) + "%";
+    const pts = Array.from({ length: 99 }, (_, i) => 0.01 + i * 0.01);
+    Plot.line($("fChart"), { series: [{ label: "cross-entropy", color: MX.css("--muted"), data: pts.map(p => [p, fl(p, 0)]), dash: [5, 4], width: 2 }, { label: `focal, γ = ${g}`, color: MX.css("--c-ls"), data: pts.map(p => [p, fl(p, g)]), width: 3 }], yMin: 0, yMax: 3, xLabel: "p_t (probability of the right answer)" });
+    win("gHalf", sh[2] >= 0.5); win("gEasy", sh[0] < 0.01); win("g10k", shrink >= 9999);
+    $("fMsg").textContent = g === 0 ? "Plain cross-entropy: the 100,000 easy examples outvote everything." : sh[2] >= 0.9 ? "Almost all the signal now comes from the examples the model gets wrong." : "";
+  }
+  $("fG").oninput = drawFocal;
+  drawFocal();
+
+  /* ---------- 3. Hungarian matching ---------- */
+  const COST = [[1.8, 4.2, 10.2], [1.25, 1.35, 8.6], [9.1, 6.7, 0.75], [5.4, 3.0, 4.7], [10.55, 12.95, 12.55]];
+  const GTS = [[2.6, 5, 2.4, 4], [5.0, 5, 2.4, 4], [8, 4, 2, 2]], QS = [[1.9, 5.3, 2.2, 3.7], [3.75, 5, 2.4, 4], [7.8, 4.2, 2.2, 2.0], [6.2, 4.6, 2.0, 3.4], [1.2, 1.2, 1.0, 1.0]];
+  const GN = ["A", "B", "C"];
+  let pick = [-1, -1, -1], shownOpt = false;
+  const OPT = (() => { let best = [1e9]; for (let a = 0; a < 5; a++) for (let b = 0; b < 5; b++) for (let c = 0; c < 5; c++) { if (a === b || b === c || a === c) continue; const t = COST[a][0] + COST[b][1] + COST[c][2]; if (t < best[0] - 1e-9) best = [t, a, b, c]; } return best; })();
+  function greedy() { const ur = new Set(), uc = new Set(), p = [-1, -1, -1]; for (let k = 0; k < 3; k++) { let b = [1e9]; COST.forEach((r, i) => r.forEach((v, j) => { if (!ur.has(i) && !uc.has(j) && v < b[0]) b = [v, i, j]; })); ur.add(b[1]); uc.add(b[2]); p[b[2]] = b[1]; } return p; }
+  function drawH(msg) {
+    let html = "<tr><th></th>" + GN.map(g => `<th>${g}</th>`).join("") + "</tr>";
+    COST.forEach((r, i) => { html += `<tr><th>Q${i + 1}</th>` + r.map((v, j) => `<td class="c${pick[j] === i ? " pick" : ""}" data-i="${i}" data-j="${j}">${v.toFixed(2)}</td>`).join("") + "</tr>"; });
+    $("hT").innerHTML = html;
+    [...$("hT").querySelectorAll("td.c")].forEach(td => (td.onclick = () => { const i = +td.dataset.i, j = +td.dataset.j;
+      pick = pick.map((p, jj) => (jj !== j && p === i ? -1 : p)); pick[j] = pick[j] === i ? -1 : i; drawH(); }));
+    const full = pick.every(p => p >= 0), tot = full ? pick.reduce((s, p, j) => s + COST[p][j], 0) : null;
+    $("hYou").textContent = full ? tot.toFixed(2) : `${pick.filter(p => p >= 0).length} / 3 picked`;
+    $("hOpt").textContent = shownOpt ? OPT[0].toFixed(2) : "?";
+    if (full && Math.abs(tot - OPT[0]) < 1e-9 && !shownOpt) win("gMatch", true);
+    // picture
+    const { x, w } = fit($("hC")), k = w / 10;
+    const rect = (b, col, lw, dash) => { x.setLineDash(dash || []); x.strokeStyle = col; x.lineWidth = lw; x.strokeRect((b[0] - b[2] / 2) * k, (b[1] - b[3] / 2) * k, b[2] * k, b[3] * k); x.setLineDash([]); };
+    GTS.forEach((b, j) => { rect(b, css("--c-y"), 2.5, [6, 4]); x.fillStyle = css("--c-y"); x.font = "700 13px " + css("--font"); x.fillText(GN[j], (b[0] - b[2] / 2) * k + 4, (b[1] + b[3] / 2) * k + 16); });
+    QS.forEach((b, i) => { const matched = pick.includes(i); rect(b, matched ? css("--c-at") : css("--muted"), matched ? 3 : 1.2, matched ? null : [3, 3]);
+      x.fillStyle = matched ? css("--c-at") : css("--muted"); x.font = "600 12px " + css("--mono"); x.fillText("Q" + (i + 1) + (matched ? "" : " ∅"), (b[0] - b[2] / 2) * k + 3, (b[1] - b[3] / 2) * k - 4); });
+    pick.forEach((p, j) => { if (p < 0) return; x.strokeStyle = css("--c-at"); x.lineWidth = 2; x.beginPath(); x.moveTo(QS[p][0] * k, QS[p][1] * k); x.lineTo(GTS[j][0] * k, GTS[j][1] * k); x.stroke(); });
+    $("hMsg").textContent = msg || (full ? (Math.abs(tot - OPT[0]) < 1e-9 ? "That's the optimum. Unmatched queries (∅) are trained to predict “no object”." : "A valid matching, but not the cheapest. Can you lower it?") : "Pick one prediction for each object.");
+  }
+  $("hGreedy").onclick = () => { pick = greedy(); const t = pick.reduce((s, p, j) => s + COST[p][j], 0); win("gGreedy", t > OPT[0] + 1e-9); drawH(`Greedy took the cheapest cell first, Q3 → C, then Q2 → A, and was left with Q4 → B: total ${t.toFixed(2)}.`); };
+  $("hHung").onclick = () => { shownOpt = true; pick = [OPT[1], OPT[2], OPT[3]]; drawH(`Hungarian: Q1 → A, Q2 → B, Q3 → C, total ${OPT[0].toFixed(2)}. Giving up the cheapest cell for A frees Q2 for B.`); };
+  $("hClear").onclick = () => { pick = [-1, -1, -1]; drawH(); };
+  drawH();
+})();
+</script>
+</body>
+</html>

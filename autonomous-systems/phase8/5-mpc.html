@@ -1,0 +1,592 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.5 Model predictive control · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.strip { width: 100%; aspect-ratio: 7 / 1; height: auto; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .steps4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 12px 0; }
+  .steps4 div { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; font-size: .92rem; }
+  .steps4 b { display: block; margin-bottom: 4px; }
+</style>
+</head>
+<body data-lesson="s8-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8 · Lesson 5</div>
+  <h1>Model predictive control: plan ahead, act once, repeat</h1>
+  <p class="subtitle">A PID controller (proportional–integral–derivative, Lesson 8.1) reacts to the error you have now. MPC asks a better question: “if I keep doing this, what happens in the next two seconds?” It plans a whole sequence of moves that respects the car's limits, uses only the first one, and plans again. That one trick is why it can brake <i>before</i> a corner.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The kinematic bicycle model</b>: state x, y, heading <span class="be">θ</span>, speed <span class="be">v</span>; inputs <span class="ct">steering δ</span> and <span class="ct">acceleration a</span>; turning curvature tan(δ)/L (Lesson 8.2).</li>
+      <li><b>A cost</b>: one number that says how bad a behaviour is, like Q (care about errors) vs R (care about effort) in LQR, the linear–quadratic regulator (Lesson 8.4).</li>
+      <li><b>Saturation</b>: a real actuator has limits; a PID that asks for more just gets clipped (Lesson 8.1).</li>
+      <li><b>Constrained optimization</b>: minimize a cost while some inequalities must hold. Refresher: <a href="../../math-course/phase7/5-constraints.html">constraints</a> in the Math course.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>You're driving at <b class="be">20 m/s</b> (72 km/h) toward a red light <b class="ag">100 m</b> ahead. Your brakes give at most <b class="ct">6 m/s²</b>. Your “driver” is a computer that, every 0.1 s, imagines the next <b class="pl">H seconds</b> and picks the best plan: stay near 20 m/s, never cross the line.</p>
+    <p><b>How far ahead must it look?</b> Half a second? The 3.3 seconds it takes to stop? Ten seconds, to be safe? Hold your guess; the first playground lets you lock it in.</p>
+    <p>This “look ahead, then act” controller is called <b>model predictive control (MPC)</b>. It didn't start in cars: engineers at Shell Oil built their own version in the early 1970s, with a first application in 1973, and a 2003 survey counted <b>more than 4,600</b> industrial MPC applications, mostly in refineries and chemical plants (<a href="https://skoge.folk.ntnu.no/prost/publications_various/mpc_survey_qin.pdf" target="_blank" rel="noopener">Qin &amp; Badgwell, 2003</a>). Today it steers cars in Autoware and flies research drones at 20 m/s.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · How far ahead must it look?</span>
+    <p class="hint">The car (purple) wants to cruise at the speed limit. Every 0.1 s, the controller simulates many candidate plans over its horizon, rejects any that cross the <b class="ag">red stop line</b>, and applies the first step of the best one. The <b class="pl">teal stretch</b> is how far its plan reaches. Set your guess for the <b>shortest horizon that stops in time</b>, then lock it in.</p>
+    <canvas class="strip" id="bStrip"></canvas>
+    <div class="controls">
+      <label>my guess: horizon <input type="range" id="bGuess" min="0.5" max="5" step="0.1" value="3.3"> <b class="mono" id="bGuessV"></b></label>
+      <button class="btn primary" id="bLock">🔒 Lock in my guess</button>
+    </div>
+    <div class="verdict" id="bVerdict"></div>
+    <div class="controls" id="bSliders" style="opacity:.45; pointer-events:none">
+      <label><span class="pl">horizon H</span> <input type="range" id="bH" min="0.3" max="5" step="0.1" value="1.0"> <b class="mono" id="bHV"></b></label>
+      <label><span class="be">speed</span> <input type="range" id="bV" min="10" max="30" step="1" value="20"> <b class="mono" id="bVV"></b></label>
+      <label><input type="checkbox" id="bTerm"> terminal rule: “every plan must end able to stop”</label>
+      <button class="btn" id="bRun">▶ Drive</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">plan reaches (v × H) <b id="bReach">–</b></div>
+      <div class="stat">stopping distance v²/(2a) <b id="bStop">–</b></div>
+      <div class="stat">result <b id="bRes">–</b></div>
+    </div>
+    <p class="hint" id="bHint">The sliders unlock after you guess.</p>
+  </div>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> after you've found the shortest safe horizon at 20 m/s, drag the speed to 30 m/s. Does the safe horizon grow 1.5× (like the speed) or 2.25× (like the stopping distance)?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">About <b>1.5×</b>. The stopping distance grows with v² (33 m → 75 m), but so does the distance the plan reaches, v × H. Setting v × H ≥ v²/(2a) gives H ≥ v/(2a): linear in speed. At 20 m/s that's 1.7 s, at 30 m/s 2.5 s; the playground needs a few tenths more because it only re-plans every 0.1 s and its plans are coarse (two blocks of constant acceleration). And tick the terminal rule: then even a 0.5 s horizon stops safely. That's a real MPC trick you'll meet again below.</div>
+  </div>
+
+  <h2>Numbers first: the red light, by hand</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: why 1 second crashes and 2 seconds doesn't</span>
+    <ol>
+      <li><b>Stopping distance</b> at 20 m/s with 6 m/s² of braking: v² ÷ (2a) = 400 ÷ 12 = <b>33.3 m</b>, taking 20 ÷ 6 = 3.3 s.</li>
+      <li><b>What a 1 s horizon sees.</b> The “keep cruising” plan covers 20 × 1 = <b class="pl">20 m</b>. The controller only notices the line when even that plan would cross it, so it starts braking with 20 m to go. Too late: it needs 33 m. It hits the line still doing about √(400 − 2·6·20) = √160 ≈ <b class="ag">13 m/s</b>.</li>
+      <li><b>What a 2 s horizon sees.</b> The cruising plan reaches 40 m. Trouble shows up 40 m out, braking needs 33 m: it stops with room to spare.</li>
+      <li><b>The rule.</b> The plan must reach at least the stopping distance: v·H ≥ v²/(2a) → <b>H ≥ v/(2a) = 1.7 s</b>. Not the 3.3 s stopping <i>time</i>: what matters is how far ahead the plan <i>reaches</i>.</li>
+    </ol>
+    <p>So a horizon is not a detail: too short and the controller is <b>myopic</b>, it can't see a problem until it's already unavoidable.</p>
+  </div>
+
+  <h2>The MPC loop, in four steps</h2>
+  <div class="steps4">
+    <div><b>1 · Predict</b>Start from the current <span class="be">state estimate</span>. Use the model (here, the bicycle) to simulate what a candidate input sequence would do over the next N steps.</div>
+    <div><b>2 · Optimize</b>Score each sequence with a <span class="pl">cost</span> (tracking error, comfort, progress) and keep only sequences that obey the <span class="ag">constraints</span>. Find the best one.</div>
+    <div><b>3 · Apply the first input</b>Send only <span class="ct">u₀</span>, the first steering and throttle command, to the car. Throw the rest away.</div>
+    <div><b>4 · Repeat</b>0.1 s later, measure again and re-plan from scratch (warm-started from the old plan). The horizon slides forward: a <b>receding horizon</b>.</div>
+  </div>
+  <div class="eq">
+    minimize over <span class="ct">u₀ … u<sub>N−1</sub></span> &nbsp; Σ<sub>k</sub> ( <span class="be">e<sub>k</sub></span>ᵀ Q <span class="be">e<sub>k</sub></span> + <span class="ct">u<sub>k</sub></span>ᵀ R <span class="ct">u<sub>k</sub></span> ) + terminal cost<br><br>
+    subject to &nbsp; <span class="be">x<sub>k+1</sub></span> = f(<span class="be">x<sub>k</sub></span>, <span class="ct">u<sub>k</sub></span>) &nbsp;·&nbsp; |<span class="ct">δ</span>| ≤ δ<sub>max</sub> &nbsp;·&nbsp; a<sub>min</sub> ≤ <span class="ct">a</span> ≤ a<sub>max</sub> &nbsp;·&nbsp; <span class="be">v</span> ≤ v<sub>limit</sub> &nbsp;·&nbsp; stay inside the <span class="mp">lane</span>
+    <span class="say">Find the input sequence with the lowest total cost (errors <span class="be">e</span> weighted by Q, effort weighted by R, just as in LQR), using the model f to predict each next state, while every limit holds at every step of the plan.</span>
+  </div>
+  <p>Notice how close this is to LQR (Lesson 8.4): same Q and R, same model. The two differences are the whole point. LQR solves the problem once, for an infinite horizon and <i>no limits</i>, and gets a fixed gain K. MPC solves it <i>again every tick</i>, over a finite horizon, <i>with</i> limits. That costs a lot more compute, and buys you constraints.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    MPC turns control into <b>repeated planning</b>: plan a short future that obeys every limit, commit to only the first move, and re-plan as soon as you know more. Re-planning is what makes it robust to model errors and surprises; the horizon is what lets it act early.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a driver on a mountain road</span>
+    <p>A good driver doesn't steer by the white line under the bonnet. They look down the road, see the hairpin coming, and think “brake now, turn in late, accelerate out.” They don't execute that whole plan blindly though: a cyclist appears, and they re-plan instantly. And their plan respects what the car can do: they never plan a turn sharper than the tyres allow. That's MPC: a short look ahead, a plan inside the limits, the first move, and again.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> PID and LQR compute the command from the error <i>right now</i>. They can't see a corner coming, and they know nothing about limits: when they ask for 0.6 rad of steering on a car that has 0.5, the command is simply clipped and the car runs wide. On a car that must brake for a bend, respect a speed limit, and never exceed its tyres' grip, “react to now” isn't enough.</li>
+      <li><b>What people tried.</b> <i>Feedforward</i> from the path curvature (good, but no limits). <i>Gain scheduling</i>: a different PID per speed. <i>Anti-windup and hand-made rules</i> (“if steering is saturated, slow down”), which pile up fast. <i>Planning a trajectory once</i> and then tracking it: fine until the world changes mid-plan.</li>
+      <li><b>Why this works.</b> Put the limits <i>inside</i> the optimization, and plan far enough ahead to act early. The red light: at 20 m/s with 6 m/s² of brakes, a plan that reaches v·H ≥ 33 m (H ≥ 1.7 s) brakes in time; a 1 s plan sees the line at 20 m and hits it at 13 m/s. Re-planning every 0.1 s fixes small model errors before they grow.</li>
+      <li><b>What it costs, when it fails.</b> You solve an optimization <b>every control tick</b> (10–100 times a second), and compute grows with the horizon. The solver must finish on time, every time, or you have no command. It's only as good as its model: if the road is wetter than the model thinks, it plans to a limit that isn't there (Playground 3). Nonlinear models give non-convex problems that can converge to a poor answer, and too-short horizons give myopic, even unstable, behaviour.</li>
+      <li><b>What came next.</b> Fast structured solvers (OSQP for quadratic programs, acados for nonlinear MPC) and tools like CasADi to build the problem; <b>terminal constraints and costs</b> that make short horizons safe; <b>robust and tube MPC</b> that tighten limits for model error; <b>sampling-based MPC</b> (MPPI, the cross-entropy method) that runs on GPUs; and <b>learned planners</b> whose output trajectories an MPC or simpler controller then tracks.</li>
+    </ol>
+  </div>
+
+  <h2>Constraints are where MPC shines</h2>
+  <p>Here's a limit every car has. The tyres can only push sideways so hard: call it <b>4 m/s²</b> of lateral acceleration for comfortable, safe driving (dry asphalt can do more, wet less). Sideways acceleration on a curve is v² × curvature, so the steering you can actually use <i>shrinks with speed</i>:</p>
+  <div class="eq">
+    a<sub>lat</sub> = <span class="be">v</span>² · tan(<span class="ct">δ</span>) / L ≤ 4 m/s² &nbsp;&nbsp;⇒&nbsp;&nbsp; <span class="ct">δ</span><sub>usable</sub> = min( δ<sub>max</sub>, atan( L · 4 / <span class="be">v</span>² ) )
+    <span class="say">At 14 m/s the usable steering is only atan(2.7 · 4 / 196) ≈ 0.055 rad (3°), a 49 m circle. At 6 m/s it's 0.29 rad, a 9 m circle. To take a 10 m-radius bend you must be at or below √(4 × 10) ≈ 6.3 m/s.</span>
+  </div>
+  <table>
+    <tr><th>Controller</th><th>What it does at this corner (14 m/s, 10 m radius)</th></tr>
+    <tr><td>PID / pure pursuit at constant speed</td><td>Asks for 0.26 rad of steering at the bend; the tyres deliver what 3° gives; the car <b class="ag">slides wide</b>. Someone has to add a “slow down for curves” rule by hand.</td></tr>
+    <tr><td>LQR</td><td>Optimal gain, but for an unlimited, linear world: same story, the limit is clipped after the fact.</td></tr>
+    <tr><td>MPC with the grip limit as a constraint</td><td>Sees the bend in its plan, discovers that no plan keeps 14 m/s <i>and</i> stays on the road, and <b class="mp">brakes from 14 to about 6 m/s</b> before turning in. Braking 14 → 6.3 m/s at 5 m/s² takes (196 − 40)/10 ≈ 16 m: that's the distance its plan has to reach.</td></tr>
+  </table>
+
+  <div class="predict" id="pr2">
+    <b class="q">🧩 Predict before Playground 2:</b> braking needs about 16 m and the car starts at 14 m/s. Roughly what's the shortest horizon that can make this corner: 0.5 s, 1.2 s or 3 s?
+    <div><button class="btn small" data-open="pr2">Show the answer</button></div>
+    <div class="ans">Around <b>1.2–1.4 s</b>: 14 m/s × 1.2 s ≈ 17 m, just over the braking distance. Shorter horizons notice the bend too late; the car can't slow down enough and slides off. The playground's MPC also uses the lane's width (swinging out, cutting the apex), which buys a little extra radius. Test it: start at 3 s (comfortable), then shorten until it breaks.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · The horizon, a corner, and a steering limit</span>
+    <p class="hint">A 4 m-wide road with a 10 m-radius left bend. The car starts at the 14 m/s speed limit. Each 0.1 s the MPC tries 3 rounds of 48 candidate plans (steering and throttle over the horizon), keeps the best, and drives the first step. <b class="pl">Teal</b>: its current plan. <b class="be">Purple</b>: where it has been; <b class="ag">red</b> marks skidding. The steering limit at the current speed is the grip formula above (and never more than 0.5 rad).</p>
+    <canvas class="sim" id="cSim"></canvas>
+    <div class="controls">
+      <button class="btn primary" id="cRun">▶ Run</button>
+      <button class="btn" id="cStep">⏭ One decision</button>
+      <button class="btn" id="cReset">↺ Reset</button>
+      <label><span class="pl">horizon</span> <input type="range" id="cH" min="0.4" max="5" step="0.1" value="3"> <b class="mono" id="cHV"></b></label>
+      <label><input type="checkbox" id="cAware" checked> MPC knows the steering limit</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">speed <b id="cSpd">–</b></div>
+      <div class="stat">steering used / limit <b id="cSt">–</b></div>
+      <div class="stat">worst off-centre <b id="cErr">–</b></div>
+      <div class="stat">steps over the limit <b id="cSk">–</b></div>
+      <div class="stat">compute per decision <b id="cMs">–</b></div>
+      <div class="stat">model steps per decision <b id="cEv">–</b></div>
+    </div>
+    <div class="verdict" id="cVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> take the corner without ever exceeding the steering limit and without leaving the road (worst off-centre under 2 m), with the <b>shortest horizon you can</b>: 1.4 s or less wins. Then untick “MPC knows the steering limit”: the same optimizer, planning as if the tyres had unlimited grip, plans the impossible at any horizon.</p>
+    <div class="controls"><button class="btn" id="cSweep">📈 Sweep every horizon (0.6–4 s)</button> <span class="hint" id="cSweepNote">Runs 18 laps in the background; about a second or two.</span></div>
+    <canvas class="chart" id="cErrChart" style="height:200px"></canvas>
+    <canvas class="chart" id="cCpuChart" style="height:170px"></canvas>
+  </div>
+  <p>What you should see in the sweep: below about 1.2 s the worst error shoots past the road edge (myopic); above about 1.4 s it stays inside the road, and longer horizons mostly buy speed: the lap drops from about 10 s to under 9 s because the plan can brake later and more precisely, with diminishing returns past 2 s. Meanwhile the compute per decision climbs <b>linearly</b> with the horizon, because every candidate plan is simulated step by step. That is the horizon trade-off in one picture: <b>too short is blind, too long is expensive</b>, and the sweet spot is “a bit more than the distance you need to react.”</p>
+
+  <h2>Inside the tiny MPC on this page</h2>
+  <p>Real automotive MPCs solve the problem with gradient-based optimizers. To keep this page light, the playgrounds use a <b>sampling-based</b> optimizer, the <b>cross-entropy method</b>: about 150 plan simulations per decision.</p>
+  <ul>
+    <li><b>A plan</b> is 8 numbers: steering and acceleration at 4 knots spread over the horizon, joined by straight lines. Longer horizons don't add numbers, just simulation steps.</li>
+    <li><b>Round 1</b>: sample 48 plans around last tick's best plan (the <i>warm start</i>), simulate each with the bicycle model, score them.</li>
+    <li><b>Rounds 2–3</b>: keep the 8 cheapest, re-centre and narrow the sampling around them, try again.</li>
+    <li><b>Constraints</b>: each sampled steering value is clipped to the usable limit for the predicted speed at that step, so <i>every</i> plan obeys the grip limit; leaving the lane costs a big penalty.</li>
+  </ul>
+  <p>This is the same family as <b>MPPI</b> (model predictive path integral control), which ROS 2's Nav2 ships for mobile robots and measures at 50+ Hz on a modest 4th-generation Intel i5. Gradient methods (next section's tools) need far fewer evaluations for smooth problems; sampling shines when the cost is jagged, like collisions.</p>
+
+  <div class="predict" id="pr3">
+    <b class="q">🧩 Predict before Playground 3:</b> it starts raining. The road now grips only 3 m/s², but the MPC's model still says 4. The MPC obeys its constraint perfectly. Does the car make the corner?
+    <div><button class="btn small" data-open="pr3">Show the answer</button></div>
+    <div class="ans">No. MPC obeys the limit <i>in its model</i>. It brakes to the speed that 4 m/s² allows (about 6.3 m/s), turns in, and the real tyres, which only give 3, slide. Every “optimal” plan was optimal for the wrong world. The fix is honest models plus a safety margin: plan with 3 (or a bit less) and the car makes it, slightly slower. Too much margin and you crawl around the bend.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · When the model is wrong (a wet road)</span>
+    <p class="hint">Same corner and MPC. Now you set two numbers: how much grip the <b>road really has</b>, and how much grip the <b>MPC's model assumes</b>. The MPC plans with its assumption; the car skids whenever it asks for more than the real road gives.</p>
+    <canvas class="sim" id="wSim"></canvas>
+    <div class="controls">
+      <button class="btn primary" id="wRun">▶ Run</button>
+      <label>real grip <input type="range" id="wReal" min="2" max="5" step="0.25" value="3"> <b class="mono" id="wRealV"></b></label>
+      <label>MPC assumes <input type="range" id="wModel" min="2" max="5" step="0.25" value="4"> <b class="mono" id="wModelV"></b></label>
+      <label><span class="pl">horizon</span> <input type="range" id="wH" min="0.6" max="4" step="0.1" value="2"> <b class="mono" id="wHV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">time to the finish <b id="wT">–</b></div>
+      <div class="stat">skidding steps <b id="wSk">–</b></div>
+      <div class="stat">worst off-centre <b id="wErr">–</b></div>
+      <div class="stat">slowest speed in the bend <b id="wMin">–</b></div>
+    </div>
+    <div class="verdict" id="wVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> with the real grip at 3 m/s² (wet), make the corner with <b>zero skidding</b> and reach the finish in <b>9.5 s or less</b>. A model that's too optimistic skids; one that's too pessimistic is safe but slow.</p>
+  </div>
+  <p>This is the most important practical lesson about MPC: it's a <b>model-based</b> controller. Real systems estimate friction online, leave margins (“constraint tightening”), and re-plan fast so that small surprises are corrected before they matter. Robust MPC makes the margin systematic.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>You almost never write the solver. You describe the problem and hand it to one: <b>CasADi</b> (Python/MATLAB/C++; builds the problem and computes exact derivatives by algorithmic differentiation, then calls a solver such as IPOPT), <b>acados</b> (C with Python/MATLAB interfaces, “fast and embedded solvers for nonlinear optimal control”, made for real-time MPC) and <b>OSQP</b> (an operator-splitting solver for the <i>quadratic programs</i>, QPs, you get from linear models; its docs include a full MPC example with warm starting). Autoware's MPC lateral controller and Nav2's MPPI controller are open-source MPCs you can read.</p>
+<pre><code><span class="k">import</span> casadi <span class="k">as</span> ca              <span class="c"># pip install casadi</span>
+
+N, dt, L = <span class="n">20</span>, <span class="n">0.1</span>, <span class="n">2.7</span>                    <span class="c"># 2 s horizon</span>
+opti = ca.Opti()
+X = opti.variable(<span class="n">4</span>, N + <span class="n">1</span>)                  <span class="c"># x, y, heading, speed at each step</span>
+U = opti.variable(<span class="n">2</span>, N)                      <span class="c"># steering, acceleration</span>
+x0 = opti.parameter(<span class="n">4</span>)                       <span class="c"># current state estimate</span>
+ref = opti.parameter(<span class="n">2</span>, N + <span class="n">1</span>)                <span class="c"># reference points along the path</span>
+
+cost = <span class="n">0</span>
+<span class="k">for</span> k <span class="k">in</span> range(N):
+    x, y, th, v = X[<span class="n">0</span>, k], X[<span class="n">1</span>, k], X[<span class="n">2</span>, k], X[<span class="n">3</span>, k]
+    d, a = U[<span class="n">0</span>, k], U[<span class="n">1</span>, k]
+    opti.subject_to(X[:, k + <span class="n">1</span>] == ca.vertcat(      <span class="c"># the bicycle model</span>
+        x + v * ca.cos(th) * dt, y + v * ca.sin(th) * dt,
+        th + v / L * ca.tan(d) * dt, v + a * dt))
+    cost += (x - ref[<span class="n">0</span>, k])**<span class="n">2</span> + (y - ref[<span class="n">1</span>, k])**<span class="n">2</span> + <span class="n">0.5</span> * d**<span class="n">2</span> + <span class="n">0.1</span> * a**<span class="n">2</span>
+    opti.subject_to(v**<span class="n">2</span> * ca.tan(d) / L &lt;= <span class="n">4</span>)      <span class="c"># grip limit (left turns)</span>
+    opti.subject_to(v**<span class="n">2</span> * ca.tan(d) / L &gt;= -<span class="n">4</span>)     <span class="c"># and right turns</span>
+
+opti.minimize(cost)
+opti.subject_to(X[:, <span class="n">0</span>] == x0)
+opti.subject_to(opti.bounded(-<span class="n">0.5</span>, U[<span class="n">0</span>, :], <span class="n">0.5</span>))     <span class="c"># steering rack limit (rad)</span>
+opti.subject_to(opti.bounded(-<span class="n">5</span>, U[<span class="n">1</span>, :], <span class="n">2</span>))         <span class="c"># brake / throttle (m/s²)</span>
+opti.subject_to(opti.bounded(<span class="n">0</span>, X[<span class="n">3</span>, :], <span class="n">14</span>))         <span class="c"># speed limit (m/s)</span>
+opti.solver(<span class="s">"ipopt"</span>)
+
+<span class="c"># every control tick: set the new state and reference, solve, apply only the first input</span>
+opti.set_value(x0, [<span class="n">0</span>, <span class="n">0</span>, <span class="n">0</span>, <span class="n">14</span>]); opti.set_value(ref, ref_now)   <span class="c"># ref_now: 2 × 21 array you compute</span>
+sol = opti.solve()
+steer, accel = sol.value(U[:, <span class="n">0</span>])</code></pre>
+    <p class="hint">In a real loop you'd warm-start each solve from the previous solution (<code>opti.set_initial</code>), and for speed switch to acados, which generates tailored C code. With a linearized model, the whole problem becomes a QP that OSQP solves in a loop: <code>prob.setup(P, q, A, l, u, warm_starting=True)</code>, then per tick <code>res = prob.solve()</code> and <code>prob.update(l=l, u=u)</code> with the new initial state.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚘 Tesla</h4><p>Tesla hasn't published a controller design. What it has said publicly is in its FSD v12 release notes (early 2024): v12 “upgrades the city-streets driving stack to a single end-to-end neural network trained on millions of video clips, replacing over 300k lines of explicit C++ code.” Whether any optimization-based control remains between that network and the steering rack isn't public. The MPC idea still matters for reading Tesla's direction: it's the hand-written “plan, check limits, act” logic that an end-to-end network is trained to imitate from data.</p>
+        <p class="src">Sources: <a href="https://www.notateslaapp.com/software-updates/version/2023.44.30.11/release-notes" target="_blank" rel="noopener">FSD v12 release notes (third-party record of Tesla's notes)</a>, <a href="https://www.tesla.com/fsd" target="_blank" rel="noopener">Tesla FSD (Supervised)</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo hasn't published how its production vehicle controller works. Its published research shows the layer above it: <b>EMMA</b>, a research model built on a multimodal language model, maps camera images directly to <i>planner trajectories</i> (plus detected objects and road graph). Waymo lists its limits frankly: few image frames, no lidar or radar, computationally expensive. A trajectory like that still has to be turned into steering and throttle within the car's limits, which is the job this lesson's tracking controllers and MPC do in open stacks.</p>
+        <p class="src">Sources: <a href="https://waymo.com/research/emma/" target="_blank" rel="noopener">Waymo Research: EMMA</a>, <a href="https://arxiv.org/abs/2410.23262" target="_blank" rel="noopener">arXiv 2410.23262</a></p></div>
+      <div><h4>🛸 Drones</h4><p>PX4's default multicopter controller is <b>not</b> an MPC: it's a cascade of P and PID loops (position → velocity → attitude → rate; Lesson 8.7), because it's cheap and runs at hundreds of hertz on a microcontroller. MPC appears in research and on companion computers: UZH's study of agile quadrotors at up to 20 m/s found nonlinear MPC tracks dynamically infeasible trajectories better than a flatness-based controller, “at the cost of higher computation time and risk of numerical convergence issues.” Their open Agilicious platform ships an MPC controller.</p>
+        <p class="src">Sources: <a href="https://docs.px4.io/main/en/flight_stack/controller_diagrams.html" target="_blank" rel="noopener">PX4 controller diagrams</a>, <a href="https://arxiv.org/abs/2109.01365" target="_blank" rel="noopener">Sun et al., IEEE T-RO 2022</a>, <a href="https://github.com/uzh-rpg/agilicious" target="_blank" rel="noopener">Agilicious</a></p></div>
+      <div><h4>🤖 Open self-driving stacks</h4><p><b>Autoware</b>, the open-source self-driving stack, ships an MPC lateral controller: a linear MPC, posed as a QP, that simulates a bicycle kinematics model (with a first-order steering delay) and outputs steering angle and steering rate, next to a pure-pursuit option (Lesson 8.3). Nav2 for ROS 2 robots ships MPPI, a sampling-based MPC much like this page's.</p>
+        <p class="src">Sources: <a href="https://autowarefoundation.github.io/autoware_universe/main/control/autoware_mpc_lateral_controller/" target="_blank" rel="noopener">Autoware MPC lateral controller</a>, <a href="https://github.com/ros-navigation/navigation2/tree/main/nav2_mppi_controller" target="_blank" rel="noopener">Nav2 MPPI controller</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> a flight controller must run on a small chip hundreds of times a second, so drones keep the cheap PID cascade inside and put MPC (if any) on a companion computer for aggressive flight. Open modular car stacks use MPC where limits and comfort matter. Tesla publicly moved its driving logic into one learned network, trading explicit constraints for data; Waymo publishes research on learned planners but not its production controller.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>MPC vs PID / LQR</td><td>Limits handled by design; acts early on what's coming; one framework for steering and speed</td><td>An optimization every tick; needs a good model; harder to certify and debug</td></tr>
+      <tr><td>Longer horizon</td><td>Sees further, smoother and less myopic</td><td>Compute grows with N; prediction errors grow far out</td></tr>
+      <tr><td>Shorter horizon + terminal rule</td><td>Cheap and still safe (the red light at 0.5 s)</td><td>Needs a terminal set you can prove (“can always stop”), often conservative</td></tr>
+      <tr><td>Linear model + QP (OSQP)</td><td>Convex: fast, reliable, predictable timing</td><td>Linearization error on sharp turns and big speed changes</td></tr>
+      <tr><td>Nonlinear MPC (acados, CasADi + IPOPT)</td><td>Accurate model, best at the limits</td><td>Non-convex; slower; can fail to converge on time</td></tr>
+      <tr><td>Sampling MPC (MPPI, CEM)</td><td>Any cost, even jagged; parallel on GPUs</td><td>Many samples; noisy commands without smoothing</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“When would you use MPC instead of PID, and what can go wrong?” A strong answer:</p>
+    <ul>
+      <li>Explains the <b>receding horizon</b>: optimize N steps, apply the first, re-plan; and links it to LQR (same Q, R; MPC adds limits and a finite horizon).</li>
+      <li>Picks MPC for <b>constraints</b> (steering, rates, speed, grip, keep-out zones) and for <b>preview</b> of the road ahead; keeps PID for fast, simple inner loops.</li>
+      <li>Sizes the horizon from physics: “it must see past the stopping or reaction distance: v/(2a) for braking”, then checks the compute budget at the loop rate.</li>
+      <li>Knows the failure modes: <b>solver timeouts</b> (need a fallback command), infeasibility (soft constraints with slack), model mismatch (estimate friction, tighten constraints), and non-convexity (warm starts).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Oil refineries, since 1973</b> <span class="tag hist">📜 History · 1970s</span> <a href="https://skoge.folk.ntnu.no/prost/publications_various/mpc_survey_qin.pdf" target="_blank" rel="noopener">Qin &amp; Badgwell survey (2003)</a></div>
+      <p><b>How:</b> Shell's dynamic matrix control (DMC) and Richalet's IDCOM predicted plant outputs over a horizon from step or impulse responses; Shell later posed it as a quadratic program (QDMC) so constraints appeared explicitly.</p>
+      <p><b>Why this method:</b> plants with many coupled valves and hard limits (temperatures, pressures) where operating right at the limit earns money; slow processes left minutes for each solve.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Autoware's lateral controller</b> <span class="tag oss">🧰 Open source</span> <a href="https://autowarefoundation.github.io/autoware_universe/main/control/autoware_mpc_lateral_controller/" target="_blank" rel="noopener">Autoware docs</a></div>
+      <p><b>How:</b> a linear MPC posed as a quadratic program: a bicycle model with steering delay predicts the car along the reference path, and the optimized steering sequence's first command is applied.</p>
+      <p><b>Why this method:</b> it uses the upcoming curvature (preview) and respects steering limits, which pure pursuit can't.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Agile quadrotors at 20 m/s</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2109.01365" target="_blank" rel="noopener">Sun et al., NMPC vs flatness-based control</a></div>
+      <p><b>How:</b> a nonlinear MPC over the full quadrotor model tracks racing trajectories, compared head-to-head with a differential-flatness controller in simulation and a large motion-capture arena.</p>
+      <p><b>Why this method:</b> when the requested trajectory is beyond what the motors can do, MPC finds the best feasible compromise, at a higher compute price.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>ROS 2 robots with MPPI</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/ros-navigation/navigation2/tree/main/nav2_mppi_controller" target="_blank" rel="noopener">Nav2 MPPI controller</a></div>
+      <p><b>How:</b> samples many control sequences, scores them with costs for the path, obstacles and smoothness, and blends the best: sampling-based MPC, like Playground 2.</p>
+      <p><b>Why this method:</b> obstacle costs are jagged and non-convex, which samples handle and gradients don't.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · MPC was born in no hurry</span>
+    <p>The first industrial MPCs ran on chemical plants where nothing changes faster than minutes, so a 1970s computer had plenty of time to solve an optimization each step. The same idea now has to finish in a few milliseconds on a car. The 2003 industry survey already counted over 4,600 applications, “over twice the number” of five years earlier (<a href="https://skoge.folk.ntnu.no/prost/publications_various/mpc_survey_qin.pdf" target="_blank" rel="noopener">Qin &amp; Badgwell</a>).</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>MPC is LQR (8.4) with a finite horizon and constraints, solved again every tick on the bicycle model (8.2); it can replace pure pursuit or Stanley (8.3) for path tracking, and it's how aggressive drones use the quadrotor model (8.6). Its input is the state estimate from Phase 3 and the trajectory from Phase 7's planners; with the planner's trajectory, MPC is the last step before the actuators. Planning by simulating the future also powers model-based RL: see <a href="../../rl-course/phase6/3-model-based.html">model-based RL</a> and <a href="../../rl-course/phase6/3b-mcts.html">MCTS</a> in the RL course. The math is <a href="../../math-course/phase7/5-constraints.html">constrained optimization</a> and <a href="../../math-course/phase3/4-gradient-descent.html">gradient descent</a> in the Math course.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://osqp.org/docs/examples/mpc.html" target="_blank" rel="noopener">OSQP: model predictive control example</a>. A complete linear MPC as a QP, with the closed loop, in about 60 lines.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.acados.org/" target="_blank" rel="noopener">acados documentation</a>. Real-time nonlinear MPC with code generation, with Python examples.</li>
+      <li><span class="kind">Paper</span> <a href="https://skoge.folk.ntnu.no/prost/publications_various/mpc_survey_qin.pdf" target="_blank" rel="noopener">Qin &amp; Badgwell (2003): A survey of industrial model predictive control technology</a>. The history, from IDCOM and DMC on.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A car at 20 m/s can brake at 5 m/s². Using “the plan must reach the stopping distance”, what's the shortest MPC horizon that can still stop for an obstacle?</div>
+    <div class="opts"><button class="opt">1 s</button><button class="opt" data-ok>2 s</button><button class="opt">4 s</button></div>
+    <div class="explain">Stopping distance v²/(2a) = 400/10 = 40 m. The cruising plan reaches v·H = 20H m, so 20H ≥ 40 → <b>H ≥ 2 s</b> (in practice add a margin for re-planning delays). 4 s is the stopping <i>time</i>; you don't need to plan that far, because braking starts as soon as the plan sees the problem.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your car's MPC runs at 20 Hz (a 50 ms budget), but the solver now takes 120 ms after you doubled the horizon. What's the best fix?</div>
+    <div class="opts"><button class="opt">Run it anyway and apply each answer when it arrives</button><button class="opt" data-ok>Shorten the horizon (or use coarser steps), warm-start from the last solution, and keep a fallback command if a solve doesn't finish</button><button class="opt">Remove the constraints so it solves faster</button></div>
+    <div class="explain">A late answer is an answer for a state that's already gone. Fit the budget: fewer or coarser steps (a terminal cost or constraint keeps short horizons safe), warm starts, a faster structured solver (acados, OSQP); and always have a safe fallback. Dropping constraints throws away the reason you chose MPC.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. The MPC computes an optimal 2-second plan of 20 steering commands. What does it do with them?</div>
+    <div class="opts"><button class="opt">Executes all 20 open-loop, then plans again</button><button class="opt">Executes the first 10 and plans again at the halfway point</button><button class="opt" data-ok>Applies only the first command, then re-plans from the newly measured state on the next tick</button></div>
+    <div class="explain">That's the <b>receding horizon</b>. Re-planning every tick from the latest state estimate turns an open-loop plan into feedback: model errors, gusts and surprises get corrected within one tick instead of piling up for two seconds.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>MPC: predict with a model over a horizon, optimize an input sequence under constraints, apply the first input, repeat (receding horizon).</li>
+      <li>The horizon must reach past what you need to react to: H ≥ v/(2a) for braking (1.7 s at 20 m/s and 6 m/s²). Too short → myopic; too long → compute grows.</li>
+      <li>Constraints are its superpower: steering, speed and grip limits are part of the plan, so it brakes before the corner instead of sliding wide.</li>
+      <li>It's only as good as its model and its solver's deadline: wet roads need honest grip estimates and margins; solves need warm starts and a fallback.</li>
+      <li>Tools: CasADi, acados (nonlinear, real-time), OSQP (QPs); Autoware and Nav2 ship open MPCs; PX4 flies a PID cascade; Tesla's public statements describe an end-to-end network, Waymo publishes learned planners but not its controller.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+
+  // ---------- Playground 1: braking for a stop line ----------
+  const BDT = 0.1, WALL = 100, AMIN = -6, AMAX = 2;
+  const LEV = MX.linspace(AMIN, AMAX, 9);
+  function bPlan(x, v, N, term, V0) { // brute force over two blocks of constant acceleration
+    let best = null, bc = Infinity, bestPath = null;
+    for (const a1 of LEV) for (const a2 of LEV) {
+      let px = x, pv = v, c = 0, over = 0; const path = [];
+      for (let k = 0; k < N; k++) {
+        const a = k < N / 2 ? a1 : a2; pv = Math.max(0, Math.min(V0, pv + a * BDT)); px += pv * BDT;
+        c += (pv - V0) ** 2 * BDT + 0.02 * a * a * BDT; over = Math.max(over, px - WALL); path.push(px);
+      }
+      if (term) over = Math.max(over, px + pv * pv / (2 * -AMIN) - WALL);
+      if (over > 0) c += 1e4 + 1e4 * over;
+      if (c < bc) { bc = c; best = a1; bestPath = path; }
+    }
+    return { a: best, path: bestPath };
+  }
+  function bRunSim(H, term, V0) {
+    const N = Math.max(1, Math.round(H / BDT)); let x = 0, v = V0; const frames = [];
+    for (let i = 0; i < 400; i++) {
+      const p = bPlan(x, v, N, term, V0);
+      frames.push({ x, v, reach: p.path[p.path.length - 1] });
+      v = Math.max(0, Math.min(V0, v + p.a * BDT)); x += v * BDT;
+      if (x > WALL) { frames.push({ x, v, reach: x }); return { frames, crash: true, v }; }
+      if (v < 0.05) { frames.push({ x, v: 0, reach: x }); return { frames, crash: false, gap: WALL - x }; }
+    }
+    return { frames, crash: false, gap: WALL - x };
+  }
+  function bMinH(V0) { for (let h = 3; h <= 50; h++) if (!bRunSim(h / 10, false, V0).crash) return h / 10; return null; }
+  const BW = new Sim($("bStrip"), { xRange: [-6, 112], yRange: [-6, 10.86] });
+  let bRes = null, bFrame = 0, bLocked = false;
+  BW.render(w => {
+    w.clear();
+    w.rect(-6, -2.2, 118, 4.4, { fill: "--panel", alpha: 1 });
+    for (let m = 0; m <= 100; m += 20) w.text([m, -4.4], m + " m", { color: "--muted", size: 10 });
+    w.rect(WALL, -2.2, 0.8, 4.4, { fill: "--c-ag", alpha: 0.9 });
+    w.text([WALL + 1.2, 8.3], "stop", { color: "--c-ag", size: 11, bold: true, align: "left" });
+    if (!bRes) { w.car({ x: 0, y: 0, th: 0 }, { color: "--c-be", L: 2.7 }); return; }
+    const f = bRes.frames[Math.min(bFrame, bRes.frames.length - 1)];
+    if (f.reach > f.x + 0.1) w.rect(f.x + 2.7, 2.6, Math.max(0, f.reach - f.x), 1.2, { fill: "--c-pl", alpha: 0.5 });
+    w.car({ x: f.x - 2.7, y: 0, th: 0 }, { color: "--c-be", L: 2.7 });
+    w.text([Math.min(f.x - 1.3, 88), 6.2], `${fmt(f.v)} m/s`, { color: "--c-be", size: 11, bold: true });
+  });
+  function bStats() {
+    const H = +$("bH").value, V0 = +$("bV").value;
+    $("bHV").textContent = fmt(H) + " s"; $("bVV").textContent = V0 + " m/s"; $("bGuessV").textContent = fmt(+$("bGuess").value) + " s";
+    $("bReach").textContent = fmt(V0 * H, 0) + " m"; $("bStop").textContent = fmt(V0 * V0 / 12, 1) + " m";
+  }
+  function bShowResult() {
+    $("bRes").innerHTML = bRes.crash ? `<span class="badge-lose">💥 crossed at ${fmt(bRes.v)} m/s</span>` : `<span class="badge-win">✅ stopped ${fmt(Math.max(0, bRes.gap), 1)} m short</span>`;
+  }
+  function bDrive() {
+    bRes = bRunSim(+$("bH").value, $("bTerm").checked, +$("bV").value); bFrame = 0; $("bRes").textContent = "driving…";
+    BW.run(() => { bFrame += 1; if (bFrame >= bRes.frames.length - 1) { bShowResult(); return false; } });
+  }
+  $("bLock").onclick = () => {
+    if (bLocked) { bLocked = false; $("bVerdict").innerHTML = ""; $("bLock").textContent = "🔒 Lock in my guess"; return; }
+    bLocked = true;
+    const g = +$("bGuess").value, ans = bMinH(20);
+    const off = Math.abs(g - ans);
+    $("bVerdict").innerHTML = (off <= 0.3 ? `<span class="badge-win">🎯 Spot on: ${fmt(ans)} s</span> ` : `<span class="badge-lose">The answer is about ${fmt(ans)} s</span> `) +
+      `Not the 3.3 s it takes to stop: the plan only has to <i>reach</i> the 33 m stopping distance, and at 20 m/s a ${fmt(ans)} s plan reaches ${fmt(20 * ans, 0)} m.`;
+    $("bSliders").style.opacity = 1; $("bSliders").style.pointerEvents = "auto";
+    $("bHint").textContent = "Now drive it: try 1.0 s (crash), then your answer, then 30 m/s, then tick the terminal rule and shrink the horizon to 0.5 s.";
+    $("bLock").textContent = "↺ Guess again";
+  };
+  ["bH", "bV", "bGuess"].forEach(id => ($(id).oninput = () => { bStats(); }));
+  $("bRun").onclick = bDrive;
+  bStats();
+
+  // ---------- Playgrounds 2 & 3: sampling MPC on a corner ----------
+  const L = 2.7, DT = 0.1, DMAX = 0.5, VMAX = 14, AMN = -5, AMX = 2, HW = 2, R = 10, XC = 30, YC = 10, K = 4, S = 48, E = 8, ITERS = 3;
+  const wrap = MX.wrap;
+  function proj(x, y) {
+    if (x < XC) return { e: y, h: 0 };
+    if (y < YC) { const dx = x - XC, dy = y - YC, r = Math.hypot(dx, dy), ph = Math.atan2(dy, dx); return { e: R - r, h: ph + Math.PI / 2 }; }
+    return { e: XC + R - x, h: Math.PI / 2 };
+  }
+  const dlim = (v, grip) => Math.min(DMAX, Math.atan(L * grip / Math.max(v * v, 1e-6)));
+  function step(s, d, a, realGrip) { // realGrip: null = model (no skidding), number = plant
+    d = MX.clamp(d, -DMAX, DMAX); a = MX.clamp(a, AMN, AMX);
+    let k = Math.tan(d) / L, skid = false; const v = s.v;
+    if (realGrip != null) { const km = realGrip / Math.max(v * v, 1e-6); if (Math.abs(k) > km + 1e-9) { skid = true; k = Math.sign(k) * km; } }
+    return { x: s.x + v * Math.cos(s.th) * DT, y: s.y + v * Math.sin(s.th) * DT, th: wrap(s.th + v * k * DT), v: Math.max(0, Math.min(VMAX + 0.5, v + a * DT)), skid };
+  }
+  function seqAt(p, N, k) { const u = (K - 1) * k / Math.max(1, N - 1), i = Math.min(K - 2, Math.floor(u)), f = u - i; return [p[i] * (1 - f) + p[i + 1] * f, p[K + i] * (1 - f) + p[K + i + 1] * f]; }
+  function rollout(s0, p, N, grip, keep) {
+    let s = s0, c = 0; const pts = keep ? [[s.x, s.y]] : null;
+    for (let k = 0; k < N; k++) {
+      let [d, a] = seqAt(p, N, k); if (grip != null) d = MX.clamp(d, -dlim(s.v, grip), dlim(s.v, grip));
+      s = step(s, d, a, null); const q = proj(s.x, s.y);
+      c += q.e * q.e + 2 * wrap(s.th - q.h) ** 2 + 0.3 * (s.v - VMAX) ** 2 + 0.5 * d * d;
+      if (Math.abs(q.e) > HW - 0.3) c += 300 * (Math.abs(q.e) - HW + 0.3) ** 2 + 50;
+      if (keep) pts.push([s.x, s.y]);
+    }
+    return keep ? pts : c;
+  }
+  function makeRun(o) { // o: {H, modelGrip (null = unaware), realGrip, seed}
+    return { o, N: Math.max(2, Math.round(o.H / DT)), rng: Sim.rng(o.seed || 1), s: { x: -30, y: 0, th: 0, v: VMAX },
+      warm: [0, 0, 0, 0, 0, 0, 0, 0], t: 0, skids: 0, maxE: 0, minV: VMAX, ms: 0, n: 0, evals: 0, trail: [[-30, 0, false]], plan: null, done: false, lastD: 0, lastLim: DMAX, over: 0 };
+  }
+  function decide(r) {
+    const t0 = performance.now(), N = r.N, g = r.o.modelGrip, rng = r.rng;
+    let mu = r.warm.slice(), sig = [0.25, 0.25, 0.25, 0.25, 2, 2, 2, 2], best = mu, bc = rollout(r.s, mu, N, g);
+    for (let it = 0; it < ITERS; it++) {
+      const pop = [[bc, best]];
+      for (let j = 0; j < S; j++) {
+        const p = mu.map((m, i) => { const v = m + sig[i] * Sim.randn(rng); return i < K ? MX.clamp(v, -DMAX, DMAX) : MX.clamp(v, AMN, AMX); });
+        pop.push([rollout(r.s, p, N, g), p]);
+      }
+      pop.sort((a, b) => a[0] - b[0]); bc = pop[0][0]; best = pop[0][1];
+      const el = pop.slice(0, E).map(z => z[1]);
+      mu = mu.map((_, i) => el.reduce((t, p) => t + p[i], 0) / E);
+      sig = sig.map((_, i) => Math.sqrt(el.reduce((t, p) => t + (p[i] - mu[i]) ** 2, 0) / E) + (i < K ? 0.02 : 0.2));
+    }
+    r.ms += performance.now() - t0; r.n++; r.evals = (ITERS * S + 1) * N;
+    return best;
+  }
+  function tick(r) {
+    if (r.done) return;
+    const p = decide(r); r.warm = p.slice();
+    r.plan = rollout(r.s, p, r.N, r.o.modelGrip, true);
+    let [d, a] = seqAt(p, r.N, 0);
+    if (r.o.modelGrip != null) d = MX.clamp(d, -dlim(r.s.v, r.o.modelGrip), dlim(r.s.v, r.o.modelGrip));
+    r.lastD = d; r.lastLim = dlim(r.s.v, r.o.realGrip);
+    r.s = step(r.s, d, a, r.o.realGrip); r.t += DT;
+    if (r.s.skid) r.skids++;
+    const q = proj(r.s.x, r.s.y); r.maxE = Math.max(r.maxE, Math.abs(q.e));
+    if (r.s.x > XC - 2 && r.s.y < YC + 2) r.minV = Math.min(r.minV, r.s.v);
+    r.trail.push([r.s.x, r.s.y, r.s.skid]);
+    if ((r.s.x > XC && r.s.y > 35) || r.t >= 20 || Math.abs(q.e) > 12) r.done = true;
+  }
+  const finished = r => r.s.x > XC && r.s.y > 35;
+  const ok = r => finished(r) && r.skids === 0 && r.maxE < HW;
+  function drawCorner(w, r) {
+    w.clear();
+    const center = [[-32, 0], [XC, 0]];
+    for (let a = -Math.PI / 2; a <= 0.001; a += Math.PI / 40) center.push([XC + R * Math.cos(a), YC + R * Math.sin(a)]);
+    center.push([XC + R, 42]);
+    w.line(center, { color: "--panel", width: w.px(2 * HW + 1.2), alpha: 1 });
+    w.line(center, { color: "--c-mp", width: w.px(2 * HW), alpha: 0.18 });
+    w.line(center, { color: "--line", width: 1.5, dash: [8, 8] });
+    w.text([XC + R + 3.5, 37], "finish", { color: "--muted", size: 11, align: "left" });
+    w.line([[XC + R - HW, 35], [XC + R + HW, 35]], { color: "--muted", width: 2 });
+    if (!r) { w.car({ x: -30, y: 0, th: 0 }, { color: "--c-be" }); return; }
+    if (r.plan) w.line(r.plan, { color: "--c-pl", width: 3, alpha: 0.85 });
+    w.line(r.trail.map(p => [p[0], p[1]]), { color: "--c-be", width: 2, alpha: 0.6 });
+    r.trail.forEach(p => { if (p[2]) w.dot([p[0], p[1]], { color: "--c-ag", r: 3 }); });
+    w.car({ x: r.s.x, y: r.s.y, th: r.s.th }, { color: "--c-be", steer: r.lastD });
+    w.text([-30, 38], `t = ${fmt(r.t)} s · ${fmt(r.s.v)} m/s`, { color: "--muted", size: 12, align: "left" });
+  }
+
+  // Playground 2
+  const CW = new Sim($("cSim"), { xRange: [-32, 52], yRange: [-6, 41.25] });
+  let cr = null;
+  const cOpts = () => ({ H: +$("cH").value, modelGrip: $("cAware").checked ? 4 : null, realGrip: 4, seed: 1 });
+  CW.render(w => drawCorner(w, cr));
+  function cStats() {
+    $("cHV").textContent = fmt(+$("cH").value) + " s";
+    if (!cr) { ["cSpd", "cSt", "cErr", "cSk", "cMs", "cEv"].forEach(id => ($(id).textContent = "–")); return; }
+    $("cSpd").textContent = fmt(cr.s.v) + " m/s";
+    const over = Math.abs(cr.lastD) > cr.lastLim + 1e-6;
+    $("cSt").innerHTML = `<span class="${over ? "ag" : ""}">${fmt(Math.abs(cr.lastD), 2)}</span> / ${fmt(cr.lastLim, 2)} rad`;
+    $("cErr").textContent = fmt(cr.maxE, 2) + " m"; $("cSk").textContent = cr.skids;
+    $("cMs").textContent = cr.n ? fmt(cr.ms / cr.n, 2) + " ms" : "–"; $("cEv").textContent = cr.evals.toLocaleString();
+    if (cr.done) {
+      const H = cr.o.H;
+      if (ok(cr)) $("cVerdict").innerHTML = H <= 1.4 + 1e-9 ? `<span class="badge-win">🏆 Corner taken with a ${fmt(H)} s horizon</span> in ${fmt(cr.t)} s, never over the limit.` : `<span class="badge-win">✅ Made it (${fmt(cr.t)} s)</span> <span class="muted">Now shorten the horizon: 1.4 s or less wins.</span>`;
+      else $("cVerdict").innerHTML = `<span class="badge-lose">${cr.skids ? "Skidded: steering went past the grip limit" : "Left the road"}</span> <span class="muted">${cr.o.modelGrip == null ? "This MPC doesn't know the limit, so it plans turns the tyres can't deliver." : "The plan saw the bend too late to brake: a myopic horizon."}</span>`;
+    } else $("cVerdict").innerHTML = "";
+  }
+  function cReset() { CW.stop(); cr = makeRun(cOpts()); $("cRun").textContent = "▶ Run"; cStats(); CW.render(); }
+  $("cRun").onclick = () => {
+    if (CW.running) { CW.stop(); $("cRun").textContent = "▶ Run"; return; }
+    if (!cr || cr.done) cr = makeRun(cOpts());
+    $("cRun").textContent = "⏸ Pause";
+    CW.run(() => { tick(cr); cStats(); if (cr.done) { $("cRun").textContent = "▶ Run"; return false; } });
+  };
+  $("cStep").onclick = () => { CW.stop(); $("cRun").textContent = "▶ Run"; if (!cr || cr.done) cr = makeRun(cOpts()); tick(cr); cStats(); CW.render(); };
+  $("cReset").onclick = cReset;
+  $("cH").oninput = () => { $("cHV").textContent = fmt(+$("cH").value) + " s"; };
+  $("cH").onchange = cReset; $("cAware").onchange = cReset;
+  function drawSweep(rows) {
+    Plot.line($("cErrChart"), { series: [
+      { label: "worst off-centre (m)", color: MX.css("--c-be"), data: rows.map(r => [r.H, Math.min(r.maxE, 8)]), width: 3, dots: true },
+    ], xMin: 0.5, xMax: 4.1, yMin: 0, yMax: 8, xLabel: "horizon (s)", hlines: [{ y: HW, label: "road edge", color: MX.css("--c-ag") }] });
+    Plot.line($("cCpuChart"), { series: [
+      { label: "compute per decision (ms)", color: MX.css("--c-ct"), data: rows.map(r => [r.H, r.ms]), width: 3, dots: true },
+    ], xMin: 0.5, xMax: 4.1, yMin: 0, yMax: Math.max(0.5, ...rows.map(r => r.ms)) * 1.15, xLabel: "horizon (s)" });
+  }
+  drawSweep([]);
+  $("cSweep").onclick = () => {
+    const Hs = []; for (let h = 6; h <= 40; h += 2) Hs.push(h / 10);
+    const rows = []; let i = 0; $("cSweep").disabled = true;
+    const aware = $("cAware").checked;
+    const next = () => {
+      if (i >= Hs.length) { $("cSweep").disabled = false; const okR = rows.filter(r => r.ok); $("cSweepNote").textContent = okR.length ? `Shortest horizon that made it: ${fmt(Math.min(...okR.map(r => r.H)))} s. Lap times of the clean runs: ${fmt(Math.max(...okR.map(r => r.t)))} s down to ${fmt(Math.min(...okR.map(r => r.t)))} s.` : "None made it: is the MPC allowed to know the limit?"; return; }
+      const r = makeRun({ H: Hs[i], modelGrip: aware ? 4 : null, realGrip: 4, seed: 1 });
+      while (!r.done) tick(r);
+      rows.push({ H: Hs[i], maxE: r.maxE, t: r.t, fin: finished(r), ok: ok(r), ms: r.ms / r.n });
+      $("cSweepNote").textContent = `sweeping… ${i + 1} / ${Hs.length}`;
+      drawSweep(rows); i++; setTimeout(next, 0);
+    };
+    next();
+  };
+  cStats();
+
+  // Playground 3
+  const WW = new Sim($("wSim"), { xRange: [-32, 52], yRange: [-6, 41.25] });
+  let wr = null;
+  WW.render(w => drawCorner(w, wr));
+  function wLabels() { $("wRealV").textContent = fmt(+$("wReal").value, 2) + " m/s²"; $("wModelV").textContent = fmt(+$("wModel").value, 2) + " m/s²"; $("wHV").textContent = fmt(+$("wH").value) + " s"; }
+  function wStats() {
+    if (!wr) return;
+    $("wT").textContent = finished(wr) ? fmt(wr.t) + " s" : (wr.done ? "didn't finish" : fmt(wr.t) + " s…");
+    $("wSk").textContent = wr.skids; $("wErr").textContent = fmt(wr.maxE, 2) + " m"; $("wMin").textContent = fmt(wr.minV) + " m/s";
+    if (!wr.done) { $("wVerdict").innerHTML = ""; return; }
+    const real = wr.o.realGrip;
+    if (ok(wr) && real <= 3 + 1e-9 && wr.t <= 9.5 + 1e-9) $("wVerdict").innerHTML = `<span class="badge-win">🏆 Wet corner, no skid, ${fmt(wr.t)} s</span> Honest model, tight margin.`;
+    else if (ok(wr)) $("wVerdict").innerHTML = `<span class="badge-win">✅ Clean run in ${fmt(wr.t)} s</span> <span class="muted">${real > 3 ? "Set the real grip to 3 (wet) for the challenge." : "Safe but slow: can you trust the model a bit more?"}</span>`;
+    else $("wVerdict").innerHTML = `<span class="badge-lose">${wr.skids ? `Skidded ${wr.skids} steps` : "Left the road"}</span> <span class="muted">${+$("wModel").value > real ? "The model promises grip the road doesn't have." : "Try a longer horizon."}</span>`;
+  }
+  $("wRun").onclick = () => {
+    WW.stop();
+    wr = makeRun({ H: +$("wH").value, modelGrip: +$("wModel").value, realGrip: +$("wReal").value, seed: 1 });
+    WW.run(() => { tick(wr); wStats(); if (wr.done) return false; });
+  };
+  ["wReal", "wModel", "wH"].forEach(id => ($(id).oninput = wLabels));
+  wLabels();
+})();
+</script>
+</body>
+</html>

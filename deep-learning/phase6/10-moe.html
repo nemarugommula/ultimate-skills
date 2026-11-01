@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.10 Mixture of experts · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .loads { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; align-items: end; height: 150px; border-bottom: 1px solid var(--line); position: relative; margin-top: 10px; }
+  .loads .col { display: flex; flex-direction: column; justify-content: flex-end; height: 100%; }
+  .loads .col i { display: block; background: var(--c-w); border-radius: 4px 4px 0 0; transition: height .15s; }
+  .loads .col i.over { background: var(--c-dead); }
+  .loads .capline { position: absolute; left: 0; right: 0; border-top: 2px dashed var(--text); opacity: .7; }
+  .loads .meanline { position: absolute; left: 0; right: 0; border-top: 1px solid var(--c-y); }
+  .lab8 { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; font-size: .75rem; color: var(--muted); text-align: center; }
+  .tokgrid { display: grid; grid-template-columns: repeat(24, 1fr); gap: 2px; margin: 10px 0; }
+  .tokgrid span { aspect-ratio: 1 / 1; border-radius: 3px; font-size: 9px; display: flex; align-items: center; justify-content: center; color: #fff; }
+  .tokgrid span.dr { outline: 2px solid var(--c-dead); outline-offset: -2px; }
+  .ctl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 4px 16px; }
+  .ctl-grid label { display: flex; gap: 8px; align-items: center; font-size: .88rem; }
+  .ctl-grid input[type=range] { flex: 1; }
+</style>
+</head>
+<body data-lesson="d6-10" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 10</div>
+  <h1>Mixture of experts</h1>
+  <p class="subtitle">What if a model had a trillion parameters but each word only woke up 3% of them? That's a mixture of experts: many specialist MLPs and a tiny router that picks a few for every token. It's how most of the largest open models are built today.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Every transformer block is <span class="at">attention</span> followed by an <b>MLP</b> (multi-layer perceptron, often SwiGLU), and the MLP holds about two-thirds of the parameters (Lessons 6.4, 0.5).</li>
+      <li>Per-token compute ≈ 2 × the parameters actually used; training compute C ≈ 6·N·D (6.8).</li>
+      <li>Softmax turns scores into probabilities that sum to 1 (Lesson 0.6). Decoding is memory-bound: weights must be read from GPU memory (6.9).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In December 2023 Mistral AI released <b>Mixtral 8x7B</b>. It has <b>46.7 billion</b> parameters, but each token uses only <b>12.9 billion</b> of them, so it runs at roughly the speed and cost of a 13B model. Mistral reported it beat <b>Llama 2 70B</b> on most of their benchmarks.</p>
+    <p>By 2026 the idea had taken over open models: DeepSeek-V3 has 671B parameters and uses 37B per token; DeepSeek's V4-Pro preview (April 2026) has <b>1.6 trillion</b> and uses 49B.</p>
+    <p><b>How can a model skip 97% of its weights on every token and still be smarter than a model that uses all of its own?</b> And what goes wrong when every token wants the same expert? You'll build the router and break it.</p>
+  </div>
+
+  <h2>Numbers first: total vs active parameters</h2>
+  <p>A dense transformer uses every weight for every token. A <b>mixture of experts</b> (MoE) layer replaces the one MLP in each block with <b>E</b> separate MLPs, the <b>experts</b>, plus a <b>router</b>: a tiny linear layer that scores the experts for each token and sends the token to the top <b>k</b>. Attention, embeddings and norms stay shared.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: counting Mixtral's parameters</span>
+    <p>From Mixtral's published config: width d = 4,096, expert MLP width 14,336 (SwiGLU, so 3 matrices), 32 layers, 8 experts, top-2, attention with 32 query heads and 8 key/value heads, vocabulary 32,000.</p>
+    <table>
+      <tr><th>Piece</th><th>Calculation</th><th>Parameters</th></tr>
+      <tr><td>One expert</td><td>3 × 4,096 × 14,336</td><td><span class="w">176.2M</span></td></tr>
+      <tr><td>All experts</td><td>176.2M × 8 experts × 32 layers</td><td><span class="w">45.10B</span></td></tr>
+      <tr><td>Attention</td><td>(2 × 4,096² + 2 × 4,096 × 1,024) × 32</td><td>1.34B</td></tr>
+      <tr><td>Embeddings in + out</td><td>2 × 32,000 × 4,096</td><td>0.26B</td></tr>
+      <tr><td><b>Total</b></td><td></td><td><b>46.7B</b></td></tr>
+      <tr><td><b>Active per token</b></td><td>2 experts × 176.2M × 32 + 1.34B + 0.26B</td><td class="ev"><b>12.9B</b></td></tr>
+    </table>
+    <p>Exactly the published numbers. Per-token compute ≈ 2 × 12.9B ≈ 26 GFLOPs, like a 13B dense model. But to serve it you must hold all 46.7B in memory: 93 GB in bf16.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Decouple knowledge from compute.</b> Parameters store what the model knows; FLOPs per token are what it costs to think. A dense model ties them together. An MoE grows the parameters (more experts) while keeping the FLOPs per token fixed (still k experts per token), so you get a bigger brain at the same price per word, paid for in memory and engineering.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a hospital, not a GP</span>
+    <p>A dense model is one doctor who must know everything and sees every patient. An MoE is a hospital: a receptionist (the router) glances at each patient and sends them to two specialists. The hospital knows far more than one doctor, and each patient still sees only two. The catch: if the receptionist sends everyone to cardiology, cardiology has a queue out the door and the other specialists sit idle.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Mixture of experts</span></span>
+    <ol>
+      <li><b>The problem before</b> Scaling laws (6.8) say more parameters means lower loss, but in a dense model every extra parameter costs FLOPs on every token: 10× the params, 10× the training and serving compute.</li>
+      <li><b>What people tried</b> Just paying for bigger dense models; “conditional computation” ideas from the 1990s and 2010s that were hard to make fast on GPUs.</li>
+      <li><b>Why this works</b> Shazeer et al. (2017) made sparsely gated MoE layers practical with up to thousands of experts and up to 137B parameters between LSTM layers. Switch Transformer (2021) showed up to <b>7×</b> faster pretraining than a dense T5 at the same FLOPs per token. Mixtral: 3.6× the total params of its active compute, beating a 70B dense model.</li>
+      <li><b>What it costs, when it fails</b> <b>Memory</b>: all experts must be loaded (Mixtral: 46.7B in memory to compute like 13B). <b>Communication</b>: experts are spread across GPUs, so tokens are shuffled between them every layer. <b>Instability and imbalance</b>: routers can collapse onto a few experts (playground below); Switch needed tricks such as computing the router in float32.</li>
+      <li><b>What refined it</b> Top-k routing (next), balancing losses, fine-grained and shared experts (DeepSeekMoE), auxiliary-loss-free balancing (DeepSeek-V3), and inference engines with expert parallelism.</li>
+    </ol>
+  </div>
+
+  <h2>The router: top-k routing</h2>
+  <p>For each token vector x, the router computes one score per expert (s = x · W<sub>r</sub>, a d × E matrix: for Mixtral just 4,096 × 8 numbers per layer), turns them into probabilities with softmax, and keeps the top k. The layer's output is the gate-weighted sum of those k experts' outputs:</p>
+  <div class="calc">y = Σ<sub>i ∈ top-k</sub> g<sub>i</sub>(x) · Expert<sub>i</sub>(x), &nbsp; g = softmax(x · W<sub>r</sub>) renormalised over the k chosen</div>
+  <p>In words: ask the router who's best for this token, send it to the best k, and blend their answers by how confident the router was. Because the gate g<sub>i</sub> multiplies the output, the gradient trains the router too: if an expert's answer helped, the router learns to send it similar tokens.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Top-k routing</span></span>
+    <ol>
+      <li><b>The problem before</b> A “soft” mixture (weighted sum of <i>all</i> experts) is smooth and easy to train, but it runs every expert on every token: no savings at all.</li>
+      <li><b>What people tried</b> Shazeer's noisy top-k gating (add tunable noise to the scores, keep the top k) with k ≥ 2, so the router can compare experts and keep exploring.</li>
+      <li><b>Why this works</b> Only k experts run, so compute is k/E of the dense-all-experts cost (Mixtral: 2 of 8). Switch went to <b>k = 1</b>: the simplest routing and least communication, and it still trained well. Mixtral uses k = 2; DeepSeek-V3 picks 8 of 256 small experts.</li>
+      <li><b>What it costs, when it fails</b> Picking the top k is not differentiable, so experts the router never picks get no gradient and never improve: a rich-get-richer loop that can collapse routing. Bigger k = more compute and communication.</li>
+      <li><b>What refined it</b> Load-balancing losses and capacity limits (next), expert-choice routing (experts pick tokens), and fine-grained experts with large k.</li>
+    </ol>
+  </div>
+
+  <h2>Load balancing: keep every expert busy</h2>
+  <p>Experts live on different GPUs and each processes its tokens in a fixed-size batch. Switch Transformer gives each expert a <b>capacity</b>:</p>
+  <div class="calc">capacity = capacity factor × (tokens in the batch × k ÷ number of experts)</div>
+  <p>If an expert gets more tokens than its capacity, the extra ones are <b>dropped</b>: they skip that expert and pass straight through on the residual connection, untransformed. So imbalance wastes both compute (idle experts) and quality (dropped tokens). The classic fix is an <b>auxiliary balance loss</b> added to the language-model loss:</p>
+  <div class="calc">L<sub>aux</sub> = α · E · Σ<sub>i</sub> f<sub>i</sub> · P<sub>i</sub> &nbsp; (f<sub>i</sub> = share of tokens sent to expert i, P<sub>i</sub> = average router probability for i)</div>
+  <p>In words: penalise experts that get both many tokens and high probability. It equals α exactly when routing is perfectly even (every f<sub>i</sub> = P<sub>i</sub> = 1/E) and grows as routing piles up. Switch used α = 0.01.</p>
+
+  <p class="predict">🔮 <b>Predict:</b> train the router with <b>no</b> balance loss. The two most popular experts get more tokens, so they get more gradient and get better, so… what does the load look like after 100 steps?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Route 96 tokens to 8 experts</span>
+    <p class="hint">Each square is a token, colored by its first-choice expert (red outline = at least one of its assignments was dropped). Bars = tokens per expert; dashed line = capacity; green line = the perfectly even load. <b>Train ×100</b> simulates 100 router updates: popular experts improve and attract more tokens (rich get richer), while the balancing method pushes back.</p>
+    <div class="goals">
+      <span class="goal" id="gCol">🎯 Watch it collapse (no balancing)</span>
+      <span class="goal" id="g125">🎯 No expert above 1.25× the average load</span>
+      <span class="goal" id="gDrop">🎯 Zero dropped tokens with capacity factor ≤ 1.1</span>
+      <span class="goal" id="gFree">🎯 Balance with no auxiliary loss at all</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="rBal"><button data-v="aux" class="on">Aux loss (Switch)</button><button data-v="bias">Bias nudging (DeepSeek-V3)</button></span>
+    </div>
+    <div class="ctl-grid">
+      <label>top-k <input type="range" id="rK" min="1" max="4" step="1" value="2"> <b class="mono" id="rKV"></b></label>
+      <label>balance loss α <input type="range" id="rA" min="0" max="0.03" step="0.001" value="0"> <b class="mono" id="rAV"></b></label>
+      <label>capacity factor <input type="range" id="rCF" min="0.8" max="2" step="0.05" value="1.25"> <b class="mono" id="rCFV"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="rTrain">Train ×100</button>
+      <button class="btn" id="rReset">↺ Reset router</button>
+    </div>
+    <div class="tokgrid" id="rToks"></div>
+    <div class="loads" id="rLoads"></div>
+    <div class="lab8" id="rLab"></div>
+    <div class="stat-row">
+      <div class="stat">steps <b id="rSteps">0</b></div>
+      <div class="stat">max ÷ average load <b id="rMax">–</b></div>
+      <div class="stat">dropped assignments <b id="rDrop" class="dead">–</b></div>
+      <div class="stat">balance term E·Σ f·P <b id="rAux" class="ls">–</b></div>
+      <div class="stat">tokens getting their 1st choice <b id="rFav">–</b></div>
+    </div>
+    <p class="hint" id="rMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the untrained router is already lopsided (top-2: expert 1 gets 75 of 192 assignments, 3.1× average, 55 dropped). Press Train a few times with α = 0: it <b>collapses</b> onto two experts, 4× average, 132 assignments dropped, and six experts never learn anything. Reset, set α = 0.01 (Switch's value) and train: every expert ends up within 1.1× of average and nothing is dropped, so you can even lower the capacity factor to 1.1. Notice the price: fewer tokens get their first-choice expert (about 65% instead of 100%). Now reset, switch to <b>bias nudging</b> with α = 0 and train: balanced too, without adding anything to the loss.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Load balancing (aux loss, capacity, bias nudging)</span></span>
+    <ol>
+      <li><b>The problem before</b> Routers collapse: favoured experts get more tokens, more gradient, get better and get even more tokens. In the playground, 2 of 8 experts end up with everything and 132 of 192 assignments are dropped.</li>
+      <li><b>What people tried</b> Noisy gating to force exploration (Shazeer 2017); importance and load losses; hard capacity limits that drop overflow tokens (GShard, Switch).</li>
+      <li><b>Why this works</b> The aux loss E·Σ f<sub>i</sub>P<sub>i</sub> is minimal (= 1) when the load is even, so its gradient lowers the router probability of overloaded experts. Capacity bounds the per-expert batch so GPUs stay in lockstep. DeepSeek-V3's <b>auxiliary-loss-free</b> method adds a per-expert bias to the scores <i>only for choosing</i> the top k, and after each step nudges it down by γ if the expert was overloaded and up if underloaded. The gate weights still come from the original scores, so balancing doesn't distort the language-model gradient.</li>
+      <li><b>What it costs, when it fails</b> Forcing balance overrides some of the router's preferences (first-choice rate falls). Too strong an α hurts the main loss; too weak and collapse wins. Dropped tokens silently skip computation. Capacity factors above 1 waste compute on padding.</li>
+      <li><b>What refined it</b> Shared experts and fine-grained experts (below); DeepSeek-V3 reports it keeps a good balance through all of training and <b>drops no tokens</b>, in training or inference.</li>
+    </ol>
+  </div>
+
+  <h2>Fine-grained and shared experts (DeepSeekMoE)</h2>
+  <p>DeepSeekMoE (2024) made two changes. <b>Fine-grained experts</b>: cut each expert into m smaller ones and route to m times as many. Compute is the same, but the number of possible expert combinations explodes: with 16 experts and top-2 there are 120 combinations; split each into 4 (64 experts, top-8) and there are about <b>4.4 billion</b>. <b>Shared experts</b>: a few experts that every token always uses, to hold common knowledge, so the routed experts can specialise. DeepSeek-V3 has 1 shared + 256 routed experts per MoE layer and picks 8 routed experts per token.</p>
+
+  <p class="predict">🔮 <b>Predict:</b> keep Mixtral's active compute fixed but use 32 experts that are each a quarter of the size, with top-8. Does the total parameter count go up, down, or stay the same?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Total vs active parameter calculator</span>
+    <p class="hint">Experts are SwiGLU MLPs (3 matrices of d × expert width). “Other” = attention, embeddings and any dense layers, taken from the preset. FLOPs per token ≈ 2 × active parameters.</p>
+    <div class="goals">
+      <span class="goal" id="gTen">🎯 Total ≥ 10× active</span>
+      <span class="goal" id="gFine">🎯 Fine-grained Mixtral: same active params, ≥ 1,000,000 expert combinations</span>
+      <span class="goal" id="gDense">🎯 Turn it into a dense model (total = active)</span>
+    </div>
+    <div class="controls">
+      <button class="btn small" id="pMix">Mixtral 8x7B</button>
+      <button class="btn small" id="pDS">DeepSeek-V3</button>
+    </div>
+    <div class="ctl-grid">
+      <label>experts E <input type="range" id="pE" min="0" max="9" step="1"> <b class="mono" id="pEV"></b></label>
+      <label>top-k <input type="range" id="pK" min="1" max="16" step="1"> <b class="mono" id="pKV"></b></label>
+      <label>shared experts <input type="range" id="pS" min="0" max="2" step="1"> <b class="mono" id="pSV"></b></label>
+      <label>expert width <input type="range" id="pF" min="512" max="16384" step="256"> <b class="mono" id="pFV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">total params <b id="pTot" class="w">–</b></div>
+      <div class="stat">active per token <b id="pAct" class="y">–</b></div>
+      <div class="stat">active share <b id="pPct">–</b></div>
+      <div class="stat">GFLOPs / token <b id="pFl">–</b></div>
+      <div class="stat">memory (bf16) <b id="pMem">–</b></div>
+      <div class="stat">expert combinations <b id="pComb">–</b></div>
+    </div>
+    <p class="hint" id="pMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the Mixtral preset gives 46.7B total, 12.9B active (28%). Set 32 experts, width 3,584 (a quarter) and top-8: active stays <b>12.9B</b>, total stays 46.7B, but the combinations jump from 28 to over <b>10 million</b>. That's DeepSeekMoE's argument: same cost, far more ways to mix specialists. The DeepSeek-V3 preset lands on its published 671B total and ~37B active (5.6%). Memory follows the total, not the active count: 1.3 TB in bf16, which is why it's served across many GPUs.</p>
+
+  <h2>MoE models you can download (as of late 2026)</h2>
+  <table>
+    <tr><th>Model (release)</th><th>Total</th><th>Active per token</th><th>Experts</th><th>Source</th></tr>
+    <tr><td>Mixtral 8x7B (Dec 2023)</td><td>46.7B</td><td>12.9B</td><td>8, top-2</td><td><a href="https://mistral.ai/news/mixtral-of-experts" target="_blank" rel="noopener">Mistral</a></td></tr>
+    <tr><td>DeepSeek-V3 (Dec 2024)</td><td>671B</td><td>37B</td><td>1 shared + 256 routed, top-8</td><td><a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">paper</a></td></tr>
+    <tr><td>Qwen3-235B-A22B (Apr 2025)</td><td>235B</td><td>22B</td><td>128, top-8</td><td><a href="https://huggingface.co/Qwen/Qwen3-235B-A22B" target="_blank" rel="noopener">model card</a></td></tr>
+    <tr><td>Kimi K2 (Jul 2025)</td><td>1T</td><td>32B</td><td>1 shared + 384, top-8</td><td><a href="https://huggingface.co/moonshotai/Kimi-K2-Instruct" target="_blank" rel="noopener">model card</a></td></tr>
+    <tr><td>gpt-oss-120b (Aug 2025)</td><td>117B</td><td>5.1B</td><td>128, top-4</td><td><a href="https://huggingface.co/openai/gpt-oss-120b" target="_blank" rel="noopener">model card</a></td></tr>
+    <tr><td>DeepSeek-V4-Pro preview (Apr 2026)</td><td>1.6T</td><td>49B</td><td>MoE</td><td><a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro" target="_blank" rel="noopener">model card</a></td></tr>
+  </table>
+  <p class="muted">The pattern: active parameters stay in the tens of billions while totals climb into the trillions. Picking among open models for an application: <a href="../../ai-engineer/phase7/3-open-models.html">AI Engineer 7.3</a>.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>A complete top-k MoE layer with a Switch-style balance loss fits on one screen. Real implementations replace the Python loop over experts with grouped matrix multiplies and spread experts across GPUs (expert parallelism), but the logic is this:</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn, torch.nn.functional <span class="k">as</span> F
+
+<span class="k">class</span> MoE(nn.Module):
+    <span class="s">"""Top-k mixture of experts replacing a transformer's MLP. x: (tokens, d)."""</span>
+    <span class="k">def</span> __init__(self, d=<span class="n">64</span>, d_ff=<span class="n">128</span>, n_experts=<span class="n">8</span>, k=<span class="n">2</span>):
+        super().__init__()
+        self.k, self.E = k, n_experts
+        self.router = nn.Linear(d, n_experts, bias=<span class="k">False</span>)
+        self.experts = nn.ModuleList(nn.Sequential(nn.Linear(d, d_ff), nn.SiLU(), nn.Linear(d_ff, d)) <span class="k">for</span> _ <span class="k">in</span> range(n_experts))
+
+    <span class="k">def</span> forward(self, x):
+        probs = self.router(x).softmax(-<span class="n">1</span>)                      <span class="c"># (tokens, E)</span>
+        topw, topi = probs.topk(self.k, dim=-<span class="n">1</span>)                 <span class="c"># each token's k experts</span>
+        topw = topw / topw.sum(-<span class="n">1</span>, keepdim=<span class="k">True</span>)                <span class="c"># renormalise the k gate weights</span>
+        out = torch.zeros_like(x)
+        <span class="k">for</span> e <span class="k">in</span> range(self.E):
+            tok, slot = (topi == e).nonzero(as_tuple=<span class="k">True</span>)      <span class="c"># which tokens chose expert e</span>
+            <span class="k">if</span> tok.numel():
+                out.index_add_(<span class="n">0</span>, tok, topw[tok, slot, <span class="k">None</span>] * self.experts[e](x[tok]))
+        <span class="c"># Switch-style balance loss: E * sum_i (fraction of tokens sent to i) * (mean router prob of i)</span>
+        frac = F.one_hot(topi, self.E).float().sum(<span class="n">1</span>).mean(<span class="n">0</span>) / self.k
+        aux = self.E * (frac * probs.mean(<span class="n">0</span>)).sum()
+        <span class="k">return</span> out, aux, frac
+
+torch.manual_seed(<span class="n">0</span>)
+moe = MoE()
+x = torch.randn(<span class="n">512</span>, <span class="n">64</span>)
+y, aux, frac = moe(x)
+(y.pow(<span class="n">2</span>).mean() + <span class="n">0.01</span> * aux).backward()               <span class="c"># task loss + alpha * balance loss</span>
+total = sum(p.numel() <span class="k">for</span> p <span class="k">in</span> moe.parameters())
+active = sum(p.numel() <span class="k">for</span> p <span class="k">in</span> moe.router.parameters()) + moe.k * sum(p.numel() <span class="k">for</span> p <span class="k">in</span> moe.experts[<span class="n">0</span>].parameters())
+print(<span class="s">"out"</span>, tuple(y.shape), <span class="s">f"aux {aux.item():.3f} (1.0 = perfectly balanced)"</span>)
+print(<span class="s">"load per expert:"</span>, [round(f, <span class="n">3</span>) <span class="k">for</span> f <span class="k">in</span> frac.tolist()])
+print(<span class="s">f"params total {total:,}  active per token {active:,}"</span>)
+
+<span class="c"># What we got (torch 2.8, CPU):</span>
+<span class="c"># out (512, 64) aux 1.003 (1.0 = perfectly balanced)</span>
+<span class="c"># load per expert: [0.108, 0.117, 0.13, 0.106, 0.115, 0.145, 0.136, 0.143]</span>
+<span class="c"># params total 133,120  active per token 33,664</span></code></pre>
+    <p class="hint">At random init the router is nearly uniform, so the balance term starts near 1.0; collapse happens during training. In practice you load MoE checkpoints with Hugging Face <code>AutoModelForCausalLM</code> or serve them with vLLM / SGLang, which handle expert parallelism.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>MoE vs dense (same FLOPs/token)</td><td>Much more capacity: lower loss, faster pretraining</td><td>Memory for all experts; all-to-all communication; harder to fine-tune and serve</td></tr>
+      <tr><td>Small k (1–2)</td><td>Least compute and communication</td><td>Coarser mixing; more sensitive to routing errors</td></tr>
+      <tr><td>Many small experts + larger k</td><td>Specialisation; huge number of combinations</td><td>More routing overhead, smaller matrix multiplies (less GPU-efficient)</td></tr>
+      <tr><td>Aux balance loss</td><td>Simple, prevents collapse</td><td>Interferes with the LM loss if α too big</td></tr>
+      <tr><td>Bias-based balancing</td><td>No extra loss term; no dropped tokens (DeepSeek-V3)</td><td>One more update rule and its speed γ to tune</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“What is a mixture-of-experts model, and why isn't everyone using it for everything?” A strong answer:</p>
+    <ul>
+      <li>Router + E expert MLPs per layer, top-k per token; <b>total vs active</b> parameters (Mixtral 46.7B / 12.9B) and FLOPs ≈ 2 × active.</li>
+      <li>Why: more capacity per FLOP (Switch: up to 7× faster pretraining at equal FLOPs).</li>
+      <li>Load balancing: collapse, capacity factor and dropped tokens, the aux loss E·Σ f·P, and DeepSeek-V3's bias-based alternative.</li>
+      <li>Costs: memory scales with <i>total</i> params, expert-parallel communication, instability, and less benefit at small batch on a single GPU (you still read many experts' weights).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The sparsely gated MoE layer</b> <span class="tag hist">📜 History · 2017</span> <a href="https://arxiv.org/abs/1701.06538" target="_blank" rel="noopener">Shazeer et al.: Outrageously Large Neural Networks</a></div>
+      <p><b>How:</b> noisy top-k gating over up to thousands of experts, between LSTM layers, up to 137B parameters.</p>
+      <p><b>Why this method:</b> “greater than 1000x improvements in model capacity with only minor losses in computational efficiency”.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Switch Transformer</b> <span class="tag co">🏢 Google · 2021</span> <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">Fedus, Zoph &amp; Shazeer: Switch Transformers</a></div>
+      <p><b>How:</b> top-1 routing, expert capacity with dropped tokens passed through the residual, balance loss with α = 0.01, float32 router for stability.</p>
+      <p><b>Why this method:</b> simplest routing with the least communication; up to 7× pretraining speedups over dense T5 at the same FLOPs.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Mixtral 8x7B</b> <span class="tag co">🏢 Mistral AI · 2023</span> <a href="https://arxiv.org/abs/2401.04088" target="_blank" rel="noopener">Jiang et al.: Mixtral of Experts</a></div>
+      <p><b>How:</b> Mistral 7B's architecture with each MLP replaced by 8 experts, top-2 per token per layer.</p>
+      <p><b>Why this method:</b> 13B-class speed with 47B-class knowledge; open weights made MoE mainstream.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>DeepSeekMoE → DeepSeek-V3</b> <span class="tag co">🏢 DeepSeek · 2024</span> <a href="https://arxiv.org/abs/2401.06066" target="_blank" rel="noopener">DeepSeekMoE</a>, <a href="https://arxiv.org/abs/2412.19437" target="_blank" rel="noopener">DeepSeek-V3</a></div>
+      <p><b>How:</b> fine-grained + shared experts, auxiliary-loss-free bias balancing, 671B total / 37B active, trained on 14.8T tokens.</p>
+      <p><b>Why this method:</b> specialisation without balance-loss side effects; the full training took 2.788M H800 GPU hours.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · experts aren't topic specialists</span>
+    <p>It's tempting to imagine a “biology expert” and a “code expert”. Mixtral's paper checked which experts tokens were sent to across topics (from arXiv papers to biology to philosophy) and found, in their words, no “obvious patterns in the assignment of experts based on the topic”. What they did see was syntax: indentation tokens in code always went to the same experts, and words like “self” in Python were often routed together. The experts specialise, just not the way a human org chart would.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The expert is the transformer MLP from 6.4 (SwiGLU from 0.5). Scaling laws (6.8) motivate it; memory-bound decoding (6.9) explains why MoE serving still needs all experts in memory. Expert parallelism and all-to-all communication are Phase 10's distributed training. RL post-training of MoE models (and its routing instabilities): <a href="../../rl-course/phase8/11-rl-infrastructure.html">RL 8.11</a>. Serving open MoE models: <a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://huggingface.co/blog/moe" target="_blank" rel="noopener">Hugging Face: Mixture of Experts Explained</a>. History, routing, capacity and fine-tuning tips in one place.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2101.03961" target="_blank" rel="noopener">Switch Transformers</a>. Sections 2.1–2.2 explain capacity and the balance loss with clear figures.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2401.06066" target="_blank" rel="noopener">DeepSeekMoE</a>. The case for fine-grained and shared experts.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. An MoE model has 60 MoE layers, each with 64 experts of 50M parameters, top-4 routing, plus 6B of shared (attention, embedding) parameters. How many parameters are active per token?</div>
+    <div class="opts"><button class="opt">198B</button><button class="opt" data-ok>18B</button><button class="opt">12B</button></div>
+    <div class="explain">Active experts: 4 × 50M × 60 layers = 12B, plus the 6B every token uses = 18B. (198B is the total: 64 × 50M × 60 + 6B. 12B forgets the shared part.) Per-token compute ≈ 2 × 18B = 36 GFLOPs, but memory must hold all 198B.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. During MoE pretraining, the loss stalls and you see that 3 of 64 experts receive 70% of tokens while 40 experts receive almost none. What's happening and what do you change?</div>
+    <div class="opts"><button class="opt">The experts are too small; double their width</button><button class="opt" data-ok>Routing collapse: popular experts get more gradient and more tokens; add or raise a balance mechanism (aux loss α ~0.01, or bias-based balancing) and check the capacity factor</button><button class="opt">The learning rate is too low for the router; raise it 10×</button></div>
+    <div class="explain">That's the rich-get-richer loop you saw in the playground. Overloaded experts also overflow their capacity, so many tokens are dropped and skip the layer. A balance loss (Switch's E·Σ f·P with α ≈ 0.01) or DeepSeek-V3's bias nudging spreads the load; a raised router LR would usually make collapse faster.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You must serve a model on a single 80 GB GPU at batch size 1. A 47B-total / 13B-active MoE and a 13B dense model score similarly on your task. Which is the better fit?</div>
+    <div class="opts"><button class="opt">The MoE, because it has more parameters</button><button class="opt" data-ok>The 13B dense model: the MoE needs memory for all 47B parameters (~94 GB in bf16) and its sparsity saves FLOPs, not memory</button><button class="opt">Either, they cost exactly the same to serve</button></div>
+    <div class="explain">An MoE's per-token FLOPs match its active parameters, but every expert must sit in memory, and decoding is memory-bound (6.9). At ~2 bytes per parameter, 47B doesn't fit on 80 GB without quantization. MoEs shine when you have many GPUs and big batches; on one small device a dense model of the same active size is simpler and fits.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>MoE: replace each MLP with E experts and a router that sends each token to the top k. Total params ≫ active params (Mixtral 46.7B / 12.9B; DeepSeek-V3 671B / 37B).</li>
+      <li>Why: more capacity at the same FLOPs per token (Switch: up to 7× faster pretraining). Cost: memory for all experts, communication, instability.</li>
+      <li>Routing collapses without balancing. Capacity = factor × tokens·k/E; overflow tokens are dropped. Aux loss α·E·Σ f·P (Switch α = 0.01) or DeepSeek-V3's bias nudging (no aux loss, no dropped tokens).</li>
+      <li>Fine-grained experts (many small, larger k) and shared experts (always on) improve specialisation at the same compute.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const big = v => v >= 1e12 ? (v / 1e12).toFixed(2) + "T" : v >= 1e9 ? (v / 1e9).toFixed(v >= 1e11 ? 0 : 1) + "B" : (v / 1e6).toFixed(0) + "M";
+  const COLORS = ["#e8743b", "#4e79a7", "#59a14f", "#b07aa1", "#edc948", "#76b7b2", "#ff9da7", "#9c755f"];
+
+  /* ---------- 1. the router ---------- */
+  const E = 8, T = 96, ETA = 0.05, LR = 30, GAMMA = 0.02;
+  const r0 = NN.rng(3), POP = [1.6, 1.0, 0.5, 0.2, 0, -0.2, -0.5, -0.8];
+  const A = Array.from({ length: T }, () => POP.map(p => p + r0.n()));   // each token's fixed affinity for each expert
+  let w, b, steps, bal = "aux";
+  function route(k, cf) {
+    const P = A.map(a => { const z = a.map((v, i) => v + w[i]), m = Math.max(...z), e = z.map(v => Math.exp(v - m)), s = e.reduce((x, y) => x + y); return e.map(v => v / s); });
+    const sel = P.map(p => p.map((q, i) => [Math.log(q) + b[i], i]).sort((x, y) => y[0] - x[0]).slice(0, k).map(q => q[1]));
+    const cap = Math.ceil(cf * T * k / E), load = Array(E).fill(0), kept = Array(E).fill(0), dropTok = Array(T).fill(false); let dropped = 0;
+    sel.forEach((s, t) => s.forEach(i => { load[i]++; if (kept[i] < cap) kept[i]++; else { dropped++; dropTok[t] = true; } }));
+    const f = load.map(l => l / (T * k)), Pm = Array.from({ length: E }, (_, i) => P.reduce((s, p) => s + p[i], 0) / T);
+    const aux = E * f.reduce((s, fi, i) => s + fi * Pm[i], 0);
+    const fav = A.filter((a, t) => sel[t][0] === a.indexOf(Math.max(...a))).length / T;
+    return { P, sel, load, cap, dropped, dropTok, aux, fav, f, maxr: Math.max(...load) / (T * k / E) };
+  }
+  const K = () => +$("rK").value, CF = () => +$("rCF").value, ALPHA = () => +$("rA").value;
+  function rTrain(n) {
+    for (let s = 0; s < n; s++) {
+      const R = route(K(), CF()), g = Array(E).fill(0);
+      R.P.forEach(p => { const fp = R.f.reduce((s2, fi, i) => s2 + fi * p[i], 0); for (let j = 0; j < E; j++) g[j] += p[j] * (R.f[j] - fp) / T; });
+      for (let j = 0; j < E; j++) { w[j] += ETA * (R.f[j] - 1 / E); if (bal === "aux") w[j] -= LR * ALPHA() * E * g[j]; }   // rich get richer, minus the balance-loss gradient
+      if (bal === "bias") { const mean = T * K() / E; for (let j = 0; j < E; j++) b[j] -= GAMMA * Math.sign(R.load[j] - mean); }
+      steps++;
+    }
+  }
+  function rDraw() {
+    $("rKV").textContent = K(); $("rAV").textContent = ALPHA().toFixed(3); $("rCFV").textContent = CF().toFixed(2);
+    const R = route(K(), CF()), mean = T * K() / E, top = Math.max(R.cap, ...R.load) * 1.1;
+    $("rToks").innerHTML = R.sel.map((s, t) => `<span class="${R.dropTok[t] ? "dr" : ""}" style="background:${COLORS[s[0]]}">${s[0] + 1}</span>`).join("");
+    $("rLoads").innerHTML = R.load.map(l => `<div class="col"><i class="${l > R.cap ? "over" : ""}" style="height:${100 * l / top}%"></i></div>`).join("") +
+      `<span class="capline" style="bottom:${100 * R.cap / top}%"></span><span class="meanline" style="bottom:${100 * mean / top}%"></span>`;
+    $("rLab").innerHTML = R.load.map((l, i) => `<span><b style="color:${COLORS[i]}">E${i + 1}</b> ${l}</span>`).join("");
+    $("rSteps").textContent = steps; $("rMax").textContent = R.maxr.toFixed(2) + "×"; $("rDrop").textContent = R.dropped;
+    $("rAux").textContent = R.aux.toFixed(3); $("rFav").textContent = (100 * R.fav).toFixed(0) + "%";
+    if (steps > 0) {
+      win("gCol", R.maxr >= E / K() - 0.01 && bal === "aux" && ALPHA() === 0);
+      win("g125", R.maxr <= 1.25);
+      win("gDrop", R.dropped === 0 && CF() <= 1.1);
+      win("gFree", bal === "bias" && R.maxr <= 1.25);
+    }
+    $("rMsg").textContent = steps === 0 ? "Untrained router. Press Train ×100." :
+      R.maxr >= 3 ? "Collapsed: a few experts take everything, the rest get no tokens and no gradient." :
+      R.maxr <= 1.25 ? `Balanced${bal === "bias" ? " by nudging biases, with nothing added to the loss" : ""}.` : "Partly balanced: try a bigger α or more steps.";
+  }
+  const rReset = () => { w = Array(E).fill(0); b = Array(E).fill(0); steps = 0; rDraw(); };
+  $("rTrain").onclick = () => { rTrain(100); rDraw(); };
+  $("rReset").onclick = rReset;
+  ["rK", "rA", "rCF"].forEach(id => ($(id).oninput = rDraw));
+  seg("rBal", v => { bal = v; rDraw(); });
+  rReset();
+
+  /* ---------- 2. total vs active calculator ---------- */
+  const EOPTS = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512];
+  const PRE = { pMix: { d: 4096, L: 32, other: 1.604e9, E: 8, k: 2, s: 0, f: 14336, router: true },
+                pDS: { d: 7168, L: 58, other: 14.46e9, E: 256, k: 8, s: 1, f: 2048, router: true } };
+  let cur = PRE.pMix;
+  const comb = (n, k) => { let c = 1; for (let i = 0; i < k; i++) c = c * (n - i) / (i + 1); return c; };
+  function pDraw() {
+    const Ex = EOPTS[+$("pE").value], k = Math.min(+$("pK").value, Ex), s = +$("pS").value, f = +$("pF").value;
+    $("pEV").textContent = Ex; $("pKV").textContent = k; $("pSV").textContent = s; $("pFV").textContent = f.toLocaleString();
+    const ex = 3 * cur.d * f, rt = cur.d * Ex;
+    const tot = cur.L * ((Ex + s) * ex + rt) + cur.other, act = cur.L * ((k + s) * ex + rt) + cur.other, c = comb(Ex, k);
+    $("pTot").textContent = big(tot); $("pAct").textContent = big(act); $("pPct").textContent = (100 * act / tot).toFixed(1) + "%";
+    $("pFl").textContent = (2 * act / 1e9).toFixed(0); $("pMem").textContent = (2 * tot / 1e9).toFixed(0) + " GB";
+    $("pComb").textContent = c >= 1e6 ? c.toExponential(1) : Math.round(c).toLocaleString();
+    win("gTen", tot >= 10 * act);
+    win("gFine", cur === PRE.pMix && Math.abs(act - 12.88e9) / 12.88e9 < 0.01 && c >= 1e6);
+    win("gDense", Ex === k && s === 0);
+    $("pMsg").textContent = Ex === k ? "Every expert runs on every token: this is just a (wide) dense model." : `Each token uses ${k + s} of ${Ex + s} experts per layer.`;
+  }
+  const setP = key => { cur = PRE[key]; $("pE").value = EOPTS.indexOf(cur.E); $("pK").value = cur.k; $("pS").value = cur.s; $("pF").value = cur.f; pDraw(); };
+  ["pE", "pK", "pS", "pF"].forEach(id => ($(id).oninput = pDraw));
+  $("pMix").onclick = () => setP("pMix"); $("pDS").onclick = () => setP("pDS");
+  setP("pMix");
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,450 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10.6 Experiment tracking and reproducibility · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  canvas.strip { width: 100%; height: 200px; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  canvas.hp { width: 100%; max-width: 330px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 10px; border: 1px solid var(--line); background: var(--bg2); }
+  .tog { display: grid; gap: 6px; }
+  .tog label { display: flex; gap: 8px; align-items: center; padding: 5px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); font-size: .92rem; cursor: pointer; }
+  .runcard { font-family: var(--mono); font-size: .82rem; background: var(--panel); border-radius: 10px; padding: 10px 12px; white-space: pre-wrap; border: 1px solid var(--line); }
+</style>
+</head>
+<body data-lesson="d10-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 10 · Lesson 6</div>
+  <h1>Experiment tracking and reproducibility</h1>
+  <p class="subtitle">Deep learning is an experimental science run on noisy hardware. Learn what to record so any result can be rebuilt, how many seeds it takes to trust a difference, and why random search beats a neat grid.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Training starts from <b>random</b> initial weights and sees data in a random order, so two runs differ (Lessons 1.3, 1.4).</li>
+      <li>The learning rate is the hyperparameter that matters most (Lesson 1.6).</li>
+      <li>A mean of a few noisy numbers is itself noisy; a confidence interval says how noisy (<a href="../../math-course/phase5/5-ab-tests.html">math 5.5</a>, <a href="../../rl-course/phase0/5-noisy-results.html">RL 0.5</a>).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2017, a DeepMind and Oxford team re-ran years of “new state-of-the-art” language models with the same large-scale automatic hyperparameter tuning for all of them. Their “somewhat surprising conclusion”: <b>standard LSTMs, properly regularised, outperformed the more recent models</b> (Melis et al.).</p>
+    <p>A year later, Google Brain did the same for GANs and found that “most models can reach similar scores with enough hyperparameter optimization and random restarts”, and no tested algorithm consistently beat the original 2014 GAN (Lucic et al.).</p>
+    <p>Many published gains were really tuning budgets and lucky seeds. <b>How do you make sure your own “improvement” is real, and that you can rebuild the exact model you shipped six months from now?</b></p>
+  </div>
+
+  <h2>Numbers first: the same code, different answers</h2>
+  <p>We trained a tiny network (2 → 4 → 4 → 1, ReLU) on a noisy two-moons dataset 20 times, changing only the random seed for the initial weights. Test accuracy ranged from <b>85.3% to 91.2%</b>. A 6-point spread, from nothing but the seed.</p>
+  <p>Now picture an ablation that claims “+2%”. With one run per side, the seed alone can produce that. Sources of run-to-run variation include:</p>
+  <table>
+    <tr><th>Source</th><th>Controlled by</th><th>Removable?</th></tr>
+    <tr><td>Weight initialization</td><td>the seed (<code>torch.manual_seed</code>)</td><td>yes, by fixing the seed</td></tr>
+    <tr><td>Data order, augmentation, dropout masks</td><td>seeds, including DataLoader workers' generators</td><td>yes</td></tr>
+    <tr><td>Non-deterministic GPU kernels (atomic adds in some backward passes, cuDNN autotuning)</td><td><code>torch.use_deterministic_algorithms(True)</code>, <code>cudnn.benchmark = False</code></td><td>mostly, at some speed cost</td></tr>
+    <tr><td>Hardware, driver, library versions, number of GPUs</td><td>the environment</td><td>only by recording and reusing it; PyTorch doesn't promise identical results across releases, platforms, or CPU vs GPU</td></tr>
+    <tr><td>Which data you happened to sample for train/val</td><td>the split seed</td><td>yes, but you <i>should</i> vary it to measure it</td></tr>
+  </table>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Two separate goals. <b>Reproducibility</b>: fix every seed and record everything, so the <i>same</i> run can be rebuilt. <b>Reliability</b>: vary the seeds on purpose, so you know whether a <i>difference</i> between runs is real. You need both.
+  </div>
+
+  <h2>What to log, every run</h2>
+  <div class="runcard">run: 2026-11-01_lr3e-4_w8_seed2      status: finished
+code:    git 9f2c1ab (clean)            env: torch 2.8.0, CUDA 12.x, 8×H100
+data:    moons-v3 (sha256 4be1…), split seed 0
+config:  {lr: 3e-4, width: 8, batch: 256, steps: 30000, warmup: 500, seed: 2}
+metrics: train/loss, val/loss, val/acc every 100 steps; final val/acc 0.912
+system:  GPU util, memory, tokens/s, step time
+artifacts: best.pt, last.pt, config.yaml, eval predictions</div>
+  <p>That card answers the three questions everyone eventually asks: <b>what exactly produced this model</b> (code, data, config, environment), <b>how did training go</b> (curves, not just the final number) and <b>where is it</b> (checkpoints). Tracking tools store these cards for you and let you compare runs side by side.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Config-as-code</span></span>
+    <ol>
+      <li><b>The problem before</b> Hyperparameters scattered across command-line flags, notebook cells and hard-coded constants. Weeks later nobody knows which learning rate produced the good checkpoint.</li>
+      <li><b>What people tried</b> Writing settings in a spreadsheet or the run's name (<code>run_final_v2_lr3e-4_REAL</code>).</li>
+      <li><b>Why this works</b> One typed object (a dataclass, a YAML file, a Hydra config) holds every knob. Training reads only from it, and the whole object is logged with the run, so the config <i>is</i> the record. Diffing two configs shows exactly what changed between two runs.</li>
+      <li><b>What it costs, when it fails</b> A little discipline: no “just this once” constants in the code. It records settings, not code or data: you still need the git commit and a data version.</li>
+      <li><b>What refined it</b> Config systems with overrides and sweeps (Hydra, ml_collections), and trackers that log the config automatically (W&amp;B's <code>config=</code>, MLflow's params and autologging).</li>
+    </ol>
+  </div>
+
+  <h2>Is B really better than A?</h2>
+  <p>Here is that tiny network again, training live in your browser. Two experiments: a <b>real but small</b> improvement (width 4 → 8), and a change that <b>does nothing</b> on average (width 5 → 6). Each seed is a full training run of 300 steps; A and B use different seeds, like real independent runs.</p>
+  <p class="predict">🔮 <b>Predict:</b> with one seed per config, experiment 1 shows B ahead by 4 points. Is the true gain closer to 4 points, 1.5 points or 0? How many seeds per side before you'd bet on it?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Seed noise: is the difference real?</span>
+    <p class="hint">Dots are individual runs (test accuracy on 400 held-out points). Lines are means. The bottom bar is the 95% confidence interval for B − A (Welch's t-interval): if it doesn't cross 0, the difference is unlikely to be seed luck. Runs are computed as you add seeds.</p>
+    <div class="goals"><span class="goal" id="gOne">🎯 See one seed claim a +4% win</span><span class="goal" id="gReal">🎯 Add seeds until the real gain is clear</span><span class="goal" id="gFake">🎯 Watch a fake “win” vanish</span></div>
+    <div class="controls">
+      <span class="seg" id="sExp"><button data-v="1" class="on">Experiment 1: width 4 → 8</button><button data-v="2">Experiment 2: width 5 → 6</button></span>
+      <label>seeds per config <input type="range" id="sN" min="1" max="20" step="1" value="1"> <b class="mono" id="sNV"></b></label>
+    </div>
+    <canvas class="strip" id="sCan"></canvas>
+    <div class="stat-row">
+      <div class="stat">A: mean ± sd <b id="sA">–</b></div>
+      <div class="stat">B: mean ± sd <b id="sB">–</b></div>
+      <div class="stat">B − A <b id="sD">–</b></div>
+      <div class="stat">95% CI of B − A <b id="sCI">–</b></div>
+      <div class="stat">verdict <b id="sV">–</b></div>
+    </div>
+    <p class="hint" id="sMsg"></p>
+  </div>
+  <p><b>What you should see:</b> in experiment 1, one seed each says B wins by <b>4.0 points</b>. By 5 seeds the gap has shrunk to 0.75 with an interval from about −1.4 to +2.9: can't tell. At 10 seeds it still just touches zero; from <b>11 seeds per side</b> it clears zero and stays clear, settling near a gain of 1.5 points. In experiment 2, one seed says +2.25 points; with 10–20 seeds the difference sits at about 0 with the interval straddling it. Same code, same “result” at n = 1, opposite truths.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Multiple seeds and confidence intervals</span></span>
+    <ol>
+      <li><b>The problem before</b> One run per config. Seed-to-seed spread is often as large as the effects people report (6 points across seeds in our toy), so single-run comparisons crown lucky seeds.</li>
+      <li><b>What people tried</b> Reporting the best of several runs (which inflates the result), or eyeballing curves.</li>
+      <li><b>Why this works</b> The mean of n runs has noise shrinking like 1/√n. A confidence interval for the difference turns “B looks better” into “B is better by 0.7 to 2.3 points, 95% of the time”. Bouthillier et al. (2021) showed that data sampling, initialization and hyperparameter choice all markedly affect benchmark results, and recommend randomizing all of them across trials.</li>
+      <li><b>What it costs, when it fails</b> n× the compute: impossible for a frontier pre-training run, where people instead rely on small-scale ablations and scaling trends. Intervals assume runs are independent and roughly normal; a single collapsed run (one of our width-3 runs got stuck at 50%) can dominate a mean, so look at the dots, not just the summary.</li>
+      <li><b>What refined it</b> Reporting means with intervals over 3–10 seeds; bootstrap intervals; statistical-power planning before running. In RL, where variance is wilder, the same story is told in <a href="../../rl-course/phase9/3-experiment-hygiene.html">RL 9.3</a>.</li>
+    </ol>
+  </div>
+
+  <h2>Ablations: take it apart to see what matters</h2>
+  <p>An <b>ablation</b> removes or changes one component at a time and measures the effect, holding everything else fixed. “Our model gets 91%” says little; “without the new normalization it gets 89.5 ± 0.4%, without the augmentation 90.8 ± 0.3%” says which idea did the work. Good ablations: one change per row, the same tuning budget for every row, several seeds each, and the baseline re-run in your setup rather than copied from another paper (Melis et al.'s lesson).</p>
+
+  <h2>Hyperparameter search: grid vs random</h2>
+  <p>You have budget for 9 training runs to tune the learning rate and weight decay. A neat 3 × 3 grid feels thorough. Bergstra and Bengio (2012) explained why it isn't: for most problems “only a few of the hyper-parameters really matter”. If weight decay barely matters, the grid's 9 runs test only <b>3 different learning rates</b>; random search tests 9.</p>
+  <p class="predict">🔮 <b>Predict:</b> on the surface below, only the learning rate (x-axis) matters. With 9 trials, which finds the better model, the grid or random points?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Grid vs random search</span>
+    <p class="hint">Background = validation accuracy (brighter is better) over log learning rate (x) and log weight decay (y). The best region is a narrow band of learning rates; weight decay barely matters. White squares = grid trials, pink dots = random trials. Re-roll to draw new random trials.</p>
+    <div class="goals"><span class="goal" id="gRand">🎯 Random beats the grid with 9 trials</span><span class="goal" id="gRate">🎯 Random wins ≥ 80% of 20 re-rolls</span><span class="goal" id="gGrid16">🎯 Give the grid 16 trials and count its learning rates</span></div>
+    <div class="controls">
+      <label>trials <select class="btn" id="hN"><option>4</option><option selected>9</option><option>16</option><option>25</option></select></label>
+      <button class="btn primary" id="hRoll">🎲 Re-roll random trials</button>
+      <button class="btn" id="h20">🎲 × 20</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="hp" id="hCan"></canvas><p class="hint">x: learning rate 10⁻⁴ … 10⁻¹ (log) · y: weight decay 10⁻⁶ … 10⁻² (log)</p></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">grid best <b id="hG">–</b></div>
+          <div class="stat">random best <b id="hR" class="gr">–</b></div>
+          <div class="stat">distinct learning rates tried: grid / random <b id="hD">–</b></div>
+          <div class="stat">random wins so far <b id="hW">–</b></div>
+        </div>
+        <p class="hint" id="hMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> the 3 × 3 grid's learning rates (10⁻³·⁵, 10⁻²·⁵, 10⁻¹·⁵) all straddle the good band at 10⁻², so its best run scores about 64%. Nine random trials try nine different learning rates and almost always land one near the band: about 80–90%. Over 20 re-rolls random wins nearly every time. A 4 × 4 grid still only tries 4 learning rates.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Random search over grid search</span></span>
+    <ol>
+      <li><b>The problem before</b> Grid search spends its budget evenly over every dimension, including ones that don't matter. With k hyperparameters and m values each it needs mᵏ runs, and still tries only m values of the one that matters.</li>
+      <li><b>What people tried</b> Manual tuning by intuition (unreproducible, biased toward the baseline you already like) and coarse-to-fine grids.</li>
+      <li><b>Why this works</b> Random points project onto <i>every</i> axis as n distinct values, so whichever hyperparameter turns out to matter gets n tries. Bergstra and Bengio found random search finds models “as good or better within a small fraction of the computation time” than grid search. Sample scale-type knobs (learning rate, weight decay) on a log scale.</li>
+      <li><b>What it costs, when it fails</b> Uneven coverage by chance (quasi-random sequences fix this; Google's Deep Learning Tuning Playbook prefers quasi-random search for exploration). It doesn't learn from earlier trials, so it's wasteful when runs are expensive.</li>
+      <li><b>What refined it</b> Bayesian optimization and TPE (try promising regions next), early stopping of bad trials (Hyperband, ASHA), and libraries such as <a href="https://optuna.org/" target="_blank" rel="noopener">Optuna</a> (define-by-run search spaces with pruning). For huge models, tune on small proxies and transfer (Lessons 1.6, 6.8).</li>
+    </ol>
+  </div>
+
+  <h2>When are two runs bit-identical?</h2>
+  <p class="predict">🔮 <b>Predict:</b> you set <code>torch.manual_seed(0)</code> and train twice on the same GPU. Will the final weights be bit-for-bit identical?</p>
+  <div class="playground">
+    <span class="label">🎮 Playground · Determinism checker</span>
+    <p class="hint">Toggle what you control. The verdict says whether two runs of the same script will produce bit-identical weights, and what's still varying.</p>
+    <div class="goals"><span class="goal" id="gDet">🎯 Make two GPU runs bit-identical</span></div>
+    <div class="tog" id="dTog"></div>
+    <div class="stat-row"><div class="stat">two runs bit-identical? <b id="dV">–</b></div></div>
+    <p class="hint" id="dMsg"></p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Seeds, deterministic mode, config-as-code and the smallest possible tracker (a JSON-lines file). This ran on a laptop CPU:</p>
+<pre><code><span class="k">import</span> json, random, dataclasses, torch, torch.nn <span class="k">as</span> nn
+
+@dataclasses.dataclass
+<span class="k">class</span> Config:                      <span class="c"># config-as-code: every knob in one typed, loggable object</span>
+    seed: int = <span class="n">0</span>
+    lr: float = <span class="n">0.05</span>
+    width: int = <span class="n">32</span>
+    steps: int = <span class="n">200</span>
+
+<span class="k">def</span> set_seed(seed):
+    random.seed(seed)
+    torch.manual_seed(seed)        <span class="c"># seeds the CPU and all CUDA devices</span>
+    torch.use_deterministic_algorithms(<span class="k">True</span>)   <span class="c"># error out on known non-deterministic kernels</span>
+
+<span class="k">def</span> run(cfg):
+    set_seed(cfg.seed)
+    x = torch.randn(<span class="n">256</span>, <span class="n">8</span>)
+    y = (x[:, :<span class="n">1</span>] * x[:, <span class="n">1</span>:<span class="n">2</span>] &gt; <span class="n">0</span>).float()
+    net = nn.Sequential(nn.Linear(<span class="n">8</span>, cfg.width), nn.ReLU(), nn.Linear(cfg.width, <span class="n">1</span>))
+    opt = torch.optim.SGD(net.parameters(), lr=cfg.lr)
+    <span class="k">for</span> _ <span class="k">in</span> range(cfg.steps):
+        loss = nn.functional.binary_cross_entropy_with_logits(net(x), y)
+        opt.zero_grad(); loss.backward(); opt.step()
+    <span class="k">return</span> loss.item()
+
+a, b, c = run(Config(seed=<span class="n">0</span>)), run(Config(seed=<span class="n">0</span>)), run(Config(seed=<span class="n">1</span>))
+print(<span class="s">f"seed 0 twice: {a:.10f} {b:.10f} identical={a == b}"</span>)
+print(<span class="s">f"seed 1:       {c:.10f}"</span>)
+<span class="k">with</span> open(<span class="s">"runs.jsonl"</span>, <span class="s">"a"</span>) <span class="k">as</span> f:
+    f.write(json.dumps({<span class="s">"config"</span>: dataclasses.asdict(Config(seed=<span class="n">0</span>)), <span class="s">"final_loss"</span>: a}) + <span class="s">"\n"</span>)
+
+<span class="c"># Output (torch 2.8, CPU):</span>
+<span class="c"># seed 0 twice: 0.5827357769 0.5827357769 identical=True</span>
+<span class="c"># seed 1:       0.6418628693</span></code></pre>
+    <p>On GPUs, deterministic cuBLAS also needs the environment variable <code>CUBLAS_WORKSPACE_CONFIG=:4096:8</code> (or <code>:16:8</code>), per the <code>torch.use_deterministic_algorithms</code> docs; set <code>torch.backends.cudnn.benchmark = False</code> too. The real trackers look like this (not run here: none of them is installed on this laptop):</p>
+<pre><code><span class="c"># Weights &amp; Biases (W&amp;B; part of CoreWeave since 2025)</span>
+<span class="k">import</span> wandb
+<span class="k">with</span> wandb.init(project=<span class="s">"moons"</span>, config=dataclasses.asdict(cfg)) <span class="k">as</span> run:
+    <span class="k">for</span> step <span class="k">in</span> range(cfg.steps):
+        ...
+        run.log({<span class="s">"train/loss"</span>: loss, <span class="s">"val/acc"</span>: acc})
+
+<span class="c"># MLflow (open source; view with: mlflow server --port 5000)</span>
+<span class="k">import</span> mlflow
+mlflow.set_experiment(<span class="s">"moons"</span>)
+<span class="k">with</span> mlflow.start_run():
+    mlflow.log_param(<span class="s">"lr"</span>, cfg.lr)
+    mlflow.log_metric(<span class="s">"val_loss"</span>, val_loss, step=step)
+
+<span class="c"># TensorBoard (local files; view with: tensorboard --logdir runs)</span>
+<span class="k">from</span> torch.utils.tensorboard <span class="k">import</span> SummaryWriter
+writer = SummaryWriter(<span class="s">"runs/moons_seed0"</span>)
+writer.add_scalar(<span class="s">"train/loss"</span>, loss, step)</code></pre>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Hosted tracker (W&amp;B)</td><td>Dashboards, sharing, sweeps, nothing to run yourself</td><td>Data leaves your machines; pricing; vendor lock-in</td></tr>
+      <tr><td>Self-hosted (MLflow)</td><td>Open source, model registry, your own servers</td><td>You operate it</td></tr>
+      <tr><td>TensorBoard / JSON files</td><td>Free, local, zero setup</td><td>Comparing many runs and sharing is clumsy</td></tr>
+      <tr><td>Deterministic mode</td><td>Bit-identical reruns for debugging</td><td>Slower kernels; some ops error out; only same hardware + versions</td></tr>
+      <tr><td>Many seeds per config</td><td>Trustworthy comparisons</td><td>n× compute</td></tr>
+      <tr><td>Random / Bayesian search</td><td>Better configs per trial than grids</td><td>Less intuitive to plot; Bayesian methods are sequential</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your teammate's new augmentation improved validation accuracy from 91.0% to 91.6%. Do you ship it?” A strong answer:</p>
+    <ul>
+      <li>Asks <b>how many seeds</b> per side and what the seed-to-seed spread is; 0.6 points from one run each is within typical noise.</li>
+      <li>Asks whether both sides got the <b>same tuning budget</b> and the same data split, and whether the baseline was re-run in the same setup.</li>
+      <li>Proposes 3–10 seeds each, a confidence interval on the difference, and a check on a held-out test set touched only once.</li>
+      <li>Checks that the run is <b>reproducible</b>: config, commit, data version and environment logged, checkpoint saved.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Old models, properly tuned, win</b> <span class="tag co">🏢 DeepMind / Oxford · 2017</span> <a href="https://arxiv.org/abs/1707.05589" target="_blank" rel="noopener">Melis, Dyer &amp; Blunsom: On the State of the Art of Evaluation in Neural Language Models</a></div>
+      <p><b>How:</b> re-evaluated popular architectures with the same large-scale automatic hyperparameter tuning.</p>
+      <p><b>Why this method:</b> different code bases and tuning budgets were uncontrolled sources of variation; with them controlled, standard LSTMs set a new state of the art on Penn Treebank and WikiText-2.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Most GANs are equal</b> <span class="tag co">🏢 Google Brain · 2018</span> <a href="https://arxiv.org/abs/1711.10337" target="_blank" rel="noopener">Lucic et al.: Are GANs Created Equal?</a></div>
+      <p><b>How:</b> a large, neutral study with many hyperparameter settings and random restarts per model.</p>
+      <p><b>Why this method:</b> improvements “can arise from a higher computational budget and tuning more than fundamental algorithmic changes”.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Random search</b> <span class="tag res">🧪 Research · 2012</span> <a href="https://www.jmlr.org/papers/v13/bergstra12a.html" target="_blank" rel="noopener">Bergstra &amp; Bengio: Random Search for Hyper-Parameter Optimization (JMLR)</a></div>
+      <p><b>How:</b> compared random and grid search for neural networks and deep belief networks; analysed which hyperparameters matter.</p>
+      <p><b>Why this method:</b> low effective dimensionality: only a few hyperparameters matter, and which ones differs by dataset.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Variance in benchmarks</b> <span class="tag res">🧪 Research · 2021</span> <a href="https://arxiv.org/abs/2103.03098" target="_blank" rel="noopener">Bouthillier et al.: Accounting for Variance in Machine Learning Benchmarks</a></div>
+      <p><b>How:</b> modelled the whole benchmarking process across five deep-learning tasks.</p>
+      <p><b>Why this method:</b> data sampling, initialization and hyperparameter choice all markedly change results; randomizing more of them gives better comparisons at a fraction of the cost.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · “reproducible” has an expiry date</span>
+    <p>PyTorch's own reproducibility notes state that completely reproducible results are not guaranteed across PyTorch releases, individual commits or platforms, and may differ between CPU and GPU even with identical seeds. Bit-identical reruns need the same hardware and software, which is why serious teams log the environment and keep container images, not just seeds.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Confidence intervals and A/B tests: <a href="../../math-course/phase5/5-ab-tests.html">math 5.5</a>; noisy results and experiment hygiene in RL: <a href="../../rl-course/phase0/5-noisy-results.html">RL 0.5</a>, <a href="../../rl-course/phase9/3-experiment-hygiene.html">RL 9.3</a>, reproducing papers: <a href="../../rl-course/phase9/2-reproducing.html">RL 9.2</a>. Learning-rate finding and schedules: 1.6; debugging a run: 2.6. Evaluation datasets and eval ops for LLM apps: <a href="../../ai-engineer/phase5/6-eval-ops.html">AI Engineer 5.6</a>. Next: reading papers critically, with ablations and seeds in mind (10.7).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Guide</span> <a href="https://github.com/google-research/tuning_playbook" target="_blank" rel="noopener">Google Research: Deep Learning Tuning Playbook</a>. A practical, opinionated process for tuning, including quasi-random search.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/docs/stable/notes/randomness.html" target="_blank" rel="noopener">PyTorch: Reproducibility</a>. Every source of randomness and how to control it.</li>
+      <li><span class="kind">Docs</span> <a href="https://mlflow.org/docs/latest/ml/tracking/" target="_blank" rel="noopener">MLflow Tracking</a> and <a href="https://docs.wandb.ai/quickstart" target="_blank" rel="noopener">W&amp;B quickstart</a>.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Config A over 4 seeds: 90.1, 89.3, 90.6, 89.8 (mean 89.95). Config B: 90.4, 91.0, 89.9, 90.5 (mean 90.45). Seed-to-seed standard deviation is about 0.5 on each side. Roughly, is the 0.5-point difference clearly real?</div>
+    <div class="opts"><button class="opt">Yes: B's mean is higher</button><button class="opt" data-ok>Not clearly: the standard error of the difference is about √(0.5²/4 + 0.5²/4) ≈ 0.35, so a 95% interval is roughly 0.5 ± 0.9, which includes 0</button><button class="opt">No: you can never compare means</button></div>
+    <div class="explain">Each mean has standard error 0.5/√4 = 0.25; the difference has √(0.25² + 0.25²) ≈ 0.35. With so few runs the t multiplier is about 2.5, giving roughly 0.5 ± 0.9. More seeds (or a bigger effect) are needed. This is the playground's lesson in four numbers.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You tune 3 hyperparameters with a 4 × 4 × 4 grid (64 runs). Later analysis shows only the learning rate mattered. How many distinct learning rates did you actually try, and what would 64 random trials have tried?</div>
+    <div class="opts"><button class="opt">64 and 64</button><button class="opt" data-ok>4 with the grid; 64 with random search</button><button class="opt">16 with the grid; 4 with random search</button></div>
+    <div class="explain">A grid's points share coordinates: projected onto the learning-rate axis, 64 points collapse onto just 4 values. Random points have 64 distinct values on every axis, so the one that matters gets 64 tries. That's Bergstra and Bengio's argument.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Six months after launch, a regression appears and you need to retrain the exact shipped model. Your tracker has the final metrics and the checkpoint. What's most likely missing?</div>
+    <div class="opts"><button class="opt">The learning-rate curve</button><button class="opt" data-ok>The code commit, data version and environment (library versions, hardware) that produced it, alongside the full config and seeds</button><button class="opt">Nothing: the checkpoint is enough to retrain</button></div>
+    <div class="explain">A checkpoint lets you <i>use</i> the model, not rebuild it. Rebuilding needs the code at that commit, the exact data (version or hash), every config value and seed, and the software environment, since results aren't guaranteed identical across library versions or hardware.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Log every run: config (as code), git commit, data version, seeds, environment, metric curves, system stats, checkpoints. Use W&amp;B, MLflow or TensorBoard (or a JSON file).</li>
+      <li>Reproducibility: <code>torch.manual_seed</code>, seeded data order, <code>torch.use_deterministic_algorithms(True)</code>, <code>cudnn.benchmark = False</code>, <code>CUBLAS_WORKSPACE_CONFIG</code>; bit-identical only on the same hardware and versions.</li>
+      <li>Reliability: seed noise is often as large as the effects people claim. Compare means over several seeds with a confidence interval; look at every run.</li>
+      <li>Ablations: change one thing, same tuning budget, several seeds, re-run the baseline yourself.</li>
+      <li>Random (or quasi-random) search beats grid search because few hyperparameters matter; then Bayesian methods and early stopping (Optuna).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const setup = c => { const d = window.devicePixelRatio || 1, w = c.clientWidth || 600, h = c.clientHeight || 200; c.width = w * d; c.height = h * d; const x = c.getContext("2d"); x.setTransform(d, 0, 0, d, 0, 0); x.clearRect(0, 0, w, h); x.font = "11px " + css("--font"); return { x, w, h }; };
+
+  /* ---------- 1. seed noise (real training runs, cached) ---------- */
+  const train = NN.data.moons(200, { noise: 0.25, seed: 11 }), test = NN.data.moons(400, { noise: 0.25, seed: 12 });
+  function runOnce(width, seed) {
+    const net = new NN.MLP({ sizes: [2, width, width, 1], act: "relu", out: "sigmoid", init: "he", seed });
+    for (let s = 0; s < 300; s++) net.train(train, { lr: 0.3 });
+    return test.filter(d => (net.predict(d.x)[0] > 0.5) === (d.y === 1)).length / test.length;
+  }
+  const EXP = { 1: { a: 4, b: 8 }, 2: { a: 5, b: 6 } }, cache = {};
+  const acc = (w, s) => { const k = w + "_" + s; if (!(k in cache)) cache[k] = runOnce(w, s); return cache[k]; };
+  const T95 = [NaN, 12.71, 4.30, 3.18, 2.78, 2.57, 2.45, 2.36, 2.31, 2.26, 2.23, 2.20, 2.18, 2.16, 2.14, 2.13, 2.12, 2.11, 2.10, 2.09, 2.09, 2.08, 2.07, 2.07, 2.06, 2.06, 2.06, 2.05, 2.05, 2.05, 2.04];
+  const tcrit = df => (df >= 30 ? 2.0 : T95[Math.max(1, Math.round(df))]);
+  const mean = a => a.reduce((x, y) => x + y, 0) / a.length, sdv = a => { const m = mean(a); return a.length > 1 ? Math.sqrt(a.reduce((x, y) => x + (y - m) ** 2, 0) / (a.length - 1)) : 0; };
+  let exp = "1", job = 0, oneSeedSeen = { 1: false, 2: false };
+  function seedsUpdate() {
+    const n = +$("sN").value, E = EXP[exp], my = ++job;
+    $("sNV").textContent = n;
+    const A = [], B = [];
+    let i = 0;
+    const step = () => {
+      if (my !== job) return;
+      if (i < n) { A.push(acc(E.a, i + 1)); B.push(acc(E.b, 101 + i)); i++; $("sMsg").textContent = `training seed ${i} of ${n}…`; drawSeeds(A, B, n, i < n); setTimeout(step, 0); return; }
+      drawSeeds(A, B, n, false);
+    };
+    step();
+  }
+  function drawSeeds(A, B, n, partial) {
+    const { x, w, h } = setup($("sCan")), lo = 0.84, hi = 0.93, m = { l: 40, r: 14 };
+    const X = v => m.l + (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo) * (w - m.l - m.r);
+    x.fillStyle = css("--muted"); x.textAlign = "center";
+    for (let v = 0.85; v <= 0.93 + 1e-9; v += 0.01) { x.strokeStyle = css("--line"); x.beginPath(); x.moveTo(X(v), 10); x.lineTo(X(v), 130); x.stroke(); x.fillText((100 * v).toFixed(0) + "%", X(v), 145); }
+    const row = (arr, y, col, lab) => {
+      x.fillStyle = css("--text"); x.textAlign = "right"; x.fillText(lab, m.l - 4, y + 4);
+      arr.forEach((v, k) => { x.fillStyle = col; x.globalAlpha = 0.8; x.beginPath(); x.arc(X(v), y + ((k % 5) - 2) * 4, 5, 0, 7); x.fill(); x.globalAlpha = 1; });
+      if (arr.length) { x.strokeStyle = col; x.lineWidth = 3; x.beginPath(); x.moveTo(X(mean(arr)), y - 18); x.lineTo(X(mean(arr)), y + 18); x.stroke(); x.lineWidth = 1; }
+    };
+    row(A, 40, css("--c-x"), "A"); row(B, 100, css("--c-gr"), "B");
+    const nA = A.length;
+    const d = mean(B) - mean(A);
+    $("sA").textContent = nA ? (100 * mean(A)).toFixed(1) + " ± " + (100 * sdv(A)).toFixed(1) : "–";
+    $("sB").textContent = nA ? (100 * mean(B)).toFixed(1) + " ± " + (100 * sdv(B)).toFixed(1) : "–";
+    $("sD").textContent = nA ? (d >= 0 ? "+" : "") + (100 * d).toFixed(2) + " pts" : "–";
+    let lo95 = null, hi95 = null;
+    if (nA >= 2) { const va = sdv(A) ** 2 / nA, vb = sdv(B) ** 2 / nA, se = Math.sqrt(va + vb), df = (va + vb) ** 2 / ((va * va + vb * vb) / (nA - 1) || 1e-12), t = tcrit(df); lo95 = d - t * se; hi95 = d + t * se; }
+    // CI bar at the bottom, on a ±6 point axis
+    const cx = v => (w / 2) + v / 0.06 * (w / 2 - m.r - 10), yb = 175;
+    x.strokeStyle = css("--muted"); x.beginPath(); x.moveTo(cx(0), yb - 12); x.lineTo(cx(0), yb + 12); x.stroke();
+    x.fillStyle = css("--muted"); x.textAlign = "center"; x.fillText("0", cx(0), yb + 24); x.textAlign = "left"; x.fillText("B − A, 95% CI (±6 pts shown)", 8, yb - 14);
+    if (lo95 != null) { const clear = lo95 > 0 || hi95 < 0; x.strokeStyle = clear ? css("--good") : css("--c-dead"); x.lineWidth = 6; x.beginPath(); x.moveTo(cx(Math.max(-0.06, lo95)), yb); x.lineTo(cx(Math.min(0.06, hi95)), yb); x.stroke(); x.lineWidth = 1; }
+    x.fillStyle = css("--c-ac"); x.beginPath(); x.arc(cx(Math.max(-0.06, Math.min(0.06, d))), yb, 6, 0, 7); x.fill();
+    $("sCI").textContent = lo95 == null ? "need ≥ 2 seeds" : `[${(100 * lo95).toFixed(2)}, ${(100 * hi95).toFixed(2)}]`;
+    if (partial) return;
+    const clear = lo95 != null && (lo95 > 0 || hi95 < 0);
+    $("sV").innerHTML = lo95 == null ? `<span class="dead">one run each: can't tell</span>` : clear ? `<span class="ev">${d > 0 ? "B" : "A"} is better</span>` : `<span class="dead">can't tell</span>`;
+    if (n === 1) oneSeedSeen[exp] = true;
+    win("gOne", exp === "1" && n === 1 && d >= 0.039);
+    win("gReal", exp === "1" && clear && d > 0);
+    win("gFake", exp === "2" && oneSeedSeen[2] && n >= 10 && !clear);
+    $("sMsg").textContent = n === 1 ? (exp === "1" ? "One run each: B looks 4 points better. Is it?" : "One run each: B looks 2 points better. Is it?") :
+      clear ? `With ${n} seeds per side the interval excludes 0: the gain is real, and about ${(100 * d).toFixed(1)} points, not the ${exp === "1" ? "4" : "2"} that one seed suggested.` :
+      `With ${n} seeds the interval still includes 0. ${exp === "2" ? "Here it never will: there's no real difference." : "Keep adding seeds."}`;
+  }
+  seg("sExp", v => { exp = v; seedsUpdate(); });
+  $("sN").oninput = seedsUpdate;
+
+  /* ---------- 2. grid vs random search ---------- */
+  const score = (u, v) => 0.6 + 0.3 * Math.exp(-((u + 2) ** 2) / (2 * 0.25 ** 2)) + 0.004 * Math.sin(3 * v);   // u = log10 lr in [-4,-1], v = log10 wd in [-6,-2]
+  let roll = 0, wins = 0, rolls = 0;
+  function trials() {
+    const n = +$("hN").value, k = Math.round(Math.sqrt(n)), grid = [];
+    for (let i = 0; i < k; i++) for (let j = 0; j < k; j++) grid.push([-4 + 3 * (i + 0.5) / k, -6 + 4 * (j + 0.5) / k]);
+    const r = NN.rng(1000 + roll), rand = Array.from({ length: n }, () => [-4 + 3 * r.u(), -6 + 4 * r.u()]);
+    return { grid, rand, n, k };
+  }
+  function hp(count) {
+    const { grid, rand, k } = trials(), c = $("hCan"), { x, w, h } = setup(c), N = 50;
+    const X = u => (u + 4) / 3 * w, Y = v => h - (v + 6) / 4 * h;
+    for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) { const u = -4 + 3 * (i + 0.5) / N, v = -6 + 4 * (j + 0.5) / N, t = (score(u, v) - 0.58) / 0.34; x.fillStyle = NN.cmap.seq(Math.max(0, Math.min(1, t)), "--c-y"); x.fillRect(i * w / N, h - (j + 1) * h / N, w / N + 1, h / N + 1); }
+    grid.forEach(([u, v]) => { x.fillStyle = "#fff"; x.strokeStyle = "#000"; x.fillRect(X(u) - 5, Y(v) - 5, 10, 10); x.strokeRect(X(u) - 5, Y(v) - 5, 10, 10); });
+    rand.forEach(([u, v]) => { x.fillStyle = css("--c-gr"); x.beginPath(); x.arc(X(u), Y(v), 5, 0, 7); x.fill(); x.strokeStyle = "#fff"; x.stroke(); });
+    const gb = Math.max(...grid.map(p => score(...p))), rb = Math.max(...rand.map(p => score(...p)));
+    if (count) { rolls++; if (rb > gb) wins++; }
+    $("hG").textContent = (100 * gb).toFixed(1) + "%"; $("hR").textContent = (100 * rb).toFixed(1) + "%";
+    $("hD").textContent = k + " / " + rand.length; $("hW").textContent = rolls ? `${wins} of ${rolls}` : "–";
+    win("gRand", rand.length === 9 && rb > gb);
+    win("gRate", rand.length === 9 && rolls >= 20 && wins / rolls >= 0.8);
+    win("gGrid16", rand.length === 16);
+    $("hMsg").textContent = `The grid tried ${k} learning rates, ${k} times each (weight decay barely matters, so the repeats are wasted). Random search tried ${rand.length} different learning rates.`;
+  }
+  $("hN").onchange = () => { wins = 0; rolls = 0; hp(false); };
+  $("hRoll").onclick = () => { roll++; hp(true); };
+  $("h20").onclick = () => { for (let i = 0; i < 20; i++) { roll++; hp(true); } };
+
+  /* ---------- 3. determinism checker ---------- */
+  const OPTS = [
+    ["seed", "torch.manual_seed(…) set at the start"],
+    ["data", "data order and augmentation seeded (DataLoader generator, worker seeds)"],
+    ["gpu", "training runs on a GPU"],
+    ["det", "torch.use_deterministic_algorithms(True), cudnn.benchmark = False, CUBLAS_WORKSPACE_CONFIG set"],
+    ["env", "same GPU model, driver, CUDA and PyTorch versions, same number of GPUs"],
+  ];
+  const st = { seed: true, data: false, gpu: true, det: false, env: true };
+  function det() {
+    $("dTog").innerHTML = OPTS.map(([k, t]) => `<label><input type="checkbox" data-k="${k}" ${st[k] ? "checked" : ""}> ${t}</label>`).join("");
+    [...$("dTog").querySelectorAll("input")].forEach(el => (el.onchange = () => { st[el.dataset.k] = el.checked; det(); }));
+    const missing = [];
+    if (!st.seed) missing.push("initial weights differ (no seed)");
+    if (!st.data) missing.push("batches arrive in a different order");
+    if (st.gpu && !st.det) missing.push("non-deterministic GPU kernels (atomic adds, autotuned algorithms) change the rounding");
+    if (!st.env) missing.push("different hardware or library versions use different kernels");
+    const ok = !missing.length;
+    $("dV").innerHTML = ok ? `<span class="ev">yes</span>` : `<span class="dead">no</span>`;
+    $("dMsg").textContent = ok ? (st.gpu ? "Bit-identical on this exact setup, at some speed cost. Remember: identical reruns say nothing about seed-to-seed variance." : "On a CPU with fixed seeds, the same build is usually deterministic (our snippet below is).") : "Still varying: " + missing.join("; ") + ".";
+    win("gDet", ok && st.gpu);
+  }
+  det();
+  window.addEventListener("resize", () => { seedsUpdate(); hp(false); });
+  window.addEventListener("themechange", () => { seedsUpdate(); hp(false); });
+  seedsUpdate(); hp(false);
+})();
+</script>
+</body>
+</html>

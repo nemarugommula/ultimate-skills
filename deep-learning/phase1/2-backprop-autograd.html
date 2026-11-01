@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.2 Backprop and autograd: how every weight learns its blame · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  figure.diagram svg.flow { width: 100%; height: auto; }
+  .steplog { font-family: var(--mono); font-size: .9em; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-height: 3.2em; }
+  .bugs { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin: 8px 0; }
+  .bugs button { text-align: left; font-family: var(--mono); font-size: .85em; padding: 8px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+  .bugs button.on { outline: 2px solid var(--accent); }
+  .bugs button.ok { border-color: var(--good); } .bugs button.bad { border-color: var(--bad); }
+  .bugs button small { display: block; font-family: var(--font); color: var(--muted); margin-top: 3px; }
+  .codecell { font-family: var(--mono); font-size: .9em; background: var(--bg2); border-radius: 10px; padding: 8px 12px; border: 1px solid var(--line); white-space: pre-wrap; }
+</style>
+</head>
+<body data-lesson="d1-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 1 · Lesson 2</div>
+  <h1>Backprop and autograd: how every weight learns its blame</h1>
+  <p class="subtitle">A billion weights, and each one needs to know how it should change. Nudging them one by one would take decades per step. Backpropagation gets all billion answers for the price of about three forward passes.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>The <span class="ls">loss</span> is one number; its <span class="gr">gradient</span> on a weight says how fast the loss changes if you nudge that weight (Lesson 1.1, <a href="../../math-course/phase3/3-gradients.html">math 3.3</a>).</li>
+      <li>The <b>chain rule</b>: if a affects b and b affects c, then (effect of a on c) = (effect of a on b) × (effect of b on c) (<a href="../../math-course/phase3/2-chain-rule.html">math 3.2</a>).</li>
+      <li>ReLU passes its input if positive, else outputs 0; its slope is 1 or 0 (Lesson 0.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Here's the obvious way to find a weight's gradient: nudge it by a tiny amount, run the network again, see how much the loss moved. It works. Now do it for a model with <b>1 billion</b> weights. That's 1 billion extra forward passes <i>per training step</i>. At one second per pass, a single step takes about <b>32 years</b>.</p>
+    <p>Yet PyTorch's <code>loss.backward()</code> returns all billion gradients in a time that is a small constant multiple of one forward pass: the theory guarantees under 6×, and it's typically <b>2–3×</b>. <b>How can you get a billion answers for the price of three?</b></p>
+    <p>Who uses this: every neural network you have ever heard of was trained this way. Backpropagation is the engine; autograd (automatic differentiation) is the machine in PyTorch and JAX that runs it for you on any code you write.</p>
+  </div>
+
+  <h2>Numbers first: one neuron, by hand</h2>
+  <p>One ReLU neuron with two inputs, scored by squared error. Inputs <span class="x">x₁ = 2</span>, <span class="x">x₂ = −1</span>; weights <span class="w">w₁ = 1.5</span>, <span class="w">w₂ = 0.5</span>, <span class="w">b = 0.5</span>; target <span class="y">y = 1</span>.</p>
+  <div class="calc"><b>Forward:</b> z = 1.5·2 + 0.5·(−1) + 0.5 = <span class="ac">3</span> → a = ReLU(3) = <span class="ac">3</span> → <span class="ls">L</span> = (3 − 1)² = <b>4</b></div>
+  <p>Now go <b>backwards</b>, asking at each step “how much does L change per unit change of this thing?”:</p>
+  <div class="calc"><b>Backward:</b> ∂L/∂a = 2(a − y) = <span class="gr">4</span> → ReLU is on, so ∂L/∂z = 4 × 1 = <span class="gr">4</span> → ∂L/∂w₁ = 4 × x₁ = <span class="gr">8</span>, ∂L/∂w₂ = 4 × x₂ = <span class="gr">−4</span>, ∂L/∂b = <span class="gr">4</span></div>
+  <p>Every step is the same move: <b>local derivative × the gradient that arrived from above</b>. Nobody needs to know the whole formula; each piece only knows its own little derivative. That's backpropagation. PyTorch prints exactly 8, −4 and 4 for this neuron (Tools box).</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Write the computation as a <b>graph</b> of tiny operations. Run it forward once and remember every intermediate value. Then walk the graph <b>backwards once</b>, multiplying each node's local derivative by the gradient flowing in from above. One backward walk gives the gradient for <b>every</b> input at once, because all the weights share the same path back from the loss.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: blame flowing back through a company</span>
+    <p>A product launch failed by $4M (the loss). The CEO asks each division head “how much of this is yours?”. Each head only knows their own local relationships (“my team's output feeds 100% into the launch; Ana's code was 2× as influential as Bo's”) and passes blame down proportionally. Nobody needs the whole org chart; blame arrives at every employee after <b>one</b> sweep down the hierarchy. Asking each employee “what if you had done slightly differently?” and re-running the whole launch each time is finite differences.</p>
+  </div>
+
+  <h2>Step through a computational graph</h2>
+  <p>Here's the neuron from above as a graph. Blue = inputs, orange = weights, purple = intermediate values, teal = loss. Each node will show its value (forward) and its <span class="gr">gradient</span> (backward).</p>
+  <p class="predict">🔮 <b>Predict:</b> the “+” node adds three things. When the gradient 4 arrives at it from above, what does each of its three inputs receive: 4 each, 4/3 each, or something depending on their values?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Forward, then backward, node by node</span>
+    <p class="hint">Press <b>Forward ▶</b> to compute one node at a time, then <b>◀ Backward</b> to send the gradient back one node at a time. The log explains each step. Change the weights with the sliders (it resets the passes) and break things on purpose.</p>
+    <div class="goals"><span class="goal" id="gAll">🎯 Run a full backward pass</span><span class="goal" id="gZero">🎯 Make every weight's gradient exactly 0 while the loss is not 0</span><span class="goal" id="gPerfect">🎯 Make the loss exactly 0</span></div>
+    <div class="controls">
+      <label><span class="w">w₁</span> <input type="range" id="w1" min="-3" max="3" step="0.1" value="1.5"> <b class="mono" id="w1v"></b></label>
+      <label><span class="w">w₂</span> <input type="range" id="w2" min="-3" max="3" step="0.1" value="0.5"> <b class="mono" id="w2v"></b></label>
+      <label><span class="w">b</span> <input type="range" id="bb" min="-3" max="3" step="0.1" value="0.5"> <b class="mono" id="bbv"></b></label>
+    </div>
+    <figure class="diagram"><svg id="graph"></svg></figure>
+    <div class="controls">
+      <button class="btn primary" id="fwd">Forward ▶</button>
+      <button class="btn primary" id="bwd">◀ Backward</button>
+      <button class="btn" id="allSteps">Run both</button>
+      <button class="btn" id="nudge">🔍 Check w₁ by nudging</button>
+      <button class="btn" id="gReset">↺ Reset passes</button>
+    </div>
+    <div class="steplog" id="log">Press Forward ▶.</div>
+  </div>
+  <p><b>What you should see:</b> forward fills in z = 3, a = 3, L = 4. Backward starts with ∂L/∂L = 1, becomes 4 at a, passes through the ReLU unchanged (it's on), and the “+” node hands <b>the same 4 to all three inputs</b>: adding copies the gradient. Each “×” node <b>swaps</b>: w₁ gets 4 × x₁ = 8 and x₁ gets 4 × w₁ = 6. Nudging w₁ by ±0.00001 gives 8.0000, matching backprop. Now drag b to −3: z goes negative, the ReLU outputs 0, the loss is 1 and every gradient behind the ReLU is exactly <span class="dead">0</span>. That's a dead ReLU (Lesson 0.4) seen from the inside.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: three patterns that cover almost every node</span>
+    <table>
+      <tr><th>Node</th><th>Local derivative</th><th>What it does to the gradient g from above</th><th>In our neuron</th></tr>
+      <tr><td><b>add</b> u + v + b</td><td>1 for each input</td><td><b>copies</b> g to every input</td><td>m₁, m₂, b each get 4</td></tr>
+      <tr><td><b>multiply</b> w · x</td><td>∂/∂w = x, ∂/∂x = w</td><td><b>swaps</b>: each input gets g × the <i>other</i> input</td><td>w₁: 4 × 2 = 8; x₁: 4 × 1.5 = 6</td></tr>
+      <tr><td><b>ReLU</b> max(0, z)</td><td>1 if z &gt; 0 else 0</td><td><b>gates</b>: passes g or blocks it</td><td>z = 3 &gt; 0: passes 4</td></tr>
+      <tr><td><b>square</b> (a − y)²</td><td>2(a − y)</td><td>scales g by twice the error</td><td>1 × 2 × 2 = 4</td></tr>
+    </table>
+    <p>A real network is millions of these nodes (a matrix multiply is just many multiplies and adds), but backprop never needs anything cleverer. When one weight feeds <b>several</b> paths (the same weight used twice, or a value used by two later layers), the gradients from all paths <b>add up</b>.</p>
+  </div>
+
+  <h2>Why one backward pass is enough</h2>
+  <p>Count the work. Forward: each node computed once. Backward: each node does one small multiply per input. So the backward pass costs roughly the same as the forward pass (a bit more, because a matrix multiply needs two gradient matrix multiplies). In total the gradient costs a <b>small constant</b> times one forward pass, <b>no matter how many weights</b> there are.</p>
+  <p class="predict">🔮 <b>Predict:</b> at one second per forward pass, how long does one gradient take for the smallest GPT-2 (117 million weights) by nudging each weight both ways?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Nudging vs backprop: the bill</span>
+    <p class="hint">Slide the number of weights. Centered nudging needs 2 forward passes per weight; backprop needs one forward plus one backward pass, about 3 forward-pass equivalents in total.</p>
+    <div class="controls"><label>number of weights <input type="range" id="nP" min="1" max="12" step="0.01" value="8.07"> <b class="mono" id="nPv"></b></label>
+      <label>seconds per forward pass <select id="sec" class="btn small"><option value="0.001">0.001 (a tiny MLP)</option><option value="1" selected>1</option></select></label></div>
+    <div class="stat-row">
+      <div class="stat">nudging: forward passes <b id="fdN" class="dead">–</b></div>
+      <div class="stat">nudging: time per step <b id="fdT" class="dead">–</b></div>
+      <div class="stat">backprop: pass-equivalents <b class="ev">≈ 3</b></div>
+      <div class="stat">backprop: time per step <b id="bpT" class="ev">–</b></div>
+      <div class="stat">speed-up <b id="spd" class="gr">–</b></div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> at GPT-2 small's 117 million weights nudging needs 234 million passes, about <b>7.4 years</b> per step; backprop takes about 3 seconds. At a billion weights nudging needs <b>63 years</b> per step. Training needs hundreds of thousands of steps. Without reverse-mode differentiation there would be no deep learning.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Reverse-mode autodiff (backpropagation)</span></span>
+    <ol>
+      <li><b>The problem before</b> Training needs ∂loss/∂w for every weight. Finite differences cost 2 forward passes per weight: 2 × 10⁹ passes for a billion-weight model, every step. Deriving the formula by hand for each new architecture is slow and error-prone.</li>
+      <li><b>What people tried</b> Finite differences (fine for checking, hopeless for training); symbolic differentiation (expressions explode in size); <b>forward-mode</b> autodiff, which pushes derivatives forward alongside values but needs one pass per <i>input</i>, so a billion passes again.</li>
+      <li><b>Why this works</b> A loss is a function from many numbers (weights) to <b>one</b> number. Reverse mode starts at that one output and walks back, so it needs one sweep per <i>output</i>: just one. The AD survey by Baydin et al. puts the cost at c × (one evaluation), with c guaranteed below 6 and typically 2–3. Rumelhart, Hinton &amp; Williams (1986) made it famous for neural nets as “backpropagation”.</li>
+      <li><b>What it costs, when it fails</b> <b>Memory</b>: the backward pass needs the forward pass's intermediate values, so every activation is stored until it's used; for big models activations, not weights, often fill the GPU. Gradients only exist where the function is differentiable: argmax, sampling and rounding give zero or no gradient (tricks like the reparameterization trick, Lesson 7.2, work around that).</li>
+      <li><b>What refined it</b> Autograd libraries that record any Python code as it runs (PyTorch, JAX); <b>activation checkpointing</b>, which stores fewer activations and recomputes them during backward, trading about one extra forward pass for much less memory (Chen et al. 2016); mixed precision to shrink what's stored (Lesson 10.2).</li>
+    </ol>
+  </div>
+
+  <h2>Autograd: PyTorch builds the graph while your code runs</h2>
+  <p>You never draw the graph yourself. When a tensor has <code>requires_grad=True</code>, every operation on it is <b>recorded</b> on a tape: “this came from a multiply of these two”, each result carrying a <code>grad_fn</code>. Call <code>loss.backward()</code> and PyTorch walks that tape in reverse, exactly like the playground, and stores each leaf's gradient in its <code>.grad</code>.</p>
+  <table>
+    <tr><th>You write</th><th>What autograd does</th></tr>
+    <tr><td><code>w = torch.tensor(1.5, requires_grad=True)</code></td><td>Marks w as a <b>leaf</b> whose gradient you want (<code>nn.Module</code> parameters already are)</td></tr>
+    <tr><td><code>L = (torch.relu(w * x + b) - y) ** 2</code></td><td>Runs the math <b>and</b> records each op; <code>L.grad_fn</code> is <code>PowBackward0</code></td></tr>
+    <tr><td><code>L.backward()</code></td><td>One reverse sweep; frees the recorded graph afterwards</td></tr>
+    <tr><td><code>w.grad</code></td><td>The gradient, <b>added</b> to whatever was already there</td></tr>
+    <tr><td><code>opt.zero_grad()</code></td><td>Clears <code>.grad</code> (sets it to <code>None</code> by default) before the next backward</td></tr>
+    <tr><td><code>with torch.no_grad():</code></td><td>Records nothing: for evaluation and manual weight updates</td></tr>
+  </table>
+  <p>The “added to” is the most famous trap in PyTorch. Gradients <b>accumulate</b> on purpose (it lets you sum gradients over several small batches, Lesson 1.7), so if you forget <code>zero_grad()</code> each step's gradient includes every previous step's. Lesson 1.3 shows the loss curve that produces.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Define-by-run autograd (a tape recorded as code runs)</span></span>
+    <ol>
+      <li><b>The problem before</b> Early frameworks (Theano, TensorFlow 1) made you declare a static graph first and run it later. Debugging meant inspecting a graph object, not your code; loops and if-statements needed special graph operations.</li>
+      <li><b>What people tried</b> Static graphs with clever compilers; hand-written backward functions per layer (Caffe-style).</li>
+      <li><b>Why this works</b> Record operations as ordinary Python runs. Any loop, branch or print just works, because the graph for <i>this</i> run is whatever actually happened. Chainer built its whole design around this “define-by-run” idea (as opposed to “define-and-run”), and PyTorch made it the mainstream way deep learning is written.</li>
+      <li><b>What it costs, when it fails</b> Python overhead per operation and no global view for optimizing, so small ops are slow; recorded graphs hold memory until <code>backward()</code> or until you drop the reference.</li>
+      <li><b>What refined it</b> <code>torch.compile</code> traces your eager code into an optimized graph, keeping define-by-run ergonomics with compiled speed (Lesson 10.5).</li>
+    </ol>
+  </div>
+
+  <h2>Gradient checking: trust, but verify</h2>
+  <p>When you write a backward function yourself (a custom layer, a from-scratch engine, an interview question), compare it with nudging on a few numbers. The <b>relative error</b> |analytic − numeric| ÷ max(|analytic|, |numeric|) should be tiny: around 10⁻⁷ or less in float64 (CS231n's rule of thumb: above 10⁻² is almost certainly a bug). Nudge in <b>both</b> directions, (f(x + h) − f(x − h)) ÷ 2h, with h around 10⁻⁵.</p>
+  <p class="predict">🔮 <b>Predict:</b> three of these six hand-written gradients are wrong. Can you spot which before running the check? (Hint: look for a missing chain-rule factor.)</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Find the bug</span>
+    <p class="hint">Click a function, press <b>Run gradient check</b> at a few points, then give your verdict. Score target: 6 / 6. Then play with h: too big and nudging is inaccurate; absurdly tiny and the computer runs out of decimal places.</p>
+    <div class="bugs" id="bugs"></div>
+    <div class="codecell" id="bugCode"></div>
+    <div class="controls">
+      <label>test point x <input type="range" id="bx" min="-2" max="2" step="0.1" value="0.7"> <b class="mono" id="bxv"></b></label>
+      <label>nudge h <select id="bh" class="btn small"><option value="1e-1">0.1</option><option value="1e-5" selected>0.00001</option><option value="1e-12">0.000000000001</option></select></label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="check">Run gradient check</button>
+      <button class="btn" id="vOk">✅ It's correct</button>
+      <button class="btn" id="vBug">🐞 It's buggy</button>
+      <button class="btn" id="bReset">↺ Start over</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">analytic (hand-written) <b id="ga" class="gr">–</b></div>
+      <div class="stat">numeric (nudging) <b id="gn" class="gr">–</b></div>
+      <div class="stat">relative error <b id="gre">–</b></div>
+      <div class="stat">score <b id="bScore">0 / 6</b></div>
+    </div>
+    <p class="hint" id="bMsg"></p>
+    <div class="goals"><span class="goal" id="gBugs">🎯 6 / 6 verdicts right</span><span class="goal" id="gH">🎯 Make a correct gradient fail the check with a bad h</span></div>
+  </div>
+  <p><b>What you should see:</b> correct gradients agree to about 10⁻¹¹ relative error with h = 0.00001. The buggy ones are off by a factor (the mean's gradient is 4× too big: it forgot the ÷ 4) or by a whole term. Try the tanh one at x = 0: the bug hides, because 1 − tanh(0) and 1 − tanh²(0) are both 1. Always check a few random points. With h = 0.1 even correct gradients show errors around 10⁻⁴ to 10⁻³ (the plain square is the exception: centered nudging is exact for it); with h = 10⁻¹² rounding noise pushes them to around 10⁻⁵ to 10⁻⁴. Neither is a bug in your formula, which is why you fix h ≈ 10⁻⁵ and use float64 when checking.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Gradient checking</span></span>
+    <ol>
+      <li><b>The problem before</b> A wrong gradient rarely crashes: the network still trains, just worse, and you blame the learning rate for weeks.</li>
+      <li><b>What people tried</b> Staring at the derivation; watching whether the loss goes down (a buggy gradient often still points vaguely downhill).</li>
+      <li><b>Why this works</b> Nudging is slow but needs no calculus, so it's an independent second opinion. The centered difference's error shrinks like h², so h = 10⁻⁵ gives about 10 correct digits in float64.</li>
+      <li><b>What it costs, when it fails</b> 2 forward passes per checked number, so check a handful of weights on a tiny input, not a real model. Kinks (ReLU at exactly 0, max ties) produce false alarms; float32 is too imprecise for strict checks.</li>
+      <li><b>What refined it</b> <code>torch.autograd.gradcheck</code> does it for any function in float64; framework code is gradient-checked in its test suites, which is why you rarely need to.</li>
+    </ol>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+<pre><code><span class="k">import</span> torch
+
+<span class="c"># The graph from the worked example: L = (relu(w1*x1 + w2*x2 + b) - y)^2</span>
+x1, x2, y = torch.tensor(<span class="n">2.0</span>), torch.tensor(-<span class="n">1.0</span>), torch.tensor(<span class="n">1.0</span>)
+w1 = torch.tensor(<span class="n">1.5</span>, requires_grad=<span class="k">True</span>)
+w2 = torch.tensor(<span class="n">0.5</span>, requires_grad=<span class="k">True</span>)
+b = torch.tensor(<span class="n">0.5</span>, requires_grad=<span class="k">True</span>)
+
+z = w1 * x1 + w2 * x2 + b          <span class="c"># PyTorch records every op as it runs</span>
+a = torch.relu(z)
+L = (a - y) ** <span class="n">2</span>
+print(<span class="s">"L ="</span>, L.item(), <span class="s">"| L was made by"</span>, L.grad_fn.name())
+
+L.backward()                        <span class="c"># one reverse pass fills .grad for every leaf</span>
+print(<span class="s">"grads:"</span>, w1.grad.item(), w2.grad.item(), b.grad.item())
+
+<span class="c"># Gradients ACCUMULATE: a second forward+backward adds to .grad</span>
+L2 = (torch.relu(w1 * x1 + w2 * x2 + b) - y) ** <span class="n">2</span>
+L2.backward()
+print(<span class="s">"after a 2nd backward, w1.grad ="</span>, w1.grad.item())
+w1.grad = <span class="k">None</span>                      <span class="c"># what optimizer.zero_grad() does (set_to_none=True)</span>
+
+<span class="c"># No graph is recorded under no_grad (evaluation, weight updates)</span>
+<span class="k">with</span> torch.no_grad():
+    print(<span class="s">"inside no_grad, requires_grad ="</span>, (w1 * x1).requires_grad)
+
+<span class="c"># Gradient check of a built-in op, in float64</span>
+t = torch.randn(<span class="n">3</span>, dtype=torch.float64, requires_grad=<span class="k">True</span>)
+print(<span class="s">"gradcheck:"</span>, torch.autograd.gradcheck(<span class="k">lambda</span> v: torch.sigmoid(v).sum(), t))
+
+<span class="c"># What we got (torch 2.8, CPU):</span>
+<span class="c"># L = 4.0 | L was made by PowBackward0</span>
+<span class="c"># grads: 8.0 -4.0 4.0</span>
+<span class="c"># after a 2nd backward, w1.grad = 16.0</span>
+<span class="c"># inside no_grad, requires_grad = False</span>
+<span class="c"># gradcheck: True</span></code></pre>
+    <p class="hint">Also handy: <code>tensor.detach()</code> (a copy cut off from the graph), <code>torch.autograd.grad(L, [w])</code> (returns gradients instead of writing <code>.grad</code>), and <code>L.backward(retain_graph=True)</code> if you really must go backwards twice through the same graph.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Method</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Finite differences (nudging)</td><td>No calculus needed; independent check</td><td>2 passes per weight; inaccurate (choice of h)</td></tr>
+      <tr><td>Forward-mode autodiff</td><td>Exact; little extra memory</td><td>One pass per input: great for few inputs, terrible for a billion weights</td></tr>
+      <tr><td>Reverse-mode (backprop)</td><td>All gradients in ≈ 2–3× a forward pass</td><td>Stores activations: memory grows with depth × batch</td></tr>
+      <tr><td>+ activation checkpointing</td><td>Much less activation memory</td><td>About one extra forward pass of compute</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Explain backpropagation” or “implement backward for this layer.” A strong answer:</p>
+    <ul>
+      <li>Describes the <b>graph</b>, the forward pass that caches values, and the backward pass of <b>local derivative × upstream gradient</b>, with gradients <b>summed</b> where paths merge.</li>
+      <li>Knows the patterns: add copies, multiply swaps, ReLU gates, and for a linear layer y = Wx: ∂L/∂W = (∂L/∂y)·xᵀ, ∂L/∂x = Wᵀ·(∂L/∂y).</li>
+      <li>Explains <b>why reverse mode</b>: many inputs, one output; cost ≈ a small constant times a forward pass; the price is activation memory.</li>
+      <li>Mentions PyTorch specifics: <code>.grad</code> accumulates (hence <code>zero_grad</code>), <code>no_grad</code> for eval, and gradient checking in float64.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Autograd in PyTorch</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.pytorch.org/docs/stable/notes/autograd.html" target="_blank" rel="noopener">PyTorch docs: Autograd mechanics</a></div>
+      <p><b>How:</b> records a graph of <code>Function</code> objects as tensors are combined, then evaluates it in reverse on <code>backward()</code>; the graph is rebuilt from scratch each iteration.</p>
+      <p><b>Why this method:</b> rebuilding per run is what lets you use arbitrary Python control flow and change shapes or branches between iterations.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Backprop in 150 lines</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/karpathy/micrograd" target="_blank" rel="noopener">Karpathy: micrograd</a></div>
+      <p><b>How:</b> a scalar-valued autograd engine (a <code>Value</code> class that records its parents and a local backward function) plus a tiny neural-net library on top.</p>
+      <p><b>Why this method:</b> small enough to read in one sitting; the same idea as PyTorch, minus tensors and GPUs. Lab 1 has you build a few nodes of it.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Trading compute for memory</b> <span class="tag res">🧪 Research · 2016</span> <a href="https://arxiv.org/abs/1604.06174" target="_blank" rel="noopener">Chen et al.: Training Deep Nets with Sublinear Memory Cost</a></div>
+      <p><b>How:</b> keep only some layers' activations during forward; recompute the rest during backward.</p>
+      <p><b>Why this method:</b> activation memory, not weights, limits how deep or wide you can train; the paper trains an n-layer network with O(√n) memory for the cost of an extra forward pass. PyTorch exposes it as <code>torch.utils.checkpoint</code>.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The survey that connects it all</b> <span class="tag res">🧪 Research · 2015/2018</span> <a href="https://arxiv.org/abs/1502.05767" target="_blank" rel="noopener">Baydin et al.: Automatic Differentiation in Machine Learning: a Survey</a></div>
+      <p><b>How:</b> explains forward and reverse mode, their costs, and backprop as a special case of reverse mode.</p>
+      <p><b>Why this method:</b> the source for the “c &lt; 6, typically 2–3” cost and for the history below.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · older than you think</span>
+    <p>The famous 1986 backprop paper by Rumelhart, Hinton and Williams wasn't the first. The AD survey notes that Seppo Linnainmaa's work (1970) “is often cited as the first published description of the reverse mode”, and that Paul Werbos described it in 1974. Deep learning's core algorithm was waiting for computers (and ReLUs, and data) to catch up.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The chain rule is <a href="../../math-course/phase3/2-chain-rule.html">math 3.2</a>, and the math course derives backprop for a full layer in <a href="../../math-course/phase3/5-backprop.html">math 3.5</a> and builds a network by hand in <a href="../../math-course/phase8/3-neural-net.html">math 8.3</a>. In this course: 1.3 puts autograd inside a real PyTorch training loop; 2.1 shows what happens when the backward products shrink or blow up through many layers; 5.2 runs backprop through time in recurrent networks; 10.2 and 10.3 deal with the memory that backward needs.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Course</span> <a href="https://cs231n.github.io/optimization-2/" target="_blank" rel="noopener">CS231n: Backpropagation, Intuitions</a>. The add/multiply/max “gate” patterns with worked circuits.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/tutorials/beginner/basics/autogradqs_tutorial.html" target="_blank" rel="noopener">PyTorch tutorial: Automatic Differentiation with torch.autograd</a>. <code>requires_grad</code>, <code>grad_fn</code>, <code>no_grad</code> in ten minutes.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/karpathy/micrograd" target="_blank" rel="noopener">micrograd</a>. Read <code>engine.py</code>: the whole idea in one file.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A node computes m = w · x with w = 3, x = −2. The gradient arriving from above is ∂L/∂m = 5. What is ∂L/∂w?</div>
+    <div class="opts"><button class="opt">15 (5 × w)</button><button class="opt" data-ok>−10 (5 × x)</button><button class="opt">5 (it copies the gradient)</button></div>
+    <div class="explain">Multiply “swaps”: the local derivative of w · x with respect to w is x, so ∂L/∂w = 5 × (−2) = −10. (x would receive 5 × w = 15.) Copying the gradient unchanged is what an <i>add</i> node does.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your training loop calls <code>loss.backward()</code> and <code>optimizer.step()</code> every iteration but never <code>optimizer.zero_grad()</code>. What happens?</div>
+    <div class="opts"><button class="opt">Nothing: PyTorch clears gradients automatically after each step</button><button class="opt" data-ok>Each step uses the sum of all gradients so far, so updates grow and point toward stale directions; training usually becomes unstable</button><button class="opt">PyTorch raises an error on the second backward</button></div>
+    <div class="explain"><code>.grad</code> accumulates by design (that's how gradient accumulation over small batches works). Without clearing it, step k's update is the sum of k gradients: ever-larger steps that remember old directions, like a runaway momentum. No error is raised. Lesson 1.3 shows the loss curve.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Why do deep-learning frameworks use reverse mode rather than forward mode for training?</div>
+    <div class="opts"><button class="opt">Reverse mode is more accurate</button><button class="opt">Forward mode can't handle ReLU</button><button class="opt" data-ok>The loss has one output and millions of inputs (weights); reverse mode needs one sweep per output, forward mode one per input</button></div>
+    <div class="explain">Both modes compute exact derivatives. Forward mode needs a separate pass for every input direction (a billion passes for a billion weights); reverse mode starts from the single loss and gets every weight's gradient in one backward sweep, at a cost of a few forward passes. The price is storing activations.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Any network is a graph of tiny ops. Forward computes (and caches) values; backward multiplies <b>local derivative × upstream gradient</b> node by node, summing where paths merge.</li>
+      <li>Patterns: add copies, multiply swaps, ReLU gates (0 when off: dead units get no gradient).</li>
+      <li>Reverse mode gets every weight's gradient for ≈ 2–3 forward passes (guaranteed &lt; 6); nudging needs 2 passes per weight. The price is activation memory.</li>
+      <li>PyTorch records ops on tensors with <code>requires_grad</code>; <code>backward()</code> fills <code>.grad</code>, which <b>accumulates</b>: call <code>zero_grad()</code> every step; use <code>no_grad()</code> for evaluation.</li>
+      <li>Check hand-written gradients with centered differences (h ≈ 10⁻⁵, float64, relative error ≲ 10⁻⁷).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const f2 = v => (Math.abs(v) < 5e-13 ? "0" : (+v.toFixed(3)).toString());
+
+  /* ---------- 1. step-through graph ---------- */
+  const X1 = 2, X2 = -1, Y = 1;
+  const F = new Flow($("graph"), { width: 760, height: 300 });
+  F.node("x1", { x: 60, y: 40, w: 90, h: 42, label: "x₁ = 2", kind: "x" })
+   .node("w1", { x: 60, y: 100, w: 90, h: 42, label: "w₁", kind: "w" })
+   .node("x2", { x: 60, y: 165, w: 90, h: 42, label: "x₂ = −1", kind: "x" })
+   .node("w2", { x: 60, y: 225, w: 90, h: 42, label: "w₂", kind: "w" })
+   .node("b", { x: 250, y: 270, w: 90, h: 42, label: "b", kind: "w" })
+   .node("m1", { x: 220, y: 70, w: 100, h: 46, label: "× m₁", kind: "ac" })
+   .node("m2", { x: 220, y: 195, w: 100, h: 46, label: "× m₂", kind: "ac" })
+   .node("z", { x: 390, y: 140, w: 100, h: 46, label: "+ z", kind: "ac" })
+   .node("a", { x: 530, y: 140, w: 100, h: 46, label: "ReLU a", kind: "ac" })
+   .node("y", { x: 530, y: 250, w: 90, h: 42, label: "y = 1", kind: "y" })
+   .node("L", { x: 685, y: 140, w: 120, h: 50, label: "(a − y)² L", kind: "ls" });
+  [["x1", "m1"], ["w1", "m1"], ["x2", "m2"], ["w2", "m2"], ["m1", "z"], ["m2", "z"], ["b", "z"], ["z", "a"], ["a", "L"], ["y", "L"]].forEach(([p, q]) => F.edge(p, q));
+  F.render();
+  let fstep = 0, bstep = 0, V = {}, G = {};
+  const W = () => ({ w1: +$("w1").value, w2: +$("w2").value, b: +$("bb").value });
+  function compute() {
+    const { w1, w2, b } = W();
+    const m1 = w1 * X1, m2 = w2 * X2, z = m1 + m2 + b, a = Math.max(0, z), L = (a - Y) ** 2;
+    V = { x1: X1, x2: X2, w1, w2, b, y: Y, m1, m2, z, a, L };
+    const gL = 1, ga = 2 * (a - Y), gz = ga * (z > 0 ? 1 : 0);
+    G = { L: gL, a: ga, z: gz, m1: gz, m2: gz, b: gz, w1: gz * X1, x1: gz * w1, w2: gz * X2, x2: gz * w2 };
+  }
+  const FWD = [
+    ["m1", () => `m₁ = w₁ × x₁ = ${f2(V.w1)} × 2 = ${f2(V.m1)}`],
+    ["m2", () => `m₂ = w₂ × x₂ = ${f2(V.w2)} × (−1) = ${f2(V.m2)}`],
+    ["z", () => `z = m₁ + m₂ + b = ${f2(V.m1)} + ${f2(V.m2)} + ${f2(V.b)} = ${f2(V.z)}`],
+    ["a", () => `a = ReLU(z) = max(0, ${f2(V.z)}) = ${f2(V.a)}`],
+    ["L", () => `L = (a − y)² = (${f2(V.a)} − 1)² = ${f2(V.L)}. Forward done: every value is cached for the backward pass.`],
+  ];
+  const BWD = [
+    [["L"], () => `Start: ∂L/∂L = 1.`],
+    [["a"], () => `Square node: local derivative 2(a − y) = ${f2(2 * (V.a - Y))}. Times upstream 1 → ∂L/∂a = ${f2(G.a)}.`],
+    [["z"], () => V.z > 0 ? `ReLU node: z = ${f2(V.z)} > 0, local slope 1 (gate open) → ∂L/∂z = ${f2(G.a)} × 1 = ${f2(G.z)}.` : `ReLU node: z = ${f2(V.z)} ≤ 0, local slope 0 (gate CLOSED) → ∂L/∂z = 0. Nothing behind this node will learn.`],
+    [["m1", "m2", "b"], () => `Add node: local derivative 1 for every input → it COPIES ${f2(G.z)} to m₁, m₂ and b.`],
+    [["w1", "x1"], () => `Multiply node m₁: SWAPS. ∂L/∂w₁ = ${f2(G.m1)} × x₁ (2) = ${f2(G.w1)};  ∂L/∂x₁ = ${f2(G.m1)} × w₁ (${f2(V.w1)}) = ${f2(G.x1)}.`],
+    [["w2", "x2"], () => `Multiply node m₂: ∂L/∂w₂ = ${f2(G.m2)} × x₂ (−1) = ${f2(G.w2)};  ∂L/∂x₂ = ${f2(G.m2)} × w₂ = ${f2(G.x2)}. Backward done: one sweep, every gradient.`],
+  ];
+  const shown = new Set();
+  function paint() {
+    const done = new Set(FWD.slice(0, fstep).map(s => s[0]).concat(["x1", "x2", "w1", "w2", "b", "y"]));
+    const back = new Set(BWD.slice(0, bstep).flatMap(s => s[0]));
+    Object.keys(F.nodes).forEach(id => {
+      const v = done.has(id) ? "= " + f2(V[id]) : "= ?";
+      const g = back.has(id) ? "  ∂ " + f2(G[id]) : "";
+      F.set(id, { sub: v + g, hot: back.has(id) && Math.abs(G[id]) > 0, down: back.has(id) && id !== "L" && G[id] === 0 && !["y"].includes(id) && V.z <= 0 && id !== "a" });
+    });
+    F.edges.forEach(e => F.edgeStyle(e.a, e.b, { color: back.has(e.a) ? "--c-gr" : done.has(e.b) ? "--c-ac" : "--line", width: back.has(e.a) ? 3 : 2 }));
+    $("w1v").textContent = V.w1.toFixed(1); $("w2v").textContent = V.w2.toFixed(1); $("bbv").textContent = V.b.toFixed(1);
+  }
+  function resetPasses() { compute(); fstep = 0; bstep = 0; F.clearPackets(); paint(); $("log").textContent = "Press Forward ▶."; }
+  $("fwd").onclick = () => {
+    if (fstep >= FWD.length) { $("log").textContent = "Forward is done. Now press ◀ Backward."; return; }
+    const [id, msg] = FWD[fstep++]; paint(); $("log").textContent = msg();
+  };
+  $("bwd").onclick = () => {
+    if (fstep < FWD.length) { $("log").textContent = "Backward needs the cached forward values: finish Forward ▶ first."; return; }
+    if (bstep >= BWD.length) { $("log").textContent = "Backward is done. Change a weight to start again."; return; }
+    const [ids, msg] = BWD[bstep++]; paint(); $("log").textContent = msg();
+    if (bstep === BWD.length) {
+      win("gAll", true);
+      win("gZero", G.w1 === 0 && G.w2 === 0 && G.b === 0 && V.L > 0);
+      win("gPerfect", Math.abs(V.L) < 1e-12);
+    }
+  };
+  $("allSteps").onclick = () => { fstep = FWD.length; bstep = BWD.length; paint(); $("log").textContent = BWD[BWD.length - 1][1](); win("gAll", true); win("gZero", G.w1 === 0 && G.w2 === 0 && G.b === 0 && V.L > 0); win("gPerfect", Math.abs(V.L) < 1e-12); };
+  $("nudge").onclick = () => {
+    const { w1, w2, b } = W(), h = 1e-5, Lf = w => (Math.max(0, w * X1 + w2 * X2 + b) - Y) ** 2;
+    const num = (Lf(w1 + h) - Lf(w1 - h)) / (2 * h);
+    compute();
+    $("log").textContent = `Nudging: (L(w₁ + 0.00001) − L(w₁ − 0.00001)) ÷ 0.00002 = ${num.toFixed(4)}. Backprop says ∂L/∂w₁ = ${f2(G.w1)}. ${Math.abs(num - G.w1) < 1e-4 ? "They agree." : "They disagree: you're sitting on ReLU's kink at z = 0, where the slope isn't defined."}`;
+  };
+  $("gReset").onclick = resetPasses;
+  ["w1", "w2", "bb"].forEach(id => ($(id).oninput = resetPasses));
+  resetPasses();
+
+  /* ---------- 2. the bill ---------- */
+  const human = s => s < 60 ? s.toFixed(s < 10 ? 2 : 0) + " s" : s < 3600 ? (s / 60).toFixed(1) + " min" : s < 86400 ? (s / 3600).toFixed(1) + " h" : s < 3.156e7 ? (s / 86400).toFixed(1) + " days" : (s / 3.156e7).toLocaleString("en-US", { maximumFractionDigits: s < 3.156e9 ? 1 : 0 }) + " years";
+  const big = n => n >= 1e9 ? (n / 1e9).toFixed(n >= 1e10 ? 0 : 2) + " billion" : n >= 1e6 ? (n / 1e6).toFixed(0) + " million" : Math.round(n).toLocaleString("en-US");
+  function bill() {
+    const n = Math.round(Math.pow(10, +$("nP").value)), s = +$("sec").value;
+    $("nPv").textContent = big(n);
+    $("fdN").textContent = big(2 * n);
+    $("fdT").textContent = human(2 * n * s);
+    $("bpT").textContent = human(3 * s);
+    $("spd").textContent = big(Math.round(2 * n / 3)) + "×";
+  }
+  $("nP").oninput = bill; $("sec").onchange = bill; bill();
+
+  /* ---------- 3. find the bug ---------- */
+  const sg = x => 1 / (1 + Math.exp(-x));
+  const FNS = [
+    { name: "sigmoid(x)", f: x => sg(x), g: x => sg(x) * (1 - sg(x)), code: "f(x)  = sigmoid(x)\ngrad  = sigmoid(x) * (1 - sigmoid(x))", ok: true, why: "σ′ = σ(1 − σ). Correct." },
+    { name: "tanh(x)", f: x => Math.tanh(x), g: x => 1 - Math.tanh(x), code: "f(x)  = tanh(x)\ngrad  = 1 - tanh(x)", ok: false, why: "Should be 1 − tanh²(x): the square is missing." },
+    { name: "(3x)²", f: x => (3 * x) ** 2, g: x => 2 * (3 * x) * 3, code: "f(x)  = (3*x)**2\ngrad  = 2 * (3*x) * 3", ok: true, why: "Chain rule: outer 2u times inner 3. Correct." },
+    { name: "mean of 4 copies", f: x => (x + 2 * x + 3 * x + 4 * x) / 4, g: x => 1 + 2 + 3 + 4, code: "f(x)  = mean([x, 2x, 3x, 4x])\ngrad  = 1 + 2 + 3 + 4", ok: false, why: "Forgot the ÷ 4 of the mean: the true gradient is 10 / 4 = 2.5. This exact bug (sum vs mean) silently scales your learning rate." },
+    { name: "exp(2x)", f: x => Math.exp(2 * x), g: x => Math.exp(2 * x), code: "f(x)  = exp(2*x)\ngrad  = exp(2*x)", ok: false, why: "Missing the inner derivative ×2: should be 2·exp(2x)." },
+    { name: "softmax-CE, logit 0", f: x => -Math.log(Math.exp(x) / (Math.exp(x) + Math.exp(0.5) + Math.exp(-1))), g: x => Math.exp(x) / (Math.exp(x) + Math.exp(0.5) + Math.exp(-1)) - 1, code: "logits = [x, 0.5, -1], right class = 0\nf(x)  = -log softmax(logits)[0]\ngrad  = softmax(logits)[0] - 1", ok: true, why: "p − y on the right class's logit (Lesson 1.1). Correct." },
+  ];
+  let cur = 0, verdict = {}, score = 0;
+  function bugsDraw() {
+    $("bugs").innerHTML = FNS.map((F, i) => `<button data-i="${i}" class="${i === cur ? "on" : ""} ${verdict[i] == null ? "" : verdict[i] ? "ok" : "bad"}">${F.name}<small>${verdict[i] == null ? "not judged yet" : verdict[i] ? "✓ judged right" : "✗ judged wrong"}</small></button>`).join("");
+    [...$("bugs").children].forEach(b => (b.onclick = () => { cur = +b.dataset.i; ["ga", "gn", "gre"].forEach(id => ($(id).textContent = "–")); $("bMsg").textContent = ""; bugsDraw(); }));
+    $("bugCode").textContent = FNS[cur].code;
+    $("bScore").textContent = `${score} / ${FNS.length}`;
+    $("bxv").textContent = (+$("bx").value).toFixed(1);
+  }
+  $("check").onclick = () => {
+    const F = FNS[cur], x = +$("bx").value, h = +$("bh").value;
+    const a = F.g(x), n = (F.f(x + h) - F.f(x - h)) / (2 * h), re = Math.abs(a - n) / Math.max(Math.abs(a), Math.abs(n), 1e-300);
+    $("ga").textContent = a.toPrecision(8); $("gn").textContent = n.toPrecision(8);
+    $("gre").innerHTML = re < 1e-7 ? `<span class="ev">${re.toExponential(1)} ✓</span>` : `<span class="dead">${re.toExponential(1)}</span>`;
+    win("gH", F.ok && re > 1e-7);
+    $("bMsg").textContent = re < 1e-7 ? "They agree to many digits." : F.ok && h !== 1e-5 ? "They disagree, but look at h: is the check itself trustworthy?" : "They disagree. Bug, or bad h?";
+  };
+  const judge = says => {
+    if (verdict[cur] != null) { $("bMsg").textContent = "Already judged. Pick another function."; return; }
+    const right = says === FNS[cur].ok; verdict[cur] = right; if (right) score++;
+    $("bMsg").textContent = (right ? "✅ Right. " : "❌ Not quite. ") + FNS[cur].why;
+    bugsDraw(); win("gBugs", score === FNS.length);
+  };
+  $("vOk").onclick = () => judge(true); $("vBug").onclick = () => judge(false);
+  $("bReset").onclick = () => { verdict = {}; score = 0; cur = 0; $("bMsg").textContent = ""; bugsDraw(); };
+  $("bx").oninput = bugsDraw;
+  bugsDraw();
+})();
+</script>
+</body>
+</html>

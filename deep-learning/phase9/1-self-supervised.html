@@ -1,0 +1,512 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9.1 Self-supervised learning: SimCLR, MAE, DINO · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.sq { width: 100%; max-width: 340px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 10px; border: 1px solid var(--line); }
+  canvas.px { width: 100%; max-width: 200px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 8px; border: 1px solid var(--line); image-rendering: pixelated; }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .trio { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+  .trio .hint { text-align: center; margin-top: 4px; }
+  .legend3 span { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: .85rem; }
+  .legend3 i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .pbar { height: 14px; border-radius: 99px; background: var(--panel); overflow: hidden; margin: 6px 0; }
+  .pbar > i { display: block; height: 100%; background: var(--c-y); transition: width .2s; }
+  @media (max-width: 560px) { .trio { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body data-lesson="d9-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 9 · Lesson 1</div>
+  <h1>Self-supervised learning: SimCLR, MAE, DINO</h1>
+  <p class="subtitle">Labels are the expensive part of deep learning. Self-supervised learning gets a network to teach itself from raw, unlabeled data, and today it produces the vision backbones that everyone else fine-tunes.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>An <b>embedding</b> is a vector a network produces for an input; similar inputs should get nearby vectors, measured by <b>cosine similarity</b> (<a href="../../math-course/phase1/5-embeddings.html">math 1.5</a>).</li>
+      <li><b>Softmax with a temperature</b> turns scores into probabilities; a small temperature makes it sharper (Lesson 0.6).</li>
+      <li><b>Transfer learning</b>: reuse a pretrained backbone and train a small head on your task (Lesson 3.5); ViTs cut an image into <b>patches</b> (Lesson 4.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2020, Google researchers trained a ResNet-50 on ImageNet <b>without using a single label</b>. Then they froze it and trained just one linear layer on top. It scored <b>76.5% top-1</b>, matching the same network trained the normal, fully supervised way. That method is <b>SimCLR</b>.</p>
+    <p>In 2025, Meta trained <b>DINOv3</b>, a 7-billion-parameter vision model, on <b>1.7 billion images</b>, again with no labels. Meta reports that the World Resources Institute uses it on satellite images to detect tree loss and deforestation.</p>
+    <p><b>How can a network learn what a dog is if nobody ever tells it “dog”?</b> By the end of this lesson you'll have trained a tiny one that sorts images into groups it was never told about, watched it collapse into uselessness, and fixed it.</p>
+  </div>
+
+  <h2>Numbers first: why labels are the bottleneck</h2>
+  <p>A supervised model needs a human to say “cat” for every training picture. Unlabeled pictures are nearly free: phones, the web and cameras make billions of them. So the gap looks like this:</p>
+  <table>
+    <tr><th>Data</th><th>Size</th><th>Who labelled it?</th></tr>
+    <tr><td>ImageNet-1K training set</td><td>about 1.3 million images</td><td>humans, one class each</td></tr>
+    <tr><td>DINOv2's curated set (LVD-142M)</td><td class="x">142 million images</td><td>nobody</td></tr>
+    <tr><td>DINOv3's training set</td><td class="x">1.7 billion images</td><td>nobody</td></tr>
+  </table>
+  <p>The trick: invent a task whose answer is <b>already in the data</b>, so the data labels itself. That's a <b>pretext task</b>. You don't care about the task itself; you care that solving it forces the network to learn useful features. Later you throw the task away and keep the <span class="ac">features</span>.</p>
+  <p>Language models do exactly this: “predict the next word” needs no labeller, because the next word is in the text (Lesson 6.7). This lesson is how vision found its own versions.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Self-supervised learning (SSL) = <b>make up a question the data can answer about itself</b>, train a network to answer it on huge unlabeled data, then reuse the network's features for the tasks you actually care about with very few labels. Three families: <b>contrastive</b> (SimCLR, MoCo), <b>teacher–student without negatives</b> (BYOL, DINO) and <b>masked modelling</b> (MAE).
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: spot-the-same-thing cards</span>
+    <p>A child gets a deck of photo cards. Some cards are two shots of the same object: one zoomed in, one in black and white. Nobody tells the child what the objects are, only “find the pairs”. To match a zoomed-in, grey photo of a dog with a colour photo of the same dog, the child has to notice ears, fur and snout, and ignore colour and zoom. After a thousand rounds the child has a pretty good notion of “dog”, without the word.</p>
+  </div>
+
+  <h2>Early pretext tasks (and why they weren't enough)</h2>
+  <p>The first ideas were puzzles: rotate an image by 0°, 90°, 180° or 270° and ask the net which; cut it into a 3×3 jigsaw and ask it to reorder the pieces; remove the colour and ask it to paint it back. Each works a bit. Each also has <b>shortcuts</b>: a net can learn “sky is usually at the top” to solve rotation without learning objects. The breakthrough came from a more general question: <b>are these two views the same image?</b></p>
+
+  <h2>Contrastive learning: pull pairs together, push the rest apart</h2>
+  <p>SimCLR's recipe, in four steps:</p>
+  <ol>
+    <li>Take a batch of N images. Make <b>two random augmentations</b> of each (random crop, colour jitter, blur, flip). That's 2N views.</li>
+    <li>Run every view through the same encoder (a ResNet) plus a small projection head, and normalize the output to length 1: an <span class="ac">embedding</span> on a sphere.</li>
+    <li>For each view, its twin is the <b>positive</b>; the other 2N − 2 views are <b>negatives</b>.</li>
+    <li>Loss: “pick your twin out of the line-up”. A softmax over similarities, where the right answer is the twin.</li>
+  </ol>
+  <p>That loss is called <b>InfoNCE</b> (SimCLR calls its version NT-Xent). In words: <i>take the similarity to your twin, compare it with the similarities to everyone else, and push the twin's share of the softmax towards 100%</i>. The temperature <span class="w">τ</span> divides every similarity before the softmax:</p>
+  <div class="calc"><span class="ls">loss</span> = −log [ e<sup>sim(<span class="ac">z</span>, <span class="ac">z⁺</span>)/<span class="w">τ</span></sup> ÷ ( e<sup>sim(<span class="ac">z</span>, <span class="ac">z⁺</span>)/<span class="w">τ</span></sup> + Σ<sub>negatives</sub> e<sup>sim(<span class="ac">z</span>, <span class="ac">z⁻</span>)/<span class="w">τ</span></sup> ) ]</div>
+  <p class="muted">It is exactly a cross-entropy loss for a classification problem whose “classes” are the other items in the batch (<a href="../../math-course/phase6/3-cross-entropy.html">math 6.3</a>, softmax in <a href="../../math-course/phase8/2-softmax.html">math 8.2</a>).</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: InfoNCE by hand</span>
+    <p>A view has cosine similarity <b>0.9</b> with its twin and <b>0.2</b> with each of <b>2</b> negatives. Temperature <span class="w">τ</span> = 0.5.</p>
+    <table>
+      <tr><th>Step</th><th><span class="w">τ</span> = 0.5</th><th><span class="w">τ</span> = 0.1</th></tr>
+      <tr><td>Twin: e<sup>0.9/τ</sup></td><td>e<sup>1.8</sup> = 6.05</td><td>e<sup>9</sup> = 8,103</td></tr>
+      <tr><td>Negatives: 2 × e<sup>0.2/τ</sup></td><td>2 × e<sup>0.4</sup> = 2.98</td><td>2 × e<sup>2</sup> = 14.8</td></tr>
+      <tr><td>Twin's share (softmax)</td><td>6.05 ÷ 9.03 = <b>0.670</b></td><td>8,103 ÷ 8,118 = <b>0.998</b></td></tr>
+      <tr><td><span class="ls">Loss</span> = −log(share)</td><td class="ls"><b>0.401</b></td><td class="ls"><b>0.0018</b></td></tr>
+    </table>
+    <p>Same similarities, 220× less loss: a small temperature <b>magnifies</b> differences in similarity. That makes the model care a lot about the few negatives that are close (the hard ones) and ignore easy ones. SimCLR found the temperature matters a lot; values around 0.1 to 0.5 are common.</p>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> keep the similarities fixed and raise the number of negatives from 2 to 16,382 (what SimCLR's batch of 8,192 gives you). Does the loss go up or down? Try it.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The InfoNCE line-up</span>
+    <p class="hint">One anchor view, its twin and N negatives that are all equally similar to it. Drag the sliders and watch the twin's share of the softmax (green bar) and the <span class="ls">loss</span>.</p>
+    <div class="goals"><span class="goal" id="gHard">🎯 Twin share ≥ 99% while the gap sim⁺ − sim⁻ is only 0.5</span><span class="goal" id="gMany">🎯 Push the loss above 5 with sim⁺ = 0.9 (only negatives allowed to change)</span></div>
+    <div class="controls">
+      <label>sim to twin <input type="range" id="iP" min="-1" max="1" step="0.05" value="0.9"> <b class="mono" id="iPV"></b></label>
+      <label>sim to each negative <input type="range" id="iN" min="-1" max="1" step="0.05" value="0.2"> <b class="mono" id="iNV"></b></label>
+    </div>
+    <div class="controls">
+      <label>negatives <input type="range" id="iK" min="0" max="14" step="1" value="1"> <b class="mono" id="iKV"></b></label>
+      <label>temperature <span class="w">τ</span> <input type="range" id="iT" min="0.05" max="2" step="0.05" value="0.5"> <b class="mono" id="iTV"></b></label>
+    </div>
+    <div class="pbar"><i id="iBar"></i></div>
+    <div class="stat-row">
+      <div class="stat">twin's share <b class="y" id="iShare">–</b></div>
+      <div class="stat"><span class="ls">loss</span> <b class="ls" id="iLoss">–</b></div>
+      <div class="stat">loss if it guessed at random <b id="iRand">–</b></div>
+    </div>
+    <p class="hint" id="iMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the defaults reproduce the worked example (0.670 and 0.401). Slide the negatives up to 16,382 and the loss jumps to about <b>8.3</b> (the twin's share falls to 0.02%): the twin is now one face in a stadium crowd, so the model must make its embeddings far more distinctive to win. More negatives = a harder, more informative question. That is why SimCLR wanted huge batches. With sim⁺ = 0.7 and sim⁻ = 0.2 (a gap of only 0.5) and 2 negatives, τ = 0.1 gives 98.7%, and τ = 0.05 passes 99.99%.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Contrastive loss (InfoNCE / SimCLR)</span></span>
+    <ol>
+      <li><b>The problem before</b> Supervised pretraining needs a label for every image (ImageNet-1K: about 1.3 million hand-labelled images). Puzzle pretext tasks (rotation, jigsaw, colouring) needed no labels but left a large accuracy gap and had shortcuts.</li>
+      <li><b>What people tried</b> Predicting rotations or patch positions; clustering features; memory banks of old embeddings as negatives.</li>
+      <li><b>Why this works</b> To pick its twin out of thousands, an embedding must keep what survives augmentation (shape, parts, texture of the object) and drop what doesn't (colour, crop position). The augmentations <i>define</i> what “the same” means. Negatives stop the cheap answer “map everything to one point” (you'll see that answer in the next playground). SimCLR's linear probe reached 76.5% top-1 on ImageNet, matching a supervised ResNet-50.</li>
+      <li><b>What it costs, when it fails</b> It needs <b>many negatives</b>: SimCLR's best runs used batches of 4,096 to 8,192 (16,382 negatives per pair) on 128 TPU v3 cores. Two different photos of the same breed of dog are treated as negatives anyway (“false negatives”). Results depend heavily on picking the right augmentations.</li>
+      <li><b>What refined it</b> <b>MoCo</b> keeps a <b>queue</b> of 65,536 recent embeddings as negatives, from a slowly updated “momentum” copy of the encoder, so batches can stay small. BYOL and DINO then dropped negatives altogether (below). CLIP uses the same loss between images and their captions (Lesson 4.6).</li>
+    </ol>
+  </div>
+
+  <h2>Train a contrastive learner, then break it</h2>
+  <p>Below are 24 tiny “images”, each a 4-number vector. Two numbers carry the content (which of three hidden kinds of object it is). Two numbers are pure nuisance, like lighting or colour. Each augmentation re-rolls the nuisance and jitters the content. The encoder is a linear layer (2 outputs) followed by normalization, so every view lands on a circle. The colours show the hidden kind <b>for you only</b>: the model never sees them.</p>
+  <p class="predict">🔮 <b>Predict:</b> train with all 46 negatives. Will the three colours end up in separate parts of the circle, even though nobody told the model about colours? Then press 💥 Remove negatives and train again from scratch. What happens to the 48 dots?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Contrastive learning on a circle (and collapse)</span>
+    <p class="hint">Grey lines join the two views of each image. The arrow from the centre is the average embedding: long arrow = everything in one spot. <b>kNN accuracy</b>: for each view, is its nearest other view (not its own twin) the same hidden kind? That's how SSL features are often scored.</p>
+    <div class="goals">
+      <span class="goal" id="gCol">🎯 Make it collapse</span>
+      <span class="goal" id="gFew">🎯 Avoid collapse with ≤ 2 negatives (spread ≥ 0.8, kNN ≥ 95%)</span>
+      <span class="goal" id="gAll">🎯 kNN ≥ 95% with all 46 negatives</span>
+    </div>
+    <div class="controls">
+      <label>negatives per view <input type="range" id="cK" min="0" max="6" step="1" value="6"> <b class="mono" id="cKV"></b></label>
+      <label>temperature <span class="w">τ</span> <select id="cT" class="btn small"><option>0.1</option><option>0.2</option><option selected>0.5</option><option>1</option><option>2</option></select></label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="cTrain">▶ Train</button>
+      <button class="btn" id="cStep">Step ×10</button>
+      <button class="btn" id="cCollapse">💥 Remove negatives</button>
+      <button class="btn" id="cReset">↺ Reset</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="sq" id="cCan"></canvas>
+        <p class="hint legend3"><span><i style="background:#e17055"></i>kind A</span><span><i style="background:#2f80ed"></i>kind B</span><span><i style="background:#27ae60"></i>kind C</span></p></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">step <b id="cStepV">0</b></div>
+          <div class="stat"><span class="ls">loss</span> <b id="cLoss">–</b></div>
+        </div>
+        <div class="stat-row">
+          <div class="stat">twin similarity (alignment) <b id="cAl">–</b></div>
+          <div class="stat">spread (1 − arrow length) <b id="cSp">–</b></div>
+          <div class="stat">kNN accuracy <b class="y" id="cKnn">–</b></div>
+        </div>
+        <p class="hint" id="cMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see</b> (seeded, so you'll get these): at step 0 the encoder mostly listens to the nuisance numbers and kNN accuracy is about <b>35%</b>, a coin toss among three kinds. With 46 negatives and <span class="w">τ</span> = 0.5, by step 100 kNN hits <b>100%</b> and the three colours sit in three arcs, with the arrow nearly gone (spread ≈ 0.98). The model discovered the hidden kinds because they're what survives augmentation. Press 💥 and train from scratch: twin similarity climbs to <b>1.00</b> (perfect!) while spread falls to <b>0.00</b>. Every view sits on one point. The loss is perfect and the features are useless. That's <b>collapse</b>. Now try 1 negative: it's slower but escapes (kNN 100% by step 300). In this 2D toy one negative is enough; in a real 128-dimensional embedding with thousands of kinds, more negatives give a much harder, more useful question. <span class="w">τ</span> = 0.1 trains jumpily here; <span class="w">τ</span> = 2 barely moves for 100 steps.</p>
+
+  <h2>No negatives at all: BYOL and DINO</h2>
+  <p>Negatives are expensive and sometimes wrong (two photos of the same breed are not really “different”). In 2020, <b>BYOL</b> (Bootstrap Your Own Latent, DeepMind) showed you can drop them and still avoid collapse, which surprised many people. The trick is a <b>teacher</b>:</p>
+  <ul>
+    <li>A <b>student</b> network sees one view and tries to predict the <b>teacher</b>'s output for the other view.</li>
+    <li>The teacher gets <b>no gradient</b>. Its weights are a slow moving average of the student's (BYOL: 0.996 old + 0.004 new at each step, rising towards 1).</li>
+    <li>The student also has an extra small <b>predictor</b> on top, so it can't just copy.</li>
+  </ul>
+  <p>BYOL reached <b>74.3%</b> linear-probe accuracy on ImageNet with a ResNet-50, without a single negative pair. <b>DINO</b> (Meta, 2021) applied the idea to Vision Transformers: teacher and student each output a probability distribution over many “prototype” slots, and the student is trained with cross-entropy to match the teacher.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Non-contrastive SSL with a momentum teacher (BYOL, DINO)</span></span>
+    <ol>
+      <li><b>The problem before</b> Contrastive methods need thousands of negatives per step (huge batches or a 65,536-entry queue) and treat same-class images as enemies.</li>
+      <li><b>What people tried</b> Bigger batches, memory banks, MoCo's queue, removing likely false negatives.</li>
+      <li><b>Why this works</b> The target comes from a <b>slowly moving</b> teacher, so the student chases a target that changes only a little each step; the collapse solution is not a stable place to land when the target lags behind. DINO adds two cheap guards: <b>centering</b> (subtract a running average from the teacher's outputs, so no single slot can win for every image) and <b>sharpening</b> (a low teacher temperature, so its outputs can't be flat and uniform). The paper notes that centering alone encourages collapse to a uniform output and sharpening alone to a single slot; together they balance. Bonus: DINO's ViT attention maps outline objects with no segmentation labels.</li>
+      <li><b>What it costs, when it fails</b> Two networks in memory; extra hyperparameters (moving-average rate, two temperatures, the centering rate). Get them wrong and it still collapses, often silently: always monitor the spread of embeddings or a kNN score during training.</li>
+      <li><b>What refined it</b> DINOv2 (2023) combined DINO with masked-patch prediction on 142 million curated images; DINOv3 (2025) scaled to 7 billion parameters and 1.7 billion images and added “Gram anchoring” to keep its patch features clean in long training.</li>
+    </ol>
+  </div>
+
+  <h2>Masked image modelling: hide 75% and redraw it</h2>
+  <p>BERT learned language by hiding 15% of the words and guessing them (Lesson 6.7). <b>MAE</b> (Masked Autoencoders, Meta, 2021) does the same for images: cut the image into patches, <b>hide 75% of them</b>, and train a ViT to repaint the missing pixels. Two design choices make it work:</p>
+  <ul>
+    <li>The big <b>encoder</b> only processes the <b>visible 25%</b> of patches, so pretraining is cheap; a small <b>decoder</b> gets placeholder tokens for the missing ones and does the repainting. The paper reports training <b>3× faster or more</b>.</li>
+    <li>The masking ratio is <b>much higher than BERT's</b>. Why? The MAE authors' answer: words are dense with meaning, while images are full of <b>spatial redundancy</b>: a missing patch can often be filled in from its neighbours with no understanding at all.</li>
+  </ul>
+  <p class="predict">🔮 <b>Predict:</b> below, a “lazy” filler just averages nearby visible pixels (no learning, no understanding). At BERT's 15% masking, will it do well? At MAE's 75%, how many hidden pixels will have <i>nothing</i> visible within 2 pixels?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · How much can you hide?</span>
+    <p class="hint">A 16×16 soft picture cut into 64 patches of 2×2 pixels (like a ViT, at toy size). Left: the original. Middle: what the encoder sees (hidden patches are blank). Right: the <b>lazy neighbour fill</b>, a naive interpolation, <b>not</b> what MAE does. Blank on the right = no visible pixel within 2 steps, nothing to copy.</p>
+    <div class="goals"><span class="goal" id="gEasy">🎯 Lazy fill nearly works (smile, average error under 0.08)</span><span class="goal" id="gHard2">🎯 Break the lazy trick: ≥ 15% of hidden pixels have nothing nearby</span></div>
+    <div class="controls">
+      <span class="seg" id="mImg"><button data-v="smile" class="on">Smile</button><button data-v="seven">Seven</button><button data-v="cross">Cross</button><button data-v="square">Square</button></span>
+      <label>masking ratio <input type="range" id="mR" min="0" max="95" step="5" value="15"> <b class="mono" id="mRV"></b></label>
+      <button class="btn" id="mNew">🎲 New random mask</button>
+    </div>
+    <div class="trio">
+      <div><canvas class="px" id="mOrig"></canvas><p class="hint">original</p></div>
+      <div><canvas class="px" id="mVis"></canvas><p class="hint">encoder sees</p></div>
+      <div><canvas class="px" id="mRec"></canvas><p class="hint">lazy fill (naive)</p></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">patches visible <b class="x" id="mPV">–</b></div>
+      <div class="stat">lazy-fill error, this mask <b id="mE">–</b></div>
+      <div class="stat">average over 30 masks <b class="ls" id="mEA">–</b></div>
+      <div class="stat">hidden pixels with nothing nearby <b class="dead" id="mU">–</b></div>
+    </div>
+    <p class="hint" id="mMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at 15% the lazy fill's average error on the smile is <b>0.075</b> (pixels run 0 to 1) and <b>0%</b> of hidden pixels are cut off from their neighbours. Blurring the neighbours basically solves the task, so a network trained on it would learn little more than blurring. At 75% the error doubles to <b>0.148</b> and <b>15.6%</b> of hidden pixels have nothing visible within 2 steps; at 90% it's 54%. To fill those, a model has to know what eyes and mouths look like. MAE's own sweep agrees: 75% was best for both linear probing and fine-tuning.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Masked autoencoding (MAE)</span></span>
+    <ol>
+      <li><b>The problem before</b> Contrastive and teacher methods depend on hand-picked augmentations and big batches, and their global “whole image” embedding can ignore fine detail.</li>
+      <li><b>What people tried</b> Denoising autoencoders, inpainting, and BERT-style masking with low ratios (20–50% in earlier vision work), which was slow and gave modest gains.</li>
+      <li><b>Why this works</b> Reconstructing 75% of an image from 25% can't be done by local copying (you just measured it), so the model must learn objects and parts. Skipping masked patches in the encoder makes it 4× fewer tokens: cheap enough to pretrain big ViTs on ImageNet-1K alone. A plain ViT-Huge pretrained this way and fine-tuned reached <b>87.8%</b> on ImageNet-1K, the best result among methods using only that data at the time.</li>
+      <li><b>What it costs, when it fails</b> Raw pixel reconstruction wastes effort on unpredictable detail (exact texture), and MAE features are weaker under a <b>linear probe</b> than contrastive or DINO features: they usually need fine-tuning to shine.</li>
+      <li><b>What refined it</b> Predicting <b>features</b> instead of pixels: I-JEPA (2023) predicts the embeddings of hidden blocks from a context block, and DINOv2 mixes masked prediction with DINO's teacher. Video versions like V-JEPA 2 (2025) predict missing parts of videos.</li>
+    </ol>
+  </div>
+
+  <h2>How do you score features nobody labelled?</h2>
+  <p>The standard test is the <b>linear probe</b>: freeze the pretrained encoder, then train only one linear layer on top with the labels of a benchmark. If a straight line (a hyperplane) can separate the classes in feature space, the features already “know” the classes. The other tests are <b>k-nearest-neighbour</b> accuracy (what your playground showed) and <b>fine-tuning</b> everything with few labels.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how small is a linear probe?</span>
+    <p>A ResNet-50 has <b>25,557,032</b> parameters (counted with torchvision). Its last feature vector has <b>2,048</b> numbers. A linear probe for 1,000 ImageNet classes has 2,048 × 1,000 weights + 1,000 biases = <b>2,049,000</b> parameters, all of them in one layer that can't learn new features. If that tiny layer scores 76.5%, as with SimCLR, the other 23.5 million frozen parameters already did the work. With only 1% of the ImageNet labels and fine-tuning, SimCLR reached 85.8% top-5, beating AlexNet trained on 100× more labels.</p>
+  </div>
+
+  <h2>Side by side</h2>
+  <table>
+    <tr><th>Family</th><th>Question asked</th><th>Avoids collapse by</th><th>Needs</th><th>Examples</th></tr>
+    <tr><td>Contrastive</td><td>Which of these is my twin?</td><td>negatives</td><td>big batches or a queue; good augmentations</td><td>SimCLR, MoCo, CLIP (image ↔ text)</td></tr>
+    <tr><td>Teacher–student</td><td>Match the teacher's view of the other crop</td><td>slow momentum teacher (+ centering and sharpening)</td><td>two networks, careful hyperparameters</td><td>BYOL, DINO, DINOv2, DINOv3</td></tr>
+    <tr><td>Masked modelling</td><td>Fill in the hidden part</td><td>nothing to collapse: the target is the real data</td><td>a high mask ratio; usually fine-tuning</td><td>MAE, BEiT; I-JEPA predicts features</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>In practice you rarely pretrain SSL yourself: you download a backbone (DINOv2/DINOv3 from Meta's GitHub or Hugging Face, MAE and DINO weights through <code>timm</code>) and fine-tune or probe it. When you do train one, the loss is a few lines. This is SimCLR's NT-Xent on random embeddings, plus MAE-style random masking:</p>
+<pre><code><span class="k">import</span> torch, torch.nn.functional <span class="k">as</span> F
+
+<span class="k">def</span> info_nce(z1, z2, tau=<span class="n">0.5</span>):
+    <span class="s">"""z1[i] and z2[i] are two views of image i. Every other view is a negative."""</span>
+    z = F.normalize(torch.cat([z1, z2]), dim=<span class="n">1</span>)          <span class="c"># 2N × d, length 1</span>
+    sim = z @ z.T / tau                                     <span class="c"># cosine similarity / τ</span>
+    sim.fill_diagonal_(float(<span class="s">"-inf"</span>))                      <span class="c"># a view is not its own twin</span>
+    n = z1.shape[<span class="n">0</span>]
+    twin = torch.cat([torch.arange(n, <span class="n">2</span> * n), torch.arange(<span class="n">0</span>, n)])
+    <span class="k">return</span> F.cross_entropy(sim, twin)                       <span class="c"># “pick your twin”</span>
+
+torch.manual_seed(<span class="n">0</span>)
+a = torch.randn(<span class="n">256</span>, <span class="n">128</span>)
+b = a + <span class="n">0.1</span> * torch.randn(<span class="n">256</span>, <span class="n">128</span>)                   <span class="c"># 256 near-perfect twins</span>
+print(<span class="s">"random pairs:      "</span>, round(info_nce(a, torch.randn(<span class="n">256</span>, <span class="n">128</span>)).item(), <span class="n">3</span>))
+print(<span class="s">"log(2N − 1) =      "</span>, round(torch.log(torch.tensor(<span class="n">511.</span>)).item(), <span class="n">3</span>))
+print(<span class="s">"near-copies, τ=0.5:"</span>, round(info_nce(a, b).item(), <span class="n">3</span>))
+print(<span class="s">"near-copies, τ=0.1:"</span>, round(info_nce(a, b, tau=<span class="n">0.1</span>).item(), <span class="n">3</span>))
+
+<span class="c"># MAE-style masking: keep a random 25% of 196 patch tokens (a 14 × 14 ViT grid)</span>
+tokens = torch.randn(<span class="n">8</span>, <span class="n">196</span>, <span class="n">768</span>)
+keep = torch.rand(<span class="n">8</span>, <span class="n">196</span>).argsort(dim=<span class="n">1</span>)[:, :<span class="n">49</span>]
+visible = torch.gather(tokens, <span class="n">1</span>, keep[..., <span class="k">None</span>].expand(-<span class="n">1</span>, -<span class="n">1</span>, <span class="n">768</span>))
+print(<span class="s">"encoder input:    "</span>, tuple(visible.shape))
+
+<span class="c"># What we got on a laptop CPU (torch 2.8):</span>
+<span class="c"># random pairs:       6.264</span>
+<span class="c"># log(2N − 1) =       6.236</span>
+<span class="c"># near-copies, τ=0.5: 4.275</span>
+<span class="c"># near-copies, τ=0.1: 0.036</span>
+<span class="c"># encoder input:     (8, 49, 768)</span></code></pre>
+    <p class="hint">Random embeddings score about log(2N − 1), the “guessing” loss: with 512 views that's 6.24. Notice the near-perfect twins still score 4.3 at τ = 0.5: cosine similarity can't exceed 1, so 0.99 ÷ 0.5 = 2 is the biggest score a twin can get, and 510 negatives at score 0 still outweigh e² ≈ 7.4. That's another reason SimCLR-style training uses small temperatures. If your SSL loss sits at that value for long, nothing is being learned. If the loss is near 0 but kNN accuracy is bad, check for collapse or a leak (for example, both views accidentally identical).</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Contrastive (SimCLR, MoCo)</td><td>Simple loss; strong linear-probe features; works across modalities (CLIP)</td><td>Many negatives (big batches or a queue); false negatives; augmentation-sensitive</td></tr>
+      <tr><td>Teacher–student (BYOL, DINO)</td><td>No negatives; small batches OK; DINO features are great for kNN and segmentation</td><td>Collapse risk; two networks; fiddly hyperparameters</td></tr>
+      <tr><td>Masked (MAE)</td><td>Cheap per step (encoder sees 25%); scales to huge ViTs; few augmentations</td><td>Weaker linear probe; usually needs fine-tuning; wastes effort on pixel detail</td></tr>
+      <tr><td>Use a pretrained SSL backbone</td><td>Strong features with few labels; no pretraining bill</td><td>Licence and domain gap (medical, satellite) can need continued pretraining</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Explain contrastive learning, and what stops it collapsing.” A strong answer:</p>
+    <ul>
+      <li>Two augmentations of one image are a <b>positive</b> pair; other images in the batch are <b>negatives</b>; InfoNCE is a softmax cross-entropy over similarities with a temperature.</li>
+      <li><b>Collapse</b> = every input maps to the same vector, which trivially makes positives similar. Negatives prevent it; BYOL/DINO prevent it with a momentum teacher (+ a predictor, or centering and sharpening).</li>
+      <li>Why MAE masks 75% (spatial redundancy) vs BERT's 15%, and that SSL features are judged by <b>linear probe</b>, kNN, and fine-tuning with few labels.</li>
+      <li>Practical: monitor embedding spread or kNN during training; the augmentations decide what the model learns to ignore.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Contrastive pretraining matches supervised</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/2002.05709" target="_blank" rel="noopener">Chen et al.: A Simple Framework for Contrastive Learning of Visual Representations (SimCLR)</a></div>
+      <p><b>How:</b> two augmentations per image, a ResNet plus a small projection head, NT-Xent loss over batches of up to 8,192 images.</p>
+      <p><b>Why this method:</b> no labels, no memory bank, no special architecture; the linear probe reached 76.5%, the same as a supervised ResNet-50.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A queue of negatives</b> <span class="tag res">🧪 Research · 2019</span> <a href="https://arxiv.org/abs/1911.05722" target="_blank" rel="noopener">He et al.: Momentum Contrast (MoCo)</a></div>
+      <p><b>How:</b> negatives come from a queue of K = 65,536 past embeddings, produced by a momentum encoder updated as 0.999 old + 0.001 new.</p>
+      <p><b>Why this method:</b> lots of consistent negatives without huge batches, so it runs on ordinary GPU servers.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Masked autoencoders scale ViTs cheaply</b> <span class="tag res">🧪 Research · 2021</span> <a href="https://arxiv.org/abs/2111.06377" target="_blank" rel="noopener">He et al.: Masked Autoencoders Are Scalable Vision Learners (MAE)</a></div>
+      <p><b>How:</b> mask 75% of patches, encode only the visible 25%, reconstruct pixels with a light decoder.</p>
+      <p><b>Why this method:</b> 3× or faster pretraining and 87.8% ImageNet-1K accuracy for a plain ViT-Huge using only ImageNet-1K data.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Universal vision backbones, used on satellite images</b> <span class="tag co">🏢 Meta · 2025</span> <a href="https://ai.meta.com/blog/dinov3-self-supervised-vision-model/" target="_blank" rel="noopener">Meta AI: DINOv3</a></div>
+      <p><b>How:</b> DINO-style self-distillation scaled to 7B parameters and 1.7B unlabeled images, then distilled into smaller ViT and ConvNeXt models.</p>
+      <p><b>Why this method:</b> labels are scarce or impossible for satellite and scientific images; Meta reports WRI uses DINOv3 to detect tree loss, and NASA JPL uses DINOv2 for Mars exploration robots.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · segmentation for free</span>
+    <p>The DINO paper found that a self-supervised ViT's attention maps outline the main object in the picture, a dog or a bird, crisply enough to look like a segmentation mask, though the model never saw a mask or a label. The authors write that such features “contain explicit information about the semantic segmentation of an image”, which supervised ViTs show far less clearly. You'll peek at attention maps in Lesson 4.5.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>InfoNCE is cross-entropy (<a href="../../math-course/phase6/3-cross-entropy.html">math 6.3</a>) over cosine similarities (<a href="../../math-course/phase1/5-embeddings.html">math 1.5</a>). The same loss between images and captions is CLIP (4.6); DINOv2 backbones and patch-based ViTs are 4.5; masking words (BERT) and next-token prediction are self-supervision for text (6.5, 6.7); autoencoders are 7.1. Embedding search with these features is in <a href="../../ai-engineer/phase2/1-embeddings.html">AI Engineer 2.1</a>. Next in this phase: graphs (9.2); later, SSL pretraining is step one of the trustworthy medical model in the recap.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://lilianweng.github.io/posts/2021-05-31-contrastive/" target="_blank" rel="noopener">Lilian Weng: Contrastive Representation Learning</a>. A clear tour of every contrastive loss and trick.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2104.14294" target="_blank" rel="noopener">Caron et al.: Emerging Properties in Self-Supervised Vision Transformers (DINO)</a>. Readable, with the famous attention-map figures.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2304.07193" target="_blank" rel="noopener">Oquab et al.: DINOv2</a>. How data curation and scale made SSL features general-purpose.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A SimCLR batch has N = 1,024 images. How many negatives does each view get?</div>
+    <div class="opts"><button class="opt">1,023</button><button class="opt" data-ok>2,046</button><button class="opt">2,048</button></div>
+    <div class="explain">Two views per image gives 2N = 2,048 views. Remove the view itself and its twin: 2,048 − 2 = 2,046 negatives. (SimCLR's batch of 8,192 gives 16,382, as the paper says.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You train a BYOL-style model. The loss drops to almost 0 in an hour, but the linear probe is at chance and every embedding has cosine similarity 0.999 with every other. What happened?</div>
+    <div class="opts"><button class="opt">It converged: lower loss is always better</button><button class="opt" data-ok>Collapse: the network maps everything to one vector, which trivially matches the teacher. Check the momentum teacher, predictor, centering/sharpening and learning rate</button><button class="opt">The temperature is too high, so lower it to 0.01</button></div>
+    <div class="explain">Matching two views is perfectly solved by a constant output. Non-contrastive methods rely on the slowly moving teacher, the predictor (BYOL) or centering plus sharpening (DINO) to make collapse unstable. A near-zero loss with identical embeddings is the classic signature, which is why you monitor embedding spread or kNN accuracy during training.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Why does MAE hide 75% of image patches when BERT hides only 15% of words?</div>
+    <div class="opts"><button class="opt" data-ok>Images are spatially redundant: with few patches hidden, they can be filled from neighbours without understanding; a high ratio forces the model to learn objects (and makes the encoder 4× cheaper)</button><button class="opt">Vision Transformers can't process more than 25% of an image</button><button class="opt">Words are larger than patches, so fewer fit in memory</button></div>
+    <div class="explain">Language is dense with meaning: guessing 15% of words is already hard. Neighbouring pixels are highly correlated, so a low masking ratio is a blurring task (your lazy fill nearly solved 15%). At 75% local copying fails, and the encoder only processes the visible quarter of the tokens.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>SSL invents a task the data answers itself (a pretext task), trains on huge unlabeled data, then reuses the features with few labels.</li>
+      <li>Contrastive (SimCLR, MoCo): two augmentations are positives, the rest are negatives; InfoNCE = softmax cross-entropy over similarities ÷ <span class="w">τ</span>. More negatives = harder question; MoCo keeps a 65,536 queue.</li>
+      <li>Without negatives, everything can <span class="dead">collapse</span> to one point. BYOL/DINO avoid it with a slow momentum teacher (DINO: centering + sharpening).</li>
+      <li>MAE hides 75% of patches (images are redundant; BERT hides 15% of words) and encodes only the visible quarter.</li>
+      <li>Score SSL with a linear probe or kNN; in 2026 DINOv2/DINOv3 and CLIP-style models are the go-to pretrained vision backbones.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+  /* ---------- 1. InfoNCE line-up ---------- */
+  const NEG = [0, 2, 4, 8, 16, 64, 255, 510, 1022, 2046, 4094, 8190, 16382, 32766, 65536];
+  function drawI() {
+    const sp = +$("iP").value, sn = +$("iN").value, k = NEG[+$("iK").value], t = +$("iT").value;
+    const a = sp / t, b = sn / t, m = Math.max(a, b);
+    const share = Math.exp(a - m) / (Math.exp(a - m) + k * Math.exp(b - m)), loss = -Math.log(share);
+    $("iPV").textContent = sp.toFixed(2); $("iNV").textContent = sn.toFixed(2); $("iKV").textContent = k.toLocaleString(); $("iTV").textContent = t.toFixed(2);
+    $("iShare").textContent = (100 * share).toFixed(share > 0.999 ? 2 : 1) + "%";
+    $("iLoss").textContent = loss < 0.01 ? loss.toExponential(1) : loss.toFixed(3);
+    $("iRand").textContent = k ? Math.log(k + 1).toFixed(2) : "0";
+    $("iBar").style.width = (100 * share) + "%";
+    win("gHard", share >= 0.99 && sp - sn <= 0.5 + 1e-9 && k >= 1);
+    win("gMany", loss > 5 && Math.abs(sp - 0.9) < 1e-9);
+    $("iMsg").textContent = k === 0 ? "No negatives: the loss is 0 whatever the embeddings are. Nothing to learn, which is how collapse starts." :
+      share > 0.99 ? "The twin wins easily: little gradient left. A small τ or a big gap makes the question easy." :
+      loss > Math.log(k + 1) - 0.05 ? "About as bad as guessing at random: the twin doesn't stand out from the crowd." : "";
+  }
+  ["iP", "iN", "iK", "iT"].forEach(id => ($(id).oninput = drawI));
+  drawI();
+
+  /* ---------- 2. contrastive toy on a circle ---------- */
+  // 3 hidden kinds × 8 images; x = [content(2), nuisance(2)]; encoder z = normalize(W x + b); 10 parameters, gradients by central differences
+  const KN = [0, 1, 2, 4, 8, 16, 46], KCOL = ["#e17055", "#2f80ed", "#27ae60"];
+  const IM = (() => { const r = NN.rng(3), out = []; for (let c = 0; c < 3; c++) for (let i = 0; i < 8; i++) { const a = 2 * Math.PI * c / 3; out.push({ c, s: [Math.cos(a) + 0.25 * r.n(), Math.sin(a) + 0.25 * r.n()] }); } return out; })();
+  const views = r => { const V = []; IM.forEach((im, i) => { for (let k = 0; k < 2; k++) V.push({ i, c: im.c, x: [im.s[0] + 0.3 * r.n(), im.s[1] + 0.3 * r.n(), 1.5 * r.n(), 1.5 * r.n()] }); }); return V; };
+  const enc = (P, x) => { const a = P[0] * x[0] + P[1] * x[1] + P[2] * x[2] + P[3] * x[3] + P[8], b = P[4] * x[0] + P[5] * x[1] + P[6] * x[2] + P[7] * x[3] + P[9], n = Math.hypot(a, b) || 1e-9; return [a / n, b / n]; };
+  function closs(P, V, tau, N) {
+    const Z = V.map(v => enc(P, v.x)); let L = 0;
+    for (let a = 0; a < V.length; a++) {
+      const sp = (Z[a][0] * Z[a ^ 1][0] + Z[a][1] * Z[a ^ 1][1]) / tau, ng = N[a];
+      if (!ng.length) { L -= sp; continue; }
+      const ss = ng.map(j => (Z[a][0] * Z[j][0] + Z[a][1] * Z[j][1]) / tau); let m = sp; ss.forEach(s => (m = Math.max(m, s)));
+      L += m + Math.log(Math.exp(sp - m) + ss.reduce((t, s) => t + Math.exp(s - m), 0)) - sp;
+    }
+    return L / V.length;
+  }
+  const negs = (V, k, r) => V.map((_, a) => { if (k >= V.length - 2) return V.map((_, j) => j).filter(j => j !== a && j !== (a ^ 1)); const o = new Set(); while (o.size < k) { const j = r.int(V.length); if (j !== a && j !== (a ^ 1)) o.add(j); } return [...o]; });
+  const EV = views(NN.rng(99));
+  let P, cr, steps, lastLoss;
+  function cReset() { cr = NN.rng(1); P = Array.from({ length: 10 }, () => cr.n()); [2, 3, 6, 7].forEach(q => (P[q] *= 2)); steps = 0; lastLoss = null; cDraw(); }
+  function cTrainN(n) {
+    const k = KN[+$("cK").value], tau = +$("cT").value, lr = 0.5 * Math.min(1, tau / 0.5);
+    for (let s = 0; s < n; s++) {
+      const V = views(cr), N = negs(V, k, cr), g = new Array(10).fill(0), h = 1e-4;
+      for (let q = 0; q < 10; q++) { const A = P.slice(), B = P.slice(); A[q] += h; B[q] -= h; g[q] = (closs(A, V, tau, N) - closs(B, V, tau, N)) / (2 * h); }
+      lastLoss = closs(P, V, tau, N);
+      for (let q = 0; q < 10; q++) P[q] -= lr * g[q];
+      steps++;
+    }
+  }
+  function cStats() {
+    const Z = EV.map(v => enc(P, v.x));
+    const mx = Z.reduce((s, z) => s + z[0], 0) / Z.length, my = Z.reduce((s, z) => s + z[1], 0) / Z.length;
+    let ok = 0, al = 0;
+    Z.forEach((z, i) => { let best = -2, bj = -1; Z.forEach((w, j) => { if (j !== i && j !== (i ^ 1)) { const s = z[0] * w[0] + z[1] * w[1]; if (s > best) { best = s; bj = j; } } }); if (EV[bj].c === EV[i].c) ok++; al += z[0] * Z[i ^ 1][0] + z[1] * Z[i ^ 1][1]; });
+    return { Z, mx, my, R: Math.hypot(mx, my), knn: ok / Z.length, align: al / Z.length };
+  }
+  function cDraw() {
+    const { ctx, w, h } = NN.fit($("cCan")), cx = w / 2, cy = h / 2, rad = w * 0.4, S = cStats(), k = KN[+$("cK").value];
+    ctx.clearRect(0, 0, w, h);
+    ctx.fillStyle = css("--bg2"); ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = css("--line"); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.arc(cx, cy, rad, 0, 7); ctx.stroke();
+    const P2 = z => [cx + rad * z[0], cy - rad * z[1]];
+    ctx.strokeStyle = css("--muted"); ctx.globalAlpha = 0.5;
+    for (let i = 0; i < S.Z.length; i += 2) { const a = P2(S.Z[i]), b = P2(S.Z[i + 1]); ctx.beginPath(); ctx.moveTo(a[0], a[1]); ctx.lineTo(b[0], b[1]); ctx.stroke(); }
+    ctx.globalAlpha = 1;
+    S.Z.forEach((z, i) => { const [x, y] = P2(z); ctx.beginPath(); ctx.arc(x, y, 5, 0, 7); ctx.fillStyle = KCOL[EV[i].c]; ctx.fill(); ctx.strokeStyle = css("--bg2"); ctx.lineWidth = 1; ctx.stroke(); });
+    // mean arrow
+    const ex = cx + rad * S.mx, ey = cy - rad * S.my, ang = Math.atan2(ey - cy, ex - cx);
+    ctx.strokeStyle = css("--c-dead"); ctx.fillStyle = css("--c-dead"); ctx.lineWidth = 2.5; ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(ex, ey); ctx.stroke();
+    if (S.R > 0.05) { ctx.beginPath(); ctx.moveTo(ex, ey); ctx.lineTo(ex - 9 * Math.cos(ang - 0.4), ey - 9 * Math.sin(ang - 0.4)); ctx.lineTo(ex - 9 * Math.cos(ang + 0.4), ey - 9 * Math.sin(ang + 0.4)); ctx.fill(); }
+    $("cStepV").textContent = steps; $("cKV").textContent = k;
+    $("cLoss").textContent = lastLoss == null ? "–" : lastLoss.toFixed(3);
+    $("cAl").textContent = S.align.toFixed(2); $("cSp").textContent = (1 - S.R).toFixed(2);
+    $("cKnn").textContent = (100 * S.knn).toFixed(0) + "%";
+    const collapsed = S.R > 0.97 && steps > 0;
+    win("gCol", collapsed && k === 0);
+    win("gFew", k > 0 && k <= 2 && 1 - S.R >= 0.8 && S.knn >= 0.95);
+    win("gAll", k === 46 && S.knn >= 0.95);
+    $("cMsg").innerHTML = steps === 0 ? "Press ▶ Train. Right now the encoder mostly listens to the nuisance numbers." :
+      collapsed ? `<span class="dead">Collapsed.</span> Twins are identical (alignment ${S.align.toFixed(2)}) because <i>everything</i> is identical. Perfect loss, useless features.` :
+      S.knn >= 0.95 ? "The hidden kinds have separated: the encoder learned to ignore the nuisance, with no labels." : "";
+  }
+  const cLoop = NN.loop(() => { cTrainN(2); cDraw(); if (steps >= 600) return false; }, { onStop: () => ($("cTrain").textContent = "▶ Train") });
+  $("cTrain").onclick = () => { if (cLoop.running) cLoop.stop(); else { cLoop.start(); $("cTrain").textContent = "⏸ Pause"; } };
+  $("cStep").onclick = () => { cTrainN(10); cDraw(); };
+  $("cReset").onclick = () => { cLoop.stop(); cReset(); };
+  $("cCollapse").onclick = () => { cLoop.stop(); $("cK").value = 0; cReset(); cLoop.start(); $("cTrain").textContent = "⏸ Pause"; };
+  $("cK").oninput = () => { cLoop.stop(); cReset(); };
+  $("cT").onchange = () => { cLoop.stop(); cReset(); };
+  cReset();
+
+  /* ---------- 3. MAE masking ---------- */
+  const pic16 = base => { const u = Array.from({ length: 16 }, (_, r) => Array.from({ length: 16 }, (_, c) => base[r >> 1][c >> 1]));
+    return u.map((row, r) => row.map((_, c) => { let s = 0, n = 0; for (let i = -1; i <= 1; i++) for (let j = -1; j <= 1; j++) { const y = r + i, x = c + j; if (y >= 0 && y < 16 && x >= 0 && x < 16) { s += u[y][x]; n++; } } return 0.1 + 0.8 * s / n; })); };
+  const mask = (ratio, seed) => { const r = NN.rng(seed), idx = [...Array(64).keys()]; for (let i = 63; i > 0; i--) { const j = r.int(i + 1); [idx[i], idx[j]] = [idx[j], idx[i]]; } const m = new Array(64).fill(false); idx.slice(0, Math.round(ratio * 64)).forEach(i => (m[i] = true)); return m; };
+  function recon(img, m) { const out = img.map(r => r.slice()), unk = img.map(r => r.map(() => false)), vis = (y, x) => !m[(y >> 1) * 8 + (x >> 1)];
+    for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) if (!vis(y, x)) { let s = 0, w = 0;
+      for (let i = -2; i <= 2; i++) for (let j = -2; j <= 2; j++) { const yy = y + i, xx = x + j; if (yy >= 0 && yy < 16 && xx >= 0 && xx < 16 && vis(yy, xx)) { const ww = 1 / (i * i + j * j); s += ww * img[yy][xx]; w += ww; } }
+      if (w) out[y][x] = s / w; else { out[y][x] = 0.5; unk[y][x] = true; } }
+    return { out, unk }; }
+  function err(img, m) { const { out, unk } = recon(img, m); let e = 0, n = 0, u = 0; for (let y = 0; y < 16; y++) for (let x = 0; x < 16; x++) if (m[(y >> 1) * 8 + (x >> 1)]) { e += Math.abs(out[y][x] - img[y][x]); n++; if (unk[y][x]) u++; } return [n ? e / n : 0, n ? u / n : 0]; }
+  let mName = "smile", mSeed = 1;
+  function drawM() {
+    const img = pic16(NN.img.make(mName)), q = +$("mR").value / 100, m = mask(q, mSeed), { out, unk } = recon(img, m);
+    $("mRV").textContent = Math.round(q * 100) + "%";
+    NN.heat($("mOrig"), img, { cmap: "gray", lo: 0, hi: 1, gap: 0 });
+    NN.heat($("mVis"), img.map((row, y) => row.map((v, x) => (m[(y >> 1) * 8 + (x >> 1)] ? NaN : v))), { cmap: "gray", lo: 0, hi: 1, gap: 0 });
+    NN.heat($("mRec"), out.map((row, y) => row.map((v, x) => (unk[y][x] ? NaN : v))), { cmap: "gray", lo: 0, hi: 1, gap: 0 });
+    const [e, u] = err(img, m); let ea = 0, ua = 0;
+    for (let s = 1; s <= 30; s++) { const [a, b] = err(img, mask(q, s)); ea += a; ua += b; } ea /= 30; ua /= 30;
+    $("mPV").textContent = `${64 - m.filter(Boolean).length} / 64`;
+    $("mE").textContent = q ? e.toFixed(3) : "–"; $("mEA").textContent = q ? ea.toFixed(3) : "–";
+    $("mU").textContent = q ? (100 * ua).toFixed(1) + "%" : "–";
+    win("gEasy", mName === "smile" && q > 0 && ea < 0.08);
+    win("gHard2", ua >= 0.15);
+    $("mMsg").textContent = q === 0 ? "Nothing hidden: nothing to learn." : q <= 0.2 ? "BERT-level masking: blurring the neighbours nearly solves it. Too easy to teach much." : q >= 0.7 && q <= 0.8 ? "MAE's range: local copying fails, so a model must know what the picture is of." : q >= 0.9 ? "Very little left: even a smart model has to guess a lot." : "";
+  }
+  seg("mImg", v => { mName = v; drawM(); });
+  $("mR").oninput = drawM;
+  $("mNew").onclick = () => { mSeed = 1 + (mSeed % 997) + 1; drawM(); };
+  drawM();
+})();
+</script>
+</body>
+</html>

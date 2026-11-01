@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.1 Vanishing and exploding gradients (and gradient clipping) · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .gcols { display: flex; gap: 2px; align-items: flex-end; height: 170px; position: relative; border-bottom: 1px solid var(--line); margin-top: 6px; }
+  .gcols > div { flex: 1; border-radius: 3px 3px 0 0; min-height: 1px; background: var(--c-gr); transition: height .15s; }
+  .gcols > div.bad { background: var(--c-dead); }
+  .gcols .band { position: absolute; left: 0; right: 0; background: color-mix(in srgb, var(--good) 16%, transparent); border-top: 1px dashed var(--good); border-bottom: 1px dashed var(--good); pointer-events: none; }
+  .gcols .one { position: absolute; left: 0; right: 0; border-top: 2px solid var(--text); opacity: .55; pointer-events: none; }
+  .axisrow { display: flex; justify-content: space-between; font-size: .78rem; color: var(--muted); }
+  canvas.bd { width: 100%; max-width: 300px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 10px; border: 1px solid var(--line); }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .powbar { height: 14px; border-radius: 99px; background: var(--panel); overflow: hidden; margin: 6px 0; }
+  .powbar > i { display: block; height: 100%; background: var(--c-gr); transition: width .2s; }
+</style>
+</head>
+<body data-lesson="d2-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 1</div>
+  <h1>Vanishing and exploding gradients (and gradient clipping)</h1>
+  <p class="subtitle">Multiply thirty numbers together and you almost never get something near 1. That one fact explains why deep networks used to be untrainable, why training runs suddenly print NaN, and why every big language model clips its gradients.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Backprop</b> sends the <span class="gr">gradient</span> from the <span class="ls">loss</span> backwards, layer by layer, multiplying by each layer's local slope (the chain rule, Lesson 1.2 and <a href="../../math-course/phase3/5-backprop.html">math 3.5</a>).</li>
+      <li>An activation's <b>slope</b> is at most 0.25 for sigmoid and exactly 1 for ReLU when z &gt; 0 (Lesson 0.4).</li>
+      <li>A training step moves each <span class="w">weight</span> by <span class="lr">learning rate</span> × <span class="gr">gradient</span> (Lessons 1.5 and 1.6).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Google trained <b>PaLM</b>, a 540-billion-parameter language model, in 2022. Its paper reports that the loss <b>spiked roughly 20 times</b> during training, “despite the fact that gradient clipping was enabled”. Their fix was brute force: rewind to a checkpoint about 100 steps before the spike and skip 200 to 500 batches of data.</p>
+    <p>Meanwhile GPT-3, LLaMA and Llama 2 all list the same line in their training recipe: <b>clip the gradient norm at 1.0</b>. So does Karpathy's nanoGPT (<code>grad_clip = 1.0</code>). Thirty years earlier, in 1991, a student named Sepp Hochreiter showed in his diploma thesis why deep and recurrent networks were so hard to train in the first place.</p>
+    <p><b>What makes gradients either shrink to nothing or blow up to infinity, and almost never stay “just right”?</b> In this lesson you'll make both happen on purpose, beat a depth-30 challenge, crash a training run to NaN and rescue it with one line of code.</p>
+  </div>
+
+  <h2>Numbers first: multiply thirty numbers</h2>
+  <p>During backprop, the gradient that reaches layer 1 is the gradient at the output <b>multiplied by one factor per layer</b>. Here's what thirty factors do:</p>
+  <table>
+    <tr><th>Factor per layer</th><th>After 30 layers</th><th>What layer 1 feels</th></tr>
+    <tr><td>0.5</td><td class="dead">0.5³⁰ ≈ 0.000000001</td><td>A billionth of the signal: it never learns</td></tr>
+    <tr><td>0.9</td><td class="dead">0.9³⁰ ≈ 0.042</td><td>Only 4%, from a factor that looked harmless</td></tr>
+    <tr><td>1.0</td><td class="ev">1³⁰ = 1</td><td>The signal arrives intact</td></tr>
+    <tr><td>1.1</td><td class="dead">1.1³⁰ ≈ 17</td><td>17× too loud: early layers take giant steps</td></tr>
+    <tr><td>2.0</td><td class="dead">2³⁰ ≈ 1,000,000,000</td><td>A billion times too loud: NaN is coming</td></tr>
+  </table>
+  <p>A 10% error per layer becomes a 24× swing (from 0.042 to 17) after thirty layers. Being <b>exactly</b> 1 is a knife edge. Anything else, compounded, either <b>vanishes</b> or <b>explodes</b>.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    The gradient at an early layer is a <b>product</b> of one factor per layer above it, and each factor is roughly <b>(how big the <span class="w">weights</span> are) × (the activation's slope)</b>. Products of many numbers drift exponentially. Every technique in this phase is a way to keep those factors near 1, or to stop the damage when they aren't.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: photocopying a photocopy</span>
+    <p>Copy a page, then copy the copy, thirty times. If the machine makes each copy 10% lighter, the last one is blank. If it makes each 10% darker, the last one is solid black. Only a perfectly calibrated machine keeps the page readable. Backprop is that photocopier, run once per layer, on the learning signal.</p>
+  </div>
+
+  <h2>Where the factor comes from</h2>
+  <p>Look at one layer: <span class="ac">z</span> = <span class="w">W</span><span class="ac">a</span>, then <span class="ac">a′</span> = f(<span class="ac">z</span>). Going backwards, the gradient passes through two things:</p>
+  <ul>
+    <li><b>The activation:</b> multiplied by its slope f′(<span class="ac">z</span>). Sigmoid: at most 0.25. Tanh: up to 1, falling fast. ReLU: 1 or 0.</li>
+    <li><b>The weights:</b> multiplied by <span class="w">W</span>ᵀ. If the weights are typically too big, the signal grows; too small, it shrinks. For a layer of width n with weights of spread σ, the size factor is about σ·√n.</li>
+  </ul>
+  <p>So the per-layer factor is roughly <b>weight scale × average slope</b>. Initialization (Lesson 1.4) chooses the weight scale so that the product is 1: Xavier for tanh, He (σ = √(2/n), the extra 2 making up for ReLU switching off half its units) for ReLU.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: three layers, one neuron each</span>
+    <p>A chain of three neurons. Each has weight <span class="w">w</span> and sits where its activation's slope is s. The output sends back a <span class="gr">gradient</span> of 1. Each layer multiplies by <span class="w">w</span> × s:</p>
+    <table>
+      <tr><th>Setup</th><th>Factor per layer</th><th>Reaches layer 1</th></tr>
+      <tr><td>Sigmoid at z = 0 (s = 0.25), <span class="w">w</span> = 0.5</td><td>0.5 × 0.25 = 0.125</td><td class="dead">0.125³ ≈ 0.002</td></tr>
+      <tr><td>ReLU, on (s = 1), <span class="w">w</span> = 1.5</td><td>1.5 × 1 = 1.5</td><td class="dead">1.5³ ≈ 3.4</td></tr>
+      <tr><td>ReLU, on (s = 1), <span class="w">w</span> = 1</td><td>1 × 1 = 1</td><td class="ev">1³ = 1</td></tr>
+    </table>
+    <p>Three layers already make a 1,700× difference between the first and second rows (3.4 ÷ 0.002). Real layers have many neurons, so the factor is an average over them, but the arithmetic is the same.</p>
+  </div>
+
+  <h2>Playground: push a gradient through N layers</h2>
+  <p>Below is a real stack of layers, 32 units wide, with random weights. We send a gradient of size 1 back from the top and measure how big it is when it reaches each layer. Each column is one layer (layer 1 on the left). The height is on a <b>log scale</b>, relative to the last layer: the black line is “same size as the last layer”, the green band is “within 10×”.</p>
+  <p class="predict">🔮 <b>Predict:</b> sigmoid, 10 layers, weights at the standard scale. How much smaller is layer 1's gradient than layer 10's: 2×, 100×, or a million×?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Gradient through N layers</span>
+    <p class="hint">Pick an activation and drag the sliders. <b>Weight scale</b> g sets the weights' spread to g/√32 (g = 1 is plain “standard” init; ReLU's He init is g = √2 ≈ 1.41). Red columns are more than 10× off.</p>
+    <div class="goals">
+      <span class="goal" id="gDeep">🎯 Depth 30, layer 1 within 10× of the last layer</span>
+      <span class="goal" id="gVanish">🎯 Vanish: layer 1 gets under a millionth</span>
+      <span class="goal" id="gExplode">🎯 Explode: layer 1 gets 1,000× the last layer</span>
+    </div>
+    <div class="controls"><span class="seg" id="cAct"><button data-v="sigmoid" class="on">Sigmoid</button><button data-v="tanh">Tanh</button><button data-v="relu">ReLU</button><button data-v="linear">None (linear)</button></span></div>
+    <div class="controls">
+      <label>depth <input type="range" id="cDepth" min="2" max="50" step="1" value="10"> <b class="mono" id="cDepthV"></b></label>
+      <label><span class="w">weight scale</span> g <input type="range" id="cG" min="0.5" max="3" step="0.05" value="1"> <b class="mono" id="cGV"></b></label>
+    </div>
+    <div class="gcols" id="cCols"></div>
+    <div class="axisrow"><span>layer 1 (first)</span><span id="cLastLbl">last layer</span></div>
+    <div class="stat-row">
+      <div class="stat">layer 1 ÷ last layer <b id="cRatio" class="gr">–</b></div>
+      <div class="stat">average factor per layer <b id="cFactor" class="gr">–</b></div>
+      <div class="stat">verdict <b id="cVerdict">–</b></div>
+    </div>
+    <p class="hint" id="cMsg"></p>
+  </div>
+  <p><b>What you should see:</b> sigmoid at depth 10 leaves layer 1 with about <b>two millionths</b> (2 × 10⁻⁶) of the last layer's gradient; the average factor is about 0.24, close to sigmoid's best slope of 0.25. Raising the weight scale can't save it: even g = 3, the slider's maximum, only lifts the factor to about 0.55. Switch to <b>ReLU</b> at depth 30: with g = 1 the factor is about 0.67 and layer 1 gets 10⁻⁵ of the signal (vanishing). Slide g to about <b>1.4 to 1.6</b> (He init is 1.41!) and the whole row turns pink: challenge solved. Push g to 2 and it explodes, about <b>4,000×</b> at depth 30. Tanh is happiest near g = 1 to 1.5. The window of “just right” is narrow, and it gets narrower as you add layers.</p>
+
+  <h2>How each failure shows up in a real run</h2>
+  <p>You rarely see gradients directly. You see their symptoms:</p>
+  <table>
+    <tr><th></th><th>Vanishing</th><th>Exploding</th></tr>
+    <tr><td><span class="ls">Loss curve</span></td><td>Flat from the start, or creeps down painfully slowly. Often stuck at the “guessing” value (0.69 for two classes).</td><td>Sudden spikes, jumps to a huge value, then <code>inf</code> or <code>NaN</code>. Sometimes a spike and then a flat line.</td></tr>
+    <tr><td><span class="gr">Gradient norms</span></td><td>Early layers 100× to 10⁶× smaller than late layers.</td><td>The global norm jumps by orders of magnitude between steps.</td></tr>
+    <tr><td><span class="w">Weights</span></td><td>First layers barely change from their initial values.</td><td>Some weights become enormous; ReLU units die after one giant step.</td></tr>
+    <tr><td>Usual causes</td><td>Saturating activations, too-small init, very deep plain stacks, long RNN sequences.</td><td>Too-large init, too-high learning rate, long RNN sequences, unlucky batches.</td></tr>
+  </table>
+  <p class="muted">A flat loss can also be a bug (Lesson 2.6), and a spike can be one bad batch of data. Checking per-layer gradient norms tells you which story you're in.</p>
+
+  <h2>The extreme case: recurrent networks</h2>
+  <p>A recurrent network (RNN, Lesson 5.2) reads a sequence one step at a time and reuses the <b>same weight</b> at every step. Backprop through 100 time steps multiplies by that same factor 100 times. There's no averaging over different layers to save you:</p>
+  <div class="calc">0.9¹⁰⁰ ≈ 0.00003 &nbsp;&nbsp;·&nbsp;&nbsp; 1.0¹⁰⁰ = 1 &nbsp;&nbsp;·&nbsp;&nbsp; 1.1¹⁰⁰ ≈ 13,781</div>
+  <p class="predict">🔮 <b>Predict:</b> what recurrent weight w keeps at least 10% of the gradient after 100 steps without growing past 10×?</p>
+  <div class="playground">
+    <span class="label">🎮 Mini · The same weight, again and again</span>
+    <p class="hint">One recurrent neuron (no activation): the gradient from step T back to step 1 is w<sup>T</sup>. Find the band where both goals hold.</p>
+    <div class="goals"><span class="goal" id="gRnn">🎯 Keep between 0.1 and 10 after 100 steps</span></div>
+    <div class="controls">
+      <label><span class="w">recurrent weight w</span> <input type="range" id="rW" min="0.5" max="1.5" step="0.005" value="0.9"> <b class="mono" id="rWV"></b></label>
+      <label>steps T <input type="range" id="rT" min="1" max="100" step="1" value="100"> <b class="mono" id="rTV"></b></label>
+    </div>
+    <div class="stat-row"><div class="stat">gradient left = w<sup>T</sup> <b id="rOut" class="gr">–</b></div></div>
+    <div class="powbar" title="log scale from 1e-6 to 1e6"><i id="rBar"></i></div>
+    <p class="hint" id="rMsg"></p>
+  </div>
+  <p><b>What you should see:</b> only w between about <b>0.977</b> and <b>1.023</b> survives 100 steps. That's a window of ±2.3% around 1. Hochreiter's 1991 thesis and Bengio, Simard &amp; Frasconi (1994) analysed exactly this: plain RNNs struggle to learn dependencies across long time spans. Their answer, gates that keep a memory path with factor ≈ 1, became the LSTM (Lesson 5.3).</p>
+
+  <h2>The fix list (a map of this phase)</h2>
+  <table>
+    <tr><th>Fix</th><th>What it does to the factor</th><th>Fixes</th><th>Lesson</th></tr>
+    <tr><td>ReLU family</td><td>Slope exactly 1 when on, so the activation stops shrinking it</td><td>Vanishing</td><td>0.4, 0.5</td></tr>
+    <tr><td>Xavier / He init</td><td>Picks the weight scale so weight × slope ≈ 1 at the start</td><td>Both, at step 0</td><td>1.4</td></tr>
+    <tr><td>Residual connections</td><td>Adds a path with factor exactly 1 around every block</td><td>Vanishing in very deep nets</td><td>2.2</td></tr>
+    <tr><td>Normalization</td><td>Rescales activations every layer, so they can't drift</td><td>Both, during training</td><td>2.3</td></tr>
+    <tr><td>Gates (LSTM / GRU)</td><td>A learned memory path with factor near 1 through time</td><td>Vanishing in RNNs</td><td>5.3</td></tr>
+    <tr><td>Lower learning rate, warmup</td><td>Smaller steps, so one big gradient does less harm</td><td>Exploding (symptoms)</td><td>1.6</td></tr>
+    <tr><td><b>Gradient clipping</b></td><td>Caps the size of each update, whatever the gradient says</td><td>Exploding (damage)</td><td>this lesson</td></tr>
+  </table>
+  <p>Notice what clipping is <i>not</i>: it does nothing for vanishing gradients. You can't clip a tiny number into a useful one. It's a seatbelt, not an engine.</p>
+
+  <h2>Gradient clipping: by value or by norm</h2>
+  <p>Think of all the gradients of all the weights as one long arrow g. Its length ‖g‖ (the <b>global norm</b>: square every gradient, add them all up, take the square root) says how big the step will be. There are two ways to cap it at a threshold c:</p>
+  <ul>
+    <li><b>Clip by value:</b> clamp every single number into [−c, c]. Simple, but it <b>bends the arrow</b>: big components get cut, small ones don't.</li>
+    <li><b>Clip by norm:</b> if ‖g‖ &gt; c, shrink the whole arrow: g ← g × c / ‖g‖. Same <b>direction</b>, shorter length. If ‖g‖ ≤ c, nothing happens.</li>
+  </ul>
+  <p class="predict">🔮 <b>Predict:</b> the gradient is (4, 1) and the threshold is 2. Clip by value gives (2, 1). Does it still point the same way?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Value clipping bends, norm clipping shrinks</span>
+    <p class="hint">Drag the pink arrow (the raw <span class="gr">gradient</span>). Green = clipped by norm. Gold dashed = clipped by value. The dashed circle is ‖g‖ = c, the dashed square is |each component| ≤ c.</p>
+    <canvas class="plane wide" id="vPlane"></canvas>
+    <div class="controls"><label>threshold c <input type="range" id="vC" min="0.5" max="4" step="0.1" value="2"> <b class="mono" id="vCV"></b></label></div>
+    <div class="stat-row">
+      <div class="stat">raw ‖g‖ <b id="vNorm" class="gr">–</b></div>
+      <div class="stat">by norm <b id="vByNorm" class="y">–</b></div>
+      <div class="stat">by value <b id="vByVal" class="at">–</b></div>
+      <div class="stat">direction change (by value) <b id="vAngle">–</b></div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> with g = (4, 1) and c = 2, clipping by value gives (2, 1): the angle jumps from 14° to 27°, a <b>12.5° turn</b>, because only the big component was cut. Clipping by norm gives (1.94, 0.49): same direction, length 2. Drag the arrow inside the circle and norm clipping leaves it alone. That's why norm clipping is the default: in normal steps it does nothing, and in a bad step it keeps the direction the gradient asked for and only limits how far you go.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Gradient clipping by global norm</span></span>
+    <ol>
+      <li><b>The problem before</b> One bad batch or one steep “cliff” in the loss surface produces a gradient 100× to 10⁶⁰× larger than usual (you'll see 2.4 × 10⁶⁰ below). The step lr × g throws the weights somewhere useless: the loss spikes, ReLUs die, or the numbers overflow to <code>inf</code> and <code>NaN</code>. Hours of training gone in one step.</li>
+      <li><b>What people tried</b> A lower learning rate for the whole run (slow everywhere, to survive a few bad steps); penalties on the recurrent weights; clipping each gradient entry separately (Mikolov's element-wise clipping, which Pascanu et al. (2013) describe as the backbone of their approach).</li>
+      <li><b>Why this works</b> Pascanu, Mikolov &amp; Bengio (2013) proposed rescaling the gradient whenever its norm goes over a threshold: if ‖g‖ &gt; c, g ← c·g/‖g‖. The direction is kept, only the step length is capped. Example: g = (30, 40) has norm 50; with c = 1 it becomes (0.6, 0.8). Normal steps (‖g‖ ≤ c) are untouched, so it costs nothing when training is healthy.</li>
+      <li><b>What it costs, when it fails</b> One more hyperparameter. Too tight (c = 0.1 in our playground) and <i>every</i> step is clipped, which is just a smaller learning rate: 229 steps instead of 41. It can hide a real bug (bad data, a too-high LR). It doesn't help vanishing gradients at all. With mixed precision you must unscale gradients first (Lesson 10.2). And it isn't a guarantee: PaLM still spiked with it on.</li>
+      <li><b>What refined it</b> Adam's per-parameter scaling (Lesson 1.5) already tames gradient size; learning-rate warmup (1.6) avoids early explosions; adaptive gradient clipping (AGC, Brock et al. 2021) clips each unit by the ratio of its gradient norm to its weight norm and let them train ResNets without normalization; and for giant runs, monitoring plus rewind-and-skip (PaLM). In LLM pretraining, c = 1.0 is the common default.</li>
+    </ol>
+  </div>
+
+  <h2>Crash a training run, then rescue it</h2>
+  <p>A real network, training live: 6 hidden ReLU layers of 16 units on the two-circles data. The weights start <b>2× too big</b> (twice He's scale), so every layer's factor is about 2 and the gradient explodes on the way back. The bottom-right chart shows the global gradient norm on a log scale (each gridline is a factor of 10<sup>10</sup>).</p>
+  <p class="predict">🔮 <b>Predict:</b> with clipping off and a learning rate of 0.3, what happens in the first 10 steps? And what will a clip of 1.0 change?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Exploding loss, rescued by clipping</span>
+    <div class="goals">
+      <span class="goal" id="gNan">🎯 Crash it to NaN</span>
+      <span class="goal" id="gRescue">🎯 Rescue 2× weights to ≥ 95% with clipping</span>
+      <span class="goal" id="gTight">🎯 Feel a too-tight clip (0.1) reach 95%</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="eScale"><button data-v="1">weights 1× (He)</button><button data-v="2" class="on">weights 2×</button></span>
+      <label><span class="lr">learning rate</span> <select id="eLr" class="btn small"><option>0.1</option><option selected>0.3</option><option>1</option></select></label>
+      <span class="seg" id="eClip"><button data-v="0" class="on">clip off</button><button data-v="0.1">clip 0.1</button><button data-v="1">clip 1</button><button data-v="10">clip 10</button></span>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="eTrain">▶ Train</button>
+      <button class="btn" id="eStep">Step ×1</button>
+      <button class="btn" id="eReset">↺ Reset</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="bd" id="eBound"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">step <b id="eStepN">0</b></div>
+          <div class="stat"><span class="ls">loss</span> <b id="eLoss">–</b></div>
+          <div class="stat">accuracy <b id="eAcc">–</b></div>
+        </div>
+        <div class="stat-row">
+          <div class="stat"><span class="gr">‖g‖</span> now <b id="eG">–</b></div>
+          <div class="stat">biggest ‖g‖ <b id="eGmax">–</b></div>
+          <div class="stat">steps clipped <b id="eClipped">0</b></div>
+        </div>
+        <p class="hint" id="eMsg"></p>
+      </div>
+    </div>
+    <div class="pg-cols">
+      <canvas class="chart" id="eLossC" style="height:160px"></canvas>
+      <canvas class="chart" id="eGC" style="height:160px"></canvas>
+    </div>
+  </div>
+  <p><b>What you should see</b> (seeded, so you'll get these exact numbers): with clipping off, the gradient norm goes 28 → 310 → 1,600 → 5 × 10⁶ → … → <b>2.4 × 10⁶⁰</b> by step 7. The loss jumps to 13.8 (our toy caps it there; PyTorch would show <code>inf</code>), then every ReLU in the first layers is dead and the loss sits at 0.69 forever. Set the learning rate to 1: <b>NaN at step 7</b>. Now pick <b>clip 1</b> with lr 0.3: the first 9 steps are all clipped, the loss bounces, and it passes 95% at step 41. Clip 10 gets there in 16 steps. Clip 0.1 clips every single step and crawls to 95% in 229. And with lr 1, clip 10 is too loose to stop the damage, while clip 1 still works (23 steps). Finally try weights 1×: no explosion, no clipping needed. Clipping treated the symptom; good init fixed the cause.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>In PyTorch, clipping is one line between <code>loss.backward()</code> and <code>optimizer.step()</code>: <code>torch.nn.utils.clip_grad_norm_</code> (by norm, the default choice) or <code>clip_grad_value_</code> (by value). <code>clip_grad_norm_</code> <b>returns the norm before clipping</b>: log it, it's the best early-warning signal you have. This snippet measures vanishing in a 30-layer tanh stack and then clips.</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn
+
+torch.manual_seed(<span class="n">0</span>)
+net = nn.Sequential(*[m <span class="k">for</span> _ <span class="k">in</span> range(<span class="n">30</span>) <span class="k">for</span> m <span class="k">in</span> (nn.Linear(<span class="n">64</span>, <span class="n">64</span>), nn.Tanh())], nn.Linear(<span class="n">64</span>, <span class="n">1</span>))
+x, y = torch.randn(<span class="n">256</span>, <span class="n">64</span>), <span class="n">100</span> * torch.randn(<span class="n">256</span>, <span class="n">1</span>)   <span class="c"># big targets → big gradients</span>
+
+loss = nn.functional.mse_loss(net(x), y)
+loss.backward()
+linears = [m <span class="k">for</span> m <span class="k">in</span> net <span class="k">if</span> isinstance(m, nn.Linear)]
+print(<span class="s">f"layer 1 grad norm:  {linears[0].weight.grad.norm():.1e}"</span>)
+print(<span class="s">f"layer 31 grad norm: {linears[-1].weight.grad.norm():.1e}"</span>)
+
+<span class="c"># gradient clipping: one line between backward() and step()</span>
+total = torch.nn.utils.clip_grad_norm_(net.parameters(), max_norm=<span class="n">1.0</span>)
+print(<span class="s">f"global norm before clipping: {total:.3f}"</span>)
+after = torch.sqrt(sum(p.grad.pow(<span class="n">2</span>).sum() <span class="k">for</span> p <span class="k">in</span> net.parameters()))
+print(<span class="s">f"global norm after clipping:  {after:.3f}"</span>)
+
+<span class="c"># What we got on a laptop CPU (torch 2.8):</span>
+<span class="c"># layer 1 grad norm:  9.6e-07</span>
+<span class="c"># layer 31 grad norm: 4.9e+00</span>
+<span class="c"># global norm before clipping: 10.158</span>
+<span class="c"># global norm after clipping:  1.000</span></code></pre>
+    <p class="hint">Layer 1 gets about 5 × 10⁶ times less gradient than the last layer with PyTorch's default init and tanh: vanishing, live. Gotchas: clip <b>after</b> <code>backward()</code> and <b>before</b> <code>step()</code>; with <code>torch.amp</code>'s GradScaler call <code>scaler.unscale_(optimizer)</code> first, or you clip the scaled numbers. In Hugging Face's <code>Trainer</code> the setting is <code>max_grad_norm</code> (default 1.0).</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Clip by global norm</td><td>Keeps direction; no effect on healthy steps; one standard number (1.0)</td><td>Needs every gradient before stepping (an extra sum; across GPUs, an extra communication)</td></tr>
+      <tr><td>Clip by value</td><td>Trivial, per-element, no global sum</td><td>Bends the update direction; the threshold depends on each layer's scale</td></tr>
+      <tr><td>Tight threshold</td><td>Very stable</td><td>Clips every step: secretly a lower learning rate</td></tr>
+      <tr><td>No clipping</td><td>One less knob</td><td>One bad batch can end the run; risky for RNNs and large transformers</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Why are deep networks hard to train, and what does gradient clipping fix?” A strong answer:</p>
+    <ul>
+      <li>Backprop multiplies one factor per layer (weights × activation slope); a product of many factors shrinks or grows <b>exponentially</b> unless each is ≈ 1. RNNs are the worst case because they reuse one weight at every time step.</li>
+      <li>Names symptoms: vanishing = flat loss, tiny early-layer gradient norms; exploding = spikes, <code>inf</code>/<code>NaN</code>, dead ReLUs.</li>
+      <li>Maps fixes to causes: ReLU, Xavier/He init, residuals, normalization, LSTM gates for vanishing; lower LR, warmup and clipping for exploding.</li>
+      <li>Explains clipping by norm (rescale if ‖g‖ &gt; c, direction kept) vs by value, places it after <code>backward()</code>, and knows the LLM default of 1.0 and that it doesn't fix vanishing.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Clipping, as introduced for RNNs</b> <span class="tag res">🧪 Research · 2013</span> <a href="https://arxiv.org/abs/1211.5063" target="_blank" rel="noopener">Pascanu, Mikolov &amp; Bengio: On the difficulty of training recurrent neural networks</a></div>
+      <p><b>How:</b> analyses exploding and vanishing gradients in RNNs and proposes rescaling the gradient whenever its norm exceeds a threshold.</p>
+      <p><b>Why this method:</b> exploding gradients come from sharp “cliffs” in the loss surface; capping the step length keeps the optimizer from being thrown off the cliff while leaving normal steps alone.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The LLM default: clip at 1.0</b> <span class="tag co">🏢 OpenAI · 2020</span> <a href="https://arxiv.org/abs/2005.14165" target="_blank" rel="noopener">Brown et al.: Language Models are Few-Shot Learners (GPT-3)</a></div>
+      <p><b>How:</b> “we clip the global norm of the gradient at 1.0”, alongside Adam and a cosine learning-rate schedule. LLaMA and Llama 2 (Meta, 2023) report the same “gradient clipping of 1.0”.</p>
+      <p><b>Why this method:</b> large transformers occasionally see huge gradients; a fixed norm cap costs nothing in normal steps and limits the damage of rare bad ones.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>When clipping isn't enough</b> <span class="tag co">🏢 Google · 2022</span> <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">Chowdhery et al.: PaLM</a></div>
+      <p><b>How:</b> the 540B model's loss spiked about 20 times with clipping on; they restarted from a checkpoint about 100 steps earlier and skipped roughly 200 to 500 batches.</p>
+      <p><b>Why this method:</b> no principled fix was affordable at that scale, and the spikes didn't appear in smaller models: monitoring the loss and gradient norm, then rewinding, was the practical answer.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One line in a popular training script</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener">Karpathy: nanoGPT</a></div>
+      <p><b>How:</b> <code>grad_clip = 1.0</code> in the config and <code>torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)</code> right after unscaling the gradients.</p>
+      <p><b>Why this method:</b> it's the cheapest insurance in the whole training loop, and the script is the template many people learn GPT training from.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the problem was found in a student thesis</span>
+    <p>The first formal analysis of vanishing and exploding gradients is Sepp Hochreiter's 1991 diploma thesis at TU Munich, written in German (“Untersuchungen zu dynamischen neuronalen Netzen”). His advisor Jürgen Schmidhuber later called it “a first milestone of Deep Learning research”. Six years later the two of them published the LSTM, built specifically to give the gradient a path with factor 1 through time.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The per-layer multiplication is the chain rule (<a href="../../math-course/phase3/2-chain-rule.html">math 3.2</a>, <a href="../../math-course/phase3/5-backprop.html">math 3.5</a>); overflow to <code>inf</code> and <code>NaN</code> is floating-point arithmetic (<a href="../../math-course/phase8/5-numerics.html">math 8.5</a>). Slopes come from Lesson 0.4, weight scales from initialization (1.4), the learning rate and warmup from 1.6. Next: residual connections add a factor-1 highway (2.2), normalization keeps activations in range (2.3), and Lesson 2.6 turns gradient norms into a debugging tool. RNNs and LSTMs are Lessons 5.2 and 5.3; mixed precision and unscaling before clipping are in Phase 10.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Book</span> <a href="https://d2l.ai/chapter_multilayer-perceptrons/numerical-stability-and-init.html" target="_blank" rel="noopener">Dive into Deep Learning: Numerical Stability and Initialization</a>. Vanishing and exploding gradients with plots and code.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1211.5063" target="_blank" rel="noopener">On the difficulty of training recurrent neural networks (2013)</a>. The cliff picture and norm clipping, in a readable paper.</li>
+      <li><span class="kind">History</span> <a href="https://people.idsia.ch/~juergen/fundamentaldeeplearningproblem.html" target="_blank" rel="noopener">Schmidhuber: Sepp Hochreiter's Fundamental Deep Learning Problem (1991)</a>. The story of the thesis, with references (including <a href="https://www.comp.hkbu.edu.hk/~markus/teaching/comp7650/tnn-94-gradient.pdf" target="_blank" rel="noopener">Bengio, Simard &amp; Frasconi 1994</a>).</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Each of 20 layers multiplies the gradient by about 0.8 on the way back. Roughly what fraction of the output gradient reaches layer 1?</div>
+    <div class="opts"><button class="opt">About 0.8 × 20 = 16, so it grows</button><button class="opt" data-ok>About 0.8²⁰ ≈ 0.012, roughly 1%</button><button class="opt">About 0.8, because each layer only loses 20%</button></div>
+    <div class="explain">Factors <b>multiply</b>: 0.8²⁰ ≈ 0.0115. A 20% loss per layer leaves about 1% after 20 layers. That compounding is the whole problem: a factor that looks nearly harmless becomes a vanishing gradient with depth.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Training a transformer, the loss is fine for 3,000 steps, then jumps to <code>NaN</code>. Your logged gradient norm went from about 0.8 to 900 one step before. What's the best first fix?</div>
+    <div class="opts"><button class="opt">Switch every ReLU to sigmoid so outputs are bounded</button><button class="opt">Increase the learning rate to escape the bad region faster</button><button class="opt" data-ok>Clip the gradient norm (e.g. max_norm = 1.0) and check the learning rate and the batch that caused it</button></div>
+    <div class="explain">A sudden 1,000× jump in the norm followed by NaN is an exploding gradient. Clipping by norm caps the step at a safe length; then look at the cause (LR too high, missing warmup, a corrupted batch). Sigmoid would bring back vanishing gradients, and a higher LR makes explosions worse.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A gradient is (6, 8) and you clip by norm with c = 5. What do you get?</div>
+    <div class="opts"><button class="opt">(5, 5)</button><button class="opt" data-ok>(3, 4)</button><button class="opt">(6, 8), because clipping only applies to values above 10</button></div>
+    <div class="explain">‖(6, 8)‖ = 10 &gt; 5, so multiply by 5/10 = 0.5 → (3, 4): same direction, length 5. (5, 5) is clipping by <i>value</i>, which changes the direction from 53° to 45°.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>The gradient at layer 1 is a product of one factor per layer (≈ weight scale × activation slope). Products drift exponentially: 0.9³⁰ ≈ 0.04, 1.1³⁰ ≈ 17.</li>
+      <li>Vanishing: flat loss, tiny early-layer gradients. Exploding: spikes, <code>inf</code>/<code>NaN</code>, dead ReLUs. RNNs are the extreme case (one weight, reused every step).</li>
+      <li>Fixes for the cause: ReLU (0.4), Xavier/He init (1.4), residuals (2.2), normalization (2.3), LSTM gates (5.3), a sane learning rate (1.6).</li>
+      <li>Gradient clipping limits the damage of exploding steps: by norm (g ← c·g/‖g‖ if ‖g‖ &gt; c) keeps the direction; by value bends it. LLMs commonly clip at 1.0.</li>
+      <li>Log the norm that <code>clip_grad_norm_</code> returns: it's your early warning. Clipping is a seatbelt, not a fix for bad init or a too-high learning rate.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/plane.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); return () => bs.find(b => b.classList.contains("on")).dataset.v; };
+  const sci = v => (!isFinite(v) ? String(v) : v === 0 ? "0" : Math.abs(v) >= 1e4 || Math.abs(v) < 0.01 ? v.toExponential(1) : v.toFixed(Math.abs(v) >= 100 ? 0 : Math.abs(v) >= 1 ? 2 : 3));
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+
+  /* ---------- 1. gradient through N layers (width 32, batch 16, weights std g/√32) ---------- */
+  function chain(act, N, g, W = 32, B = 16, seed = 7) {
+    const r = NN.rng(seed), A = NN.act[act];
+    const Ws = []; for (let l = 0; l < N; l++) Ws.push(Array.from({ length: W * W }, () => g / Math.sqrt(W) * r.n()));
+    const norms = new Array(N).fill(0);
+    for (let b = 0; b < B; b++) {
+      let a = Array.from({ length: W }, () => r.n()); const zs = [];
+      for (let l = 0; l < N; l++) { const z = new Array(W).fill(0); for (let j = 0; j < W; j++) { let s = 0; for (let i = 0; i < W; i++) s += Ws[l][j * W + i] * a[i]; z[j] = s; } zs.push(z); a = z.map(v => A.f(v)); }
+      let d = Array.from({ length: W }, () => r.n() / Math.sqrt(W));
+      for (let l = N - 1; l >= 0; l--) {
+        const dz = d.map((v, j) => v * A.d(zs[l][j]));
+        norms[l] += Math.sqrt(dz.reduce((s, v) => s + v * v, 0));
+        const p = new Array(W).fill(0); for (let j = 0; j < W; j++) for (let i = 0; i < W; i++) p[i] += Ws[l][j * W + i] * dz[j]; d = p;
+      }
+    }
+    return norms.map(v => v / B);
+  }
+  let cAct = "sigmoid";
+  function cDraw() {
+    const N = +$("cDepth").value, g = +$("cG").value;
+    $("cDepthV").textContent = N; $("cGV").textContent = g.toFixed(2);
+    const n = chain(cAct, N, g), last = n[N - 1], rel = n.map(v => v / last);
+    const lo = -12, hi = 6, H = v => Math.max(0.5, Math.min(100, 100 * (Math.log10(Math.max(v, 1e-30)) - lo) / (hi - lo)));
+    const y1 = 100 * (0 - lo) / (hi - lo), yb0 = 100 * (-1 - lo) / (hi - lo), yb1 = 100 * (1 - lo) / (hi - lo);
+    $("cCols").innerHTML = rel.map((v, l) => `<div class="${v < 0.1 || v > 10 ? "bad" : ""}" style="height:${H(v)}%" title="layer ${l + 1}: ${sci(v)} × last"></div>`).join("") +
+      `<span class="band" style="bottom:${yb0}%;height:${yb1 - yb0}%"></span><span class="one" style="bottom:${y1}%"></span>`;
+    $("cLastLbl").textContent = `layer ${N} (last)`;
+    const ratio = rel[0], factor = Math.pow(ratio, 1 / (N - 1));
+    $("cRatio").textContent = sci(ratio);
+    $("cFactor").textContent = factor.toFixed(3);
+    const verdict = ratio < 0.1 ? `<span class="dead">vanishing</span>` : ratio > 10 ? `<span class="dead">exploding</span>` : `<span class="ev">healthy</span>`;
+    $("cVerdict").innerHTML = verdict;
+    win("gDeep", N >= 30 && ratio >= 0.1 && ratio <= 10);
+    win("gVanish", ratio < 1e-6);
+    win("gExplode", ratio >= 1000);
+    $("cMsg").textContent = ratio < 0.1 ? `Each layer multiplies the gradient by about ${factor.toFixed(2)} on average; ${N - 1} of those leave ${sci(ratio)}.` :
+      ratio > 10 ? `Each layer multiplies by about ${factor.toFixed(2)}: the early layers get ${sci(ratio)}× the signal of the last one. Big steps, then NaN.` :
+      N >= 30 ? "Factor ≈ 1 at every layer: the gradient survives the whole stack." : "Healthy here. Now make it deeper: 30 layers is the challenge.";
+  }
+  seg("cAct", v => { cAct = v; cDraw(); });
+  $("cDepth").oninput = cDraw; $("cG").oninput = cDraw;
+  cDraw();
+
+  /* ---------- 2. RNN: w^T ---------- */
+  function rDraw() {
+    const w = +$("rW").value, T = +$("rT").value, v = Math.pow(w, T);
+    $("rWV").textContent = w.toFixed(3); $("rTV").textContent = T;
+    $("rOut").textContent = `${w.toFixed(3)}^${T} = ${sci(v)}`;
+    $("rBar").style.width = Math.max(0, Math.min(100, 100 * (Math.log10(v) + 6) / 12)) + "%";
+    const ok = T >= 100 && v >= 0.1 && v <= 10;
+    win("gRnn", ok);
+    $("rMsg").textContent = v < 0.1 ? "Vanished: step 1 barely hears about the loss at step T." : v > 10 ? "Exploded: one long sequence and the update is enormous." : ok ? "Survived 100 steps. Notice how narrow the window is." : "OK so far. Now try T = 100.";
+  }
+  $("rW").oninput = rDraw; $("rT").oninput = rDraw; rDraw();
+
+  /* ---------- 3. clip by value vs by norm ---------- */
+  let gv = [4, 1];
+  const vPlane = new Plane($("vPlane"), { xRange: [-5, 5], yRange: [-3.2, 3.2], snap: 0.1, onDrag: (k, p) => { gv = p; vDraw(); } });
+  function vDraw() {
+    const c = +$("vC").value, nrm = Math.hypot(gv[0], gv[1]);
+    const byN = nrm > c ? gv.map(v => v * c / nrm) : gv.slice();
+    const byV = gv.map(v => Math.max(-c, Math.min(c, v)));
+    const ang = v => Math.atan2(v[1], v[0]) * 180 / Math.PI;
+    let dA = Math.abs(ang(byV) - ang(gv)); if (dA > 180) dA = 360 - dA;
+    const circle = Array.from({ length: 73 }, (_, i) => [c * Math.cos(i * Math.PI / 36), c * Math.sin(i * Math.PI / 36)]);
+    vPlane.draw([
+      { type: "path", pts: circle, color: "--c-y", width: 1.5, dash: [5, 4] },
+      { type: "path", pts: [[-c, -c], [c, -c], [c, c], [-c, c]], close: true, color: "--c-at", width: 1.5, dash: [3, 4] },
+      { type: "vec", to: byV, color: "--c-at", width: 3, dash: [7, 4] },
+      { type: "vec", to: byN, color: "--c-y", width: 4 },
+      { type: "vec", to: gv, color: "--c-gr", width: 2.5, drag: "g", label: "g" },
+    ]);
+    $("vCV").textContent = c.toFixed(1);
+    const f = v => `(${v[0].toFixed(2)}, ${v[1].toFixed(2)})`;
+    $("vNorm").textContent = nrm.toFixed(2);
+    $("vByNorm").textContent = f(byN) + (nrm > c ? "" : " untouched");
+    $("vByVal").textContent = f(byV);
+    $("vAngle").innerHTML = dA < 0.05 ? `<span class="ev">0°</span>` : `<span class="dead">${dA.toFixed(1)}°</span>`;
+  }
+  $("vC").oninput = vDraw; vDraw();
+
+  /* ---------- 4. exploding loss, rescued by clipping ---------- */
+  const data = NN.data.circle(200);
+  let scale = 2, clip = 0, net, steps = 0, hl = [], hg = [], last = null, gmax = 0, nClipped = 0;
+  const acc = () => data.filter(s => (net.predict(s.x)[0] > 0.5) === (s.y === 1)).length / data.length;
+  function eReset() {
+    net = new NN.MLP({ sizes: [2, 16, 16, 16, 16, 16, 16, 1], act: "relu", out: "sigmoid", init: "he", initScale: scale, seed: 1 });
+    steps = 0; hl = []; hg = []; last = null; gmax = 0; nClipped = 0; eDraw();
+  }
+  function eTrain(n) {
+    for (let i = 0; i < n; i++) {
+      last = net.train(data, { lr: +$("eLr").value, clip: clip || undefined }); steps++;
+      if (clip && last.gradNorm > clip) nClipped++;
+      if (isFinite(last.gradNorm)) gmax = Math.max(gmax, last.gradNorm); else gmax = last.gradNorm;
+      hl.push([steps, isFinite(last.loss) ? Math.min(last.loss, 14) : NaN]);
+      hg.push([steps, isFinite(last.gradNorm) && last.gradNorm > 0 ? Math.log10(last.gradNorm) : NaN]);
+      if (steps === 1) { /* nothing */ }
+    }
+  }
+  function eDraw() {
+    const a = acc();
+    NN.drawBoundary($("eBound"), (x, y) => net.predict([x, y])[0], data, { res: 36 });
+    $("eStepN").textContent = steps;
+    $("eLoss").textContent = last ? (isFinite(last.loss) ? last.loss.toFixed(3) : "NaN") : "–";
+    $("eAcc").textContent = (100 * a).toFixed(0) + "%";
+    $("eG").textContent = last ? sci(last.gradNorm) : "–";
+    $("eGmax").textContent = last ? sci(gmax) : "–";
+    $("eClipped").textContent = nClipped;
+    Plot.line($("eLossC"), { series: [{ label: "training loss", color: MX.css("--c-ls"), data: hl.length ? hl : [[0, 0.7]], width: 2.2 }], yMin: 0, yMax: 14, xLabel: "step", hlines: [{ y: 0.693, label: "0.69 = coin flip", color: MX.css("--muted") }] });
+    Plot.line($("eGC"), { series: [{ label: "log₁₀ ‖g‖", color: MX.css("--c-gr"), data: hg.length ? hg : [[0, 0]], width: 2.2 }], yMin: -4, yMax: 64, xLabel: "step", hlines: clip ? [{ y: Math.log10(clip), label: "clip threshold", color: MX.css("--c-y") }] : [] });
+    const nan = last && !isFinite(last.loss);
+    win("gNan", nan);
+    win("gRescue", scale === 2 && clip > 0 && a >= 0.95);
+    win("gTight", clip === 0.1 && a >= 0.95);
+    const st = last && !nan ? net.stats(data) : null, dead = st ? Math.max(...st.map(s => s.dead)) : 0;
+    $("eMsg").innerHTML = !last ? "Press ▶ Train, or Step ×1 to watch the first steps one by one." :
+      nan ? `<span class="dead">NaN.</span> The numbers overflowed. Nothing can train from here: reset and turn on clipping.` :
+      a >= 0.95 ? `Solved in ${steps} steps${clip ? `, with ${nClipped} steps clipped` : ""}.` :
+      dead >= 0.9 && !clip ? `<span class="dead">${Math.round(100 * dead)}% of a layer's ReLUs are dead</span> after the explosion: the gradient is now ~0 and the loss will stay flat. Reset with clipping on.` :
+      last.gradNorm > 1e3 ? "The gradient norm is exploding: watch the right-hand chart." : "";
+  }
+  const loop = NN.loop(() => { eTrain(2); eDraw(); if (steps >= 400 || (last && !isFinite(last.loss) && steps > 20)) return false; }, { onStop: () => ($("eTrain").textContent = "▶ Train") });
+  $("eTrain").onclick = () => { if (loop.running) loop.stop(); else { loop.start(); $("eTrain").textContent = "⏸ Pause"; } };
+  $("eStep").onclick = () => { eTrain(1); eDraw(); };
+  $("eReset").onclick = () => { loop.stop(); eReset(); };
+  seg("eScale", v => { scale = +v; loop.stop(); eReset(); });
+  seg("eClip", v => { clip = +v; loop.stop(); eReset(); });
+  $("eLr").onchange = () => { loop.stop(); eReset(); };
+  eReset();
+})();
+</script>
+</body>
+</html>

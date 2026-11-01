@@ -1,0 +1,401 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9.2 End-to-end driving: photons to controls · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.strip { width: 100%; aspect-ratio: 7 / 1; height: auto; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  svg.flow { width: 100%; height: auto; display: block; }
+</style>
+</head>
+<body data-lesson="s9-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 9 · Lesson 2</div>
+  <h1>End-to-end driving: photons to controls</h1>
+  <p class="subtitle">For twenty years self-driving software was a relay race of hand-built modules: detect, track, predict, plan, control. End-to-end driving trains one big network from camera pixels to the car's path instead. Tesla bet its whole stack on it; Waymo and Wayve each took their own version. Why it's so powerful, and why it's so hard to trust.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The modular stack</b>: perception → tracking → prediction → planning → control, each a separate piece with its own outputs (Lesson 0.3), and the modular vs end-to-end debate in outline (Lesson 0.4).</li>
+      <li><b>Behavior cloning and covariate shift</b>: copying an expert's actions from logs, and why errors compound once the car leaves the expert's states (Lesson 9.1).</li>
+      <li><b>Logistic regression</b>: a model that outputs a probability from a weighted sum of inputs, σ(<i>w</i>·<i>x</i>). Neural networks are stacks of these; see <span class="dlref" data-href="phase1/1-losses.html">the Deep Learning course, Phase 1 (losses)</span>.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>Two driving models are scored on a held-out log of expert driving. <b>Model A</b> predicts the expert's brake pedal correctly <b>96%</b> of the time. <b>Model B</b> gets <b>82%</b>. Same training data, same kind of model. You get to put one in the car.</p>
+    <p><b>Which one?</b> Lock in your answer; Playground 2 will show you one of these models crashing in 15 of 20 test drives. And the stranger fact: the worse one on paper got worse because it was given <i>more</i> information.</p>
+    <p>Why this matters now: Tesla's FSD v12 release notes (December 2023) described city driving as “a single end-to-end neural network trained on millions of video clips, replacing over 300k lines of explicit C++ code” (as reproduced by <a href="https://www.notateslaapp.com/software-updates/version/2023.44.30.10/release-notes" target="_blank" rel="noopener">Not a Tesla App</a>), and Tesla's Q4 2023 letter says “V12 utilizes end-to-end training” (<a href="https://digitalassets.tesla.com/tesla-contents/image/upload/IR/TSLA-Q4-2023-Update.pdf" target="_blank" rel="noopener">Tesla</a>). Every big AV company now has an answer to “are you end-to-end?”.</p>
+  </div>
+
+  <h2>Two ways to wire a car</h2>
+  <p>Press the button to send one camera frame through each design. The top row is the classic modular stack; every arrow is an <b>interface</b> a human designed: a list of boxes, a set of tracks, a few predicted paths. The bottom row is end-to-end: one network, trained on the final goal, with only learned numbers flowing inside it.</p>
+  <svg id="flowSvg"></svg>
+  <div class="controls">
+    <button class="btn primary" id="flowGo">▶ Send a frame through both</button>
+    <span class="muted" id="flowNote">Every interface in the top row is a place information can be dropped.</span>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what a box can't say</span>
+    <p>A pedestrian stands 1.0 m from the curb, walking toward the road at 0.4 m/s. The perception module sends the planner exactly that: a box at (x, y), velocity 0.4 m/s, class “pedestrian”.</p>
+    <ul>
+      <li>Case 1: she's looking at her phone, walking parallel to the curb with a slight drift.</li>
+      <li>Case 2: she's turned her head and is looking straight at your car, about to step out.</li>
+    </ul>
+    <p>Both produce <b>the same box</b>. A planner downstream literally cannot tell them apart, so it must either brake for both (annoying, and dangerous if the car behind you doesn't expect it) or brake for neither (dangerous). The pixels held the answer, the head direction, but the interface threw it away. Engineers can add a “head direction” field, then a “holding a phone” field, then a “waving you through” field… and the list never ends. End-to-end training lets the network decide what to keep, because it's graded only on the final driving.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · The lossy interface: will she cross?</span>
+    <p class="hint">3,000 simulated pedestrians near the curb, each with a distance to the curb, a walking speed toward the road, whether they're at a crosswalk, and which way their head is turned. About 1 in 5 crosses within 2 seconds. A model is trained on whatever the <b>interface</b> passes to it, and the car brakes when the predicted chance of crossing is above your threshold. Scores are per 1,000 new pedestrians.</p>
+    <div class="controls">
+      <label><input type="checkbox" checked disabled> position &amp; speed (the tracked box)</label>
+      <label><input type="checkbox" id="pedC"> + crosswalk (from the map)</label>
+      <label><input type="checkbox" id="pedG"> + head direction (only in the pixels)</label>
+    </div>
+    <div class="controls">
+      <label>brake if P(cross) &gt; <input type="range" id="pedTh" min="0.04" max="0.5" step="0.01" value="0.3"> <b class="mono" id="pedThV"></b></label>
+    </div>
+    <canvas class="chart" id="pedChart" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">missed crossings (danger) <b id="pedMiss">–</b></div>
+      <div class="stat">needless hard brakes <b id="pedFA">–</b></div>
+      <div class="stat">what the model can see <b id="pedSee">–</b></div>
+    </div>
+    <div class="verdict" id="pedVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> get <b>at most 25 missed crossings and at most 300 needless brakes</b> per 1,000. Slide the threshold all you like with just the box: you'll trade one failure for the other. Then widen the interface.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>End-to-end</b> means the whole mapping from sensors to driving is trained on the driving objective, so nothing is lost at hand-designed interfaces and the system improves by adding data rather than code. The price: you can no longer test each piece on its own, it's hard to see <i>why</i> it did something, and it can learn a shortcut that predicts the expert in the logs without being the real reason the expert acted.
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Modular stacks are made of hand-designed interfaces (boxes, tracks, lanes) and hand-written rules on top. Each interface drops information, each module's errors pass downstream unseen, and every new situation (a hand signal, a double-parked truck, a ball rolling into the road) needs new code. Tesla's own description of v12: replacing “over 300k lines of explicit C++ code”.</li>
+      <li><b>What people tried.</b> Better interfaces: richer outputs like occupancy grids and multi-modal predictions (Lessons 6.3 and 7.1). Learned planners on top of hand-built perception. Then <b>planning-oriented</b> networks that keep the modules but train them all together for planning, like UniAD (a CVPR 2023 best paper), and pure behavior cloning from pixels to steering like NVIDIA's 2016 DAVE-2 (Lesson 9.1).</li>
+      <li><b>Why end-to-end works.</b> The training signal is the thing you care about (did it drive like a good driver?), so the network keeps whatever helps, including cues no engineer listed. In Playground 1, a box-only model at a 0.3 threshold misses about 134 crossers per 1,000; letting the head direction through cuts that to about 61 at the same threshold, with slightly fewer needless brakes too. And it scales with data: more fleet video, not more code.</li>
+      <li><b>What it costs, when it fails.</b> <b>Validation</b>: you can't unit-test a perception module that doesn't exist; you test the whole driver, mostly in closed loop (Lessons 9.4 and 9.6). <b>Interpretability</b>: when it brakes for nothing, there's no box list to inspect. <b>Causal confusion</b>: with every pixel available, the network may latch onto a cue that predicts the expert's action without causing it (Playground 2). <b>Data hunger</b>: rare events are rare in video too.</li>
+      <li><b>What came next.</b> Hybrids that keep learned embeddings flowing end to end but also output <b>structured, checkable</b> things (objects, lanes, trajectories) for validation, as Waymo describes its Foundation Model. Language-model backbones that bring world knowledge (Waymo's EMMA research, Wayve's LINGO work). Reinforcement learning after imitation (Tesla's v14.3). And closed-loop benchmarks and learned simulators to test the whole driver (Lessons 9.3 and 9.4).</li>
+    </ol>
+  </div>
+
+  <h2>The trap: learning the wrong cue</h2>
+  <p>In 2019 de Haan, Jayaraman and Levine named a strange effect in imitation learning, <b>causal misidentification</b>: “access to more information can yield worse performance” (<a href="https://arxiv.org/abs/1905.11979" target="_blank" rel="noopener">Causal Confusion in Imitation Learning</a>). The model is trained to <i>predict</i> the expert's action, not to understand why the expert acted. If something in the input is a <b>consequence</b> of the expert's past actions, it can be the best predictor of all, and useless for driving.</p>
+  <p>Here's the classic kind of example. The camera sees part of the dashboard, where a light comes on whenever the brakes are pressed. Drivers hold the brake for a few seconds at a time, so “the light was on a moment ago” predicts “the driver is braking now” almost perfectly. The real reason the driver brakes, the car ahead getting close, is visible too, but blurrier. Guess which one an optimizer prefers.</p>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> a model that leans on the brake light. What happens when it drives itself, starting from cruising (light off)?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">It has learned “brake when the light is on”. With the light off, it needs the car ahead to be <i>very</i> close before the distance cue alone outweighs the missing light, so it starts braking far too late. In the logs this never mattered, because the expert always started the braking (and turned the light on) on time. On the road, the model has to start the braking itself, and the shortcut can't do that. Open-loop accuracy looks great; closed-loop driving crashes.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Causal confusion: the dashboard brake light</span>
+    <p class="hint">An expert follows a lead car that brakes at random, sometimes hard, holding the brake until it's at a comfortable distance. A logistic-regression “driver” is trained on the expert's logs. Its inputs: the <b class="se">time gap to the car ahead</b> as estimated from the camera (a bit noisy) and, if you allow it, the <b class="ag">dashboard brake light</b> (on if the car braked a moment ago). <b>Open-loop</b> = accuracy at predicting the expert on new logs. <b>Closed-loop</b> = 20 test drives where the model drives.</p>
+    <canvas class="strip" id="ccStrip"></canvas>
+    <div class="controls">
+      <label><input type="checkbox" id="ccLamp" checked> model can see the dashboard brake light</label>
+      <label>minutes of expert demos <input type="range" id="ccHours" min="1" max="6" step="1" value="2"> <b class="mono" id="ccHoursV"></b></label>
+      <label>camera distance noise <input type="range" id="ccNoise" min="0.05" max="0.4" step="0.05" value="0.1"> <b class="mono" id="ccNoiseV"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="ccTrain">🧠 Train &amp; test 20 drives</button>
+      <button class="btn" id="ccReplay">▶ Replay a test drive</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">open-loop accuracy <b id="ccAcc">–</b></div>
+      <div class="stat">closed-loop crashes (of 20) <b id="ccCrash">–</b></div>
+      <div class="stat">weight on distance <b id="ccWg">–</b></div>
+      <div class="stat">weight on brake light <b id="ccWl">–</b></div>
+    </div>
+    <div class="verdict" id="ccVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> <b>0 crashes in 20 test drives</b>. First try more minutes of demos with the light visible: does more data fix a wrong cue? Watch the open-loop accuracy when you finally win.</p>
+  </div>
+  <p>What you just saw is the reason end-to-end teams obsess over <b>closed-loop evaluation</b>: the model that wins the log-replay leaderboard (96%) is the one that crashes, and the model that “only” gets 82% drives perfectly. Masking the shortcut is one fix; de Haan et al. propose <b>targeted interventions</b>, asking the expert or the environment which inputs really matter. Real shortcuts are subtler than a dashboard light: the car's own speed and recent path (the “ego status”), a time of day that happens to correlate with traffic, the lead car's brake lights versus its actual distance. Codevilla et al. (2019) list “the lack of a causal model” among behavior cloning's core limitations for driving (<a href="https://arxiv.org/abs/1904.08980" target="_blank" rel="noopener">paper</a>). Lesson 9.4 shows the ego-status shortcut fooling a whole research benchmark.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Open end-to-end research mostly runs on public datasets and simulators: <b>nuScenes</b> and the <b>Waymo Open Dataset</b> for open-loop training, <b>nuPlan</b> (Motional's closed-loop planning benchmark), <b>NAVSIM</b> (a middle ground: non-reactive simulation scored on real data), <b>Bench2Drive</b> (closed-loop tests in CARLA with 44 scenarios over 220 routes), and <b>CARLA</b> itself. Models are ordinary PyTorch. The core training loop of an imitation-trained planner is short:</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn
+
+<span class="k">class</span> TinyDriver(nn.Module):                       <span class="c"># camera frames → future path (end to end)</span>
+    <span class="k">def</span> __init__(self, horizon=<span class="n">8</span>):
+        super().__init__()
+        self.enc = nn.Sequential(nn.Conv2d(<span class="n">3</span>, <span class="n">32</span>, <span class="n">5</span>, stride=<span class="n">2</span>), nn.ReLU(),
+                                 nn.Conv2d(<span class="n">32</span>, <span class="n">64</span>, <span class="n">5</span>, stride=<span class="n">2</span>), nn.ReLU(),
+                                 nn.AdaptiveAvgPool2d(<span class="n">1</span>), nn.Flatten())
+        self.head = nn.Linear(<span class="n">64</span> + <span class="n">2</span>, horizon * <span class="n">2</span>)      <span class="c"># + 2 = route command (e.g. turn left / go straight)</span>
+    <span class="k">def</span> forward(self, img, cmd):
+        <span class="k">return</span> self.head(torch.cat([self.enc(img), cmd], <span class="n">1</span>)).view(-<span class="n">1</span>, <span class="n">8</span>, <span class="n">2</span>)   <span class="c"># 8 future (x, y) waypoints</span>
+
+model = TinyDriver(); opt = torch.optim.AdamW(model.parameters(), <span class="n">3e-4</span>)
+<span class="k">for</span> img, cmd, expert_path <span class="k">in</span> loader:               <span class="c"># logged human driving</span>
+    loss = (model(img, cmd) - expert_path).abs().mean()  <span class="c"># L1 imitation loss on the waypoints</span>
+    opt.zero_grad(); loss.backward(); opt.step()
+<span class="c"># Notice: nothing here feeds in the car's own speed or past actions. Adding them lowers</span>
+<span class="c"># this loss quickly... and invites the shortcut of Playground 2 (see Lesson 9.4).</span></code></pre>
+    <p class="hint">Outputting a short path of waypoints (and letting a simple controller from Phase 8 follow it) is the common design in research; it's easier to check for collisions than raw steering and pedal commands.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / Wayve do it</span>
+    <div class="cols">
+      <div><h4>🚘 Tesla</h4><p>The most committed to end-to-end. v12 (release notes Dec 2023, wide release in 2024) replaced hand-written driving code with one network trained on video. Tesla's Q4 2024 letter credits v13 with a “4.2x increase in data, higher resolution video inputs, 2x reduction in photon-to-control latency and redesigned controller”. v14 (October 2025) brought “a large portion of the Robotaxi FSD model to consumers”, and Tesla's Jan 2026 letter calls it an “end-to-end foundation model trained on both customer and Robotaxi real-world data”. The product is still named <b>FSD (Supervised)</b>: a human must supervise.</p>
+        <p class="src">Sources: <a href="https://digitalassets.tesla.com/tesla-contents/image/upload/IR/TSLA-Q4-2024-Update.pdf" target="_blank" rel="noopener">Tesla Q4 2024</a>, <a href="https://assets-ir.tesla.com/tesla-contents/IR/TSLA-Q3-2025-Update.pdf" target="_blank" rel="noopener">Q3 2025</a>, <a href="https://assets-ir.tesla.com/tesla-contents/IR/TSLA-Q4-2025-Update.pdf" target="_blank" rel="noopener">Q4 2025</a>, <a href="https://www.tesla.com/fsd" target="_blank" rel="noopener">tesla.com/fsd</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Explicitly hybrid. Its Dec 2025 post says the Waymo Foundation Model “provides significant benefits over the pure end-to-end or modular approaches”: learned embeddings flow between components and it “supports full end-to-end signal backpropagation during training”, while “compact, materialized structured representations like objects, semantic attributes, and roadgraph elements” allow safety validation. It pairs a fast sensor-fusion encoder (camera, lidar, radar) with a Gemini-based driving VLM. Its Oct 2024 <b>EMMA</b> research mapped camera pixels straight to trajectories with a multimodal language model, and listed limits: up to 4 frames, no lidar or radar.</p>
+        <p class="src">Sources: <a href="https://waymo.com/blog/2025/12/demonstrably-safe-ai-for-autonomous-driving" target="_blank" rel="noopener">Waymo, Dec 2025</a>, <a href="https://waymo.com/blog/2024/10/introducing-emma/" target="_blank" rel="noopener">EMMA blog</a>, <a href="https://arxiv.org/abs/2410.23262" target="_blank" rel="noopener">EMMA paper</a></p></div>
+      <div><h4>🇬🇧 Wayve</h4><p>The London startup built around end-to-end “embodied AI” from the start, and the source of the GAIA world models (Lesson 9.3). Nissan announced in Dec 2025 that its next-generation ProPILOT will integrate “Wayve AI technology”, with the first model planned in Japan in fiscal year 2027; Uber and Wayve announced plans in June 2025 for public-road trials of Level 4 vehicles in London. (For drones, the end-to-end story is research-stage: Lesson 9.1's high-speed forest flight maps sensor data straight to trajectories.)</p>
+        <p class="src">Sources: <a href="https://global.nissannews.com/en/releases/251210-01-e" target="_blank" rel="noopener">Nissan, Dec 2025</a>, <a href="https://arxiv.org/abs/2309.17080" target="_blank" rel="noopener">GAIA-1</a>, <a href="https://arxiv.org/abs/2110.05113" target="_blank" rel="noopener">high-speed flight</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> Tesla sells millions of camera-only cars, so its edge is video volume, and an end-to-end network is the design that turns volume into skill. Waymo runs driverless robotaxis today and must convince regulators and itself that each release is safe, so it keeps structured outputs it can check. Wayve has neither a huge fleet nor HD maps everywhere, so it bets on a network that generalizes to new cities and carmakers' hardware.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Modular, hand-designed interfaces</td><td>Each module testable alone; inspectable; easy to add rules (“never enter a red-light intersection”)</td><td>Information lost at every interface; errors cascade; endless special cases in code</td></tr>
+      <tr><td>Pure end-to-end (pixels → path or controls)</td><td>Keeps every useful cue; improves with data; one model to optimize</td><td>Hard to validate and explain; shortcuts and causal confusion; needs huge, well-curated data</td></tr>
+      <tr><td>Hybrid (end-to-end training + structured outputs)</td><td>Gradient flows through everything, yet objects, lanes and paths can be checked</td><td>More complex training; the structured outputs constrain what the model can express</td></tr>
+      <tr><td>Language-model backbone (EMMA, LINGO)</td><td>World knowledge (“a school bus with flashing lights”); can explain itself in words</td><td>Big and slow for real-time control; explanations aren't guaranteed to be the real reason</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Would you build our driving stack end-to-end or modular?” Interviewers want trade-offs, not a side:</p>
+    <ul>
+      <li>Explain the <b>lossy interface</b> argument with an example (head direction, hand signals) and the <b>scaling</b> argument (data instead of code).</li>
+      <li>Explain the costs: <b>validation</b> without module-level tests, <b>interpretability</b>, and <b>causal confusion</b>, with a concrete shortcut (brake light, ego speed).</li>
+      <li>Propose a <b>hybrid</b>: end-to-end training with structured intermediate outputs for monitoring, a rule-based safety checker on the final trajectory, and closed-loop simulation as the main metric.</li>
+      <li>Mention <b>where</b> it would run: a camera-only consumer car under human supervision is a different risk budget from a driverless robotaxi.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Tesla FSD v12 → v14</b> <span class="tag co">🏢 Company · 2023–2026</span> <a href="https://assets-ir.tesla.com/tesla-contents/IR/TSLA-Q1-2026-Update.pdf" target="_blank" rel="noopener">Tesla Q1 2026 update</a></div>
+      <p><b>How:</b> one network from the car's cameras to driving, trained on fleet video (v12), scaled up with more data, higher-resolution video and lower photon-to-control latency (v13), merged with the Robotaxi model (v14), with an upgraded reinforcement-learning stage in v14.3 (April 2026).</p>
+      <p><b>Why this method:</b> camera-only hardware plus millions of cars means data is plentiful and code is the bottleneck.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Waymo Foundation Model</b> <span class="tag av">🚗 AV · 2025</span> <a href="https://waymo.com/blog/2025/12/demonstrably-safe-ai-for-autonomous-driving" target="_blank" rel="noopener">Demonstrably Safe AI</a></div>
+      <p><b>How:</b> a sensor-fusion encoder and a driving VLM feed a World Decoder that predicts other road users, produces maps and generates trajectories, trained end to end but with structured outputs.</p>
+      <p><b>Why this method:</b> keep the learning benefits while keeping things a safety case can check.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>UniAD</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2212.10156" target="_blank" rel="noopener">Planning-oriented Autonomous Driving</a></div>
+      <p><b>How:</b> perception, prediction and planning tasks in one network, connected by learned queries and all trained toward planning; a CVPR 2023 best paper.</p>
+      <p><b>Why this method:</b> separate modules “might suffer from accumulative errors or deficient task coordination”, as the paper puts it.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Closed-loop benchmarks</b> <span class="tag oss">🧰 Open source</span> <a href="https://arxiv.org/abs/2406.03877" target="_blank" rel="noopener">Bench2Drive</a></div>
+      <p><b>How:</b> nuPlan (2021) scores planners in closed loop with reactive agents on real logs; NAVSIM (2024) uses short non-reactive simulation; Bench2Drive (2024) runs end-to-end models through 220 routes in CARLA.</p>
+      <p><b>Why this method:</b> open-loop scores rewarded shortcuts (Lesson 9.4); driving the model is the honest test.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · “photon-to-control”</span>
+    <p>Tesla's own shareholder letter uses the phrase this lesson is named after: v13 halved the <b>photon-to-control latency</b>, the time from light hitting the camera sensor to the car acting on it. At 30 m/s (about 108 km/h), every 100 ms saved is 3 meters of road the car reacts sooner. In an end-to-end design there's no pipeline of modules to wait on, just one network to make faster.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>End-to-end driving is behavior cloning at scale (Lesson 9.1), so it inherits covariate shift and adds causal confusion. It can't be judged on logs, which is why learned world models (9.3) and closed-loop simulation (9.4) matter so much, and why the fleet data engine (9.5) and safety validation (9.6) are the real bottlenecks. The modules it replaces are Phases 6–8: BEV perception and occupancy (6.2, 6.3), prediction (7.1), planning (7.6) and control (8.3). For the networks themselves, see <span class="dlref" data-href="phase4/5-vit.html">the Deep Learning course, Phase 4 (vision transformers)</span> and <span class="dlref" data-href="phase6/4-transformer-block.html">Phase 6 (the transformer block)</span>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1905.11979" target="_blank" rel="noopener">de Haan, Jayaraman &amp; Levine (2019): Causal Confusion in Imitation Learning</a>. More information, worse driving.</li>
+      <li><span class="kind">Blog</span> <a href="https://waymo.com/blog/2025/12/demonstrably-safe-ai-for-autonomous-driving" target="_blank" rel="noopener">Waymo: Demonstrably Safe AI for Autonomous Driving</a>. The clearest public description of a hybrid design.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2410.23262" target="_blank" rel="noopener">EMMA (Waymo, 2024)</a>. A multimodal language model that outputs trajectories, objects and road graphs from camera images.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A car at 25 m/s cuts its photon-to-control latency from 200 ms to 100 ms. How much sooner (in road distance) does it start reacting?</div>
+    <div class="opts"><button class="opt">0.25 m</button><button class="opt" data-ok>2.5 m</button><button class="opt">25 m</button></div>
+    <div class="explain">Distance = speed × time saved = 25 m/s × 0.1 s = <b>2.5 m</b>. That's half a car length of extra braking room, from software alone.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A driving model scores 96% at predicting the expert's braking on held-out logs, but crashes in closed loop. Removing one input drops it to 82% offline and stops the crashes. What happened?</div>
+    <div class="opts"><button class="opt">The 82% model is underfitting; add the input back and train longer</button><button class="opt" data-ok>The removed input was a consequence of the expert's past actions (a shortcut), not the cause of braking</button><button class="opt">Closed-loop tests are noisy, so the two models are really equal</button></div>
+    <div class="explain">Causal confusion: a cue like “the brake light was on a moment ago” predicts the next action in logs but can't start a braking event on its own. Offline accuracy rewards it; driving punishes it (Playground 2).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Which design best matches Waymo's December 2025 description of its Foundation Model?</div>
+    <div class="opts"><button class="opt">Separate hand-coded modules with no learning between them</button><button class="opt">One network from pixels to steering with no intermediate outputs</button><button class="opt" data-ok>End-to-end trainable with learned embeddings between components, plus structured outputs (objects, roadgraph) used for validation</button></div>
+    <div class="explain">Waymo says it “provides significant benefits over the pure end-to-end or modular approaches”: full backpropagation in training, plus compact structured representations for safety validation, simulation and evaluation.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Modular stacks pass hand-designed summaries (boxes, tracks) between modules; each interface can drop the cue you needed (head direction, hand signals).</li>
+      <li>End-to-end trains sensors → driving on the driving objective: nothing lost at interfaces, and it improves with data instead of code.</li>
+      <li>Costs: hard to validate module by module, hard to explain, and prone to causal confusion: a 96%-accurate model on logs can crash 15 drives in 20.</li>
+      <li>Tesla is all-in (v12 → v14, “photon-to-control”); Waymo is hybrid with structured, checkable outputs; Wayve built end-to-end from day one.</li>
+      <li>Judge end-to-end models by driving them in closed loop (Lesson 9.4), not by log accuracy.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/sim.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  const sig = z => 1 / (1 + Math.exp(-z));
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+
+  // ---------- Flow: modular vs end-to-end ----------
+  const F = new Flow($("flowSvg"), { width: 760, height: 250 });
+  F.node("cam1", { x: 50, y: 60, w: 78, h: 44, label: "Cameras", kind: "se" })
+   .node("det", { x: 165, y: 60, w: 96, h: 44, label: "Detector", sub: "boxes", kind: "be" })
+   .node("trk", { x: 285, y: 60, w: 96, h: 44, label: "Tracker", sub: "tracks", kind: "be" })
+   .node("pred", { x: 405, y: 60, w: 96, h: 44, label: "Prediction", sub: "paths", kind: "ag" })
+   .node("plan", { x: 525, y: 60, w: 96, h: 44, label: "Planner", sub: "trajectory", kind: "pl" })
+   .node("ctl1", { x: 655, y: 60, w: 100, h: 44, label: "Controller", sub: "steer, pedals", kind: "ct" })
+   .node("cam2", { x: 50, y: 180, w: 78, h: 44, label: "Cameras", kind: "se" })
+   .node("net", { x: 345, y: 180, w: 300, h: 50, label: "One network (trained on driving)", sub: "learned features inside", kind: "be" })
+   .node("ctl2", { x: 655, y: 180, w: 100, h: 44, label: "Controller", sub: "follows the path", kind: "ct" });
+  F.edge("cam1", "det").edge("det", "trk").edge("trk", "pred").edge("pred", "plan").edge("plan", "ctl1")
+   .edge("cam2", "net").edge("net", "ctl2", { label: "trajectory" });
+  F.render();
+  let flowBusy = false;
+  $("flowGo").onclick = async () => {
+    if (flowBusy) return; flowBusy = true;
+    $("flowNote").textContent = "Top: 4 hand-designed hand-offs. Bottom: one learned mapping.";
+    await Promise.all([
+      F.packet(["cam1", "det", "trk", "pred", "plan", "ctl1"], { color: "--c-se", dur: 600 }),
+      F.packet(["cam2", "net", "ctl2"], { color: "--c-pl", dur: 1500 }),
+    ]);
+    F.set("det", { sub: "head turn? dropped", hot: true }); setTimeout(() => { F.set("det", { sub: "boxes", hot: false }); flowBusy = false; }, 1800);
+  };
+
+  // ---------- Playground 1: lossy interface ----------
+  function makePeds(n, seed) {
+    const r = Sim.rng(seed), P = [];
+    for (let i = 0; i < n; i++) {
+      const d = 3 * r(), s = -0.3 + 1.3 * r(), g = r() < 0.35 ? 1 : 0, c = r() < 0.3 ? 1 : 0;
+      P.push({ d, s, g, c, y: r() < sig(-3.2 + 1.6 * s - 0.9 * d + 3.4 * g + 1.4 * c) ? 1 : 0 });
+    }
+    return P;
+  }
+  const train = makePeds(3000, 1), test = makePeds(2000, 2);
+  const feat = (p, m) => { const f = [1, p.d, p.s]; if (m.c) f.push(p.c); if (m.g) f.push(p.g); return f; };
+  function trainLR(P, m) {
+    const X = P.map(p => feat(p, m)), y = P.map(p => p.y); let w = new Array(X[0].length).fill(0);
+    for (let k = 0; k < 400; k++) {
+      const gr = w.map(() => 0);
+      for (let i = 0; i < X.length; i++) { let z = 0; for (let j = 0; j < w.length; j++) z += X[i][j] * w[j]; const e = sig(z) - y[i]; for (let j = 0; j < w.length; j++) gr[j] += e * X[i][j]; }
+      w = w.map((v, j) => v - 0.8 * gr[j] / X.length);
+    }
+    return w;
+  }
+  const pedModels = {};
+  function pedModel() { const m = { c: $("pedC").checked, g: $("pedG").checked }, k = (m.c ? "c" : "") + (m.g ? "g" : ""); if (!pedModels[k]) pedModels[k] = { m, w: trainLR(train, m) }; return pedModels[k]; }
+  function pedRun() {
+    const { m, w } = pedModel(), th = +$("pedTh").value; let miss = 0, fa = 0;
+    for (const p of test) { const f = feat(p, m); let z = 0; for (let j = 0; j < w.length; j++) z += f[j] * w[j]; const br = sig(z) > th; if (p.y && !br) miss++; if (!p.y && br) fa++; }
+    miss = Math.round(miss / 2); fa = Math.round(fa / 2);
+    $("pedThV").textContent = fmt(th, 2); $("pedMiss").textContent = miss + " / 1000"; $("pedFA").textContent = fa + " / 1000";
+    $("pedSee").textContent = ["box", m.c ? "crosswalk" : null, m.g ? "head" : null].filter(Boolean).join(" + ");
+    Plot.bars($("pedChart"), { bars: [
+      { label: "missed crossings", value: miss, color: MX.css("--c-ag"), marker: 25 },
+      { label: "needless hard brakes", value: fa, color: MX.css("--c-un"), marker: 300 },
+    ], yMin: 0, yMax: 800, yLabel: "per 1,000 pedestrians" });
+    const win = miss <= 25 && fa <= 300;
+    $("pedVerdict").innerHTML = win ? `<span class="badge-win">🏆 ${miss} missed, ${fa} needless brakes</span> ${m.g ? "The head direction was the missing cue: the box alone can't carry it." : ""}`
+      : `<span class="badge-lose">${miss > 25 ? "Too many missed crossings" : "Too many needless brakes"}</span> <span class="muted">Dashed lines are the targets.</span>`;
+  }
+  ["pedC", "pedG"].forEach(id => ($(id).onchange = pedRun)); $("pedTh").oninput = pedRun; pedRun();
+
+  // ---------- Playground 2: causal confusion ----------
+  const DT = 0.1, VMAX = 15, BRK = 7, ACC = 1.5, HI = 2.0, LO = 1.3, EPLEN = 600;
+  const headway = (g, v) => (g - 4) / Math.max(v, 1);
+  const expertAct = (g, v, prev) => { const h = headway(g, v); return prev ? (h < HI ? 1 : 0) : (h < LO ? 1 : 0); };
+  function makeLead(r) { const v = []; let lv = VMAX, tgt = VMAX; for (let i = 0; i < EPLEN; i++) { if (r() < 0.01) tgt = r() < 0.4 ? 0 : 4 + 8 * r(); if (lv > tgt) lv = Math.max(tgt, lv - 6 * DT); else lv = Math.min(tgt, lv + 1 * DT); if (Math.abs(lv - tgt) < 0.01 && tgt < VMAX && r() < 0.02) tgt = VMAX; v.push(lv); } return v; }
+  function episode(policy, r, rec) {
+    const lead = makeLead(r); let xl = 40, x = 0, v = VMAX, lamp = 0, crash = false; const data = [], trace = [];
+    for (let i = 0; i < EPLEN; i++) {
+      xl += lead[i] * DT; const g = xl - x;
+      if (g <= 0) { crash = true; trace.push({ x, xl, v, lamp, crash: true }); break; }
+      const a = policy(g, v, lamp, r); if (rec) data.push({ g, v, lamp, a });
+      v = a ? Math.max(0, v - BRK * DT) : Math.min(VMAX, v + ACC * DT); x += v * DT; lamp = a;
+      trace.push({ x, xl, v, lamp });
+    }
+    return { data, crash, trace };
+  }
+  let ccModel = null, ccTraces = [], ccShow = 0;
+  function ccTrain() {
+    const useLamp = $("ccLamp").checked, hours = +$("ccHours").value, noise = +$("ccNoise").value;
+    const r = Sim.rng(5); let D = [];
+    for (let e = 0; e < hours * 6; e++) D = D.concat(episode((g, v, l) => expertAct(g, v, l), r, true).data);   // one-minute logs
+    const rf = Sim.rng(9), feats = (g, v, lamp, rr) => [1, Math.min(headway(g, v) + noise * Sim.randn(rr), 4), useLamp ? lamp : 0];
+    const X = D.map(d => feats(d.g, d.v, d.lamp, rf)), y = D.map(d => d.a);
+    let w = [0, 0, 0];
+    for (let k = 0; k < 300; k++) { const gr = [0, 0, 0]; for (let i = 0; i < X.length; i++) { const x = X[i], e = sig(x[0] * w[0] + x[1] * w[1] + x[2] * w[2]) - y[i]; gr[0] += e * x[0]; gr[1] += e * x[1]; gr[2] += e * x[2]; } w = w.map((wj, j) => wj - 0.5 * (gr[j] / X.length + 1e-3 * wj)); }
+    // open-loop accuracy on fresh expert logs
+    const r3 = Sim.rng(77); let ok = 0, n = 0;
+    for (let e = 0; e < 10; e++) episode((g, v, l) => expertAct(g, v, l), r3, true).data.forEach(d => { const f = feats(d.g, d.v, d.lamp, r3); if ((f[0] * w[0] + f[1] * w[1] + f[2] * w[2] > 0 ? 1 : 0) === d.a) ok++; n++; });
+    const pol = (g, v, lamp, rr) => { const f = feats(g, v, lamp, rr); return f[0] * w[0] + f[1] * w[1] + f[2] * w[2] > 0 ? 1 : 0; };
+    const r4 = Sim.rng(123); let crashes = 0; ccTraces = [];
+    for (let e = 0; e < 20; e++) { const o = episode(pol, r4, false); if (o.crash) crashes++; ccTraces.push(o); }
+    ccModel = { w, acc: ok / n, crashes, useLamp };
+    $("ccAcc").textContent = fmt(100 * ccModel.acc, 1) + "%"; $("ccCrash").textContent = crashes;
+    $("ccWg").textContent = fmt(w[1], 2); $("ccWl").textContent = useLamp ? fmt(w[2], 2) : "masked";
+    $("ccVerdict").innerHTML = crashes === 0
+      ? `<span class="badge-win">🏆 0 crashes in 20 drives</span> with only ${fmt(100 * ccModel.acc, 0)}% open-loop accuracy. ${useLamp ? "" : "Masking the shortcut made the model learn the real cause: the gap to the car ahead."}`
+      : `<span class="badge-lose">${crashes} crashes in 20 drives</span> <span class="muted">${useLamp ? "Look at the weights: the brake light outweighs the distance. More minutes of the same logs won't change that." : "No shortcut now, but a noisy distance estimate makes braking late. Turn the noise down."}</span>`;
+    ccShow = Math.max(0, ccTraces.findIndex(t => t.crash)); ccReplay();
+  }
+  const S = new Sim($("ccStrip"), { xRange: [-12, 58], yRange: [-3.5, 6.5] });
+  let ccFrame = 0;
+  S.render(w => {
+    w.clear();
+    w.rect(-12, -2, 70, 4, { fill: "--panel", alpha: 1 });
+    w.line([[-12, 0], [58, 0]], { color: "--line", width: 1, dash: [8, 8] });
+    if (!ccTraces.length) { w.text([23, 4.5], "Train a model to see a test drive", { color: "--muted", size: 12 }); return; }
+    const tr = ccTraces[ccShow].trace, f = tr[Math.min(ccFrame, tr.length - 1)], gap = f.xl - f.x;
+    w.car({ x: -1.35, y: 0, th: 0 }, { color: "--c-ct", L: 2.7, width: 1.8 });
+    w.car({ x: gap - 1.35 - 2.7, y: 0, th: 0 }, { color: "--c-ag", L: 2.7, width: 1.8 });
+    w.circle(-8, 4.4, 1.0, { fill: f.lamp ? "--c-ag" : "--panel", stroke: "--muted", width: 1.5 });
+    w.text([-5.8, 4.4], "dashboard brake light", { color: "--muted", size: 11, align: "left" });
+    w.text([30, 4.4], `drive ${ccShow + 1} of 20 · speed ${fmt(f.v, 1)} m/s · time gap ${fmt(Math.max(0, headway(gap, f.v)), 1)} s`, { color: "--muted", size: 11 });
+    if (f.crash) w.text([gap - 2, 3.2], "💥 crash", { color: "--c-ag", size: 14, bold: true });
+  });
+  function ccReplay() {
+    if (!ccTraces.length) return;
+    const tr = ccTraces[ccShow].trace; ccFrame = Math.max(0, tr.length - 260);
+    S.stop(); S.run(() => { ccFrame += 2; return ccFrame < tr.length - 1; });
+  }
+  $("ccTrain").onclick = ccTrain;
+  $("ccReplay").onclick = () => { if (!ccTraces.length) { ccTrain(); return; } ccShow = (ccShow + 1) % 20; ccReplay(); };
+  const ccLabels = () => { $("ccHoursV").textContent = (6 * $("ccHours").value) + " min"; $("ccNoiseV").textContent = "± " + $("ccNoise").value + " s"; };
+  ["ccHours", "ccNoise"].forEach(id => ($(id).oninput = ccLabels)); ccLabels();
+})();
+</script>
+</body>
+</html>

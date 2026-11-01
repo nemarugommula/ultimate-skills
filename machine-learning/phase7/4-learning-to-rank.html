@@ -1,0 +1,466 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.4 Learning to rank · Machine Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌲</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .serp { list-style: none; padding: 0; margin: 10px 0; display: grid; gap: 6px; }
+  .serp li { display: grid; grid-template-columns: 30px 1fr auto auto; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); cursor: grab; user-select: none; touch-action: none; }
+  .serp li.drag { opacity: .6; border-style: dashed; border-color: var(--accent); }
+  .serp .pos { font: 700 .9rem var(--mono); color: var(--muted); text-align: center; }
+  .serp .ttl { font-size: .92rem; }
+  .serp .grade { font: 700 .8rem var(--mono); padding: 2px 8px; border-radius: 99px; background: var(--panel); white-space: nowrap; }
+  .serp .g3 { color: var(--good); } .serp .g2 { color: var(--c-tg); } .serp .g1 { color: var(--c-bd); } .serp .g0 { color: var(--c-lo); }
+  .serp .mv { display: flex; gap: 2px; } .serp .mv button { font: inherit; font-size: .8rem; padding: 2px 7px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+  .serp .contrib { font: .72rem var(--mono); color: var(--muted); }
+  @media (max-width: 640px) { .serp li { grid-template-columns: 24px 1fr auto; } .serp .grade { display: none; } }
+</style>
+</head>
+<body data-lesson="ml7-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 4</div>
+  <h1>Learning to rank</h1>
+  <p class="subtitle">Search results, product listings, feeds, the reranked candidates of a recommender: whenever the output is an <i>ordered list</i>, what matters is the order, not the scores. Learning to rank trains models on exactly that, and gradient-boosted LambdaMART has been the workhorse for fifteen years.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Gradient boosting fits each new tree to the <b>gradient</b> of the loss: “which way should each prediction move?” (Lesson 4.3).</li>
+      <li>Logistic loss turns a score difference into a probability (Lesson 2.3).</li>
+      <li>A recommender retrieves a few hundred candidates; something must then order them (Lesson 7.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook: the top result gets the click, even when it's worse</span>
+    <p>In a 2005 eye-tracking study at Cornell, Thorsten Joachims and colleagues watched students use Google. Users looked at the first and second results about equally often, yet clicked the <b>first one substantially more</b>. Then the researchers secretly <b>swapped</b> the top two results for some users.</p>
+  </div>
+
+  <div class="predict" data-answer="1">
+    <span class="label">🔮 Predict first</span>
+    <p>With the top two swapped, so the less relevant page now sits at #1, what did users do?</p>
+    <div class="choices"><button>They found the better page at #2 and clicked it</button><button>They still mostly clicked #1</button><button>They stopped clicking either</button></div>
+    <div class="reveal">Even in the swapped condition the authors still found “a strong bias to click on link one”, although the second abstract was more relevant. Users <b>trust the ranking</b>. Two consequences you'll handle below: the top few positions matter enormously (so the metric must weigh them most), and clicks are a <b>biased</b> label for training the next ranker.</div>
+  </div>
+
+  <h2>Numbers first: grading a results page</h2>
+  <p>Ranking data comes in <b>query groups</b>: for each query, a list of candidate documents, each with <span class="ft">features</span> (text match, freshness, popularity…) and a graded <span class="tg">relevance label</span> from human raters, say 0 = irrelevant, 1 = marginal, 2 = good, 3 = perfect. Here's one query and the order our current model shows:</p>
+  <table>
+    <tr><th>Position</th><th>Result for “women's trail running shoes”</th><th class="tg">Grade</th><th>Gain 2<sup>grade</sup> − 1</th><th>Discount 1 ⁄ log₂(position + 1)</th><th class="mt">Contribution</th></tr>
+    <tr><td>1</td><td>Men's road running shoes: summer sale</td><td>1</td><td>1</td><td>1.000</td><td>1.000</td></tr>
+    <tr><td>2</td><td>Women's trail running shoes: buying guide</td><td>3</td><td>7</td><td>0.631</td><td>4.417</td></tr>
+    <tr><td>3</td><td>Trail running in the Alps: a travel blog</td><td>0</td><td>0</td><td>0.500</td><td>0</td></tr>
+    <tr><td>4</td><td>Women's waterproof trail shoes, tested</td><td>2</td><td>3</td><td>0.431</td><td>1.292</td></tr>
+  </table>
+  <p>Add up the contributions and you get the <b>DCG</b> (discounted cumulative gain) of the page: 6.71 for these four positions. The best possible order puts the 3 first, then the 2, then the 1: DCG = 7 + 1.893 + 0.5 = 9.39. Their ratio is <b>NDCG</b> (normalized DCG) = 6.71 ÷ 9.39 = <span class="mt">0.71</span>. A perfect page scores 1.</p>
+  <div class="eq">NDCG@k = DCG@k ⁄ ideal DCG@k, &nbsp; DCG@k = Σ<sub>i=1..k</sub> (2<sup><span class="tg">rel<sub>i</sub></span></sup> − 1) ⁄ log₂(i + 1)
+    <span class="say">“Score each of the top k results by how good it is, shrink the score the further down it sits, add them up, and divide by the score of the best possible order.”</span></div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A ranker is judged by the <b>order</b> it produces <b>within each query</b>, with the top positions weighted most (NDCG@k). Pointwise models predict each document's grade separately; pairwise models learn which of two documents should come first; listwise models (LambdaRank, LambdaMART) push hardest on the swaps that change NDCG the most.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: judging a talent show</span>
+    <p>A judge who gives everyone scores out of 10 (pointwise) can be harsh on Monday and generous on Friday; all that matters is whether she puts the best act first. A judge who only compares two acts at a time (pairwise) never has a “harsh day” problem. And a judge who knows only the top three get prizes (listwise, NDCG@3) spends her attention on the close calls near the top, not on 17th versus 18th place.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? Why LambdaMART?</span>
+    <ol>
+      <li><b>The problem before.</b> Early search engines ranked by hand-tuned formulas: a text-match score such as BM25, plus link popularity, plus freshness, with weights someone adjusted by eye. With hundreds of signals, hand-tuning stops working.</li>
+      <li><b>What people tried.</b> <b>Pointwise</b>: regress the grade from the features. It wastes effort getting absolute scores right across queries, when only the order inside each query matters. <b>Pairwise</b>: RankNet (Burges et al., 2005) learns from pairs “A should beat B” with a logistic loss. Better, but every misordered pair costs the same, whether it's positions 1 and 2 or 50 and 51.</li>
+      <li><b>Why this works.</b> LambdaRank keeps the pairwise gradient but multiplies it by <b>how much NDCG would change if the two swapped</b>. Swapping a grade-3 and a grade-0 document at positions 1 and 2 changes DCG by 7 × (1 − 0.631) = <b>2.58</b>; the same pair at positions 9 and 10 changes it by 7 × (0.301 − 0.289) = <b>0.084</b>, 31 times less, so that pair gets 31 times less push. LambdaMART feeds these “lambda” gradients to boosted trees (MART, multiple additive regression trees). In Playground 2 it reaches NDCG@3 <span class="mt">0.83</span> against <span class="lo">0.78</span> for plain pairwise.</li>
+      <li><b>What it costs, when it fails.</b> You need labelled query groups: human grades are expensive, clicks are cheap but biased by position (Playground 3). Training cost grows with the number of pairs per query. NDCG at a fixed k ignores everything below it. Features are query–document pairs you must engineer.</li>
+      <li><b>What came next.</b> <b>Unbiased learning to rank</b> from clicks, weighting each click by the inverse chance it was seen (Joachims et al., 2017); neural rerankers that read query and document together (cross-encoders, <a href="../../ai-engineer/phase3/4-retrieval-reranking.html">AI Engineer 3.4</a>); and LLM-based reranking. LambdaMART stays the default for feature-based ranking.</li>
+    </ol>
+  </div>
+
+  <h2>Step 1: feel NDCG with your hands</h2>
+  <div class="predict" data-answer="0">
+    <span class="label">🔮 Predict first</span>
+    <p>Which hurts NDCG@6 more: swapping the results at positions 1 and 2, or at positions 5 and 6 (same two grades, 3 and 0, in each case)?</p>
+    <div class="choices"><button>Positions 1 and 2, by a lot</button><button>About the same</button><button>Positions 5 and 6</button></div>
+    <div class="reveal">Positions 1 and 2: the discount drops from 1.000 to 0.631 there, but only from 0.387 to 0.356 between 5 and 6. Drag the cards below and watch the contributions.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Drag the results, watch NDCG</span>
+    <p class="hint">Six results for “women's trail running shoes”, in the order our model returned them. <b>Drag</b> a card (or use ↑ ↓) to reorder. Each card shows its grade and its contribution to DCG. Switch the gain: XGBoost and LightGBM default to 2<sup>grade</sup> − 1, scikit-learn's <code>ndcg_score</code> uses the grade itself.</p>
+    <div class="controls">
+      <label>cut-off <span class="bd">k</span> <input type="range" id="nk" min="1" max="6" step="1" value="4"> <b class="mono" id="nkv"></b></label>
+      <span class="seg" id="gainSeg"><button data-v="exp" class="on">gain 2<sup>g</sup> − 1</button><button data-v="lin">gain = grade</button></span>
+      <span class="goal" id="goalN">🎯 Goal: NDCG@k = 1.000</span>
+    </div>
+    <ol class="serp" id="serp"></ol>
+    <div class="controls"><button class="btn" id="nIdeal">✨ Ideal order</button><button class="btn" id="nShuffle">🎲 Shuffle</button><button class="btn" id="nReset">↺ Model's order</button></div>
+    <div class="stat-row">
+      <div class="stat">DCG@k <b id="nDcg">–</b></div>
+      <div class="stat">ideal DCG@k <b id="nIdcg">–</b></div>
+      <div class="stat">NDCG@k <b id="nNdcg">–</b></div>
+      <div class="stat">misordered pairs <b id="nPairs">–</b></div>
+    </div>
+    <p class="hint" id="nMsg"></p>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the ideal DCG@4 for the playground's query</span>
+    <p>The grades available are 3, 3, 2, 1, 1, 0. The ideal top 4 is 3, 3, 2, 1.</p>
+    <ul>
+      <li>Gains: 7, 7, 3, 1. Discounts: 1, 0.631, 0.5, 0.431.</li>
+      <li>Ideal DCG@4 = 7 + 4.417 + 1.5 + 0.431 = <b>13.35</b>.</li>
+      <li>The model's order (1, 3, 0, 2, 3, 1) has DCG@4 = 1 + 4.417 + 0 + 1.292 = 6.71, so NDCG@4 = 6.71 ÷ 13.35 = <b>0.50</b>. (The table above used only the first four results as the whole list, so its ideal was smaller.)</li>
+    </ul>
+  </div>
+
+  <h2>Step 2: pointwise, pairwise, listwise</h2>
+  <table>
+    <tr><th>Approach</th><th>Trains on</th><th>Loss in words</th><th>Examples</th></tr>
+    <tr><td><b>Pointwise</b></td><td>single documents</td><td>“predict this document's grade”</td><td>any regressor or classifier</td></tr>
+    <tr><td><b>Pairwise</b></td><td>pairs in the same query</td><td>“the better one should score higher” (logistic on the score difference)</td><td>RankNet, RankSVM, XGBoost <code>rank:pairwise</code></td></tr>
+    <tr><td><b>Listwise</b></td><td>the whole list</td><td>“move the swaps that change NDCG most”</td><td>LambdaRank, LambdaMART: XGBoost <code>rank:ndcg</code>, LightGBM <code>lambdarank</code></td></tr>
+  </table>
+  <p>One trap catches pointwise models: features that shift <b>per query</b>. A popular query's documents all have high click counts; an obscure query's all have low ones. A pointwise model must explain those shifts in absolute grades, which it can't. A pairwise model compares documents inside the same query, so any shift shared by the whole query cancels out.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Three ways to train the same linear ranker</span>
+    <p class="hint">60 training and 60 test queries, 10 documents each, two features: <span class="ft">text match</span> (noisy but honest) and <span class="ft">length</span>, which separates junk (very short) from the rest but is <b>reversed at the top</b>: the best pages are concise. The slider adds a per-query shift to both features. Each method fits a weight for each feature; we score all three on the test queries.</p>
+    <div class="controls">
+      <label><span class="bd">per-query shift</span> <input type="range" id="qoff" min="0" max="4" step="0.5" value="0"> <b class="mono" id="qoffv"></b></label>
+      <label>metric cut-off <span class="bd">k</span> <input type="range" id="lk" min="1" max="10" step="1" value="3"> <b class="mono" id="lkv"></b></label>
+      <button class="btn primary" id="ltrTrain">🏋️ Train all three</button>
+    </div>
+    <canvas class="chart" id="ltrChart" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">pointwise NDCG@k <b id="lPt">–</b></div>
+      <div class="stat">pairwise NDCG@k <b id="lPw">–</b></div>
+      <div class="stat">LambdaRank NDCG@k <b id="lLm">–</b></div>
+      <div class="stat">pairs right (pairwise / Lambda) <b id="lPa">–</b></div>
+    </div>
+    <p class="hint" id="lMsg"></p>
+  </div>
+  <p>Two results to notice. With no shift, LambdaRank gets <b>fewer</b> pairs right overall than pairwise (80.8% vs 83.8%) yet scores higher NDCG@3 (<span class="mt">0.83</span> vs 0.78): it gives the “length” feature a negative weight because that is what matters at the top, and accepts more mistakes among the junk below. And as the per-query shift grows, the pointwise model sinks (0.81 → 0.77 at shift 3) while both pair-based models don't move at all.</p>
+
+  <h2>Step 3: learning from clicks, and position bias</h2>
+  <p>Human grades are expensive, so most systems learn from <b>clicks</b>. But a click depends on two things: was the result <b>seen</b>, and was it <b>relevant</b>? The chance of being seen falls with position; that's <b>position bias</b>. Train on raw clicks and the new model learns “whatever was on top is good”, copies the old ranking, and the feedback loop locks in. The fix is <b>inverse propensity scoring</b> (IPS): estimate how often each position is examined (by occasionally swapping results, as Joachims did) and weight each click by 1 ⁄ that probability. A click at position 8, rarely seen, counts for much more than one at position 1.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Clicks lie; reweight them</span>
+    <p class="hint">8 documents with known true relevance, shown in our old ranker's (imperfect) order to simulated users. A user examines position i with probability (1 ⁄ i)<sup><span class="bd">η</span></sup> and clicks if the document is relevant. We then re-rank by naive click-through rate and by IPS-weighted clicks, and grade both orders against the truth.</p>
+    <div class="controls">
+      <label>position bias <span class="bd">η</span> <input type="range" id="eta" min="0" max="2" step="0.1" value="1"> <b class="mono" id="etav"></b></label>
+      <label>sessions <input type="range" id="nsess" min="0" max="4" step="1" value="2"> <b class="mono" id="nsessv"></b></label>
+      <button class="btn primary" id="simClicks">🖱️ Simulate clicks</button>
+    </div>
+    <canvas class="chart" id="pbChart" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">old ranker NDCG@5 <b id="pbOld">–</b></div>
+      <div class="stat">re-ranked by raw clicks <b id="pbNaive">–</b></div>
+      <div class="stat">re-ranked by IPS clicks <b id="pbIps">–</b></div>
+      <div class="stat">clicks at position 1 <b id="pbTop">–</b></div>
+    </div>
+    <p class="hint" id="pbMsg"></p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>XGBoost</b> (3.4): <code>XGBRanker</code>, default objective <code>rank:ndcg</code> (LambdaMART), query ids passed as <code>qid</code> (rows sorted by query), pair sampling via <code>lambdarank_pair_method</code> (<code>"mean"</code> or <code>"topk"</code>) and <code>lambdarank_num_pair_per_sample</code>, and click debiasing with <code>lambdarank_unbiased=True</code>. <b>LightGBM</b> (4.7): <code>LGBMRanker</code>, default objective <code>lambdarank</code>, query sizes passed as <code>group</code> (they must sum to the number of rows), metric positions via <code>eval_at</code>. <b>scikit-learn</b>: <code>ndcg_score</code>, <code>dcg_score</code> (linear gains). Search engines ship it too: Elasticsearch and OpenSearch have LTR plugins, Vespa and Solr have built-in support.</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+<span class="k">from</span> sklearn.ensemble <span class="k">import</span> HistGradientBoostingRegressor
+<span class="k">from</span> sklearn.metrics <span class="k">import</span> ndcg_score
+
+rng = np.random.default_rng(<span class="n">0</span>)
+<span class="k">def</span> make_queries(n_q, docs=<span class="n">20</span>):
+    X, y, qid = [], [], []
+    <span class="k">for</span> q <span class="k">in</span> range(n_q):
+        z = rng.normal(size=docs)                                 <span class="c"># hidden relevance</span>
+        shift = rng.normal() * <span class="n">2</span>                                  <span class="c"># per-query shift (e.g. query popularity)</span>
+        X.append(np.c_[z + rng.normal(<span class="n">0</span>, <span class="n">0.8</span>, docs) + shift, rng.normal(size=(docs, <span class="n">3</span>))])
+        y.append(np.digitize(z, [-<span class="n">0.2</span>, <span class="n">0.5</span>, <span class="n">1.2</span>])); qid.append(np.full(docs, q))
+    <span class="k">return</span> np.vstack(X), np.concatenate(y), np.concatenate(qid)
+
+X_tr, y_tr, q_tr = make_queries(<span class="n">300</span>)
+X_te, y_te, q_te = make_queries(<span class="n">100</span>)
+
+<span class="k">def</span> mean_ndcg(scores, k=<span class="n">5</span>):                                    <span class="c"># average NDCG@k over test queries</span>
+    <span class="k">return</span> np.mean([ndcg_score([y_te[q_te == q]], [scores[q_te == q]], k=k) <span class="k">for</span> q <span class="k">in</span> np.unique(q_te)])
+
+pointwise = HistGradientBoostingRegressor(random_state=<span class="n">0</span>).fit(X_tr, y_tr)
+<span class="k">print</span>(<span class="s">"pointwise NDCG@5:"</span>, round(mean_ndcg(pointwise.predict(X_te)), <span class="n">3</span>))
+
+<span class="k">try</span>:                                                              <span class="c"># LambdaMART (needs OpenMP on macOS: brew install libomp)</span>
+    <span class="k">import</span> lightgbm <span class="k">as</span> lgb, xgboost <span class="k">as</span> xgb
+    sizes = np.bincount(q_tr)                                     <span class="c"># LightGBM wants group sizes, rows grouped by query</span>
+    lgbm = lgb.LGBMRanker(objective=<span class="s">"lambdarank"</span>, n_estimators=<span class="n">300</span>, verbose=-<span class="n">1</span>).fit(X_tr, y_tr, group=sizes)
+    xgbr = xgb.XGBRanker(objective=<span class="s">"rank:ndcg"</span>, lambdarank_pair_method=<span class="s">"topk"</span>,
+                         lambdarank_num_pair_per_sample=<span class="n">8</span>, n_estimators=<span class="n">300</span>).fit(X_tr, y_tr, qid=q_tr)
+    <span class="k">print</span>(<span class="s">"LGBMRanker NDCG@5:"</span>, round(mean_ndcg(lgbm.predict(X_te)), <span class="n">3</span>))
+    <span class="k">print</span>(<span class="s">"XGBRanker  NDCG@5:"</span>, round(mean_ndcg(xgbr.predict(X_te)), <span class="n">3</span>))
+<span class="k">except</span> Exception <span class="k">as</span> e:
+    <span class="k">print</span>(<span class="s">"LightGBM/XGBoost not available here:"</span>, type(e).__name__)</code></pre>
+    <p class="hint" id="toolsNote">Without the boosting libraries, the pointwise baseline prints NDCG@5 ≈ 0.69 (0.688 on scikit-learn 1.9); the per-query shift is what drags it down, and that is the gap the rankers close. The ranker calls follow the XGBoost learning-to-rank tutorial and the LightGBM <code>LGBMRanker</code> reference (checked November 2026). Keep each query's rows together and never split one query across train and test.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Pointwise</td><td>Any regressor, simple, scores are interpretable as grades</td><td>Ignores query grouping; hurt by per-query shifts; spends effort on the bottom of the list</td></tr>
+      <tr><td>Pairwise</td><td>Robust to per-query shifts; learns relative order</td><td>Treats all pairs equally; pairs grow quadratically with list length</td></tr>
+      <tr><td>LambdaMART (listwise)</td><td>Optimizes the top of the list (NDCG@k) directly; strong with tabular features</td><td>Needs graded, grouped labels; tuned for one metric and cut-off</td></tr>
+      <tr><td>Human grades vs clicks</td><td>Grades: clean, unbiased. Clicks: free, huge, fresh</td><td>Grades: expensive, slow. Clicks: position bias, need IPS or randomization</td></tr>
+      <tr><td>Cross-encoder reranker</td><td>Reads query and document text together; best quality on text</td><td>Slow: only for the top tens of candidates</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Use the search engine's text score (BM25) plus a couple of hand-weighted signals, and log every query, result list, position and click. Grade 200 queries by hand and compute NDCG@10 so you can measure every change. Then train an <code>LGBMRanker</code> on those features.</p></div>
+      <div><h4>At scale</h4><p>Hundreds of features per query–document pair, LambdaMART or neural rankers retrained daily on debiased clicks, small randomized “interleaving” experiments to estimate position bias and compare rankers, and a cross-encoder or LLM reranker on the top candidates.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you improve the ranking of our product search?” A strong answer:</p>
+    <ul>
+      <li>Defines the metric: <b>NDCG@k</b> (or MRR, mean reciprocal rank) on graded query groups, plus online conversion.</li>
+      <li>Frames it as learning to rank with query–document features, and explains pointwise vs pairwise vs <b>LambdaMART</b> and why NDCG-weighted gradients focus on the top.</li>
+      <li>Handles labels: human grades for evaluation, clicks for training, corrected for <b>position bias</b> (IPS, randomization).</li>
+      <li>Splits by <b>query</b> (and by time), never by row; watches for feedback loops.</li>
+      <li>Places it in a pipeline: cheap retrieval → feature-based ranker → expensive reranker on the top few.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>RankNet → LambdaRank → LambdaMART</b> <span class="tag res">🧪 Research · 2010</span> <a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/MSR-TR-2010-82.pdf" target="_blank" rel="noopener">Burges: From RankNet to LambdaRank to LambdaMART: An Overview (PDF)</a></div>
+      <p><b>How:</b> a self-contained derivation of the three algorithms; LambdaMART is the boosted-tree version of LambdaRank.</p>
+      <p><b>Why this method:</b> per the overview, an ensemble of LambdaMART rankers won Track 1 of the 2010 Yahoo! Learning to Rank Challenge.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Position bias, measured</b> <span class="tag res">🧪 Research · 2005</span> <a href="https://www.cs.cornell.edu/people/tj/publications/joachims_etal_05a.pdf" target="_blank" rel="noopener">Joachims et al.: Accurately Interpreting Clickthrough Data as Implicit Feedback (PDF)</a></div>
+      <p><b>How:</b> eye-tracking plus “swapped” and “reversed” result orders on Google results.</p>
+      <p><b>Why this method:</b> showed clicks are relative signals shaped by trust in the ranking, which is why relative (pairwise) interpretations of clicks work better than absolute ones.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Unbiased learning to rank</b> <span class="tag res">🧪 Research · 2017</span> <a href="https://arxiv.org/abs/1608.04468" target="_blank" rel="noopener">Joachims, Swaminathan &amp; Schnabel: Unbiased Learning-to-Rank with Biased Feedback</a></div>
+      <p><b>How:</b> inverse propensity weighting of clicks inside a ranking objective, with propensities estimated from randomized interventions.</p>
+      <p><b>Why this method:</b> learns from free click logs without copying the old ranker's position bias; XGBoost's <code>lambdarank_unbiased</code> builds on this line of work.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>LTR in the library</b> <span class="tag oss">🧰 Open source</span> <a href="https://xgboost.readthedocs.io/en/stable/tutorials/learning_to_rank.html" target="_blank" rel="noopener">XGBoost: Learning to Rank tutorial</a></div>
+      <p><b>How:</b> <code>XGBRanker</code> with <code>qid</code>, LambdaMART objectives for NDCG, MAP and pairwise, top-k pair construction and position debiasing.</p>
+      <p><b>Why this method:</b> gradient-boosted trees on hand-made features stay strong and fast for ranking with tabular signals.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · ranking by “lambdas” that aren't a loss</span>
+    <p>LambdaRank's trick is that it never writes down a loss function: it simply <b>declares</b> what the gradient for each document should be (the pairwise push times |ΔNDCG|) and lets the optimizer follow it. Burges' overview reports that his team then showed empirically that following these gradients does optimize NDCG directly. Sometimes in ML you can skip the loss and go straight to the gradient.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Learning to rank is the second stage after a recommender's retrieval (Lesson 7.3) or a search engine's keyword and vector retrieval (<a href="../../ai-engineer/phase2/4-hybrid-search.html">AI Engineer 2.4: hybrid search</a>). LambdaMART is gradient boosting (Lessons 4.3–4.4) with a custom gradient; pairwise loss is logistic regression on score differences (Lesson 2.3). Splitting by query is group cross-validation (Lesson 5.1); position bias is a causal-inference problem (Lesson 8.4).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/MSR-TR-2010-82.pdf" target="_blank" rel="noopener">Burges (2010): From RankNet to LambdaRank to LambdaMART</a>. 19 pages, the clearest derivation of the lambda gradients.</li>
+      <li><span class="kind">Docs</span> <a href="https://lightgbm.readthedocs.io/en/stable/pythonapi/lightgbm.LGBMRanker.html" target="_blank" rel="noopener">LightGBM: LGBMRanker</a>. The <code>group</code> and <code>eval_at</code> parameters, and label gains.</li>
+      <li><span class="kind">Docs</span> <a href="https://scikit-learn.org/stable/modules/generated/sklearn.metrics.ndcg_score.html" target="_blank" rel="noopener">scikit-learn: ndcg_score</a>. Note that it uses the grade itself as the gain.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A results page has grades 0, 3, 1 at positions 1–3. Using gain 2<sup>grade</sup> − 1, what is DCG@3? (Discounts: 1, 0.631, 0.5.)</div>
+    <div class="opts"><button class="opt">4.0</button><button class="opt" data-ok>4.92</button><button class="opt">7.5</button></div>
+    <div class="explain">Gains 0, 7, 1 → 0 × 1 + 7 × 0.631 + 1 × 0.5 = 4.417 + 0.5 = <b>4.92</b>. The ideal order (3, 1, 0) has DCG 7 + 0.631 = 7.63, so NDCG@3 ≈ 0.64.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You train a ranker on click logs from your current search engine. Offline, the new model agrees with the old ranking almost perfectly, and its NDCG on click labels is excellent. What's the most likely problem?</div>
+    <div class="opts"><button class="opt">The model is underfitting</button><button class="opt" data-ok>Position bias: top results got clicks because they were on top, so the model learned to copy the old order. Weight clicks by inverse examination propensity, or randomize a little to measure it</button><button class="opt">NDCG is the wrong metric for search</button></div>
+    <div class="explain">Clicks mix relevance with exposure. Training on raw clicks rewards whatever the old ranker showed first, a feedback loop. IPS weighting (and evaluation on human grades or randomized traffic) breaks it.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A teammate splits the ranking dataset randomly by row into train and test. Why is that a problem?</div>
+    <div class="opts"><button class="opt" data-ok>Documents from the same query land in both sets, so the model is tested on queries it partly trained on; split by query (group k-fold) instead</button><button class="opt">Random splits break the label grades</button><button class="opt">It's fine as long as the test set is 20%</button></div>
+    <div class="explain">Rankers are evaluated per query, and query-level quirks leak through shared queries. Keep each query's documents together (<code>GroupKFold</code> with the query id, Lesson 5.1), and split by time too if queries trend.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Ranking data = query groups of documents with graded labels; only the order inside each query matters.</li>
+      <li>NDCG@k: gains (2<sup>grade</sup> − 1) discounted by 1 ⁄ log₂(position + 1), divided by the ideal; the top positions dominate.</li>
+      <li>Pointwise predicts grades; pairwise learns which of two wins; LambdaRank/LambdaMART weight each pair's push by |ΔNDCG|.</li>
+      <li>Tools: <code>XGBRanker(objective="rank:ndcg")</code> with <code>qid</code>, <code>LGBMRanker</code> with <code>group</code>; split by query.</li>
+      <li>Clicks are position-biased: weight them by inverse examination probability (IPS) or you'll just copy the old ranker.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/ml.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const mean = a => a.reduce((s, v) => s + v, 0) / (a.length || 1);
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const segBind = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const disc = i => 1 / Math.log2(i + 2); // i = 0-based position
+  let gainKind = "exp";
+  const gain = g => (gainKind === "exp" ? 2 ** g - 1 : g);
+  const dcg = (grades, k) => grades.slice(0, k).reduce((s, g, i) => s + gain(g) * disc(i), 0);
+
+  /* ---------- Playground 1: drag to reorder ---------- */
+  const DOCS = [
+    { t: "Men's road running shoes: summer sale", g: 1 },
+    { t: "Women's trail running shoes: buying guide", g: 3 },
+    { t: "Trail running in the Alps: a travel blog", g: 0 },
+    { t: "Women's waterproof trail shoes, tested", g: 2 },
+    { t: "Best women's trail runners of 2026: 12 pairs reviewed", g: 3 },
+    { t: "How to lace running shoes for wide feet", g: 1 },
+  ];
+  const START = [0, 1, 2, 3, 4, 5];
+  let order = START.slice(), dragFrom = null;
+  const shR = ML.rng(4);
+  function renderN() {
+    const k = +$("nk").value, grades = order.map(i => DOCS[i].g), ideal = grades.slice().sort((a, b) => b - a);
+    const d = dcg(grades, k), D = dcg(ideal, k), n = D ? d / D : 1;
+    $("nkv").textContent = k;
+    $("serp").innerHTML = order.map((di, p) => { const doc = DOCS[di], c = p < k ? gain(doc.g) * disc(p) : 0;
+      return `<li data-p="${p}"><span class="pos">${p + 1}</span><span class="ttl">${esc(doc.t)}<br><span class="contrib">${p < k ? `gain ${gain(doc.g)} × discount ${disc(p).toFixed(3)} = ${c.toFixed(3)}` : `below the cut-off k = ${k}: contributes 0`}</span></span><span class="grade g${doc.g}">grade ${doc.g}</span><span class="mv"><button data-up="${p}" aria-label="move up">↑</button><button data-dn="${p}" aria-label="move down">↓</button></span></li>`; }).join("");
+    let mis = 0; for (let a = 0; a < 6; a++) for (let b = a + 1; b < 6; b++) if (grades[a] < grades[b]) mis++;
+    $("nDcg").textContent = d.toFixed(3); $("nIdcg").textContent = D.toFixed(3); $("nNdcg").textContent = n.toFixed(3); $("nPairs").textContent = mis;
+    const hit = n > 0.9995; $("goalN").classList.toggle("hit", hit);
+    $("goalN").textContent = hit ? `🎯 Goal reached: NDCG@${k} = 1.000 🎉` : "🎯 Goal: NDCG@k = 1.000";
+    $("nMsg").innerHTML = hit && mis ? `NDCG@${k} is perfect even though ${mis} pair(s) below position ${k} are still misordered: the metric ignores everything under the cut-off.`
+      : hit ? "Perfect order: every better result sits above every worse one."
+      : `NDCG@${k} = ${n.toFixed(3)}. The biggest wins come from moving the grade-3 results into the top two slots, where the discount is gentlest.` + (gainKind === "lin" ? " With linear gain, a 3 is worth only 3× a 1 instead of 7×, so mistakes at the top cost less." : "");
+    $("serp").querySelectorAll("button[data-up]").forEach(b => (b.onclick = e => { e.stopPropagation(); move(+b.dataset.up, +b.dataset.up - 1); }));
+    $("serp").querySelectorAll("button[data-dn]").forEach(b => (b.onclick = e => { e.stopPropagation(); move(+b.dataset.dn, +b.dataset.dn + 1); }));
+  }
+  function move(a, b) { if (b < 0 || b > 5 || a === b) return; const [x] = order.splice(a, 1); order.splice(b, 0, x); renderN(); }
+  // pointer-based dragging (works with mouse and touch)
+  $("serp").addEventListener("pointerdown", e => { const li = e.target.closest("li"); if (!li || e.target.closest("button")) return; dragFrom = +li.dataset.p; li.classList.add("drag"); $("serp").setPointerCapture(e.pointerId); });
+  $("serp").addEventListener("pointermove", e => {
+    if (dragFrom == null) return;
+    const lis = [...$("serp").children], to = lis.findIndex(li => { const r = li.getBoundingClientRect(); return e.clientY >= r.top && e.clientY <= r.bottom; });
+    if (to >= 0 && to !== dragFrom) { move(dragFrom, to); dragFrom = to; $("serp").children[to].classList.add("drag"); }
+  });
+  const endDrag = () => { if (dragFrom != null) { dragFrom = null; renderN(); } };
+  $("serp").addEventListener("pointerup", endDrag); $("serp").addEventListener("pointercancel", endDrag);
+  $("nk").oninput = renderN;
+  segBind("gainSeg", v => { gainKind = v; renderN(); });
+  $("nIdeal").onclick = () => { order.sort((a, b) => DOCS[b].g - DOCS[a].g); renderN(); };
+  $("nShuffle").onclick = () => { order = ML.shuffle(order, shR); renderN(); };
+  $("nReset").onclick = () => { order = START.slice(); renderN(); };
+  renderN();
+
+  /* ---------- Playground 2: pointwise vs pairwise vs LambdaRank ---------- */
+  const egain = g => 2 ** g - 1;
+  function ndcgK(labels, scores, k) {
+    const ord = labels.map((l, i) => [scores[i], l]).sort((a, b) => b[0] - a[0]).map(x => x[1]), id = labels.slice().sort((a, b) => b - a);
+    const d = ord.slice(0, k).reduce((s, l, i) => s + egain(l) * disc(i), 0), D = id.slice(0, k).reduce((s, l, i) => s + egain(l) * disc(i), 0);
+    return D ? d / D : 1;
+  }
+  function gen(nq, seed, off) {
+    const r = ML.rng(seed), Q = [];
+    for (let q = 0; q < nq; q++) { const b = ML.randn(r), docs = [];
+      for (let d = 0; d < 10; d++) { const z = ML.randn(r), lab = z > 1.2 ? 3 : z > 0.5 ? 2 : z > -0.2 ? 1 : 0;
+        const len = lab === 0 ? -2.0 + 0.5 * ML.randn(r) : -0.8 * lab + 0.5 * ML.randn(r);
+        docs.push({ x: [z + 0.8 * ML.randn(r) + off * b, len + off * 0.5 * b], y: lab }); }
+      Q.push(docs); }
+    return Q;
+  }
+  function trainPoint(Q) { const m = new ML.Linear().fit(Q.flat().map(d => d.x), Q.flat().map(d => d.y)); return { f: x => m.predict(x), w: m.w }; }
+  function trainPair(Q, lambda) {
+    let w = [0, 0];
+    for (let e = 0; e < 200; e++) {
+      const g = [0, 0]; let n = 0;
+      for (const docs of Q) {
+        const s = docs.map(d => w[0] * d.x[0] + w[1] * d.x[1]);
+        const idcg = docs.map(d => d.y).sort((a, b) => b - a).reduce((a, l, i) => a + egain(l) * disc(i), 0) || 1;
+        const pos = []; s.map((v, i) => [v, i]).sort((a, b) => b[0] - a[0]).forEach(([, i], p) => (pos[i] = p));
+        for (let i = 0; i < docs.length; i++) for (let j = 0; j < docs.length; j++) {
+          if (docs[i].y <= docs[j].y) continue;
+          const p = 1 / (1 + Math.exp(s[i] - s[j]));
+          const wt = lambda ? (10 * Math.abs((egain(docs[i].y) - egain(docs[j].y)) * (disc(pos[i]) - disc(pos[j])))) / idcg : 1;
+          for (let f = 0; f < 2; f++) g[f] += wt * p * (docs[i].x[f] - docs[j].x[f]); n++;
+        }
+      }
+      w = w.map((v, f) => v + 0.5 * g[f] / n);
+    }
+    return { f: x => w[0] * x[0] + w[1] * x[1], w };
+  }
+  const pairAcc = (Q, f) => { let ok = 0, n = 0; Q.forEach(docs => docs.forEach(a => docs.forEach(b => { if (a.y > b.y) { n++; if (f(a.x) > f(b.x)) ok++; } }))); return ok / n; };
+  let lastLtr = null;
+  const ltrCache = {};
+  function fitAll(off) {
+    if (ltrCache[off]) return ltrCache[off];
+    const tr = gen(60, 1, off), te = gen(60, 2, off);
+    return (ltrCache[off] = { te, pt: trainPoint(tr), pw: trainPair(tr, false), lm: trainPair(tr, true) });
+  }
+  function renderLtr() {
+    const off = +$("qoff").value, k = +$("lk").value; $("qoffv").textContent = off.toFixed(1); $("lkv").textContent = k;
+    if (!lastLtr || lastLtr.off !== off) { $("lMsg").textContent = "Settings changed: press 🏋️ Train all three."; return; }
+    const R = lastLtr.R, ev = m => mean(R.te.map(docs => ndcgK(docs.map(d => d.y), docs.map(d => m.f(d.x)), k)));
+    const a = ev(R.pt), b = ev(R.pw), c = ev(R.lm);
+    $("lPt").textContent = a.toFixed(3); $("lPw").textContent = b.toFixed(3); $("lLm").textContent = c.toFixed(3);
+    $("lPa").textContent = (100 * pairAcc(R.te, R.pw.f)).toFixed(1) + "% / " + (100 * pairAcc(R.te, R.lm.f)).toFixed(1) + "%";
+    Plot.bars($("ltrChart"), { bars: [{ label: "pointwise", value: a, color: MX.css("--c-c1") }, { label: "pairwise (RankNet-style)", value: b, color: MX.css("--c-mt") }, { label: "LambdaRank", value: c, color: MX.css("--c-pd") }], yMin: 0.5, yMax: 1, yLabel: `test NDCG@${k}` });
+    const wl = v => `text ${v[0].toFixed(2)}, length ${v[1].toFixed(2)}`;
+    $("lMsg").innerHTML = `Weights: pointwise (${wl(R.pt.w)}), pairwise (${wl(R.pw.w)}), LambdaRank (${wl(R.lm.w)}). ` +
+      (R.lm.w[1] < R.pw.w[1] ? "LambdaRank gives length a more negative weight: at the top, shorter is better, and the top is all NDCG cares about. " : "") +
+      (off >= 2 ? `With a per-query shift of ${off}, pointwise has to explain shifts it can't see; the pair-based models compare documents inside a query, so the shift cancels.` : "Raise the per-query shift and retrain to see pointwise suffer.");
+  }
+  $("ltrTrain").onclick = () => { const off = +$("qoff").value; $("ltrTrain").disabled = true; setTimeout(() => { lastLtr = { off, R: fitAll(off) }; renderLtr(); $("ltrTrain").disabled = false; }, 20); };
+  ["qoff", "lk"].forEach(id => ($(id).oninput = renderLtr));
+  Plot.bars($("ltrChart"), { bars: [{ label: "pointwise", value: 0 }, { label: "pairwise (RankNet-style)", value: 0 }, { label: "LambdaRank", value: 0 }], yMin: 0.5, yMax: 1, yLabel: "test NDCG@k" });
+  lastLtr = { off: 0, R: fitAll(0) }; renderLtr();
+
+  /* ---------- Playground 3: position bias and IPS ---------- */
+  const REL = [0.15, 0.7, 0.05, 0.9, 0.4, 0.6, 0.1, 0.8]; // true click-if-seen probability of docs A..H
+  const SHOWN = [1, 0, 4, 3, 2, 5, 7, 6]; // the old ranker's order (indices into REL), best guess but imperfect
+  const SESS = [500, 1000, 3000, 10000, 30000];
+  const grade = p => (p >= 0.75 ? 3 : p >= 0.5 ? 2 : p >= 0.3 ? 1 : 0);
+  const trueGrades = REL.map(grade);
+  const ndcg5 = ord => ndcgK(ord.map(i => trueGrades[i]), ord.map((_, p) => -p), 5);
+  let clickR = ML.rng(5);
+  function simulate() {
+    const eta = +$("eta").value, n = SESS[+$("nsess").value];
+    const prop = SHOWN.map((_, p) => Math.pow(1 / (p + 1), eta)), clicks = new Array(8).fill(0);
+    for (let s = 0; s < n; s++) for (let p = 0; p < 8; p++) if (clickR() < prop[p] && clickR() < REL[SHOWN[p]]) clicks[SHOWN[p]]++;
+    const pos = []; SHOWN.forEach((d, p) => (pos[d] = p));
+    const ctr = clicks.map(c => c / n), ips = clicks.map((c, d) => c / n / prop[pos[d]]);
+    const by = sc => ML.range(8).sort((a, b) => sc[b] - sc[a]);
+    return { eta, n, prop, clicks, ctr, ips, naive: by(ctr), ipsOrd: by(ips) };
+  }
+  function renderPb(r) {
+    $("etav").textContent = (+$("eta").value).toFixed(1); $("nsessv").textContent = SESS[+$("nsess").value].toLocaleString("en-US");
+    if (!r) return;
+    const L = "ABCDEFGH";
+    $("pbOld").textContent = ndcg5(SHOWN).toFixed(3); $("pbNaive").textContent = ndcg5(r.naive).toFixed(3); $("pbIps").textContent = ndcg5(r.ipsOrd).toFixed(3);
+    $("pbTop").textContent = `${r.clicks[SHOWN[0]].toLocaleString("en-US")} (doc ${L[SHOWN[0]]})`;
+    Plot.bars($("pbChart"), { bars: SHOWN.map((d, p) => ({ label: `#${p + 1}: ${L[d]}`, value: r.ctr[d], color: MX.css("--c-c1"), marker: Math.min(1, r.ips[d]) })), yMin: 0, yMax: 1, yLabel: "click rate (bar) · IPS estimate (marker) · true relevance shown below" });
+    $("pbMsg").innerHTML = `Shown order: ${SHOWN.map(d => L[d]).join(" ")}. True relevance: ${SHOWN.map(d => L[d] + " " + REL[d]).join(", ")}. ` +
+      (r.eta < 0.05 ? "With η = 0 every position is seen, so raw clicks are already unbiased: both re-rankings agree."
+        : `Raw clicks rank ${r.naive.map(d => L[d]).join(" ")}: documents shown low barely get seen, so they look bad no matter what. IPS divides each click rate by the chance its position was examined and ranks ${r.ipsOrd.map(d => L[d]).join(" ")}.` + (r.n < 1000 ? " With few sessions, IPS estimates for low positions are noisy (big weights on few clicks): add sessions." : ""));
+  }
+  $("simClicks").onclick = () => renderPb(simulate());
+  ["eta", "nsess"].forEach(id => ($(id).oninput = () => renderPb(null)));
+  clickR = ML.rng(5); renderPb(simulate());
+})();
+</script>
+</body>
+</html>

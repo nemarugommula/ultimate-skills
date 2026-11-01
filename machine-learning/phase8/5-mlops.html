@@ -1,0 +1,405 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.5 MLOps: tracking, registry, feature stores, serving · Machine Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌲</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  table.data tr.pick td { background: color-mix(in srgb, var(--good) 16%, transparent); }
+  table.data tr.leak td { background: color-mix(in srgb, var(--bad) 14%, transparent); }
+  table.data tr.after td { opacity: .55; }
+  .alias { display: inline-block; font: 700 .75rem var(--mono); padding: 1px 8px; border-radius: 99px; background: var(--accent); color: #fff; margin-left: 4px; }
+</style>
+</head>
+<body data-lesson="ml8-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8 · Lesson 5</div>
+  <h1>MLOps: tracking, registry, feature stores, serving</h1>
+  <p class="subtitle">A model in a notebook is a prototype. A model in production is a system: data pipelines, versioned artifacts, features computed the same way twice, a way to roll back, and something answering requests at 3 a.m. Here's the minimum machinery, why each piece exists, and the bug each one prevents.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>A <b>Pipeline</b> bundles preprocessing and the model so they're fitted and applied together (Lesson 1.6).</li>
+      <li><b>Leakage</b>: training on information you won't have at prediction time gives scores that collapse in production (Lesson 0.6).</li>
+      <li>Validation must mimic how the model will be used, including <b>time order</b> (Lessons 5.1 and 7.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook: the 5% problem</span>
+    <p>In 2015 a team of Google engineers led by D. Sculley published “Hidden Technical Debt in Machine Learning Systems” at NeurIPS. Its most famous figure is a big diagram of boxes (data collection, feature extraction, configuration, serving infrastructure, monitoring…) with a tiny black square in the middle labelled “ML code”. The caption: <b>only a small fraction of real-world ML systems is composed of the ML code</b>.</p>
+    <p>They warned that a mature system might end up being <b>at most 5% machine learning code and at least 95% glue code</b>, and coined a rule every ML engineer learns the hard way: <b>CACE, “Changing Anything Changes Everything”</b>. Change one input's distribution, one feature's definition, one threshold, and the model's behaviour shifts everywhere.</p>
+    <p>MLOps is the discipline of building that other 95% so it doesn't bite.</p>
+  </div>
+
+  <div class="predict" data-answer="2">
+    <span class="label">🔮 Predict first</span>
+    <p>A churn model scores <b>AUC 0.95</b> in offline validation. After launch it catches far fewer churners than promised. The training data joined each customer's label with the <b>latest</b> value of “support tickets in the last 7 days” from the feature table. What went wrong?</p>
+    <div class="choices"><button>The model overfit: it needs more regularization</button><button>Production traffic is just different</button><button>The join used ticket counts recorded after the prediction date, including calls to cancel: the future leaked into training</button></div>
+    <div class="reveal">The “latest” ticket count includes the cancellation calls that happen <i>because</i> a customer is leaving. At prediction time those calls haven't happened yet. Join features <b>as of</b> each label's prediction time (a point-in-time join) and the honest offline AUC is 0.78, which is exactly what production delivers. Playground 2.</div>
+  </div>
+
+  <h2>Numbers first: the same model, two joins</h2>
+  <table>
+    <tr><th>Training data built with…</th><th>Offline AUC</th><th>Production AUC</th><th>Churners caught at threshold 0.5</th><th>Average predicted churn (true: 20%)</th></tr>
+    <tr><td class="lo">Latest feature value (leaky)</td><td class="lo">0.955</td><td>0.777</td><td class="lo">80% promised → 15% delivered</td><td class="lo">9%</td></tr>
+    <tr><td class="mt">Value as of the prediction time (point-in-time)</td><td class="mt">0.779</td><td class="mt">0.779</td><td>27% → 27%</td><td class="mt">20%</td></tr>
+  </table>
+  <p>The leaky model isn't worse at ranking in production (0.777 vs 0.779); it's <b>dishonest about itself</b>. It promised 0.955, its probabilities are off by more than half, and a threshold tuned offline catches a fraction of the churners. Every number you used to decide to launch it was wrong. That's the kind of bug MLOps tooling exists to prevent.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Make every model <b>reproducible</b> (which code, data, parameters and environment produced it: <b>experiment tracking</b>), <b>versioned and swappable</b> (a <b>model registry</b> with aliases like <code>@champion</code>, so deploy and rollback are pointer moves), <b>consistent</b> between training and serving (one feature definition, <b>point-in-time-correct</b> training joins, one packaged Pipeline: a <b>feature store</b> and good packaging), and <b>served the cheapest way that's fresh enough</b> (batch vs real-time). Then watch it (Lesson 8.6).
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a restaurant kitchen, not a home cook</span>
+    <p>A home cook makes one great dish once. A restaurant must make it identically 500 times a night: written recipes with versions (tracking), a pass where only approved dishes go out and the old menu can come back tomorrow (registry), ingredients prepped the same way for the tasting and for service (feature store, no training-serving skew), and a choice between cooking to order and batch prep (real-time vs batch serving). The recipe is 5% of running a restaurant.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? Why tracking, registries and feature stores?</span>
+    <ol>
+      <li><b>The problem before.</b> Models lived as <code>final_v2_really_final.pkl</code> on someone's laptop. Nobody could say which data or parameters made the model in production, features were re-implemented by hand in the serving code (in another language, slightly differently), and rollbacks meant a redeploy and a prayer.</li>
+      <li><b>What people tried.</b> Spreadsheets of runs, pickles in a shared bucket, and copying feature SQL into a Java service. They break on the first incident: the spreadsheet is stale, the pickle doesn't load with the new scikit-learn, and the Java version of “days since last order” rounds differently. Google's Rules of ML put the fix bluntly: re-use code between training and serving, and log the features used at serving time to train on.</li>
+      <li><b>Why this works.</b> Tracking makes runs comparable and reproducible; a registry turns “deploy v7” into moving an alias, and rollback into moving it back in seconds; a feature store computes each feature once and serves the same values offline (for training, with point-in-time joins) and online (for prediction). In our churn example, the point-in-time join alone moves the offline estimate from a fantasy 0.955 to the true 0.779.</li>
+      <li><b>What it costs, when it fails.</b> Every tool is more infrastructure to run, secure and pay for; a feature store is overkill for one batch model; tracking only helps if people log consistently; and none of it fixes a bad label or a bad metric. Over-engineering MLOps before the first model has proven value is a classic startup mistake.</li>
+      <li><b>What came next.</b> Managed platforms (Uber's Michelangelo and Meta's FBLearner Flow inspired SageMaker, Vertex AI, Databricks), open-source stacks (MLflow, Feast, Kubeflow, Metaflow), and monitoring and retraining loops (Lesson 8.6). For LLM systems the same ideas became LLMOps (prompt and eval versioning).</li>
+    </ol>
+  </div>
+
+  <h2>Step 1: experiment tracking and the model registry</h2>
+  <table>
+    <tr><th>Piece</th><th>Stores</th><th>Answers</th></tr>
+    <tr><td><b>Run</b> (tracking)</td><td>Parameters, metrics, code version (git commit), data version, environment, artifacts</td><td>“What exactly produced this model? Can I reproduce it?”</td></tr>
+    <tr><td><b>Registered model</b></td><td>A named model (“churn”) with numbered <b>versions</b>, each pointing to a run's artifact</td><td>“What versions exist, and where did each come from?”</td></tr>
+    <tr><td><b>Alias</b></td><td>A movable name on one version: <code>@champion</code>, <code>@challenger</code></td><td>“What's serving right now?” Serving loads <code>models:/churn@champion</code></td></tr>
+  </table>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · A tiny model registry</span>
+    <p class="hint">Train a few runs (each tries a regularization strength C and logs a validation AUC), register the best as a new version, promote it to <code>@champion</code>, then pretend it misbehaves and roll back. Serving always loads whatever <code>@champion</code> points to; nothing is redeployed.</p>
+    <div class="controls">
+      <button class="btn" id="rRun">▶️ Train a run</button>
+      <button class="btn" id="rReg">📦 Register best run</button>
+      <button class="btn" id="rPromo">🏆 Promote newest version to @champion</button>
+      <button class="btn" id="rBack">⏪ Roll back @champion</button>
+      <button class="btn" id="rReset">↺ Reset</button>
+    </div>
+    <div class="cols" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px">
+      <div><h4>Runs (tracking)</h4><table class="data" id="rRuns"></table></div>
+      <div><h4>Registered model “churn”</h4><table class="data" id="rVers"></table></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">runs logged <b id="rN">0</b></div>
+      <div class="stat">serving <code>models:/churn@champion</code> → <b id="rServe">nothing yet</b></div>
+      <div class="stat">time to roll back <b id="rTime">–</b></div>
+    </div>
+    <p class="hint" id="rMsg"></p>
+  </div>
+
+  <h2>Step 2: feature stores and point-in-time joins</h2>
+  <p><b>Training-serving skew</b> means the model sees different feature values (or definitions) in production than in training. Two common causes: the feature is computed by two different code paths, and the training set was built with values from <b>after</b> the moment the prediction would have been made. A feature store addresses both: one definition per feature, an <b>offline store</b> (history, for building training sets) and an <b>online store</b> (latest values, low latency, for serving), and training sets built with <b>point-in-time joins</b>.</p>
+  <div class="eq">training row = (<span class="ft">entity</span>, <span class="bd">prediction time t</span>) + for each feature: <span class="ft">the latest value with timestamp ≤ t</span> + <span class="tg">label observed after t</span>
+    <span class="say">“For every example, look up each feature as it was at the moment you'd have predicted, never later.”</span></div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Leaky join vs point-in-time join</span>
+    <p class="hint">Top: one customer's feature log. We predict on the <b>prediction date</b>; the label is “churned in the next 30 days”. Bottom: 1,200 training and 600 test customers; a logistic regression on “tickets in the last 7 days” and tenure. Churners file more tickets before deciding (a real signal) and many more after (cancellation calls). Switch the join and the leak's strength.</p>
+    <div class="controls">
+      <span class="seg" id="jMode"><button data-v="leaky" id="jLeakyB">Latest value (leaky)</button><button data-v="pit" class="on">Point-in-time (as of prediction date)</button></span>
+      <label>prediction date <input type="range" id="jDate" min="0" max="4" step="1" value="2"> <b class="mono" id="jDateV"></b></label>
+      <label>post-decision tickets of churners <input type="range" id="jLeak" min="0" max="6" step="0.5" value="3.5"> <b class="mono" id="jLeakV"></b></label>
+    </div>
+    <table class="data" id="jLog"></table>
+    <div class="stat-row">
+      <div class="stat">offline AUC (what you'll report) <b id="jOff">–</b></div>
+      <div class="stat">production AUC (what you'll get) <b id="jProd">–</b></div>
+      <div class="stat">churners caught, offline → production <b id="jRec">–</b></div>
+      <div class="stat">avg predicted churn in production <b id="jAvg">–</b></div>
+    </div>
+    <p class="hint" id="jMsg"></p>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: one training row, by hand</span>
+    <p>Customer 17: prediction date 1 March; churned on 20 March (label = 1). Feature log for <code>tickets_7d</code>: 5 Jan → 0, 2 Feb → 1, 27 Feb → 1, 8 Mar → 4, 15 Mar → 6.</p>
+    <ul>
+      <li><b>Point-in-time:</b> latest row with date ≤ 1 March is 27 Feb → <code>tickets_7d = 1</code>. That's what the serving system would have seen.</li>
+      <li><b>Leaky “latest value”:</b> 15 Mar → 6. Those six tickets are the customer calling to cancel. The model learns “6 tickets ⇒ churn”, a rule that can only fire after it's too late.</li>
+      <li>With Feast: put (customer_id, prediction timestamp, label) rows in an <code>entity_df</code> and call <code>get_historical_features</code>; it scans backward from each row's timestamp, up to the feature view's <code>ttl</code>.</li>
+    </ul>
+  </div>
+
+  <h2>Step 3: batch or real-time serving?</h2>
+  <table>
+    <tr><th></th><th>Batch (offline) scoring</th><th>Real-time (online) serving</th></tr>
+    <tr><td>How</td><td>A scheduled job scores every entity and writes predictions to a table</td><td>An API scores each request when it arrives</td></tr>
+    <tr><td>Freshness</td><td>As old as the last run (hours)</td><td>Uses the latest features (seconds)</td></tr>
+    <tr><td>Cost driver</td><td>Number of entities × runs per day</td><td>Peak requests per second × latency; servers run all day</td></tr>
+    <tr><td>Fits</td><td>Churn lists, weekly demand forecasts, nightly recommendations</td><td>Fraud checks at payment, search ranking, prices that depend on the session</td></tr>
+  </table>
+
+  <div class="predict" data-answer="0">
+    <span class="label">🔮 Predict first</span>
+    <p>You score 2 million users for a daily email campaign. Each prediction takes 2 ms on one CPU core. Roughly how much compute does one nightly batch run need?</p>
+    <div class="choices"><button>About 1 CPU-hour</button><button>About 100 CPU-hours</button><button>About 10,000 CPU-hours</button></div>
+    <div class="reveal">2,000,000 × 2 ms = 4,000 s ≈ <b>1.1 CPU-hours</b>, minutes on a few cores. Batch scoring is usually cheap; it's freshness that pushes you to real time. Try your own numbers below.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Batch vs real-time calculator</span>
+    <p class="hint">Plug in your own workload. Assumptions are yours to change: price per CPU-hour, and that a real-time service keeps cores at most half busy to absorb spikes (a common rule of thumb). Batch runs as often as the freshness you need.</p>
+    <div class="controls">
+      <label>entities to score <input type="range" id="bEnt" min="3" max="8" step="0.1" value="6.3"> <b class="mono" id="bEntV"></b></label>
+      <label>requests per day <input type="range" id="bReq" min="3" max="9" step="0.1" value="5"> <b class="mono" id="bReqV"></b></label>
+      <label>peak ÷ average traffic <input type="range" id="bPeak" min="1" max="10" step="0.5" value="3"> <b class="mono" id="bPeakV"></b></label>
+      <label>model latency (ms per prediction) <input type="range" id="bMs" min="0.1" max="50" step="0.1" value="2"> <b class="mono" id="bMsV"></b></label>
+      <label>freshness needed <input type="range" id="bFresh" min="0" max="7" step="1" value="6"> <b class="mono" id="bFreshV"></b></label>
+      <label>$ per CPU-hour <input type="range" id="bPrice" min="0.01" max="0.2" step="0.01" value="0.05"> <b class="mono" id="bPriceV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">batch: CPU-hours per day <b id="bBh">–</b></div>
+      <div class="stat">batch: $ per day <b id="bBc">–</b></div>
+      <div class="stat">real-time: cores always on <b id="bRc">–</b></div>
+      <div class="stat">real-time: $ per day <b id="bRd">–</b></div>
+    </div>
+    <p class="verdict" id="bVerdict"></p>
+    <p class="hint" id="bMsg"></p>
+  </div>
+
+  <h2>Step 4: package it as one artifact</h2>
+  <p>The single most effective anti-skew habit is boring: put <b>all preprocessing inside the scikit-learn Pipeline</b> (imputation, encoding, scaling) and ship that one object. The serving code then calls <code>pipe.predict(raw_rows)</code>; there's no second implementation of the features to drift apart. Record what it is in a <b>model card</b>: intended use, training data, metrics overall and by group (Lesson 8.3), limitations, and owner (Mitchell et al., 2019).</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>MLflow</b> (3.17 as of late 2026) for tracking and the registry: <code>mlflow.sklearn.log_model(..., name=...)</code> (the old <code>artifact_path</code> argument is deprecated), <code>registered_model_name=</code> to register, aliases via <code>MlflowClient.set_registered_model_alias</code>, and loading with <code>models:/name@alias</code>. <b>Feast</b> (0.67) for features: <code>get_historical_features</code> (point-in-time training sets) and <code>get_online_features</code> (serving). Alternatives: Weights &amp; Biases, Vertex AI, SageMaker, Databricks; Tecton and Hopsworks for features; BentoML, KServe, FastAPI for serving.</p>
+<pre><code><span class="k">import</span> mlflow
+<span class="k">from</span> mlflow <span class="k">import</span> MlflowClient
+<span class="c"># … X_tr, X_te, y_tr, y_te and a fitted Pipeline `pipe` as below …</span>
+mlflow.set_experiment(<span class="s">"cancer-screen"</span>)
+<span class="k">with</span> mlflow.start_run():
+    mlflow.log_param(<span class="s">"C"</span>, <span class="n">0.5</span>)
+    mlflow.log_metric(<span class="s">"test_accuracy"</span>, pipe.score(X_te, y_te))
+    info = mlflow.sklearn.log_model(pipe, name=<span class="s">"model"</span>, input_example=X_te.head(<span class="n">3</span>),
+                                    registered_model_name=<span class="s">"cancer-screen"</span>)
+
+client = MlflowClient()
+client.set_registered_model_alias(<span class="s">"cancer-screen"</span>, <span class="s">"champion"</span>, info.registered_model_version)
+model = mlflow.sklearn.load_model(<span class="s">"models:/cancer-screen@champion"</span>)   <span class="c"># what serving loads</span></code></pre>
+<pre><code><span class="k">import</span> json, joblib, sklearn
+<span class="k">from</span> sklearn.datasets <span class="k">import</span> load_breast_cancer
+<span class="k">from</span> sklearn.linear_model <span class="k">import</span> LogisticRegression
+<span class="k">from</span> sklearn.model_selection <span class="k">import</span> train_test_split
+<span class="k">from</span> sklearn.pipeline <span class="k">import</span> make_pipeline
+<span class="k">from</span> sklearn.preprocessing <span class="k">import</span> StandardScaler
+
+X, y = load_breast_cancer(return_X_y=<span class="k">True</span>, as_frame=<span class="k">True</span>)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, stratify=y, random_state=<span class="n">0</span>)
+pipe = make_pipeline(StandardScaler(), LogisticRegression(C=<span class="n">0.5</span>, max_iter=<span class="n">1000</span>)).fit(X_tr, y_tr)
+
+joblib.dump(pipe, <span class="s">"model.joblib"</span>)                 <span class="c"># preprocessing + model in ONE artifact</span>
+card = {<span class="s">"name"</span>: <span class="s">"cancer-screen"</span>, <span class="s">"version"</span>: <span class="n">3</span>, <span class="s">"sklearn"</span>: sklearn.__version__,
+        <span class="s">"features"</span>: <span class="k">list</span>(X.columns), <span class="s">"test_accuracy"</span>: <span class="k">round</span>(pipe.score(X_te, y_te), <span class="n">3</span>),
+        <span class="s">"intended_use"</span>: <span class="s">"decision support for radiologists; not a diagnosis"</span>,
+        <span class="s">"limitations"</span>: <span class="s">"569 fine-needle aspirates from one Wisconsin hospital; not validated elsewhere"</span>}
+json.dump(card, <span class="k">open</span>(<span class="s">"model_card.json"</span>, <span class="s">"w"</span>), indent=<span class="n">2</span>)
+
+served = joblib.load(<span class="s">"model.joblib"</span>)              <span class="c"># the serving side loads the same object</span>
+<span class="k">print</span>(card[<span class="s">"test_accuracy"</span>], served.predict(X_te.head(<span class="n">3</span>)))</code></pre>
+    <p class="hint">The second block runs as is (it prints <code>0.965 [1 0 0]</code>); the MLflow block is checked against the MLflow 3 API docs. Pickles and joblib files only load reliably with the same library versions, which is why the card records <code>sklearn.__version__</code> (and why MLflow logs the environment; its scikit-learn flavour now defaults to the safer <code>skops</code> format outside Databricks). Never load a pickle you didn't produce: loading one can run arbitrary code.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Experiment tracking</td><td>Reproducibility, comparisons, an audit trail</td><td>Discipline to log everything; a server to run</td></tr>
+      <tr><td>Registry with aliases</td><td>Deploy and roll back by moving a pointer; clear lineage</td><td>Process overhead for tiny teams</td></tr>
+      <tr><td>Feature store</td><td>One definition, point-in-time training sets, low-latency online values, reuse across teams</td><td>Heavy infrastructure; overkill for a single batch model</td></tr>
+      <tr><td>Batch scoring</td><td>Cheap, simple, easy to retry and inspect</td><td>Stale predictions; scores entities nobody asks about</td></tr>
+      <tr><td>Real-time serving</td><td>Fresh features, scores only what's requested</td><td>Always-on servers, latency budgets, on-call, harder debugging</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>A Pipeline in a <code>joblib</code> file, a model card JSON, metrics in MLflow (it runs locally with one command), and a nightly batch job writing predictions to your database. Build training sets with an “as of” join in SQL. No feature store until you have several models or a real-time need.</p></div>
+      <div><h4>At scale</h4><p>Platform teams run a shared registry, a feature store with offline and online stores, CI that retrains and validates before a model can get <code>@champion</code>, shadow or canary deployments, and monitoring wired to retraining (8.6). Uber's 2017 Michelangelo write-up described about 10,000 shared features and P95 serving latency under 5 ms for models that didn't need to fetch features from Cassandra.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your model's online performance is much worse than offline. How do you debug it?” A strong answer:</p>
+    <ul>
+      <li>Suspects <b>training-serving skew</b> first: compare the feature values the model sees online (log them) with the training values for the same entities and times.</li>
+      <li>Checks for <b>leakage in the training join</b> (latest values instead of point-in-time), differing feature code paths, defaults for missing values, and units or encodings.</li>
+      <li>Then <b>drift</b> (the world changed since training: Lesson 8.6) and label delays or a different label definition.</li>
+      <li>Prevention: one Pipeline artifact, feature store or shared feature code, point-in-time joins, logged serving features, a registry with rollback, and monitoring.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The technical-debt paper</b> <span class="tag res">🧪 Research · 2015</span> <a href="https://papers.nips.cc/paper_files/paper/2015/hash/86df7dcfd896fcaf2674f757a2463eba-Abstract.html" target="_blank" rel="noopener">Sculley et al.: Hidden Technical Debt in Machine Learning Systems (NeurIPS)</a></div>
+      <p><b>How:</b> catalogues ML-specific debt: boundary erosion, entanglement (CACE), hidden feedback loops, undeclared consumers, data dependencies, configuration debt, changes in the external world.</p>
+      <p><b>Why this method:</b> naming the failure modes is what turned “MLOps” from glue scripts into a discipline.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>FBLearner Flow</b> <span class="tag co">🏢 Meta · 2016</span> <a href="https://engineering.fb.com/2016/05/09/core-infra/introducing-fblearner-flow-facebook-s-ai-backbone/" target="_blank" rel="noopener">Introducing FBLearner Flow: Facebook's AI backbone</a></div>
+      <p><b>How:</b> a shared platform for defining training workflows, tracking experiments and deploying models; used by more than 25% of Facebook's engineering team, with more than a million models trained and over 6 million predictions per second.</p>
+      <p><b>Why this method:</b> engineers without ML infrastructure skills could reuse pipelines, rerun with new inputs and compare results, instead of building one-off systems.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Training-serving skew, from experience</b> <span class="tag co">🏢 Google</span> <a href="https://developers.google.com/machine-learning/guides/rules-of-ml" target="_blank" rel="noopener">Rules of Machine Learning</a></div>
+      <p><b>How:</b> Rule #29: save the features used at serving time and pipe them to a log to train on; Rule #32: re-use code between training and serving pipelines.</p>
+      <p><b>Why this method:</b> if training reads exactly what serving saw, skew can't creep in between two implementations.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Point-in-time joins</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.feast.dev/getting-started/concepts/point-in-time-joins" target="_blank" rel="noopener">Feast: point-in-time joins</a></div>
+      <p><b>How:</b> for each entity row and timestamp, Feast scans backward in time up to the feature view's TTL and joins the value that existed then; <code>get_online_features</code> serves the latest values.</p>
+      <p><b>Why this method:</b> reproduces the state of features at a past moment, which is the definition of a leak-free training set.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Model cards</b> <span class="tag res">🧪 Research · 2019</span> <a href="https://arxiv.org/abs/1810.03993" target="_blank" rel="noopener">Mitchell et al.: Model Cards for Model Reporting</a></div>
+      <p><b>How:</b> a short document per model: intended use, factors, metrics (disaggregated by group), training and evaluation data, ethical considerations, caveats.</p>
+      <p><b>Why this method:</b> the registry says <i>what</i> is deployed; the card says <i>what it's for and where it fails</i>.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · “Changing Anything Changes Everything”</span>
+    <p>The CACE principle in Sculley et al. applies, they wrote, not only to input signals but also to hyperparameters, learning settings, sampling methods, convergence thresholds and data selection: “essentially every other possible tweak”. It's why mature teams treat a feature-definition change like a schema migration, with a new model version and a comparison against the old one.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Pipelines (1.6) are the unit you package; leakage (0.6) and time-aware validation (5.1, 7.1) are what point-in-time joins enforce. Model cards carry the fairness numbers of 8.3 and the explanations of 8.1–8.2. Monitoring and retraining close the loop in 8.6, and the full design of an ML system is Lesson 9.1. For the infrastructure side: <a href="../../system-design-course/phase6/1-cicd.html">System Design 6.1 (CI/CD)</a>, <a href="../../system-design-course/phase6/2-deployments.html">6.2 (deployments: canary, blue-green)</a> and <a href="../../system-design-course/phase1/3-caching.html">1.3 (caching)</a>; for LLM systems, <a href="../../ai-engineer/phase8/1-llmops.html">AI Engineer 8.1: LLMOps</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://mlflow.org/docs/latest/ml/model-registry/" target="_blank" rel="noopener">MLflow Model Registry</a>. Versions, aliases and the <code>models:/name@alias</code> URIs.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.feast.dev/" target="_blank" rel="noopener">Feast documentation</a>. Feature views, offline and online stores, point-in-time joins.</li>
+      <li><span class="kind">Guide</span> <a href="https://developers.google.com/machine-learning/guides/rules-of-ml" target="_blank" rel="noopener">Google: Rules of Machine Learning</a>. 43 rules from shipping ML products, still the best checklist.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You serve 50 requests per second on average, peaks are 4× that, each prediction takes 20 ms of CPU, and you keep cores at most 50% busy. About how many cores do you need?</div>
+    <div class="opts"><button class="opt">2</button><button class="opt" data-ok>8</button><button class="opt">200</button></div>
+    <div class="explain">Peak = 200 requests/s × 0.020 s = 4 cores fully busy; at 50% target utilization, <b>8 cores</b>. (If the same 4.3 million daily predictions were needed only once a day in batch: 4.3M × 20 ms ≈ 24 CPU-hours.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A new model version is live and conversion drops 4% within an hour. You use a registry with aliases. What's the fastest safe action?</div>
+    <div class="opts"><button class="opt">Retrain the model with the latest data</button><button class="opt" data-ok>Point <code>@champion</code> back to the previous version (serving reloads it), then investigate the new version offline</button><button class="opt">Delete the new version from the registry and redeploy the service</button></div>
+    <div class="explain">Aliases make rollback a pointer move: seconds, no rebuild, and the bad version stays in the registry with its run for debugging. Retraining under pressure usually ships a second untested model; deleting destroys the evidence.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your training set joins each loan application with the applicant's “number of missed payments” from the feature table, using the current value. What's wrong?</div>
+    <div class="opts"><button class="opt">Nothing, as long as you use cross-validation</button><button class="opt">The feature should be scaled first</button><button class="opt" data-ok>Current values include missed payments on the very loan you're predicting (after the application date): use a point-in-time join as of the application date</button></div>
+    <div class="explain">A missed payment on this loan <i>is</i> the default you're predicting. Cross-validation can't detect it, because every fold has the same leak. Join each feature as of the application timestamp, the only information the decision could use.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>ML code is the small part; MLOps is the data, packaging, deployment and monitoring around it (Sculley et al.: CACE, glue code).</li>
+      <li>Track every run; register versions; serve through an alias like <code>@champion</code> so deploy and rollback are pointer moves.</li>
+      <li>Training-serving skew is the classic production bug: one feature definition, point-in-time joins for training sets, one Pipeline artifact.</li>
+      <li>Batch scoring is cheap and simple; real-time buys freshness at the price of always-on servers. Compute both with your numbers.</li>
+      <li>Write a model card. Then monitor it (8.6).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/ml.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const pct = v => Math.round(100 * v) + "%";
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  /* ---------- Playground 1: leaky vs point-in-time join ---------- */
+  const LOG = [["5 Jan", 0], ["2 Feb", 1], ["27 Feb", 1], ["8 Mar", 4], ["15 Mar", 6]];
+  const DATES = ["1 Feb", "15 Feb", "1 Mar", "10 Mar", "20 Mar"], DIDX = [31, 45, 59, 68, 78], LOGD = [4, 32, 57, 66, 73];
+  let mode = "pit";
+  const pois = (lam, r) => { let L = Math.exp(-lam), k = 0, p = 1; do { k++; p *= r(); } while (p > L); return k - 1; };
+  function make(seed, n, leak) { const r = ML.rng(seed), rows = []; for (let i = 0; i < n; i++) { const y = r() < 0.2 ? 1 : 0, ten = Math.max(0, 24 + 12 * ML.randn(r) - 8 * y); const pre = pois(0.8 + 0.9 * y, r), post = pois(0.4 + leak * y, r); rows.push({ y, ten, pre, post }); } return rows; }
+  const feat = (d, leaky) => [leaky ? d.pre + d.post : d.pre, d.ten / 12];
+  const auc = (y, s) => ML.auc(ML.roc(y, s));
+  const cache = {};
+  function fitJ(leak) {
+    const k = leak.toFixed(1); if (cache[k]) return cache[k];
+    const tr = make(3, 1200, leak), te = make(4, 600, leak), yte = te.map(d => d.y), out = {};
+    for (const leaky of [true, false]) {
+      const m = new ML.Logistic({ lr: 0.1, epochs: 400 }).fit(tr.map(d => feat(d, leaky)), tr.map(d => d.y));
+      const sOff = te.map(d => m.score1(feat(d, leaky))), sProd = te.map(d => m.score1(feat(d, false)));
+      out[leaky ? "leaky" : "pit"] = { off: auc(yte, sOff), prod: auc(yte, sProd), recOff: ML.confusion(yte, sOff, 0.5).recall, recProd: ML.confusion(yte, sProd, 0.5).recall, avg: sProd.reduce((a, b) => a + b, 0) / sProd.length };
+    }
+    return (cache[k] = out);
+  }
+  function renderJ() {
+    const di = +$("jDate").value, leak = +$("jLeak").value; $("jDateV").textContent = DATES[di]; $("jLeakV").textContent = "+" + leak.toFixed(1) + " a week";
+    const tday = DIDX[di]; let pick = -1; LOGD.forEach((d, i) => { if (d <= tday) pick = i; });
+    const chosen = mode === "pit" ? pick : LOG.length - 1;
+    $("jLog").innerHTML = `<tr><th>feature row (customer 17)</th><th>tickets_7d</th><th>joined?</th></tr>` + LOG.map(([d, v], i) => `<tr class="${i === chosen ? (mode === "pit" ? "pick" : "leak") : LOGD[i] > tday ? "after" : ""}"><td>${d}${LOGD[i] > tday ? " (after the prediction date)" : ""}</td><td>${v}</td><td>${i === chosen ? (mode === "pit" ? "✔ as of " + DATES[di] : "✘ the future") : ""}</td></tr>`).join("") + `<tr><td>label: churned 20 Mar</td><td colspan="2">${tday < 78 ? "1 (within 30 days of the prediction date)" : "–"}</td></tr>`;
+    const r = fitJ(leak)[mode];
+    $("jOff").textContent = r.off.toFixed(3); $("jProd").textContent = r.prod.toFixed(3);
+    $("jRec").textContent = `${pct(r.recOff)} → ${pct(r.recProd)}`; $("jAvg").textContent = pct(r.avg);
+    $("jMsg").innerHTML = mode === "leaky"
+      ? (leak > 0 ? `The leaky join hands the model tickets filed after the decision to leave, so offline it looks brilliant (AUC ${r.off.toFixed(3)}). In production those tickets don't exist yet: AUC ${r.prod.toFixed(3)}, churners caught at threshold 0.5 drop from ${pct(r.recOff)} to ${pct(r.recProd)}, and predicted churn averages ${pct(r.avg)} against a true 20%.` : "With no post-decision tickets the latest value adds only noise: the leak disappears, and so does the gap. Leaks are dangerous exactly when they're strong.")
+      : `Point-in-time join: each training row uses the value as of its prediction date. The offline estimate (${r.off.toFixed(3)}) matches production (${r.prod.toFixed(3)}), and the probabilities are honest (average ${pct(r.avg)} vs a true 20%). Less impressive, entirely true.`;
+  }
+  [...$("jMode").querySelectorAll("button")].forEach(b => (b.onclick = () => { [...$("jMode").children].forEach(x => x.classList.toggle("on", x === b)); mode = b.dataset.v; renderJ(); }));
+  ["jDate", "jLeak"].forEach(id => ($(id).oninput = renderJ));
+  renderJ();
+
+  /* ---------- Playground 2: a tiny registry ---------- */
+  let rr, runs, versions, champ, history, ticks;
+  function resetR() { rr = ML.rng(21); runs = []; versions = []; champ = null; history = []; ticks = 0; renderR("Start by training a few runs."); }
+  function renderR(msg) {
+    $("rRuns").innerHTML = `<tr><th>run</th><th>C</th><th>val AUC</th></tr>` + (runs.length ? runs.map(r => `<tr class="${r.reg ? "pick" : ""}"><td>${esc(r.id)}</td><td>${r.C}</td><td>${r.auc.toFixed(3)}</td></tr>`).join("") : `<tr><td colspan="3" class="muted">no runs yet</td></tr>`);
+    $("rVers").innerHTML = `<tr><th>version</th><th>from run</th><th>val AUC</th></tr>` + (versions.length ? versions.map(v => `<tr><td>v${v.n}${champ === v.n ? '<span class="alias">@champion</span>' : ""}</td><td>${esc(v.run)}</td><td>${v.auc.toFixed(3)}</td></tr>`).join("") : `<tr><td colspan="3" class="muted">no versions yet</td></tr>`);
+    $("rN").textContent = runs.length; $("rServe").textContent = champ ? `v${champ}` : "nothing yet";
+    $("rMsg").innerHTML = msg;
+  }
+  $("rRun").onclick = () => { const C = +(10 ** (-2 + 3 * rr())).toPrecision(2), auc = 0.86 - 0.02 * (Math.log10(C) - 0.2) ** 2 + 0.006 * ML.randn(rr); runs.push({ id: "run-" + (runs.length + 1), C, auc, reg: false }); renderR(`Logged run-${runs.length}: C = ${C}, validation AUC ${auc.toFixed(3)}, plus (in real life) the git commit, data version and environment.`); };
+  $("rReg").onclick = () => { const free = runs.filter(r => !r.reg); if (!free.length) return renderR("Train a run first: every version must come from a tracked run."); const best = free.reduce((a, b) => (b.auc > a.auc ? b : a)); best.reg = true; versions.push({ n: versions.length + 1, run: best.id, auc: best.auc }); renderR(`Registered ${best.id} as <b>churn v${versions.length}</b>. It isn't serving yet: registering and deploying are separate steps.`); };
+  $("rPromo").onclick = () => { if (!versions.length) return renderR("Register a version first."); const v = versions[versions.length - 1].n; if (champ === v) return renderR(`v${v} is already @champion.`); if (champ) history.push(champ); champ = v; renderR(`@champion → v${v}. Serving loads <code>models:/churn@champion</code> on its next refresh; no code change, no redeploy.`); };
+  $("rBack").onclick = () => { if (!history.length) { $("rTime").textContent = "–"; return renderR("Nothing to roll back to: promote at least two versions first."); } const bad = champ; champ = history.pop(); $("rTime").textContent = "seconds (one alias move)"; renderR(`Rolled back: @champion moved from v${bad} to v${champ}. v${bad} stays in the registry, with its run, for the post-mortem.`); };
+  $("rReset").onclick = () => { $("rTime").textContent = "–"; resetR(); };
+  resetR();
+
+  /* ---------- Playground 3: batch vs real-time cost ---------- */
+  const FRESH = [["1 minute", 1], ["5 minutes", 5], ["15 minutes", 15], ["1 hour", 60], ["4 hours", 240], ["12 hours", 720], ["1 day", 1440], ["1 week", 10080]];
+  const human = v => v >= 1e9 ? (v / 1e9).toFixed(1) + " billion" : v >= 1e6 ? (v / 1e6).toFixed(1) + " million" : v >= 1e3 ? Math.round(v / 1e3) + " thousand" : Math.round(v) + "";
+  const money = v => v < 1 ? "$" + v.toFixed(2) : v < 100 ? "$" + v.toFixed(1) : "$" + Math.round(v).toLocaleString();
+  function renderB() {
+    const ent = 10 ** +$("bEnt").value, req = 10 ** +$("bReq").value, peak = +$("bPeak").value, ms = +$("bMs").value, [fl, fm] = FRESH[+$("bFresh").value], price = +$("bPrice").value;
+    $("bEntV").textContent = human(ent); $("bReqV").textContent = human(req); $("bPeakV").textContent = peak + "×"; $("bMsV").textContent = ms.toFixed(1); $("bFreshV").textContent = fl; $("bPriceV").textContent = "$" + price.toFixed(2);
+    const runs = Math.max(1 / 7, 1440 / fm), runHours = ent * ms / 1000 / 3600, batchH = runHours * runs, batchC = batchH * price;
+    const peakQps = req / 86400 * peak, cores = Math.max(1, Math.ceil(peakQps * ms / 1000 / 0.5)), rtC = cores * 24 * price;
+    const runMin = runHours * 60; // on one core
+    $("bBh").textContent = batchH < 10 ? batchH.toFixed(2) : Math.round(batchH).toLocaleString(); $("bBc").textContent = money(batchC);
+    $("bRc").textContent = cores.toLocaleString(); $("bRd").textContent = money(rtC);
+    const cheaper = batchC < rtC ? "batch" : "real-time";
+    $("bVerdict").textContent = `Cheaper here: ${cheaper} (${money(Math.min(batchC, rtC))} vs ${money(Math.max(batchC, rtC))} a day).`;
+    $("bMsg").innerHTML = (fm <= 15 ? `Fresh within ${fl} means ${Math.round(runs)} batch runs a day, re-scoring all ${human(ent)} entities each time; ` : `A batch run every ${fl} scores ${human(ent)} entities (about ${runMin < 120 ? Math.round(runMin) + " CPU-minutes" : (runMin / 60).toFixed(0) + " CPU-hours"} per run); `) +
+      `real-time needs ${cores} core${cores > 1 ? "s" : ""} for a peak of ${Math.round(peakQps).toLocaleString()} requests/s. ` +
+      (fm <= 5 ? "Freshness this tight usually also means features that change within a session, which batch can't see at all: real time (or a hybrid) wins on quality, not just cost." : ent > 20 * req ? "You score far more entities than anyone asks about: real time avoids that waste, if the latency budget allows." : "Many teams precompute in batch and fall back to real time only for new or very active users: a hybrid.");
+  }
+  ["bEnt", "bReq", "bPeak", "bMs", "bFresh", "bPrice"].forEach(id => ($(id).oninput = renderB));
+  renderB();
+})();
+</script>
+</body>
+</html>

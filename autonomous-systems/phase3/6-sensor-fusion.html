@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.6 Sensor fusion in practice: GPS + IMU & visual-inertial · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.strip { width: 100%; aspect-ratio: 7 / 1; height: auto; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .tilt-wrap { display: grid; grid-template-columns: minmax(180px, 1fr) 2.4fr; gap: 12px; align-items: center; }
+  @media (max-width: 700px) { .tilt-wrap { grid-template-columns: 1fr; } }
+  svg.flow { width: 100%; height: auto; display: block; }
+</style>
+</head>
+<body data-lesson="s3-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 6</div>
+  <h1>Sensor fusion in practice: GPS + IMU &amp; visual-inertial</h1>
+  <p class="subtitle">A fast sensor that drifts, a slow sensor that doesn't, and a filter in between. This lesson builds the estimator that flies every PX4 drone, keeps your phone's AR furniture on the floor, and lets a robot cross a tunnel without losing itself.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The Kalman loop</b>: <i>predict</i> (move the guess, grow the uncertainty by <span class="un">Q</span>), then <i>correct</i> (gain K = <span class="un">P</span>/(<span class="un">P</span>+<span class="un">R</span>), pull toward the measurement, shrink the uncertainty). Lesson 3.3.</li>
+      <li><b>The EKF</b>: the same loop for curved models, using a straight-line (Jacobian) approximation at the current guess (Lesson 3.4).</li>
+      <li><b>IMU</b> (inertial measurement unit): a gyroscope measures how fast you rotate (°/s), an accelerometer measures acceleration plus gravity (m/s²). Both have a small, slowly changing offset called <b class="un">bias</b> (Lesson 2.5).</li>
+      <li><b>GNSS</b> (global navigation satellite systems: GPS, Galileo, BeiDou, GLONASS): a position fix a few times a second, good to a few meters, worse between tall buildings (Lesson 2.6). We'll say “GPS” for short.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>Your drone's accelerometer has a tiny bias: it reads <b class="un">0.05 m/s²</b> too high, about half a percent of gravity. You switch off GPS and fly on the IMU alone, integrating acceleration into velocity and velocity into position.</p>
+    <p><b>How far off is the position estimate after one minute?</b> About 1 m? 10 m? 100 m? Commit to a number, then open the box below.</p>
+    <p>That number is why no real vehicle navigates on an IMU alone, and why every PX4 drone runs a <b>24-state</b> filter in which the IMU drives the prediction at 100 Hz or more and GPS, barometer, magnetometer and cameras correct it (<a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4 docs</a>). Two of those 24 states are not positions at all: they're the IMU's own biases.</p>
+  </div>
+
+  <div class="predict" id="pr0">
+    <b class="q">🧩 Your guess:</b> 0.05 m/s² of bias, 60 seconds, no GPS. How many meters of error?
+    <div><button class="btn small" data-open="pr0">Show the answer</button></div>
+    <div class="ans">About <b>90 m</b>. A constant acceleration error integrates twice: error = ½ × b × t² = ½ × 0.05 × 60² = <b>90 m</b>. After 10 s it's only 2.5 m, which is why the problem hides at first; it grows with the <i>square</i> of time. Halve the time, quarter the error; double it, four times the error. An IMU is a superb <i>short-term</i> sensor and a terrible long-term one.</div>
+  </div>
+
+  <h2>The pattern every vehicle uses: fast predict, slow correct</h2>
+  <p>Each sensor is good at one thing and bad at another. The trick is to give each the job it's good at.</p>
+  <table>
+    <tr><th>Sensor</th><th>Typical rate</th><th>Good at</th><th>Bad at</th><th>Job in the filter</th></tr>
+    <tr><td class="se">IMU</td><td>100–1000 Hz</td><td>Smooth, instant, never “drops out”</td><td>Drifts: bias integrates into meters</td><td><b>Predict</b> (the motion model's input)</td></tr>
+    <tr><td class="se">GPS</td><td>1–10 Hz</td><td>No drift: the error stays a few meters forever</td><td>Noisy, slow, delayed, lost in tunnels, fooled by reflections</td><td><b>Correct</b></td></tr>
+    <tr><td class="se">Camera (visual odometry)</td><td>10–60 Hz</td><td>Very precise relative motion, works indoors</td><td>Needs texture and light; one camera can't tell scale</td><td><b>Correct</b> (or a second prediction source)</td></tr>
+    <tr><td class="se">Barometer, magnetometer, wheels</td><td>10–100 Hz</td><td>Height, heading, ground speed</td><td>Weather, metal, wheel slip</td><td><b>Correct</b></td></tr>
+  </table>
+  <p class="hint">Rates are typical, not specs; check your sensors' datasheets.</p>
+
+  <svg id="flow1"></svg>
+  <div class="controls"><button class="btn" id="flowGo">▶ Play 0.2 s of data</button> <span class="hint" id="flowHint">IMU samples arrive 20 times between two GPS fixes.</span></div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: one GPS interval, step by step</span>
+    <p>IMU at 100 Hz (Δt = 0.01 s), GPS at 5 Hz. The car is at 0 m, driving 10 m/s; the accelerometer reads 2 m/s². Variance grows by <span class="un">Q</span> = 0.01 m² per IMU step.</p>
+    <ol>
+      <li><b>Predict, 20 times</b> (one per IMU sample): each step does p ← p + v·Δt + ½a·Δt², v ← v + a·Δt. After 0.2 s: v = 10 + 2 × 0.2 = <b>10.4 m/s</b>, p = 10 × 0.2 + ½ × 2 × 0.2² = <b>2.04 m</b>. Variance: 1 + 20 × 0.01 = <b class="un">1.2 m²</b> (if it started at 1 m²).</li>
+      <li><b>Correct, once</b>: GPS says <b class="se">2.9 m</b> with <span class="un">R</span> = 4 m² (σ = 2 m). K = 1.2 ÷ (1.2 + 4) = <b>0.23</b>; new p = 2.04 + 0.23 × 0.86 = <b>2.24 m</b>; new variance (1 − 0.23) × 1.2 = <b class="un">0.92 m²</b>.</li>
+      <li>Repeat. The controller gets a fresh estimate at <b>100 Hz</b>, even though GPS only speaks at 5 Hz.</li>
+    </ol>
+    <p>Notice the asymmetry: the IMU is not a “measurement” here. It's the <i>input</i> that moves the state, exactly like the commanded speed <span class="ct">v</span>·Δt in Lesson 3.3. PX4 says it plainly: its EKF “uses the IMU data for state prediction only”.</p>
+  </div>
+
+  <h2>Bias as a state: let the filter learn the sensor's mistake</h2>
+  <p>The hook's 90 m came from one constant number. If the filter knew it, it could subtract it. Nobody tells the filter the bias, but GPS quietly reveals it: when the IMU keeps predicting “you're further ahead than GPS says”, fix after fix, in the same direction, that pattern is a bias, not noise.</p>
+  <div class="eq">
+    state = [ <span class="be">p</span>, <span class="be">v</span>, <span class="un">b</span> ] &nbsp;&nbsp; Predict: <span class="be">v</span> ← <span class="be">v</span> + (<span class="se">a<sub>measured</sub></span> − <span class="un">b</span>)·Δt, &nbsp; <span class="be">p</span> ← <span class="be">p</span> + <span class="be">v</span>·Δt, &nbsp; <span class="un">b</span> ← <span class="un">b</span> (it changes only slowly)
+    <span class="say">Add the bias to the state, subtract it from every IMU reading, and let the GPS corrections tune it. The covariance P links “I'm drifting ahead” to “my bias guess is too small”, exactly like it linked position to velocity in Lesson 3.3.</span>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · IMU predicts, GPS corrects, then a tunnel</span>
+    <p class="hint">A car drives 40 s, speeding up and slowing down. Its accelerometer runs at 100 Hz with noise and a <b class="un">bias</b> you choose; GPS (σ = 2 m) arrives at the rate you pick. From 25 s to 35 s there's a <b>GPS outage</b> (grey band). The chart shows the filter's position <b>error</b>, and its own <span class="un">±2σ</span> band.</p>
+    <canvas class="chart" id="f1Chart" style="height:250px"></canvas>
+    <div class="controls">
+      <label><input type="checkbox" id="f1Bias"> estimate the <b class="un">bias</b> as a state</label>
+      <label>GPS rate <select id="f1Hz"><option value="1">1 Hz</option><option value="2" selected>2 Hz</option><option value="5">5 Hz</option><option value="10">10 Hz</option></select></label>
+      <label>accelerometer bias <input type="range" id="f1B" min="0" max="0.5" step="0.05" value="0.3"> <b class="mono" id="f1BV"></b></label>
+      <label><input type="checkbox" id="f1Out" checked> 10 s GPS outage</label>
+      <button class="btn" id="f1Roll">🎲 New noise</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">worst error in the outage <b id="f1Worst">–</b></div>
+      <div class="stat">RMS error (whole drive) <b id="f1Rms">–</b></div>
+      <div class="stat">bias estimate <b id="f1BEst">–</b></div>
+      <div class="stat">challenge <b id="f1Chal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> with a bias of 0.2 m/s² or more and the outage on, get through the tunnel with a worst error under <b>3 m</b>. With the defaults it's tens of meters. Then switch the GPS rate to 1 Hz: why does the bias estimate need fixes to learn from?</p>
+  </div>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> with the bias state <i>off</i>, is the filter at least fine <i>before</i> the tunnel, while GPS is still arriving?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">No, and it's worse than raw GPS. The filter believes the IMU is only randomly noisy, so it keeps trusting the biased prediction and lags behind every fix: switch the outage off and the RMS error with the defaults is still around 10 m, five times the GPS's own 2 m. A bias isn't noise that averages away; it's a <i>model error</i>. Give it a state, and the same filter beats GPS and coasts through the tunnel.</div>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    The fast, drifting sensor <b>predicts</b>; the slow, drift-free sensor <b>corrects</b>; and anything that makes the fast sensor drift (biases, scale factors, even wind) becomes <b>extra state</b> that the corrections can learn. When the slow sensor disappears, the learned biases are what keep you on the road.
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> A controller needs position, velocity and attitude hundreds of times a second. GPS gives a few noisy fixes a second, late, and vanishes in tunnels. An IMU gives perfect smoothness and drifts: 0.05 m/s² of bias is 90 m after a minute.</li>
+      <li><b>What people tried.</b> <i>GPS only, interpolated</i> (jittery, delayed, blind in tunnels). <i>IMU only, dead reckoning</i> (fine for seconds, lost after a minute; military-grade IMUs drift far less but cost far more). A <i>plain Kalman filter</i> on top (better, but a bias isn't random noise, so it still drags the estimate, as Playground 1 shows). A <i>fixed complementary blend</i> (great for attitude, below, but can't learn biases or weigh a degraded GPS).</li>
+      <li><b>Why this works.</b> The IMU becomes the motion model's input, so you get 100+ Hz estimates for free; GPS bounds the drift; and bias states let every correction teach the filter about the sensor's mistake. In Playground 1 at 2 Hz GPS and a 0.3 m/s² bias, adding one bias state takes the tunnel error from about 60 m to a few meters.</li>
+      <li><b>What it costs, when it fails.</b> More states to tune (bias random-walk noise, initial bias uncertainty). States must be <i>observable</i>: a bias can only be learned if the motion and the corrections reveal it (a drone hovering perfectly still can't separate some biases from tilt). Rotations make the model nonlinear, so it's an EKF, with all of Lesson 3.4's linearization risks. Delayed or wrong corrections (multipath, a late timestamp) poison it; that's Lesson 3.7.</li>
+      <li><b>What came next.</b> <b>Error-state</b> filters for better-behaved rotations, <b>tightly coupled</b> fusion of raw satellite and camera measurements, <b>visual-inertial odometry</b> (VIO) for GPS-free flight, and optimization over a sliding window of past states (pose graphs, Lesson 5.3) instead of a single filter step.</li>
+    </ol>
+  </div>
+
+  <h2>Loosely vs tightly coupled: how deep do you plug the sensor in?</h2>
+  <p>A GPS receiver doesn't really measure position. It measures the distance to each satellite (a <b>pseudorange</b>), and solves for position from those. To solve for x, y, z and its own clock error it needs <b>at least 4 satellites</b>. That gives you two ways to fuse it:</p>
+  <table>
+    <tr><th></th><th>Loosely coupled</th><th>Tightly coupled</th></tr>
+    <tr><td>What enters the filter</td><td>The receiver's finished answer: position (and velocity) with an uncertainty</td><td>The raw measurements: one pseudorange (and Doppler) per satellite</td></tr>
+    <tr><td>With 3 satellites in a city canyon</td><td>No fix → no correction at all</td><td>Still 3 useful measurements, each one a correction</td></tr>
+    <tr><td>Camera version</td><td>Visual odometry outputs a pose; the filter fuses the pose</td><td>The filter fuses each tracked image feature (as MSCKF, OpenVINS and VINS-Mono do)</td></tr>
+    <tr><td>Cost</td><td>Simple, modular, swap receivers freely</td><td>Needs a detailed sensor model, more compute, more ways to get it subtly wrong</td></tr>
+  </table>
+
+  <div class="predict" id="pr2">
+    <b class="q">🧩 Predict:</b> loosely coupled systems are simpler. So why do people bother with tightly coupled ones in exactly the places they matter most?
+    <div><button class="btn small" data-open="pr2">Show the answer</button></div>
+    <div class="ans">Because the hard cases are <i>partial</i> information. Downtown, a receiver may see only two or three clean satellites; loosely coupled gets nothing, tightly coupled still gets two or three constraints. A camera in a dim corridor may track only a dozen features; a pose solver may fail, but each feature still constrains the motion. Tightly coupled fusion never throws away a measurement just because there isn't a complete answer.</div>
+  </div>
+
+  <h2>Error-state EKF: estimate the mistake, not the state</h2>
+  <p>Flight and VIO filters rarely run a “plain” EKF on the full state. They split it in two:</p>
+  <ul>
+    <li>a <b class="be">nominal state</b>: integrate the IMU at full rate with the exact nonlinear equations (rotate, add gravity, integrate twice), with no uncertainty bookkeeping;</li>
+    <li>a small <b class="un">error state</b>: how far the nominal state is off (say 0.5° of tilt and 0.3 m), with its covariance. The Kalman filter runs on <i>this</i>. After each correction, the error is folded into the nominal state and reset to zero.</li>
+  </ul>
+  <p>Why bother? Three reasons. The error is always <b>small</b>, so the straight-line approximation of Lesson 3.4 is very accurate. Rotations become well-behaved: orientation is a quaternion with 4 numbers that must keep length 1 (Lesson 1.4), but a small rotation error is just <b>3 numbers</b> with no constraint. The MSCKF paper does exactly this, describing the orientation error as a small “error quaternion” (<a href="https://www-users.cse.umn.edu/~stergios/papers/ICRA07-MSCKF.pdf" target="_blank" rel="noopener">Mourikis &amp; Roumeliotis, 2007</a>), and PX4's EKF2 docs say it uses an “error-state” formulation to keep rotation uncertainty well-behaved (<a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4</a>). And the fast IMU loop stays cheap, with the matrix math running only on the error.</p>
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the hiking map and the pencil correction</span>
+    <p>You walk with a compass and a step count, and you draw your route in ink as you go: that's the nominal state. Every time you reach a signpost you don't redraw the whole route; you note “I'm 40 m east of where my ink says”, with how sure you are, and shift the ink from here on. You only ever do careful arithmetic on the small correction, never on the whole journey.</p>
+  </div>
+
+  <h2>Visual-inertial odometry: a camera, an IMU, and the scale problem</h2>
+  <p>Indoors, under bridges, or for a drone between trees, there's no GPS. A camera can take over the correcting job: track features from frame to frame and you get the motion very precisely. But a <b>single camera can't measure scale</b>. A video of a 1:10 model town flown through at 1 m/s looks exactly like the real town flown at 10 m/s.</p>
+  <p>The IMU fixes that. Its accelerometer measures in <b>m/s²</b>, real units. Match the camera's motion to the IMU's accelerations and the scale pops out. A tiny example: the camera's track implies an acceleration of 0.25 “camera units”/s² while the IMU feels 1.0 m/s² → scale = 1.0 ÷ 0.25 = <b>4 m per camera unit</b>. That's <b>visual-inertial odometry (VIO)</b>, the core of GPS-free drones and of phone AR.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Find the scale from the IMU</span>
+    <p class="hint">A phone is waved around. Its single camera tracked the motion, but in unknown units. The <b class="se">blue dots</b> are what the accelerometer felt (m/s², noisy). The <b class="be">purple line</b> is the camera's acceleration times <i>your</i> scale guess. Slide the scale until they match. The live <b>misfit</b> (RMS gap) is your only clue.</p>
+    <canvas class="chart" id="v2Chart" style="height:240px"></canvas>
+    <div class="controls">
+      <label>scale (m per camera unit) <input type="range" id="v2S" min="0" max="1" step="0.002" value="0"> <b class="mono" id="v2SV"></b></label>
+      <button class="btn" id="v2Solve">🧮 Let the filter solve it</button>
+      <button class="btn" id="v2New">🎲 New scene</button>
+      <label><input type="checkbox" id="v2Const"> move at constant speed</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">misfit (RMS) <b id="v2Fit">–</b></div>
+      <div class="stat">your scale <b id="v2Your">–</b></div>
+      <div class="stat">challenge <b id="v2Chal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> get the scale within <b>5%</b> of the truth by hand, before pressing 🧮. Then tick <b>move at constant speed</b> and try again. What happens to the misfit as you slide?</p>
+  </div>
+  <p>The constant-speed case is the famous catch: with no acceleration, the IMU feels nothing, every scale fits equally well, and the scale is <b>unobservable</b>. Real VIO systems need <i>excitation</i>: some acceleration and rotation, especially at start-up. That's why AR apps ask you to move your phone around first, and why a drone's VIO can drift in scale on a long, perfectly straight, constant-speed leg.</p>
+
+  <h2>The complementary filter: attitude with one line of code</h2>
+  <p>Before any Kalman filter, a drone needs to know which way is down. It has two clues, with opposite flaws:</p>
+  <ul>
+    <li>the <b class="se">gyro</b>, integrated: smooth and instant, but its bias makes it drift (1°/s of bias is 60° off after a minute);</li>
+    <li>the <b class="se">accelerometer</b>: at rest it measures gravity, so it tells you the tilt directly, with no drift. But it's noisy, and every vibration or turn adds accelerations that look like tilt.</li>
+  </ul>
+  <p>So trust the gyro for fast changes and the accelerometer for the slow average. With a blend weight α (alpha) close to 1:</p>
+  <div class="eq">
+    <span class="be">θ</span> ← α · ( <span class="be">θ</span> + <span class="se">ω<sub>gyro</sub></span>·Δt ) + (1 − α) · <span class="se">θ<sub>accel</sub></span>
+    <span class="say">Each step: rotate by what the gyro says, then lean a little (1 − α) toward the accelerometer's tilt. The gyro's drift gets pulled back; the accelerometer's noise gets averaged out.</span>
+  </div>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what α means in seconds</span>
+    <p>The blend has a <b>time constant</b> τ = α·Δt ÷ (1 − α): roughly, “the accelerometer's opinion takes over after τ seconds”. At 100 Hz (Δt = 0.01 s) with α = 0.98: τ = 0.98 × 0.01 ÷ 0.02 = <b>0.49 s</b>.</p>
+    <ul>
+      <li>A gyro bias of 1°/s now leaves a steady error of only bias × τ ≈ 1 × 0.49 = <b>0.49°</b>, instead of 60° after a minute.</li>
+      <li>Accelerometer wobbles faster than about 1/τ ≈ 2 rad/s are mostly filtered out.</li>
+      <li>Bigger α (say 0.998, τ ≈ 5 s): less accelerometer noise, but 5× the bias error. Smaller α: the reverse. The best α is a trade-off you can feel in the next playground.</li>
+    </ul>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Keep the drone level-headed</span>
+    <p class="hint">A drone rocks back and forth for 20 s. Grey is its <b>true tilt</b>. Orange dashed is the <b class="ct">gyro alone</b> (drifts), thin blue is the <b class="se">accelerometer alone</b> (noisy, and shaken by the propellers' vibration), purple is the <b class="be">complementary filter</b> with your α. Press ▶ to watch the drone.</p>
+    <div class="tilt-wrap">
+      <canvas class="sim square" id="c3Sim"></canvas>
+      <canvas class="chart" id="c3Chart" style="height:250px"></canvas>
+    </div>
+    <div class="controls">
+      <label>α <input type="range" id="c3A" min="0" max="14" step="1" value="3"> <b class="mono" id="c3AV"></b></label>
+      <label>gyro bias <input type="range" id="c3B" min="0" max="3" step="0.25" value="1"> <b class="mono" id="c3BV"></b></label>
+      <label>accel noise <input type="range" id="c3N" min="0" max="6" step="0.5" value="3"> <b class="mono" id="c3NV"></b></label>
+      <label><input type="checkbox" id="c3Sh" checked> propeller vibration</label>
+      <button class="btn primary" id="c3Play">▶ Play</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">gyro only (RMS) <b id="c3G">–</b></div>
+      <div class="stat">accel only <b id="c3Ac">–</b></div>
+      <div class="stat">complementary <b id="c3F">–</b></div>
+      <div class="stat">time constant τ <b id="c3T">–</b></div>
+      <div class="stat">challenge <b id="c3Chal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> with vibration on, a gyro bias of at least 1°/s and accelerometer noise of at least 3°, keep the RMS tilt error under <b>1°</b>. Too small an α lets the vibration through; too big lets the bias drift in. Then set the bias to 0: which α wins now, and why?</p>
+  </div>
+  <p>What you should find: the window is narrow, around α ≈ 0.98, τ ≈ 0.5 s. That's the complementary filter's limit: one fixed number trades noise against drift. A Kalman filter does the same blend but picks the weight from the uncertainties, and can estimate the gyro bias as a state, so the trade-off disappears. Yet the complementary filter is still everywhere: it's tiny, it can't diverge, and PX4 itself uses one to carry EKF2's delayed estimate forward to the present (Lesson 3.7).</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>On a ground robot with ROS 2, <b>robot_localization</b> gives you the whole recipe by configuration: its docs suggest <b>two EKFs</b>, one fusing only continuous data (wheels, IMU) in the <code>odom</code> frame for smooth local control, and one adding GPS in the <code>map</code> frame, because GPS “jumps”; <code>navsat_transform_node</code> converts latitude/longitude into that frame. On drones you configure <b>PX4 EKF2</b> or <b>ArduPilot EKF3</b> by parameters. For attitude on a microcontroller, a complementary filter (or the open-source <b>x-io Fusion</b> AHRS library) is a few lines. For VIO, start from <b>OpenVINS</b> (an MSCKF-based EKF) or <b>VINS-Mono</b> (sliding-window optimization).</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+
+<span class="c"># Complementary filter for tilt (roll) from a gyro + accelerometer, 100 Hz</span>
+dt, alpha = <span class="n">0.01</span>, <span class="n">0.98</span>                  <span class="c"># time constant = alpha*dt/(1-alpha) ≈ 0.49 s</span>
+roll = <span class="n">0.0</span>
+<span class="k">def</span> step(roll, gyro_x, acc_y, acc_z):
+    roll_acc = np.arctan2(acc_y, acc_z)           <span class="c"># tilt seen by gravity (rad)</span>
+    <span class="k">return</span> alpha * (roll + gyro_x * dt) + (<span class="n">1</span> - alpha) * roll_acc
+
+<span class="c"># 1D GPS + IMU with an accelerometer-bias state: x = [p, v, b]</span>
+F = np.array([[<span class="n">1</span>, dt, -<span class="n">0.5</span>*dt**<span class="n">2</span>], [<span class="n">0</span>, <span class="n">1</span>, -dt], [<span class="n">0</span>, <span class="n">0</span>, <span class="n">1</span>]])
+B = np.array([<span class="n">0.5</span>*dt**<span class="n">2</span>, dt, <span class="n">0</span>])                  <span class="c"># how the measured acceleration enters</span>
+<span class="k">def</span> predict(x, P, a_meas, Q):
+    <span class="k">return</span> F @ x + B * a_meas, F @ P @ F.T + Q     <span class="c"># v += (a_meas - b)*dt, p += ...</span></code></pre>
+<pre><code><span class="c"># robot_localization: the GPS-aware "map" EKF (ekf_global.yaml, abridged)</span>
+ekf_filter_node_map:
+  ros__parameters:
+    frequency: <span class="n">30.0</span>
+    world_frame: map                <span class="c"># the odom-frame EKF uses world_frame: odom</span>
+    odom0: /wheel/odometry
+    odom0_config: [<span class="k">false</span>, <span class="k">false</span>, <span class="k">false</span>,  <span class="k">false</span>, <span class="k">false</span>, <span class="k">false</span>,
+                   <span class="k">true</span>,  <span class="k">true</span>,  <span class="k">false</span>,  <span class="k">false</span>, <span class="k">false</span>, <span class="k">true</span>,
+                   <span class="k">false</span>, <span class="k">false</span>, <span class="k">false</span>]
+    odom1: /odometry/gps             <span class="c"># output of navsat_transform_node</span>
+    odom1_config: [<span class="k">true</span>,  <span class="k">true</span>,  <span class="k">false</span>,  <span class="k">false</span>, <span class="k">false</span>, <span class="k">false</span>,
+                   <span class="k">false</span>, <span class="k">false</span>, <span class="k">false</span>,  <span class="k">false</span>, <span class="k">false</span>, <span class="k">false</span>,
+                   <span class="k">false</span>, <span class="k">false</span>, <span class="k">false</span>]   <span class="c"># GPS gives x, y only</span>
+    imu0: /imu/data
+    imu0_config: [<span class="k">false</span>, <span class="k">false</span>, <span class="k">false</span>,  <span class="k">false</span>, <span class="k">false</span>, <span class="k">true</span>,
+                  <span class="k">false</span>, <span class="k">false</span>, <span class="k">false</span>,  <span class="k">false</span>, <span class="k">false</span>, <span class="k">true</span>,
+                  <span class="k">true</span>,  <span class="k">false</span>, <span class="k">false</span>]</code></pre>
+    <p class="hint">Two classic bugs: fusing GPS into the controller's <code>odom</code> estimate (the robot twitches at every GPS jump), and an IMU whose axes or frame don't match the robot's (the filter “learns” a huge bias that is really a mounting error). Check frames first (Lesson 1.6).</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🛸 Drones (PX4, ArduPilot, Skydio)</h4><p>PX4's <b>EKF2</b> is a 24-state EKF: attitude quaternion, velocity, position, <b>gyro and accelerometer biases</b>, earth and body magnetic field, wind. The IMU (at least 100 Hz; the default prediction period <code>EKF2_PREDICT_US</code> is 10,000 µs) drives prediction only; GPS, baro, magnetometer, rangefinder, optical flow and vision correct it. GPS must pass quality checks for 10 s (by default) before it's used; the documented minimums include at least 6 satellites, a horizontal accuracy under 3 m and a PDOP (satellite geometry) under 2.5. PX4 also says EKF2 uses an “error-state” formulation, for the rotation uncertainty. ArduPilot's <b>EKF3</b> runs one filter core per IMU and flies on the healthiest. Skydio says its drones navigate “even where GPS isn't available” and avoid obstacles with navigation cameras; it doesn't publish the estimator.</p>
+        <p class="src">Sources: <a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4 EKF2</a>, <a href="https://docs.px4.io/main/en/advanced_config/parameter_reference.html" target="_blank" rel="noopener">PX4 parameters</a>, <a href="https://ardupilot.org/copter/docs/common-apm-navigation-extended-kalman-filter-overview.html" target="_blank" rel="noopener">ArduPilot EKF</a>, <a href="https://www.skydio.com/autonomy" target="_blank" rel="noopener">Skydio</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo hasn't published its localization filter. What it has said: its cars know “what the road ahead looks like” from prebuilt maps, which help them “navigate places even where GPS struggles, like tunnels or between skyscrapers”, and they detect road changes by “cross-referencing the real-time sensor data with its on-board map” (2020). That is fusion with a map as one of the sensors: lidar and cameras matched against the map play the role GPS plays for a drone. The 6th-generation Driver (rider-only since Feb 2026) pairs cameras, lidar and imaging radar so that “lidar and radar provide the necessary redundancy” when a camera's view is limited.</p>
+        <p class="src">Sources: <a href="https://waymo.com/blog/2020/09/the-waymo-driver-handbook-mapping/" target="_blank" rel="noopener">Waymo, mapping (2020)</a>, <a href="https://waymo.com/blog/2026/02/ro-on-6th-gen-waymo-driver" target="_blank" rel="noopener">Waymo, Feb 2026</a></p></div>
+      <div><h4>🚘 Tesla</h4><p>Tesla hasn't published how it estimates the car's own position, or how it fuses GPS, IMU and cameras. What it has said publicly: Model 3 and Model Y in North America dropped radar from May 2021 (“Tesla Vision”), and in his CVPR 2021 keynote Andrej Karpathy, then head of AI, showed networks estimating other cars' depth and velocity from video alone. So the public story is about perceiving <i>others</i> from cameras; the ego-motion estimator isn't described.</p>
+        <p class="src">Sources: <a href="https://www.tesla.com/support/transitioning-tesla-vision" target="_blank" rel="noopener">Tesla support</a>, <a href="https://www.youtube.com/watch?v=g6bOwQdCJrc" target="_blank" rel="noopener">CVPR'21 WAD keynote</a></p></div>
+      <div><h4>🤖 Robots &amp; phones</h4><p>ROS 2 robots use <b>robot_localization</b> (two EKFs plus <code>navsat_transform_node</code>). Your phone runs VIO: Apple's ARKit docs say it uses “visual-inertial odometry”, combining the motion sensors with computer vision on the camera image. Research VIO such as <b>VINS-Mono</b> (aimed at drones and AR) and <b>OpenVINS</b> (an MSCKF-based EKF) is open source.</p>
+        <p class="src">Sources: <a href="https://github.com/cra-ros-pkg/robot_localization/blob/ros2/doc/integrating_gps.rst" target="_blank" rel="noopener">robot_localization GPS docs</a>, <a href="https://developer.apple.com/documentation/arkit/understanding-world-tracking" target="_blank" rel="noopener">ARKit</a>, <a href="https://arxiv.org/abs/1708.03852" target="_blank" rel="noopener">VINS-Mono</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> a drone has no wheels and no map, so an IMU-driven EKF with GPS, baro and vision corrections <i>is</i> its sense of self, and it's documented in the open. A robotaxi drives a mapped area, so matching lidar and cameras to the map (Lesson 5.6) gives it corrections where GPS fails; the details are proprietary. Tesla's public talks focus on learned perception from cameras, and it hasn't described its localization at all.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Complementary filter</td><td>A few lines, can't diverge, no matrices</td><td>One fixed trade-off (α); no uncertainty; can't learn biases</td></tr>
+      <tr><td>EKF / error-state EKF with bias states</td><td>Learns biases; weighs each sensor by its uncertainty; 100+ Hz output</td><td>Tuning many noise values; observability; linearization (Lesson 3.4)</td></tr>
+      <tr><td>Loosely coupled</td><td>Modular; any receiver or VO module</td><td>Throws away partial information (3 satellites, few features)</td></tr>
+      <tr><td>Tightly coupled</td><td>Uses every satellite and every feature; better in hard places</td><td>Complex models; more compute; harder to debug</td></tr>
+      <tr><td>VIO (camera + IMU)</td><td>No GPS needed; metric scale; works indoors</td><td>Needs light, texture and motion; slow drift over long distances</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Design the state estimator for a drone with an IMU, GPS and a downward camera.” A strong answer:</p>
+    <ul>
+      <li>IMU drives the <b>prediction</b> at its full rate; GPS, baro, magnetometer and camera are <b>corrections</b>, each with its own noise, delay and gate.</li>
+      <li>Includes <b>gyro and accelerometer biases</b> as states (and says what motion makes them observable).</li>
+      <li>Uses an <b>error-state</b> formulation for attitude (3-number errors, not quaternion components).</li>
+      <li>Knows <b>loosely vs tightly coupled</b> and when each is worth it; knows a monocular camera needs the IMU for <b>scale</b>.</li>
+      <li>Mentions <b>time stamps and delays</b>, outlier gates and what happens when GPS drops out (Lesson 3.7).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>PX4 EKF2 on open-source drones</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4: Using the ECL EKF</a></div>
+      <p><b>How:</b> a 24-state EKF with IMU-driven prediction and bias states; GPS, baro, magnetometer, rangefinder, optical flow and external vision as corrections, each with a delay parameter.</p>
+      <p><b>Why this method:</b> the attitude and velocity controllers need fast, smooth, drift-free estimates, and no single sensor provides them.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>MSCKF: vision-aided inertial navigation</b> <span class="tag res">🧪 Research · 2007</span> <a href="https://www-users.cse.umn.edu/~stergios/papers/ICRA07-MSCKF.pdf" target="_blank" rel="noopener">Mourikis &amp; Roumeliotis, ICRA 2007</a></div>
+      <p><b>How:</b> an EKF keeps a sliding window of recent camera poses; a feature seen from several poses becomes a constraint between them, without putting the feature's 3D position in the state.</p>
+      <p><b>Why this method:</b> cost grows only linearly with the number of features, so a camera plus IMU can run in real time; it's the ancestor of many VIO systems, including OpenVINS.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>VINS-Mono</b> <span class="tag res">🧪 Research · 2017</span> <a href="https://arxiv.org/abs/1708.03852" target="_blank" rel="noopener">Qin, Li, Shen: VINS-Mono</a></div>
+      <p><b>How:</b> one camera plus an IMU, fused tightly by optimization over a sliding window, with loop detection and pose-graph optimization for long runs.</p>
+      <p><b>Why this method:</b> the minimal sensor set, a camera and an IMU, that every drone and phone already has; its authors target drone state estimation and AR.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>GPS on ROS 2 ground robots</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/cra-ros-pkg/robot_localization" target="_blank" rel="noopener">robot_localization</a></div>
+      <p><b>How:</b> a continuous odom-frame EKF (wheels + IMU) for control and a map-frame EKF that adds GPS through <code>navsat_transform_node</code>.</p>
+      <p><b>Why this method:</b> controllers hate jumps; planners need a globally correct position. Two estimates give each what it needs.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · your phone is a VIO robot</span>
+    <p>When you place a virtual sofa in your living room and walk around it, your phone is doing what a GPS-free drone does: Apple's ARKit uses “visual-inertial odometry”, combining the phone's motion sensors with computer vision on the camera image (<a href="https://developer.apple.com/documentation/arkit/understanding-world-tracking" target="_blank" rel="noopener">Apple</a>). That's why AR apps ask you to move the phone around first: without motion, the scale is unobservable, exactly as in Playground 2.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This is the Kalman filter of Lesson 3.3 with the IMU as its motion model, made nonlinear by rotations (the EKF of Lesson 3.4), with the sensors of Lessons 2.5 (IMU) and 2.6 (GNSS). Next, Lesson 3.7 protects it from the measurements that lie (multipath, delays). VIO grows into visual SLAM (Lesson 5.4) and drone autonomy (Lesson 8.8), and the estimate you built here is what every controller in Phase 8 consumes. Math refreshers: <a href="../../math-course/phase4/3-distributions.html">distributions</a> and <a href="../../math-course/phase4/2-bayes.html">Bayes' rule</a> in the Math course.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4: Using the ECL EKF</a>. States, sensors, delays and what the log plots mean.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/rpng/open_vins" target="_blank" rel="noopener">OpenVINS</a>. A research platform for visual-inertial estimation (MSCKF-based EKF), with excellent documentation.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/xioTechnologies/Fusion" target="_blank" rel="noopener">x-io Fusion</a>. A small, readable IMU orientation library whose README explains its complementary-filter gain in plain words.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A complementary filter runs at 200 Hz (Δt = 0.005 s) with α = 0.99. The gyro has a bias of 2°/s. Roughly what steady tilt error does the bias leave?</div>
+    <div class="opts"><button class="opt">0.01°</button><button class="opt" data-ok>About 1°</button><button class="opt">It grows without limit, 2° every second</button></div>
+    <div class="explain">τ = α·Δt ÷ (1 − α) = 0.99 × 0.005 ÷ 0.01 ≈ <b>0.5 s</b>, and the steady error ≈ bias × τ = 2 × 0.5 ≈ <b>1°</b>. Without the accelerometer pulling it back (α = 1) it would indeed grow by 2° every second.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A delivery robot's position estimate is great on open streets but drifts 20 m after every long underpass, always in the direction of travel. GPS and wheel odometry are fused in an EKF without bias states. What's the best first fix?</div>
+    <div class="opts"><button class="opt">Increase R so GPS is trusted less</button><button class="opt" data-ok>Add a state for the systematic error (e.g. a wheel-speed scale factor or accelerometer bias) so GPS can calibrate it before the underpass</button><button class="opt">Run the filter faster</button></div>
+    <div class="explain">Drift in a consistent direction is a <b>model error</b>, not random noise. A bias or scale-factor state lets the filter learn it from GPS while it's available, and remove it when GPS disappears (Playground 1).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A drone with one camera and an IMU flies a long, perfectly straight line at constant speed, and its VIO slowly gets the distance wrong. Why?</div>
+    <div class="opts"><button class="opt" data-ok>With no acceleration, the IMU gives no information about scale, so scale is unobservable and can drift</button><button class="opt">Cameras can't see while moving</button><button class="opt">The gyro bias is too large</button></div>
+    <div class="explain">A monocular camera knows motion only up to scale; the accelerometer supplies the meters, but only when there's acceleration to compare. Constant velocity looks identical at every scale, as the flat misfit showed in Playground 2. A little excitation (turns, speed changes) or another sensor (GPS, a rangefinder) fixes it.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>The IMU <b>predicts</b> at 100+ Hz; GPS, baro, magnetometer and cameras <b>correct</b>. A 0.05 m/s² bias alone is 90 m after a minute (½·b·t²).</li>
+      <li>Make biases <b>states</b>: GPS calibrates them, and they carry you through outages (tens of meters → a few meters in Playground 1).</li>
+      <li><b>Loosely coupled</b> fuses finished answers; <b>tightly coupled</b> fuses raw satellites or features and works with partial information.</li>
+      <li><b>Error-state</b> EKFs track the small mistake (3 numbers for attitude), not the full state.</li>
+      <li><b>VIO</b>: camera for precise motion, IMU for scale, which needs acceleration. <b>Complementary filter</b>: α = 0.98 at 100 Hz is τ ≈ 0.5 s.</li>
+      <li>PX4 EKF2 (24 states) and ArduPilot EKF3 do all of this in the open; Waymo leans on its maps; Tesla hasn't published its localization.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/sim.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+  const mul = (A, B) => A.map(r => B[0].map((_, j) => r.reduce((s, v, k) => s + v * B[k][j], 0)));
+  const tr = M => M[0].map((_, j) => M.map(r => r[j]));
+  const add = (A, B) => A.map((r, i) => r.map((v, j) => v + B[i][j]));
+
+  // ---------- Flow diagram ----------
+  const F = new Flow($("flow1"), { width: 760, height: 190 });
+  F.node("imu", { x: 80, y: 60, w: 120, h: 48, label: "IMU", sub: "100–1000 Hz", kind: "se" })
+   .node("pred", { x: 280, y: 60, w: 140, h: 48, label: "Predict", sub: "move + grow P", kind: "be" })
+   .node("gps", { x: 80, y: 145, w: 120, h: 48, label: "GPS / camera", sub: "1–30 Hz, late", kind: "se" })
+   .node("corr", { x: 480, y: 100, w: 140, h: 48, label: "Correct", sub: "gain K, shrink P", kind: "be" })
+   .node("ctl", { x: 680, y: 100, w: 130, h: 48, label: "Controller", sub: "needs 100+ Hz", kind: "ct" })
+   .edge("imu", "pred").edge("pred", "corr", { label: "state + P" }).edge("gps", "corr", { label: "fix" }).edge("corr", "ctl");
+  F.render();
+  let flowBusy = false;
+  $("flowGo").onclick = async () => {
+    if (flowBusy) return; flowBusy = true;
+    for (let i = 1; i <= 20; i++) {
+      F.set("pred", { sub: `step ${i} of 20` });
+      await F.packet(["imu", "pred", "corr", "ctl"], { color: "--c-se", dur: 140 });
+    }
+    F.set("pred", { sub: "move + grow P" });
+    $("flowHint").textContent = "…and now one GPS fix corrects all that prediction.";
+    await F.packet(["gps", "corr", "ctl"], { color: "--c-un", dur: 700 });
+    $("flowHint").textContent = "20 IMU predictions, 1 GPS correction, every 0.2 s.";
+    flowBusy = false;
+  };
+
+  // ---------- Playground 1: GPS + IMU with a bias state ----------
+  let seed1 = 3;
+  function sim1() {
+    const r = Sim.rng(seed1), dt = 0.01, N = 4000, sa = 0.3, sg = 2;
+    const hz = +$("f1Hz").value, every = Math.round(1 / (hz * dt)), bias = +$("f1B").value;
+    const bs = $("f1Bias").checked, outage = $("f1Out").checked;
+    const acc = t => 1.2 * Math.sin(0.35 * t) + 0.6 * Math.sin(0.9 * t + 1);
+    let pt = 0, vt = 5;
+    let x = bs ? [0, 5, 0] : [0, 5], P = bs ? [[4, 0, 0], [0, 1, 0], [0, 0, 0.25]] : [[4, 0], [0, 1]];
+    const q = sa * sa, Fm = bs ? [[1, dt, -0.5 * dt * dt], [0, 1, -dt], [0, 0, 1]] : [[1, dt], [0, 1]];
+    const g = bs ? [0.5 * dt * dt, dt, 0] : [0.5 * dt * dt, dt];
+    const Q = g.map(a => g.map(b => a * b * q)); if (bs) Q[2][2] = 0.002 * 0.002 * dt;
+    const FT = tr(Fm);
+    const out = { err: [], sig: [], worst: 0, se: 0 };
+    for (let i = 1; i <= N; i++) {
+      const t = i * dt, a = acc(t);
+      pt += vt * dt + 0.5 * a * dt * dt; vt += a * dt;
+      const am = a + bias + sa * Sim.randn(r), ab = bs ? am - x[2] : am;
+      x[0] += x[1] * dt + 0.5 * ab * dt * dt; x[1] += ab * dt;
+      P = add(mul(mul(Fm, P), FT), Q);
+      const inOut = outage && t >= 25 && t < 35;
+      if (i % every === 0 && !inOut) {
+        const z = pt + sg * Sim.randn(r), S = P[0][0] + sg * sg, K = P.map(row => row[0] / S), y = z - x[0];
+        x = x.map((v, k) => v + K[k] * y);
+        const row0 = P[0].slice(); P = P.map((row, a2) => row.map((v, b2) => v - K[a2] * row0[b2]));
+      }
+      const e = x[0] - pt;
+      if (t >= 25 && t < 35) out.worst = Math.max(out.worst, Math.abs(e));
+      out.se += e * e;
+      if (i % 10 === 0) { out.err.push([t, e]); out.sig.push([t, 2 * Math.sqrt(P[0][0])]); }
+    }
+    out.rms = Math.sqrt(out.se / N); out.b = bs ? x[2] : null;
+    return out;
+  }
+  function draw1() {
+    $("f1BV").textContent = fmt(+$("f1B").value, 2) + " m/s²";
+    const o = sim1();
+    const m = Math.max(...o.err.map(p => Math.abs(p[1])), ...o.sig.map(p => p[1]));
+    const lim = Math.min(90, Math.max(5, m * 1.15));
+    const series = [
+      { label: "filter error", color: MX.css("--c-be"), data: o.err, width: 2.5 },
+      { label: "filter's own ±2σ", color: MX.css("--c-un"), data: o.sig, width: 1.5, dash: [4, 3] },
+      { label: "", color: MX.css("--c-un"), data: o.sig.map(p => [p[0], -p[1]]), width: 1.5, dash: [4, 3] },
+    ];
+    if ($("f1Out").checked) series.unshift({ label: "GPS outage", color: MX.css("--muted"), data: [[25, lim], [35, lim]], width: 0.5, fill: true });
+    Plot.line($("f1Chart"), { series, xMin: 0, xMax: 40, yMin: -lim, yMax: lim, xLabel: "time (s)", yLabel: "error (m)", hlines: [{ y: 0 }] });
+    $("f1Worst").textContent = $("f1Out").checked ? fmt(o.worst, 1) + " m" : "no outage";
+    $("f1Rms").textContent = fmt(o.rms, 2) + " m";
+    $("f1BEst").textContent = o.b == null ? "not estimated" : fmt(o.b, 3) + " (true " + fmt(+$("f1B").value, 2) + ")";
+    const win = $("f1Bias").checked && $("f1Out").checked && +$("f1B").value >= 0.2 && o.worst < 3;
+    $("f1Chal").innerHTML = win ? `<span class="badge-win">✅ Through the tunnel within ${fmt(o.worst, 1)} m</span>` : `<span class="muted">target: worst &lt; 3 m</span>`;
+  }
+  ["f1Bias", "f1Hz", "f1Out"].forEach(id => ($(id).onchange = draw1));
+  $("f1B").oninput = draw1;
+  $("f1Roll").onclick = () => { seed1++; draw1(); };
+  draw1();
+
+  // ---------- Playground 2: VIO scale ----------
+  let seed2 = 5, sTrue = 3.7;
+  const S_MIN = 0.5, S_MAX = 10, sOf = u => S_MIN * Math.pow(S_MAX / S_MIN, u);
+  let scene2 = null;
+  function makeScene() {
+    const r = Sim.rng(seed2), dt = 0.05, N = 400, cst = $("v2Const").checked;
+    const aT = t => cst ? 0 : -1.5 * 0.81 * Math.sin(0.9 * t) - 0.8 * 4.41 * Math.sin(2.1 * t + 0.5);
+    const ts = [], imu = [], cam = [];
+    for (let i = 0; i < N; i++) { const t = i * dt, a = aT(t); ts.push(t); imu.push(a + 0.3 * Sim.randn(r)); cam.push(a / sTrue + 0.01 * Sim.randn(r)); }
+    scene2 = { ts, imu, cam };
+  }
+  function fit(s) { const o = scene2; let se = 0; o.imu.forEach((a, i) => (se += (a - s * o.cam[i]) ** 2)); return Math.sqrt(se / o.imu.length); }
+  let solved = false;
+  function draw2() {
+    if (!scene2) return;
+    const s = sOf(+$("v2S").value), o = scene2;
+    $("v2SV").textContent = fmt(s, 2);
+    Plot.line($("v2Chart"), {
+      series: [
+        { label: "IMU acceleration (m/s²)", color: MX.css("--c-se"), data: o.ts.map((t, i) => [t, o.imu[i]]), dotsOnly: true },
+        { label: "camera × your scale", color: MX.css("--c-be"), data: o.ts.map((t, i) => [t, s * o.cam[i]]), width: 2.5 },
+      ], xMin: 0, xMax: 20, yMin: -6, yMax: 6, xLabel: "time (s)", yLabel: "acceleration", hlines: [{ y: 0 }],
+    });
+    $("v2Fit").textContent = fmt(fit(s), 3) + " m/s²";
+    $("v2Your").textContent = fmt(s, 2) + " m/unit";
+    const cst = $("v2Const").checked, err = Math.abs(s - sTrue) / sTrue;
+    if (cst) $("v2Chal").innerHTML = `<span class="badge-lose">Scale unobservable</span> <span class="muted">every scale fits: no acceleration, no information</span>`;
+    else if (err < 0.05 && !solved) $("v2Chal").innerHTML = `<span class="badge-win">✅ Within ${fmt(err * 100, 1)}% of the true ${fmt(sTrue, 2)}</span>`;
+    else if (err < 0.05) $("v2Chal").innerHTML = `<span class="muted">solved by the filter: true scale ${fmt(sTrue, 2)} (try a 🎲 new scene by hand)</span>`;
+    else $("v2Chal").innerHTML = `<span class="muted">target: within 5% of the true scale</span>`;
+  }
+  $("v2S").oninput = () => { solved = false; draw2(); };
+  $("v2Solve").onclick = () => {
+    const o = scene2, num = MX.sum(o.imu.map((a, i) => a * o.cam[i])), den = MX.sum(o.cam.map(c => c * c));
+    if ($("v2Const").checked || den < 1e-6) { $("v2Chal").innerHTML = `<span class="badge-lose">The filter can't solve it either</span> <span class="muted">the camera shows no acceleration to compare</span>`; return; }
+    const s = num / den; solved = true;
+    $("v2S").value = Math.log(s / S_MIN) / Math.log(S_MAX / S_MIN); draw2();
+  };
+  $("v2New").onclick = () => { seed2++; const r = Sim.rng(seed2 * 7); sTrue = 1.5 + 6.5 * r(); solved = false; $("v2S").value = 0; makeScene(); draw2(); };
+  $("v2Const").onchange = () => { makeScene(); draw2(); };
+  makeScene(); draw2();
+
+  // ---------- Playground 3: complementary filter ----------
+  const ALPHAS = [0, 0.5, 0.8, 0.9, 0.93, 0.95, 0.96, 0.97, 0.98, 0.985, 0.99, 0.995, 0.998, 0.999, 1];
+  const DT3 = 0.01, N3 = 2000;
+  const th3 = t => 10 * Math.sin(0.5 * t) + 5 * Math.sin(1.7 * t), om3 = t => 5 * Math.cos(0.5 * t) + 8.5 * Math.cos(1.7 * t);
+  let run3 = null, frame3 = N3 - 1;
+  function sim3() {
+    const r = Sim.rng(17), a = ALPHAS[+$("c3A").value], bias = +$("c3B").value, an = +$("c3N").value, sh = $("c3Sh").checked;
+    let g = 0, f = 0; const o = { t: [], tr: [], g: [], acc: [], f: [], se: [0, 0, 0] };
+    for (let i = 1; i <= N3; i++) {
+      const t = i * DT3, wm = om3(t) + bias + 0.5 * Sim.randn(r);
+      const shake = sh ? 8 * Math.sin(13 * t) * (Math.sin(0.7 * t) > 0 ? 1 : 0.3) : 0;
+      const ta = th3(t) + an * Sim.randn(r) + shake;
+      g += wm * DT3; f = a * (f + wm * DT3) + (1 - a) * ta;
+      const T = th3(t);
+      o.se[0] += (g - T) ** 2; o.se[1] += (ta - T) ** 2; o.se[2] += (f - T) ** 2;
+      o.t.push(t); o.tr.push(T); o.g.push(g); o.acc.push(ta); o.f.push(f);
+    }
+    o.rms = o.se.map(v => Math.sqrt(v / N3)); o.a = a;
+    return o;
+  }
+  function chart3(n) {
+    const o = run3, k = 4, pick = arr => o.t.slice(0, n).map((t, i) => [t, arr[i]]).filter((_, i) => i % k === 0);
+    Plot.line($("c3Chart"), {
+      series: [
+        { label: "accelerometer alone", color: MX.css("--c-se"), data: pick(o.acc), width: 1, },
+        { label: "gyro alone", color: MX.css("--c-ct"), data: pick(o.g), width: 2, dash: [6, 4] },
+        { label: "true tilt", color: MX.css("--muted"), data: pick(o.tr), width: 3 },
+        { label: "complementary filter", color: MX.css("--c-be"), data: pick(o.f), width: 2.5 },
+      ], xMin: 0, xMax: 20, yMin: -30, yMax: 40, xLabel: "time (s)", yLabel: "tilt (°)", hlines: [{ y: 0 }],
+    });
+  }
+  const W3 = new Sim($("c3Sim"), { xRange: [-3, 3], yRange: [-3, 3] });
+  W3.render(w => {
+    w.clear();
+    if (!run3) return;
+    const i = frame3, bar = (deg, color, width, len) => { const a = MX.rad(deg), L = len || 2.2; w.line([[-L * Math.cos(a), -L * Math.sin(a)], [L * Math.cos(a), L * Math.sin(a)]], { color, width }); };
+    w.line([[-3, -2.4], [3, -2.4]], { color: "--line", width: 1 });
+    bar(MX.clamp(run3.g[i], -80, 80), "--c-ct", 2, 2.4);
+    bar(run3.tr[i], "--muted", 9, 2.0);
+    bar(run3.f[i], "--c-be", 3, 2.3);
+    const a = MX.rad(run3.tr[i]);
+    w.drone({ x: 0, y: 0, th: 0 }, { color: "--muted", size: 0.35, alpha: 0.6 });
+    w.arrow([0, 0], [-1.1 * Math.sin(a), 1.1 * Math.cos(a)], { color: "--muted", width: 1.5 });
+    w.text([0, 2.6], `t = ${fmt(run3.t[i], 1)} s`, { color: "--muted", size: 12 });
+    w.text([0, -2.75], `true ${fmt(run3.tr[i], 1)}° · filter ${fmt(run3.f[i], 1)}° · gyro ${fmt(run3.g[i], 0)}°`, { color: "--text", size: 11 });
+  });
+  function refresh3() {
+    const a = ALPHAS[+$("c3A").value];
+    $("c3AV").textContent = a === 1 ? "1 (gyro only)" : a === 0 ? "0 (accel only)" : String(a);
+    $("c3BV").textContent = $("c3B").value + " °/s"; $("c3NV").textContent = "± " + $("c3N").value + "°";
+    W3.stop(); $("c3Play").textContent = "▶ Play";
+    run3 = sim3(); frame3 = N3 - 1; chart3(N3); W3.render();
+    $("c3G").textContent = fmt(run3.rms[0], 2) + "°"; $("c3Ac").textContent = fmt(run3.rms[1], 2) + "°"; $("c3F").textContent = fmt(run3.rms[2], 2) + "°";
+    $("c3T").textContent = a >= 1 ? "∞" : a === 0 ? "0 s" : fmt(a * DT3 / (1 - a), 2) + " s";
+    const win = $("c3Sh").checked && +$("c3B").value >= 1 && +$("c3N").value >= 3 && run3.rms[2] < 1;
+    $("c3Chal").innerHTML = win ? `<span class="badge-win">✅ ${fmt(run3.rms[2], 2)}° RMS</span>` : `<span class="muted">target: &lt; 1° with vibration</span>`;
+  }
+  ["c3A", "c3B", "c3N"].forEach(id => ($(id).oninput = refresh3));
+  $("c3Sh").onchange = refresh3;
+  $("c3Play").onclick = () => {
+    if (W3.running) { W3.stop(); $("c3Play").textContent = "▶ Play"; return; }
+    $("c3Play").textContent = "⏸ Pause"; frame3 = 0;
+    W3.run(() => { frame3 = Math.min(N3 - 1, frame3 + 4); chart3(frame3 + 1); if (frame3 >= N3 - 1) { $("c3Play").textContent = "▶ Play"; return false; } });
+  };
+  refresh3();
+})();
+</script>
+</body>
+</html>

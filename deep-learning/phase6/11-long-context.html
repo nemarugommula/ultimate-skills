@@ -1,0 +1,408 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.11 Long context · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  canvas.dials { width: 100%; height: 190px; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  canvas.lim { width: 100%; height: 240px; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  .ctl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 4px 16px; }
+  .ctl-grid label { display: flex; gap: 8px; align-items: center; font-size: .88rem; }
+  .ctl-grid input[type=range] { flex: 1; }
+</style>
+</head>
+<body data-lesson="d6-11" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 11</div>
+  <h1>Long context</h1>
+  <p class="subtitle">Context windows went from 2,048 tokens (GPT-3) to a million (2026 open models). Getting there meant fighting a quadratic bill, a memory explosion, positions the model had never seen, and a model that reads the whole book but forgets the middle.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><span class="at">Attention</span> compares every token with every earlier token: n² scores for n tokens (6.1). FlashAttention avoids storing them but still computes them (6.9).</li>
+      <li><b>RoPE</b> (rotary position embedding) rotates each pair of numbers in a query or key by an angle proportional to the token's position, with fast- and slow-turning pairs, like the hands of a clock (Lesson 6.3).</li>
+      <li>The <b>KV cache</b> stores keys and values for every past token: 128 KiB per token for Llama 3 8B in bf16 (6.9).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2024 Google gave Gemini 1.5 a <b>grammar manual</b> for Kalamang, a language with fewer than 200 speakers, inside its prompt. No Kalamang in its training data. It learned to translate English to Kalamang about as well as a person who learned from the same material. Its report also claims near-perfect retrieval (&gt; 99%) of planted facts at up to <b>10 million</b> tokens.</p>
+    <p>A year earlier, Liu et al. had tested a model on questions with 20 documents in the prompt. When the document with the answer sat in the <b>middle</b>, GPT-3.5-Turbo did <b>worse than with no documents at all</b> (56.1% closed-book).</p>
+    <p><b>How do you stretch a model trained on 4,000 tokens to a million, what does it cost, and why can a model that “reads” a million tokens still miss a fact in the middle?</b></p>
+  </div>
+
+  <h2>Numbers first: what grows when context grows</h2>
+  <table>
+    <tr><th>Cost</th><th>How it scales with context n</th><th>Llama 3 8B at 8k → 128k (16×)</th></tr>
+    <tr><td>Weights FLOPs per token</td><td>constant (2N)</td><td>16 GFLOPs → 16 GFLOPs</td></tr>
+    <tr><td><span class="at">Attention</span> FLOPs per token</td><td>∝ n</td><td>2.1 → 34 GFLOPs</td></tr>
+    <tr><td>Prefill (read the whole prompt)</td><td>∝ n²</td><td>256× more attention work</td></tr>
+    <tr><td>KV cache memory</td><td>∝ n</td><td>1 GiB → 16 GiB per user</td></tr>
+  </table>
+  <p>Attention FLOPs per token follow Kaplan et al.'s count: about 2 · layers · n · d<sub>attn</sub>. For Llama 3 8B (32 layers, d = 4,096) that equals the weights' 2N when n ≈ 61k tokens: <b>past that, attention costs more than the whole rest of the model</b>. Then there's position: the model was trained up to some length, and positions beyond it are new territory.</p>
+
+  <p class="predict">🔮 <b>Predict:</b> going from an 8k to a 128k-token prompt, does prefill for Llama 3 8B take about 16× longer, or more?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The long-context bill</span>
+    <p class="hint">Prefill time assumes one A100 at 40% of its 312 TFLOPs peak. Attention FLOPs use the causal average (each token sees about half the prompt). The sliding window caps how far back each token looks and how much KV is kept (Mistral-style rolling buffer).</p>
+    <div class="goals">
+      <span class="goal" id="gHalf">🎯 Attention outweighs all the weights</span>
+      <span class="goal" id="gMin">🎯 Prefill longer than a minute</span>
+      <span class="goal" id="gWin">🎯 1M tokens with a KV cache under 1 GiB</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="lM"><button data-v="8" class="on">Llama 3 8B</button><button data-v="70">Llama 3 70B</button></span>
+      <span class="seg" id="lW"><button data-v="0" class="on">Full attention</button><button data-v="4096">Sliding window 4,096</button></span>
+    </div>
+    <div class="controls"><label>context n <input type="range" id="lN" min="10" max="20" step="0.25" value="13"> <b class="mono" id="lNV"></b></label></div>
+    <div class="stat-row">
+      <div class="stat">attention share of FLOPs/token <b id="lShare" class="at">–</b></div>
+      <div class="stat">prefill FLOPs <b id="lF">–</b></div>
+      <div class="stat">prefill time <b id="lT">–</b></div>
+      <div class="stat">KV cache (bf16) <b id="lKV" class="at">–</b></div>
+    </div>
+    <p class="hint" id="lMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at 8k tokens attention is 12% of the per-token work and prefill takes about 1.1 seconds. At 128k it's 68%, the KV cache is 16 GiB, and prefill is about 35 seconds: 16× the tokens, about 31× the time, and the gap keeps widening because the attention part grows with n². Switch to the 70B at 1M tokens: almost two hours of prefill on one GPU and 320 GiB of KV per user. A 4,096-token sliding window turns the n² back into n, and the cache into a fixed 0.5 GiB, at the price of not seeing far back directly.</p>
+
+  <h2>Positions the model has never seen</h2>
+  <p>With RoPE, each pair of dimensions in a query or key turns by position × θ<sub>i</sub>, where θ<sub>i</sub> = base<sup>−2i/d</sup> (base usually 10,000). Fast pairs spin many times within the training length, so the model sees every angle. <b>Slow pairs</b> may turn less than a full circle in training, so the model only ever sees a slice of their dial. Go past the training length and those slow hands point at angles the model has <i>never seen</i>: attention scores go haywire and quality collapses, often abruptly.</p>
+  <p>Three fixes, from simplest to best:</p>
+  <ul>
+    <li><b>Position interpolation</b> (PI, Chen et al. 2023): divide every position by s = new length ÷ trained length, so all angles land in the trained range. Llama models stretched to 32,768 tokens with under 1,000 fine-tuning steps. Cost: the fast hands slow down too, so neighbouring tokens look more alike.</li>
+    <li><b>NTK-aware scaling</b> (proposed online by “bloc97”, 2023): raise the RoPE base instead, which stretches slow pairs a lot and fast pairs barely at all. Not exact for middle pairs.</li>
+    <li><b>YaRN</b> (Peng et al. 2023): per-pair treatment: leave fast pairs alone, interpolate slow pairs fully, blend in between, and slightly sharpen attention (a temperature of 0.1·ln s + 1). It needed about 10× fewer tokens and 2.5× fewer steps than earlier methods. Qwen3's model card tells you to switch it on with <code>"rope_type": "yarn", "factor": 4.0</code> to go from 32k to 131k.</li>
+  </ul>
+
+  <p class="predict">🔮 <b>Predict:</b> trained on 4,096 tokens, you read position 16,384. Which dials go out of their trained range with no scaling? Which method keeps every dial in range <i>and</i> the fastest dial at full speed?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · RoPE dials beyond the training length</span>
+    <p class="hint">8 rotating pairs (head dim 16, base 10,000), trained up to 4,096 tokens. Gold arc = angles seen in training (a full ring when the pair turned all the way round). The hand is the angle at the current position: <span class="dead">red</span> = never seen in training.</p>
+    <div class="goals">
+      <span class="goal" id="gOod">🎯 Break it: a dial out of range</span>
+      <span class="goal" id="gPI">🎯 Fix all dials with interpolation</span>
+      <span class="goal" id="gYarn">🎯 Fix all dials at 32k, fastest dial at full speed</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="rM"><button data-v="none" class="on">No scaling</button><button data-v="pi">Position interpolation</button><button data-v="ntk">NTK-aware</button><button data-v="yarn">YaRN ramp</button></span>
+      <label>target context <select id="rT" class="btn small"><option>4096</option><option>8192</option><option selected>16384</option><option>32768</option></select></label>
+    </div>
+    <div class="controls"><label>position <input type="range" id="rP" min="0" max="1" step="0.005" value="1"> <b class="mono" id="rPV"></b></label></div>
+    <canvas class="dials" id="rCv"></canvas>
+    <div class="stat-row">
+      <div class="stat">dials out of range <b id="rOod" class="dead">–</b></div>
+      <div class="stat">fastest dial speed vs trained <b id="rFast">–</b></div>
+    </div>
+    <p class="hint" id="rMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at position 16,384 with no scaling, the two slowest dials point far outside the slices they saw in training (dial 6 at 16.4 rad, where training only ever reached 4.1). Position interpolation pulls everything back into range, but the fastest dial now turns at <b>¼ speed</b>: nearby tokens blur together. NTK-aware keeps the fast dial at full speed and fixes the slowest dial, but dial 6 still overshoots a little (5.0 vs 4.1). The YaRN ramp keeps fast dials untouched, squeezes slow ones exactly into range: zero out of range at 32k with full-speed fast dials.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">RoPE scaling (PI → NTK-aware → YaRN)</span></span>
+    <ol>
+      <li><b>The problem before</b> Retraining at long length is expensive (attention is n²), but a RoPE model run past its training length sees unseen angles on its slow dimensions and its perplexity explodes.</li>
+      <li><b>What people tried</b> Plain extrapolation (just run longer: fails), learned or ALiBi-style positions, training from scratch on long data.</li>
+      <li><b>Why this works</b> Map the new, longer positions back onto angles the model knows. PI divides positions by s (e.g. 16k → looks like 4k), YaRN does it only for the slow dimensions that need it and leaves the fast, local ones sharp, plus a small attention temperature. A short fine-tune (hundreds to a few thousand steps) then adapts the model. In the playground: at 32k, PI and YaRN both give 0 dials out of range, but only YaRN keeps the fastest dial at full speed.</li>
+      <li><b>What it costs, when it fails</b> Still needs some long-document fine-tuning to be good; stretched short models can pass simple retrieval tests while failing harder long-range tasks (RULER, below). Static scaling slightly hurts short-context quality, which is why Qwen recommends enabling it only when needed.</li>
+      <li><b>What refined it</b> Training with a much larger RoPE base from the start (Llama 3 uses θ = 500,000), progressive long-context training stages, and sparse or compressed attention designs (DeepSeek-V4).</li>
+    </ol>
+  </div>
+
+  <h2>Sliding windows and attention sinks</h2>
+  <p><b>Sliding-window attention</b> (SWA): each token attends only to the previous W tokens. Mistral 7B used W = 4,096 across 32 layers. Information still travels further, one window per layer: after 32 layers, a token can be influenced by tokens up to 32 × 4,096 ≈ <b>131k</b> positions back. A rolling buffer keeps only W keys and values per layer: on a 32k sequence that cut cache memory <b>8×</b> without hurting quality in their tests.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Sliding-window attention</span></span>
+    <ol>
+      <li><b>The problem before</b> Full attention's cost per token grows with n and its cache grows forever: 16 GiB per user at 128k for Llama 3 8B.</li>
+      <li><b>What people tried</b> Sparse patterns (Longformer: local windows + a few global tokens), compressing old tokens, recurrence across segments.</li>
+      <li><b>Why this works</b> Most of what a token needs is nearby. Capping the look-back at W makes per-token cost and cache size constant, and stacking layers still lets information hop W tokens per layer (Mistral: ~131k theoretical span from W = 4,096 × 32 layers).</li>
+      <li><b>What it costs, when it fails</b> A fact 100k tokens back must be relayed through many layers and often gets lost: exact long-range recall suffers. And naive window attention breaks once the very first tokens fall out of the window (next box).</li>
+      <li><b>What refined it</b> Hybrid models that interleave sliding-window layers with a few full-attention layers, attention sinks, and state-space layers (9.3).</li>
+    </ol>
+  </div>
+
+  <p>StreamingLLM (Xiao et al. 2023) found a strange thing: window attention works until the <b>first few tokens</b> are evicted, then perplexity explodes. Those early tokens get huge attention scores even though they mean nothing special. Softmax must put its weight <i>somewhere</i>, and the first tokens, visible to every later token, became the model's dumping ground: an <b>attention sink</b>. Keep just <b>4</b> initial tokens' keys and values plus the recent window, and models like Llama 2 stayed stable for up to <b>4 million</b> tokens, up to 22.2× faster than recomputing the window.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Attention sinks (StreamingLLM)</span></span>
+    <ol>
+      <li><b>The problem before</b> A chatbot that runs forever needs a bounded cache. Sliding windows bound it, but quality collapses as soon as the cache drops the start of the text.</li>
+      <li><b>What people tried</b> Recomputing the window from scratch each step (correct but slow), or growing the cache until memory runs out.</li>
+      <li><b>Why this works</b> Many heads have nothing useful to attend to for a given token; softmax weights must still sum to 1, so trained models park that spare weight on the first tokens. Removing them shifts the whole distribution. Keeping them (4 tokens is enough) restores normal attention, at a cost of 4 extra cache slots.</li>
+      <li><b>What it costs, when it fails</b> It makes long streams <i>stable</i>, not <i>remembered</i>: anything outside the window and the sinks is gone. It's a fluency fix, not a memory fix.</li>
+      <li><b>What refined it</b> Training with a dedicated learnable sink token (suggested in the same paper) or a learned per-head sink; for real memory you need full long context or retrieval.</li>
+    </ol>
+  </div>
+
+  <p><b>Ring attention</b> (Liu, Zaharia &amp; Abbeel, 2023) attacks the problem from the hardware side: split a very long sequence across GPUs arranged in a ring; each GPU keeps its block of queries and passes key/value blocks to its neighbour while computing blockwise attention, overlapping communication with math. Exact attention on sequences “up to device count times longer” than one device could hold. It's how training on millions of tokens becomes possible at all (Phase 10 covers sequence parallelism).</p>
+
+  <h2>Using a long context well: lost in the middle</h2>
+  <p>A long window is not the same as good use of it. Liu et al. (2023) moved the one relevant document through a list of distractors and measured accuracy. The result was a <b>U-shape</b>: best when the fact is at the start (primacy) or the end (recency), worst in the middle. For GPT-3.5-Turbo with 20 documents, the middle was below its 56.1% closed-book score.</p>
+
+  <p class="predict">🔮 <b>Predict:</b> you have 20 retrieved passages and one contains the answer. Where should it go? Where would you hide it if you wanted the model to miss it?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Where did the fact go?</span>
+    <p class="hint"><b>Illustrative curve</b> shaped like the published U (Liu et al. 2023, Figure 1); not real measurements. The dashed line is the paper's closed-book accuracy for GPT-3.5-Turbo (56.1%): what the model scores with <i>no</i> documents.</p>
+    <div class="goals">
+      <span class="goal" id="gWorse">🎯 Find a spot worse than no documents at all</span>
+      <span class="goal" id="g70">🎯 Place it where recall ≥ 70%</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="mN"><button data-v="10">10 docs</button><button data-v="20" class="on">20 docs</button><button data-v="30">30 docs</button></span>
+      <label>position of the answer <input type="range" id="mP" min="1" max="20" step="1" value="10"> <b class="mono" id="mPV"></b></label>
+    </div>
+    <canvas class="lim" id="mCv"></canvas>
+    <div class="stat-row">
+      <div class="stat">simulated accuracy here <b id="mAcc" class="y">–</b></div>
+      <div class="stat">vs closed-book <b id="mVs">–</b></div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> positions near the start score about 75%, the very end about 64%, and the middle dips below the dashed line: more context made the answer <i>worse</i> than none. With 30 documents the dip deepens. Practical rules that follow: put the most relevant material first (or last), keep prompts as short as the task allows, and test your own model, because newer models flatten the U to different degrees.</p>
+
+  <h2>Measuring long context: needles and beyond</h2>
+  <p>The popular <b>needle-in-a-haystack</b> (NIAH) test hides one sentence (“the magic number is 7481”) at some depth in a long filler text and asks for it. Plot depth × length as a grid; an all-green grid became the standard marketing image. Its limit: finding one distinctive string is easy for attention, a lexical match. <b>RULER</b> (NVIDIA, 2024) added multiple needles, multi-hop tracing, aggregation and question answering. Of 17 long-context models tested, almost all were nearly perfect on vanilla NIAH, but “only half of them” kept satisfactory performance at 32k, even though all claimed 32k or more. Lesson: an advertised context length is a ceiling, not a guarantee.</p>
+
+  <h2>Long context vs retrieval (RAG)</h2>
+  <table>
+    <tr><th></th><th>Long context</th><th>Retrieval-augmented generation (RAG)</th></tr>
+    <tr><td>Best for</td><td>One big document you need to reason over as a whole (a codebase, a contract)</td><td>Huge or changing collections; per-user permissions; citations</td></tr>
+    <tr><td>Cost per question</td><td>prefill ∝ n² (minus caching); big KV cache</td><td>a search + a short prompt</td></tr>
+    <tr><td>Failure mode</td><td>lost in the middle; slow; expensive</td><td>retriever misses the passage</td></tr>
+  </table>
+  <p>They combine well: retrieve generously, then let a long context read the top results. The applied side: <a href="../../ai-engineer/phase3/1-why-rag.html">AI Engineer 3.1 (why RAG)</a> and prompt caching for long, reused contexts in <a href="../../ai-engineer/phase1/4-context-engineering.html">AI Engineer 1.4</a>.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>In Hugging Face, RoPE scaling is a config field. This builds a small Llama-shaped config with YaRN (factor 4: 4,096 → 16,384) and inspects what it does to each rotating pair, with no model download:</p>
+<pre><code><span class="k">import</span> math
+<span class="k">from</span> transformers <span class="k">import</span> LlamaConfig
+<span class="k">from</span> transformers.modeling_rope_utils <span class="k">import</span> ROPE_INIT_FUNCTIONS
+
+shape = dict(hidden_size=<span class="n">1024</span>, num_attention_heads=<span class="n">8</span>, rope_theta=<span class="n">10000.0</span>)      <span class="c"># head dim 128 = 64 rotating pairs</span>
+plain = LlamaConfig(**shape, max_position_embeddings=<span class="n">4096</span>)
+yarn = LlamaConfig(**shape, max_position_embeddings=<span class="n">16384</span>,                     <span class="c"># 4x the trained 4,096</span>
+                   rope_scaling={<span class="s">"rope_type"</span>: <span class="s">"yarn"</span>, <span class="s">"factor"</span>: <span class="n">4.0</span>, <span class="s">"original_max_position_embeddings"</span>: <span class="n">4096</span>})
+
+f0, _ = ROPE_INIT_FUNCTIONS[<span class="s">"default"</span>](plain, <span class="s">"cpu"</span>)      <span class="c"># rotation speed of each pair (radians per token)</span>
+f1, attn = ROPE_INIT_FUNCTIONS[<span class="s">"yarn"</span>](yarn, <span class="s">"cpu"</span>)
+print(<span class="s">"attention scale"</span>, round(attn, <span class="n">4</span>), <span class="s">"= 0.1*ln(4)+1 ="</span>, round(<span class="n">0.1</span> * math.log(<span class="n">4</span>) + <span class="n">1</span>, <span class="n">4</span>))
+<span class="k">for</span> i <span class="k">in</span> [<span class="n">0</span>, <span class="n">16</span>, <span class="n">40</span>, <span class="n">63</span>]:                                  <span class="c"># fastest ... slowest rotating pair</span>
+    print(<span class="s">f"pair {i:2d}: wavelength {2*math.pi/f0[i]:6.0f} tokens -> yarn speed / plain speed = {f1[i]/f0[i]:.3f}"</span>)
+
+<span class="c"># What we got (transformers 4.57, CPU):</span>
+<span class="c"># attention scale 1.1386 = 0.1*ln(4)+1 = 1.1386</span>
+<span class="c"># pair  0: wavelength      6 tokens -> yarn speed / plain speed = 1.000</span>
+<span class="c"># pair 16: wavelength     63 tokens -> yarn speed / plain speed = 1.000</span>
+<span class="c"># pair 40: wavelength   1987 tokens -> yarn speed / plain speed = 0.423</span>
+<span class="c"># pair 63: wavelength  54410 tokens -> yarn speed / plain speed = 0.250</span></code></pre>
+    <p class="hint">Exactly the playground's story: fast pairs untouched, slow pairs slowed by the full factor 4, a blend in between, and attention sharpened by 1.14. Serving engines (vLLM, SGLang) accept the same <code>rope_scaling</code> dict. Sliding windows: Mistral-family configs carry <code>sliding_window</code>; FlashAttention supports windowed attention natively.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Technique</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Full attention, long training</td><td>Best long-range recall</td><td>n² prefill, KV ∝ n, expensive long-data training</td></tr>
+      <tr><td>RoPE scaling (PI / YaRN)</td><td>Extend a trained model cheaply</td><td>Needs a fine-tune to be good; can hurt short context; still n²</td></tr>
+      <tr><td>Sliding window</td><td>Constant cost and cache per token</td><td>Weak exact recall far back</td></tr>
+      <tr><td>Attention sinks</td><td>Stable infinite streaming for 4 extra slots</td><td>No memory beyond the window</td></tr>
+      <tr><td>Ring attention</td><td>Exact attention over millions of tokens in training</td><td>Many GPUs and fast interconnect</td></tr>
+      <tr><td>RAG instead</td><td>Cheap, scalable, citable</td><td>Retrieval misses; less holistic reasoning</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“A customer wants to paste 500-page contracts into your model. What breaks and what do you do?” A strong answer:</p>
+    <ul>
+      <li>Sizes it: ~250k tokens → n² prefill (tens of seconds+), KV cache of tens of GiB per user (2 · layers · kv_heads · head_dim · n · bytes).</li>
+      <li>Checks the model's <i>trained</i> and <i>effective</i> length (RULER-style evals, not just NIAH); RoPE scaling (YaRN) only with a long-context fine-tune.</li>
+      <li>Knows lost-in-the-middle: put key clauses first or last, or retrieve the relevant sections (RAG) and keep the prompt short.</li>
+      <li>Reduces serving cost: GQA/MLA models, FP8 KV cache, prefix caching for the same contract, sliding-window/hybrid architectures.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Position interpolation and YaRN</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2306.15595" target="_blank" rel="noopener">Chen et al.: Position Interpolation</a>, <a href="https://arxiv.org/abs/2309.00071" target="_blank" rel="noopener">Peng et al.: YaRN</a></div>
+      <p><b>How:</b> squeeze positions (PI), or per-frequency interpolation + attention temperature (YaRN), then a short fine-tune.</p>
+      <p><b>Why this method:</b> LLaMA to 32k with under 1,000 steps (PI); YaRN with 10× fewer tokens; now a one-line config in Qwen3 (32k → 131k).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Mistral 7B: sliding window + rolling cache</b> <span class="tag co">🏢 Mistral AI · 2023</span> <a href="https://arxiv.org/abs/2310.06825" target="_blank" rel="noopener">Jiang et al.: Mistral 7B</a></div>
+      <p><b>How:</b> W = 4,096 window over 32 layers (~131k theoretical span), cache as a ring buffer of size W.</p>
+      <p><b>Why this method:</b> 8× less cache memory at 32k tokens without hurting quality, plus GQA for faster decoding.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>StreamingLLM: attention sinks</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2309.17453" target="_blank" rel="noopener">Xiao et al.: Efficient Streaming Language Models with Attention Sinks</a></div>
+      <p><b>How:</b> keep 4 initial tokens' KV + a recent window.</p>
+      <p><b>Why this method:</b> stable language modelling up to 4M tokens with no fine-tuning; up to 22.2× faster than window recomputation.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Million-token open models</b> <span class="tag co">🏢 DeepSeek · 2026</span> <a href="https://huggingface.co/deepseek-ai/DeepSeek-V4-Pro" target="_blank" rel="noopener">DeepSeek-V4 model card</a></div>
+      <p><b>How:</b> a hybrid of compressed sparse attention schemes for a 1M-token context.</p>
+      <p><b>Why this method:</b> at 1M tokens, DeepSeek reports V4-Pro needs 27% of the per-token inference FLOPs and 10% of the KV cache of their V3.2.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Testing long context honestly</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2404.06654" target="_blank" rel="noopener">Hsieh et al.: RULER</a>, <a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener">Liu et al.: Lost in the Middle</a></div>
+      <p><b>How:</b> multi-needle, tracing, aggregation and QA tasks at growing lengths; moving the answer through the context.</p>
+      <p><b>Why this method:</b> simple needle tests saturate; these expose effective context far below the advertised one.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · GPT-3's whole window would fit in a footnote now</span>
+    <p>GPT-3 (2020) had a 2,048-token context. Llama 3.1 (2024) supports 128k: 64× more. DeepSeek-V4 (2026) supports 1M: about 500× GPT-3. Gemini 1.5's report went to 10M tokens in research tests. Meanwhile the hardest part moved from “can it fit?” to “does it actually use it?”, which is why RULER and lost-in-the-middle exist.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>RoPE itself is Lesson 6.3; the KV cache, GQA and FlashAttention are 6.9 (this lesson is where they pay off). Scaling laws (6.8) ignore attention FLOPs, which this lesson shows dominate past ~60k tokens for an 8B model. State-space and hybrid models that avoid the n² entirely: 9.3. Sequence and context parallelism (ring attention) at training scale: Phase 10. Applied: when to use RAG instead (<a href="../../ai-engineer/phase3/1-why-rag.html">AI Engineer 3.1</a>), context engineering (<a href="../../ai-engineer/phase1/4-context-engineering.html">AI Engineer 1.4</a>), and memory for agents (<a href="../../ai-engineer/phase6/4-memory.html">AI Engineer 6.4</a>).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener">Lost in the Middle</a>. Short, with the famous U-shaped figure.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/NVIDIA/RULER" target="_blank" rel="noopener">NVIDIA RULER</a> and <a href="https://github.com/gkamradt/LLMTest_NeedleInAHaystack" target="_blank" rel="noopener">the original needle-in-a-haystack test</a>. Run them on your own model.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/mit-han-lab/streaming-llm" target="_blank" rel="noopener">StreamingLLM</a>. Attention sinks in a few lines on top of Hugging Face models.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A model has 40 layers and attention width d<sub>attn</sub> = 5,120, with 13B parameters. At what context length do attention FLOPs per token (2 · layers · n · d<sub>attn</sub>) equal the weights' 2N?</div>
+    <div class="opts"><button class="opt">About 6,300 tokens</button><button class="opt" data-ok>About 63,000 tokens</button><button class="opt">About 630,000 tokens</button></div>
+    <div class="explain">Set 2 · 40 · n · 5,120 = 2 · 13 × 10⁹ → n = 13 × 10⁹ ÷ (40 × 5,120) = 13 × 10⁹ ÷ 204,800 ≈ 63,500. Below that, weights dominate per-token cost; above it, attention does. Prefill grows even faster, with n².</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You run a RoPE model trained on 8k tokens at 32k with no changes. Output turns to gibberish after about 8k tokens. Which fix addresses the cause?</div>
+    <div class="opts"><button class="opt">Increase the KV cache precision to fp32</button><button class="opt" data-ok>RoPE scaling (e.g. YaRN with factor 4) plus a short long-context fine-tune, so slow rotary dimensions stay within angles seen in training</button><button class="opt">Add attention sinks</button></div>
+    <div class="explain">Past the trained length, the slow RoPE dimensions produce rotation angles the model never saw, so attention breaks. Interpolation methods map positions back into the trained range (YaRN keeps fast dimensions sharp). Attention sinks fix stability of sliding windows, not unseen positions; cache precision is unrelated.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your RAG prompt has 25 retrieved passages; evals show answers are often wrong when the best passage ranks 8th to 18th. Cheapest first fix?</div>
+    <div class="opts"><button class="opt">Switch to a model with a 1M-token window</button><button class="opt">Add more passages so the answer appears twice</button><button class="opt" data-ok>Reorder (best passages at the start, or start and end) and send fewer, better-reranked passages</button></div>
+    <div class="explain">That's lost in the middle: models use the beginning and end of the context best. Moving the most relevant passages to the edges and trimming the list costs nothing and often fixes it. A bigger window doesn't change the U-shape; more passages push the answer further into the middle.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Longer context: attention FLOPs per token ∝ n (beat the weights past ~60k for an 8B), prefill ∝ n², KV cache ∝ n (Llama 3 8B: 16 GiB at 128k).</li>
+      <li>Past the trained length, slow RoPE dimensions see unseen angles. Fix: position interpolation (squeeze all), NTK-aware (raise the base), YaRN (per-frequency + temperature), then a short fine-tune.</li>
+      <li>Sliding windows make cost and cache constant (Mistral W = 4,096); attention sinks (keep 4 first tokens) keep streaming stable; ring attention spreads exact attention across GPUs.</li>
+      <li>Models use the middle of long prompts worst (U-shape); needle tests overstate ability (RULER). Put key info at the edges, or retrieve.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const GiB = 2 ** 30;
+  const fmtN = n => n >= 1e6 ? (n / 1e6).toFixed(n % 1e6 ? 2 : 0) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : String(Math.round(n));
+  const sizeCv = cv => { const dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 600, h = cv.clientHeight || 200; cv.width = w * dpr; cv.height = h * dpr; const ctx = cv.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h); return { ctx, w, h }; };
+  const redraws = []; window.addEventListener("resize", () => redraws.forEach(f => f()));
+
+  /* ---------- 1. the long-context bill ---------- */
+  const MODELS = { 8: { L: 32, d: 4096, kv: 8, hd: 128, N: 8.03e9 }, 70: { L: 80, d: 8192, kv: 8, hd: 128, N: 70.6e9 } };
+  let mKey = 8, Wn = 0;
+  function lDraw() {
+    const m = MODELS[mKey], n = Math.round(Math.pow(2, +$("lN").value)), W = Wn || Infinity;
+    $("lNV").textContent = fmtN(n);
+    const eff = Math.min(n, W);
+    const attTok = 2 * m.L * eff * m.d, share = attTok / (attTok + 2 * m.N);           // Kaplan: 2·layers·n_ctx·d_attn per token
+    const seen = W === Infinity ? n * n / 2 : (n <= W ? n * n / 2 : W * W / 2 + (n - W) * W);   // causal: total (query, key) pairs
+    const F = 2 * m.N * n + 2 * m.L * m.d * seen;                                           // weights + attention (Kaplan's 2·d_attn per query-key pair per layer)
+    const t = F / (0.4 * 312e12), kv = 2 * m.L * m.kv * m.hd * 2 * eff;
+    $("lShare").textContent = (100 * share).toFixed(0) + "%";
+    $("lF").textContent = F.toExponential(2);
+    $("lT").textContent = t < 60 ? t.toFixed(1) + " s" : t < 3600 ? (t / 60).toFixed(1) + " min" : (t / 3600).toFixed(1) + " h";
+    $("lKV").textContent = kv >= GiB ? (kv / GiB).toFixed(1) + " GiB" : (kv / 2 ** 20).toFixed(0) + " MiB";
+    win("gHalf", share >= 0.5); win("gMin", t >= 60); win("gWin", n >= 1e6 && kv < GiB);
+    $("lMsg").textContent = Wn ? `Window: each token sees at most ${fmtN(Wn)} tokens back, so cost per token and cache stop growing.` : share >= 0.5 ? "Attention now costs more per token than every weight in the model." : "";
+  }
+  seg("lM", v => { mKey = +v; lDraw(); }); seg("lW", v => { Wn = +v; lDraw(); });
+  $("lN").oninput = lDraw; lDraw();
+
+  /* ---------- 2. RoPE dials ---------- */
+  const D = 16, P = D / 2, BASE = 1e4, LT = 4096;
+  const th = (i, b = BASE) => Math.pow(b, -2 * i / D);
+  let meth = "none";
+  function speeds(s) {
+    return Array.from({ length: P }, (_, i) => {
+      const t = th(i);
+      if (meth === "none" || s <= 1) return t;
+      if (meth === "pi") return t / s;
+      if (meth === "ntk") return th(i, BASE * Math.pow(s, D / (D - 2)));
+      const r = LT * t / (2 * Math.PI);                 // turns during training; YaRN ramp α = 1, β = 32
+      if (r < 1) return t / s; if (r > 32) return t; const g = (r - 1) / 31; return (1 - g) * t / s + g * t;
+    });
+  }
+  function rDraw() {
+    const tgt = +$("rT").value, s = tgt / LT, pos = Math.round(+$("rP").value * tgt), sp = speeds(s);
+    $("rPV").textContent = pos.toLocaleString();
+    const { ctx, w, h } = sizeCv($("rCv")), R = Math.min(w / (P * 2.6), h / 2.9), cy = h / 2 - 6;
+    let ood = 0;
+    ctx.font = "11px " + MX.css("--font"); ctx.textAlign = "center";
+    for (let i = 0; i < P; i++) {
+      const cx = (i + 0.5) * w / P, maxSeen = LT * th(i), full = maxSeen >= 2 * Math.PI, ang = pos * sp[i], bad = !full && ang > maxSeen + 1e-6;
+      if (bad) ood++;
+      ctx.strokeStyle = MX.css("--line"); ctx.lineWidth = 2; ctx.beginPath(); ctx.arc(cx, cy, R, 0, 7); ctx.stroke();
+      ctx.strokeStyle = MX.css("--c-at"); ctx.lineWidth = 6; ctx.beginPath();
+      if (full) ctx.arc(cx, cy, R, 0, 7); else ctx.arc(cx, cy, R, -Math.PI / 2, -Math.PI / 2 + maxSeen); ctx.stroke();
+      ctx.strokeStyle = MX.css(bad ? "--c-dead" : "--text"); ctx.lineWidth = 3; ctx.beginPath(); ctx.moveTo(cx, cy);
+      ctx.lineTo(cx + 0.9 * R * Math.cos(-Math.PI / 2 + ang), cy + 0.9 * R * Math.sin(-Math.PI / 2 + ang)); ctx.stroke();
+      ctx.fillStyle = MX.css("--muted"); ctx.fillText("dial " + i, cx, cy + R + 14);
+      ctx.fillStyle = MX.css(bad ? "--c-dead" : "--muted"); ctx.fillText(full ? "full ring" : ang.toFixed(1) + " / " + maxSeen.toFixed(1), cx, cy + R + 28);
+    }
+    const fast = sp[0] / th(0);
+    $("rOod").textContent = ood; $("rFast").textContent = fast === 1 ? "1 (full)" : fast.toFixed(3);
+    if (pos > LT) { win("gOod", ood > 0); win("gPI", meth === "pi" && ood === 0); }
+    win("gYarn", tgt === 32768 && pos > LT && ood === 0 && fast === 1);
+    $("rMsg").textContent = pos <= LT ? "Within the trained length: every dial is in familiar territory." : ood ? `${ood} dial(s) point where training never went: attention on those dimensions is unpredictable.` : fast < 1 ? "All in range, but the fast dials slowed down: neighbouring tokens get harder to tell apart." : "All in range with full-speed fast dials.";
+  }
+  seg("rM", v => { meth = v; rDraw(); });
+  $("rT").onchange = rDraw; $("rP").oninput = rDraw; rDraw(); redraws.push(rDraw);
+
+  /* ---------- 3. lost in the middle (illustrative) ---------- */
+  const CLOSED = 0.561;
+  let nDocs = 20;
+  const acc = (p, n) => { const x = (p - 1) / (n - 1), mid = 0.58 - 0.0025 * n; return mid + (0.75 - mid) * Math.exp(-x / 0.15) + (0.64 - mid) * Math.exp(-(1 - x) / 0.12); };
+  function mDraw() {
+    $("mP").max = nDocs; if (+$("mP").value > nDocs) $("mP").value = nDocs;
+    const p = +$("mP").value, a = acc(p, nDocs); $("mPV").textContent = p + " of " + nDocs;
+    const { ctx, w, h } = sizeCv($("mCv")), m = { l: 46, r: 12, t: 12, b: 30 };
+    const X = q => m.l + (q - 1) / (nDocs - 1) * (w - m.l - m.r), Y = v => h - m.b - (v - 0.4) / 0.4 * (h - m.t - m.b);
+    ctx.font = "12px " + MX.css("--font"); ctx.fillStyle = MX.css("--muted"); ctx.strokeStyle = MX.css("--line"); ctx.lineWidth = 1;
+    [0.4, 0.5, 0.6, 0.7, 0.8].forEach(v => { ctx.beginPath(); ctx.moveTo(m.l, Y(v)); ctx.lineTo(w - m.r, Y(v)); ctx.stroke(); ctx.textAlign = "right"; ctx.textBaseline = "middle"; ctx.fillText(Math.round(100 * v) + "%", m.l - 6, Y(v)); });
+    ctx.textAlign = "center"; ctx.textBaseline = "top"; [1, Math.round(nDocs / 2), nDocs].forEach(q => ctx.fillText(q === 1 ? "1st" : q + "th", X(q), h - m.b + 6));
+    ctx.strokeStyle = MX.css("--muted"); ctx.setLineDash([6, 4]); ctx.beginPath(); ctx.moveTo(m.l, Y(CLOSED)); ctx.lineTo(w - m.r, Y(CLOSED)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.textAlign = "right"; ctx.textBaseline = "bottom"; ctx.fillText("closed-book 56.1%", w - m.r - 4, Y(CLOSED) - 3);
+    ctx.strokeStyle = MX.css("--c-y"); ctx.lineWidth = 2.5; ctx.beginPath();
+    for (let q = 1; q <= nDocs; q += 0.25) (q === 1 ? ctx.moveTo(X(q), Y(acc(q, nDocs))) : ctx.lineTo(X(q), Y(acc(q, nDocs)))); ctx.stroke();
+    ctx.fillStyle = MX.css(a < CLOSED ? "--c-dead" : "--c-at"); ctx.beginPath(); ctx.arc(X(p), Y(a), 7, 0, 7); ctx.fill();
+    $("mAcc").textContent = (100 * a).toFixed(0) + "%";
+    $("mVs").innerHTML = a < CLOSED ? `<span class="dead">${(100 * (a - CLOSED)).toFixed(1)} points: worse than no documents</span>` : `+${(100 * (a - CLOSED)).toFixed(1)} points`;
+    win("gWorse", a < CLOSED); win("g70", a >= 0.7);
+  }
+  seg("mN", v => { nDocs = +v; mDraw(); }); $("mP").oninput = mDraw; mDraw(); redraws.push(mDraw);
+})();
+</script>
+</body>
+</html>

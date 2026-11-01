@@ -1,0 +1,410 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.4 Audio tokens and audio language models · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .ctxbar { height: 22px; border-radius: 6px; background: var(--panel); border: 1px solid var(--line); overflow: hidden; margin: 6px 0; }
+  .ctxbar > i { display: block; height: 100%; background: var(--c-at); transition: width .2s; }
+  .ctxbar.over > i { background: var(--c-dead); }
+  .tl { position: relative; height: 92px; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; margin: 8px 0; }
+  .tl .lane { position: absolute; left: 70px; right: 10px; height: 22px; }
+  .tl .lane span { position: absolute; top: 0; height: 22px; border-radius: 5px; font-size: .7rem; color: #fff; display: flex; align-items: center; justify-content: center; overflow: hidden; white-space: nowrap; }
+  .tl .who { position: absolute; left: 8px; font-size: .75rem; color: var(--muted); }
+  .tl .ov { background: repeating-linear-gradient(45deg, var(--c-dead), var(--c-dead) 4px, transparent 4px, transparent 8px); opacity: .7; }
+  table.codes td { font-family: var(--mono); text-align: center; }
+</style>
+</head>
+<body data-lesson="d8-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8 · Lesson 4</div>
+  <h1>Audio tokens and audio language models</h1>
+  <p class="subtitle">To let a language model listen and talk, you first need a vocabulary for sound. Neural codecs turn audio into a few hundred tokens a second, and then everything you know about LLMs applies, including their context-window bill.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Vector quantization (VQ): replace a vector by the nearest entry of a learned codebook and keep only its index (Lesson 7.8).</li>
+      <li>An LLM predicts the next token; its context window is how many tokens it can attend to at once (Lessons 6.5 and 6.11).</li>
+      <li>Whisper turns 30 s of audio into 1,500 encoder vectors; a codec LM (VALL-E) generates speech as tokens (Lessons 8.2 and 8.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Before May 2024, talking to ChatGPT meant a pipeline of three models: one transcribed your speech, GPT answered in text, a third read the answer aloud. OpenAI reported average latencies of <b>2.8 seconds</b> (GPT-3.5) and <b>5.4 seconds</b> (GPT-4). Then GPT-4o, “a single new model end-to-end across text, vision, and audio”, responded to audio in as little as <b>232 ms</b>, 320 ms on average.</p>
+    <p>Months later, the French lab Kyutai published <b>Moshi</b>, an open model that listens and speaks <i>at the same time</i>, with a theoretical latency of <b>160 ms</b> (200 ms in practice), below the 230 ms average gap between turns in human conversation that the authors cite.</p>
+    <p>Both rest on one trick: <b>turn sound into tokens</b>, so a transformer can read and write audio the way it reads and writes words. <b>How do you get from 24,000 samples a second to about 100 tokens, and what does a model lose, or gain, by skipping text?</b></p>
+  </div>
+
+  <h2>Numbers first: how many tokens is a second of sound?</h2>
+  <table>
+    <tr><th>Representation</th><th>Per second of audio</th><th>A 5-minute call</th></tr>
+    <tr><td>Raw samples at 24 kHz</td><td class="x">24,000 numbers</td><td>7,200,000</td></tr>
+    <tr><td>Log-mel frames (Lesson 8.1)</td><td>100 frames × 80</td><td>30,000 frames</td></tr>
+    <tr><td>EnCodec at 6 kbps (used by VALL-E)</td><td class="at">75 frames × 8 codes = 600 tokens</td><td class="at">180,000 tokens</td></tr>
+    <tr><td>Mimi (Moshi's codec)</td><td class="at">12.5 frames × 8 codes = 100 tokens</td><td class="at">30,000 tokens</td></tr>
+    <tr><td>The transcript, as text</td><td class="y">a few text tokens</td><td class="y">a few thousand tokens</td></tr>
+  </table>
+  <p>Audio is expensive context: even a good codec spends 10–100× more tokens than the words being said, because the tokens also carry <i>how</i> they're said (voice, emotion, room, background). The whole lesson is about shrinking that number without losing what matters.</p>
+
+  <h2>Neural audio codecs</h2>
+  <p>A <b>neural audio codec</b> is an autoencoder for sound (Lesson 7.1). An encoder of strided 1D convolutions squeezes the waveform into a short sequence of vectors (SoundStream and EnCodec: one every 320 samples, so 75 a second at 24 kHz), a <b>quantizer</b> turns each vector into a few integers, and a decoder rebuilds the waveform. It's trained on reconstruction plus GAN discriminators (as in HiFi-GAN, Lesson 8.3) so the result sounds real, not just close on average. Google's <b>SoundStream</b> (2021) at <b>3 kbps</b> beat the Opus codec at 12 kbps in listening tests; Meta's <b>EnCodec</b> (2022) supports 1.5 to 24 kbps from one model.</p>
+  <p>The hard part is the quantizer. At 6 kbps and 75 frames a second, each frame gets 6,000 ÷ 75 = <b>80 bits</b>. A plain codebook with one entry per 80-bit code would need 2⁸⁰ ≈ 10²⁴ vectors, which the SoundStream paper calls “obviously unfeasible”.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Residual vector quantization (RVQ)</span></span>
+    <ol>
+      <li><b>The problem before</b> One VQ codebook is fine at low bitrates, but its size grows exponentially with the bits per frame: 80 bits means 2⁸⁰ entries. Fewer bits means bad audio.</li>
+      <li><b>What people tried</b> Product quantization (split the vector into pieces, quantize each); scalar quantization of each dimension; multiple separate models for different bitrates.</li>
+      <li><b>Why this works</b> Quantize in stages. Codebook 1 picks the nearest coarse entry; compute the <b>residual</b> (what's left: x − c₁); codebook 2 quantizes the residual; and so on. Each stage fixes part of the previous stage's error. With 8 codebooks of 1,024 entries (10 bits each), you get 80 bits per frame from only 8 × 1,024 = 8,192 stored vectors. And you can <b>drop the last codebooks</b> to lower the bitrate on the fly: EnCodec trains with a random number of codebooks so one model serves 1.5, 3, 6, 12 and 24 kbps.</li>
+      <li><b>What it costs, when it fails</b> Each frame becomes a <i>stack</i> of tokens, so a language model must predict 8 tokens per frame (600 per second), not one. Later codebooks carry fine detail and get little use if training is careless (“dead” codewords).</li>
+      <li><b>What refined it</b> Lower frame rates (Mimi: 12.5 Hz), smarter ways to predict the stack (VALL-E's AR + NAR split, Moshi's small Depth Transformer and per-level delays), and finite scalar quantization in some newer codecs.</li>
+    </ol>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> each stage has only 8 codewords (3 bits). After 1 stage the error is about 0.3. Roughly what will it be after 4 stages: 0.2, 0.1, or under 0.05?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Residual vector quantization in 2D</span>
+    <p class="hint">The orange dot is a vector to compress (drag it). Each stage's 8 codewords (learned here with k-means on random points, like a real codec trains them) are drawn as small dots around where the previous stages got you: each codebook is smaller than the last, because it only has to fix what's left. Arrows add up the chosen codewords; the red line is the remaining error.</p>
+    <div class="goals"><span class="goal" id="gFew">🎯 Error &lt; 0.05 with the fewest stages for this target</span><span class="goal" id="gLucky">🎯 Find a spot where 1 stage is already &lt; 0.05</span><span class="goal" id="gDrop">🎯 Drop stages and watch the bitrate fall</span></div>
+    <div class="controls">
+      <label>stages <input type="range" id="qS" min="1" max="4" step="1" value="1"> <b class="mono" id="qSV"></b></label>
+      <button class="btn" id="qRand">🎲 New target</button>
+    </div>
+    <canvas class="plane" id="qPlane"></canvas>
+    <table class="codes" id="qTable"></table>
+    <div class="stat-row">
+      <div class="stat">error ‖x − x̂‖ <b class="ls" id="qErr">–</b></div>
+      <div class="stat">bits per vector <b id="qBits">–</b></div>
+      <div class="stat">codewords stored (RVQ) <b class="w" id="qStore">–</b></div>
+      <div class="stat">one flat codebook would need <b class="dead" id="qFlat">–</b></div>
+    </div>
+    <p class="hint" id="qMsg"></p>
+  </div>
+  <p><b>What you should see:</b> averaged over many targets, the error falls from about <b>0.28</b> (1 stage) to <b>0.10</b>, <b>0.04</b> and <b>0.02</b> (4 stages): each stage cuts it by roughly 2.5×. Four stages give 12 bits from just 32 stored codewords; a single codebook with the same 12 bits needs 4,096. Some targets reach 0.05 in 2 stages, others need 4: that's why real codecs use 8 or more. Dropping stages is how one EnCodec model serves several bitrates.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: bits, frames and tokens</span>
+    <ul>
+      <li><b>EnCodec, 24 kHz:</b> 75 frames/s, codebooks of 1,024 entries = 10 bits each. One codebook = 75 × 10 = 750 bps. So 1.5 kbps = 2 codebooks, 6 kbps = 8, 24 kbps = 32. At 6 kbps: 75 × 8 = <b>600 tokens a second</b>.</li>
+      <li><b>VALL-E's 10-second clip:</b> 24,000 × 10 ÷ 320 = 750 frames × 8 codebooks = a <b>750 × 8</b> token matrix (6,000 tokens).</li>
+      <li><b>Mimi:</b> 12.5 frames/s × 8 codebooks × log₂(2,048) = 11 bits = <b>1,100 bps</b> (the paper's 1.1 kbps), 100 tokens a second.</li>
+      <li><b>AudioLM's semantic tokens:</b> 25 per second from k-means with 1,024 clusters: 25 × 10 = <b>250 bps</b>.</li>
+    </ul>
+    <p class="muted">We checked the EnCodec and Mimi shapes with randomly initialized models from Hugging Face <code>transformers</code> (no download): 1 s of audio gives codes of shape (1, 1, 8, 75) for EnCodec at 6 kbps and (1, 8, 13) for Mimi (12.5 frames rounds up to 13).</p>
+  </div>
+
+  <h2>Two kinds of audio tokens: what is said vs how it sounds</h2>
+  <p>Codec tokens are <b>acoustic</b>: they're optimized to rebuild the waveform, so they spend most of their bits on voice quality, noise and room. A language model trained only on them babbles: it produces convincing speech sounds that don't form words. Google's <b>AudioLM</b> (2022) added a second kind of token.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Semantic + acoustic tokens</span></span>
+    <ol>
+      <li><b>The problem before</b> Acoustic tokens (SoundStream) reconstruct audio beautifully, but long-range structure (words, syntax, melody) is buried under fine detail, so a model generating them loses the thread after a second or two.</li>
+      <li><b>What people tried</b> Generating from text (needs transcripts), or modelling only the coarse codebooks.</li>
+      <li><b>Why this works</b> Get coarse <b>semantic</b> tokens from a self-supervised speech model (AudioLM: k-means on w2v-BERT features, 25 per second): they capture <i>what</i> is said, with little about who says it. Generate those first, for long-term coherence; then generate acoustic tokens conditioned on them, for quality and speaker identity. The paper shows the two kinds “complement each other”: semantic tokens for phonetics, acoustic tokens for reconstruction quality.</li>
+      <li><b>What it costs, when it fails</b> Two or three stages of models, two tokenizers to train and keep in sync, and semantic tokens alone can't be played back.</li>
+      <li><b>What refined it</b> Codecs that put semantics <i>inside</i> the first codebook: Moshi's Mimi distills a self-supervised model (WavLM) into its first RVQ level, so one tokenizer gives both. Moshi's “Inner Monologue” adds time-aligned <b>text</b> tokens as an even more semantic layer.</li>
+    </ol>
+  </div>
+
+  <h2>The context bill: tokens per second</h2>
+  <p>Once audio is tokens, a 5-minute phone call has to fit in the model's context window next to the instructions and the conversation history. And the model has to <i>generate</i> those tokens fast enough to speak in real time.</p>
+  <p class="predict">🔮 <b>Predict:</b> will a 5-minute call in EnCodec's 6 kbps tokens fit in a 32,000-token context? What about Mimi?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Audio token budget</span>
+    <p class="hint">Start from a real codec's settings (presets from each paper) or set your own. “Flatten” writes every code as its own token in one stream; “parallel streams” predicts a frame's whole stack in one big-model step (Moshi-style: a small Depth Transformer fills in the codebooks), so sequential steps drop to the frame rate.</p>
+    <div class="goals"><span class="goal" id="gFit">🎯 Fit a 5-minute call in a 32k context</span><span class="goal" id="gHalf">🎯 Halve a preset's bitrate without touching the frame rate</span><span class="goal" id="gSteps">🎯 ≤ 12.5 big-model steps per second</span></div>
+    <div class="controls">
+      <button class="btn small" id="pEnc">EnCodec 6 kbps</button><button class="btn small" id="pEnc15">EnCodec 1.5 kbps</button><button class="btn small" id="pSS">SoundStream (AudioLM)</button><button class="btn small" id="pMimi">Mimi (Moshi)</button><button class="btn small" id="pSem">AudioLM semantic</button>
+    </div>
+    <div class="controls">
+      <label>frames per second <input type="range" id="tFr" min="5" max="100" step="0.5" value="75"> <b class="mono" id="tFrV"></b></label>
+      <label>codebooks <input type="range" id="tCb" min="1" max="32" step="1" value="8"> <b class="mono" id="tCbV"></b></label>
+      <label>codebook size <select id="tSize" class="btn small"><option>256</option><option selected>1024</option><option>2048</option><option>4096</option></select></label>
+    </div>
+    <div class="controls">
+      <label>call length <input type="range" id="tMin" min="1" max="60" step="1" value="5"> <b class="mono" id="tMinV"></b></label>
+      <label>context window <select id="tCtx" class="btn small"><option value="8192">8k</option><option value="32768" selected>32k</option><option value="131072">128k</option><option value="1000000">1M</option></select></label>
+      <span class="seg" id="tMode"><button data-v="flat" class="on">flatten</button><button data-v="par">parallel streams</button></span>
+    </div>
+    <div class="stat-row">
+      <div class="stat">bitrate <b id="tBr">–</b></div>
+      <div class="stat">tokens per second <b class="at" id="tTps">–</b></div>
+      <div class="stat">tokens for the call <b class="at" id="tTot">–</b></div>
+      <div class="stat">big-model steps per second <b class="ac" id="tSt">–</b></div>
+    </div>
+    <div class="ctxbar" id="tBar"><i></i></div>
+    <p class="hint" id="tMsg"></p>
+  </div>
+  <p><b>What you should see:</b> EnCodec at 6 kbps is 600 tokens a second, so 5 minutes is <b>180,000 tokens</b>: five times a 32k window. Mimi's 100 tokens a second makes it <b>30,000</b>, just inside. Halving EnCodec's bitrate is just dropping half the codebooks (RVQ's gift). And “parallel streams” is how Moshi keeps the big transformer at 12.5 steps a second while still producing 100 tokens a second.</p>
+
+  <h2>Three ways to put audio into an LLM</h2>
+  <table>
+    <tr><th>Design</th><th>How it works</th><th>Documented example</th></tr>
+    <tr><td><b>Cascade</b></td><td>ASR → text LLM → TTS, three separate models</td><td>ChatGPT Voice Mode before GPT-4o (2.8–5.4 s average latency)</td></tr>
+    <tr><td><b>Audio encoder + LLM</b> (audio in, text out)</td><td>A speech encoder's output vectors are projected into the LLM's embedding space and read like extra tokens</td><td>Qwen2-Audio: encoder initialized from Whisper-large-v3 (128 mel bins, 25 ms / 10 ms), a stride-2 pooling so each vector covers about 40 ms (25 per second), feeding Qwen-7B; 8.2B parameters in total</td></tr>
+    <tr><td><b>Speech-to-speech, native audio</b></td><td>Audio tokens in and out of one model</td><td>Moshi (open); GPT-4o (closed; OpenAI documents end-to-end training, not the architecture)</td></tr>
+  </table>
+  <p>The middle row is the same pattern as vision-language models in the next lesson: a pretrained encoder, a small <b>projector</b>, a pretrained LLM. It understands audio well (transcription, questions about sounds, speaker emotion) but answers in text, so a voice product still needs TTS on the way out. Qwen2-Audio reports 1.6% / 3.6% WER on LibriSpeech clean / other. Thirty seconds of audio become about 750 vectors in its context.</p>
+
+  <h2>Full duplex: listening while speaking</h2>
+  <p>Human conversation overlaps. We say “mm-hm” while the other person talks, we interrupt, we start answering before they've finished. A cascade waits for silence (voice activity detection decides you're done), then thinks, then speaks, and while it speaks it usually isn't listening.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Full-duplex speech models (Moshi)</span></span>
+    <ol>
+      <li><b>The problem before</b> Turn-based systems need an end-of-turn detector: wait too long and the agent feels slow; too short and it cuts you off. They can't back-channel (“mm-hm”), and interruptions are handled by special-case logic. Every hop (ASR, LLM, TTS) adds latency, and tone of voice is lost in the text step.</li>
+      <li><b>What people tried</b> Streaming every stage of the cascade, faster turn detectors, sentence-by-sentence TTS (see the AI Engineer course's latency budget).</li>
+      <li><b>Why this works</b> Model <b>two audio streams at once</b>, the user's and the model's own, as parallel token streams at 12.5 Hz. At every 80 ms step the model reads the newest user tokens and writes its own, which may be silence. There are no turns: overlap, interruptions and interjections are just patterns in the two streams. Moshi also predicts time-aligned text tokens for itself (“Inner Monologue”), which the paper says significantly improves the linguistic quality of what it says. Theoretical latency: 160 ms.</li>
+      <li><b>What it costs, when it fails</b> You need lots of two-speaker conversational audio (or synthetic dialogues), the model's reasoning is that of a smaller LLM running at speech pace, and it's much harder to control, log and moderate than a text pipeline (no transcript to check before it speaks).</li>
+      <li><b>What refined it</b> Many 2025–2026 voice systems keep a strong text LLM in the loop and stream everything around it; native speech-to-speech models are improving quickly. Check current model cards before choosing.</li>
+    </ol>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> the agent is mid-answer and you say “wait, no”. How long does each design keep talking over you?</p>
+  <div class="playground">
+    <span class="label">🎮 Playground · Barge-in</span>
+    <p class="hint">A toy timeline (assumed timings, not measurements). The agent answers for 4 s, synthesized in 3-second chunks; you interrupt. A half-duplex agent finishes its current chunk before it notices; a cascade with barge-in detection stops after VAD fires; a full-duplex model reacts within one or two 80 ms frames.</p>
+    <div class="goals"><span class="goal" id="gTalk">🎯 Talk-over under 0.2 s</span><span class="goal" id="gWorst">🎯 Make half-duplex talk over you for 2 s or more</span></div>
+    <div class="controls">
+      <span class="seg" id="bMode"><button data-v="half" class="on">half-duplex (no barge-in)</button><button data-v="vad">cascade + barge-in</button><button data-v="full">full-duplex</button></span>
+      <label>you interrupt at <input type="range" id="bAt" min="0.5" max="3.5" step="0.1" value="1.2"> <b class="mono" id="bAtV"></b></label>
+    </div>
+    <div class="tl" id="bTl"></div>
+    <div class="stat-row"><div class="stat">agent talks over you for <b class="dead" id="bOver">–</b></div><div class="stat">agent stops at <b id="bStop">–</b></div></div>
+    <p class="hint" id="bMsg"></p>
+  </div>
+  <p><b>What you should see:</b> with no barge-in the agent finishes its current 3-second chunk of synthesized speech no matter what, so interrupting early in a chunk means up to 3 s of talk-over. A cascade with barge-in stops once VAD confirms you're speaking (assumed 300 ms here). The full-duplex model is already listening every 80 ms frame and stops within about 0.16 s. For a full latency budget of a production voice agent (end-of-turn wait, network, time to first token, TTS), use the playground in <a href="../../ai-engineer/phase8/4-multimodal.html">AI Engineer 8.4</a>.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Hugging Face <code>transformers</code> includes EnCodec and Mimi. Building them from their config gives random weights, no download, which is enough to check token shapes (real use: <code>EncodecModel.from_pretrained("facebook/encodec_24khz")</code> or <code>MimiModel.from_pretrained("kyutai/mimi")</code>, which download weights).</p>
+<pre><code><span class="k">import</span> torch
+<span class="k">from</span> transformers <span class="k">import</span> EncodecConfig, EncodecModel, MimiConfig, MimiModel
+torch.manual_seed(<span class="n">0</span>)
+wav = torch.randn(<span class="n">1</span>, <span class="n">1</span>, <span class="n">24000</span>)                         <span class="c"># 1 s at 24 kHz (noise is fine for shapes)</span>
+cfg = EncodecConfig()
+print(cfg.target_bandwidths, cfg.codebook_size)
+enc = EncodecModel(cfg).eval()
+<span class="k">with</span> torch.no_grad():
+    <span class="k">for</span> bw <span class="k">in</span> [<span class="n">1.5</span>, <span class="n">6.0</span>, <span class="n">24.0</span>]:
+        print(bw, <span class="s">"kbps ->"</span>, tuple(enc.encode(wav, bandwidth=bw).audio_codes.shape))
+    mimi = MimiModel(MimiConfig()).eval()
+    print(<span class="s">"mimi"</span>, tuple(mimi.encode(wav, num_quantizers=<span class="n">8</span>).audio_codes.shape))
+<span class="c"># What we got (transformers 4.57, CPU):</span>
+<span class="c"># [1.5, 3.0, 6.0, 12.0, 24.0] 1024</span>
+<span class="c"># 1.5 kbps -> (1, 1, 2, 75)</span>
+<span class="c"># 6.0 kbps -> (1, 1, 8, 75)</span>
+<span class="c"># 24.0 kbps -> (1, 1, 32, 75)</span>
+<span class="c"># mimi (1, 8, 13)</span></code></pre>
+    <p>Audio-in LLMs are available as <code>Qwen2AudioForConditionalGeneration</code> (with <code>AutoProcessor</code>) in <code>transformers</code>; Moshi has its own open-source package and weights (<a href="https://github.com/kyutai-labs/moshi" target="_blank" rel="noopener">kyutai-labs/moshi</a>). Hosted realtime voice APIs are covered in the AI Engineer course.</p>
+    <p class="hint">Gotcha: codec tokens are only meaningful to the decoder they came from. Tokens from EnCodec can't be decoded by Mimi, and changing the number of codebooks changes what a downstream LM must predict.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>More codebooks / higher frame rate</td><td>Better audio quality</td><td>More tokens per second: context and generation cost grow linearly</td></tr>
+      <tr><td>Acoustic tokens only</td><td>High-fidelity reconstruction, voice cloning</td><td>Weak long-range structure (babble) without semantic guidance</td></tr>
+      <tr><td>Audio encoder + LLM (text out)</td><td>Reuses a strong text LLM; easy to log and moderate</td><td>Still needs TTS to talk; tone of the reply is lost</td></tr>
+      <tr><td>Cascade ASR → LLM → TTS</td><td>Each part swappable and debuggable; best text reasoning</td><td>Latency adds up; loses tone; turn-based</td></tr>
+      <tr><td>Full-duplex speech-to-speech</td><td>Lowest latency, natural overlap, keeps emotion</td><td>Hard to train, control and audit; smaller “brain”</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you turn a text LLM into something that can hear and talk?” A strong answer:</p>
+    <ul>
+      <li>Lays out the options: cascade, audio encoder + projector (audio in, text out), and native audio tokens in and out, with latency and control trade-offs.</li>
+      <li>Explains codec tokens: encoder → RVQ (coarse to fine codebooks, droppable for bitrate) → decoder, and computes tokens per second (frames × codebooks).</li>
+      <li>Distinguishes semantic from acoustic tokens and why both are needed for coherent, natural speech.</li>
+      <li>Budgets context (a 5-minute call at 100 tokens/s = 30,000 tokens) and sequential steps (parallel streams / depth transformer).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The first RVQ neural codec</b> <span class="tag co">🏢 Google · 2021</span> <a href="https://arxiv.org/abs/2107.03312" target="_blank" rel="noopener">Zeghidour et al.: SoundStream</a></div>
+      <p><b>How:</b> convolutional encoder (stride 320 → 75 frames/s at 24 kHz), residual vector quantizer, decoder, adversarial training; runs in real time on a smartphone CPU.</p>
+      <p><b>Why this method:</b> RVQ made high bitrates affordable; at 3 kbps it outperformed Opus at 12 kbps in listening tests.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One model, five bitrates</b> <span class="tag co">🏢 Meta · 2022</span> <a href="https://arxiv.org/abs/2210.13438" target="_blank" rel="noopener">Défossez et al.: EnCodec, High Fidelity Neural Audio Compression</a></div>
+      <p><b>How:</b> up to 32 codebooks of 1,024 entries at 24 kHz; trained with a random number of codebooks per batch.</p>
+      <p><b>Why this method:</b> 1.5–24 kbps from one network; its 6 kbps tokens became the vocabulary of VALL-E and many audio generators.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Semantic then acoustic</b> <span class="tag co">🏢 Google · 2022</span> <a href="https://arxiv.org/abs/2209.03143" target="_blank" rel="noopener">Borsos et al.: AudioLM</a></div>
+      <p><b>How:</b> w2v-BERT semantic tokens (25/s) generated first, then SoundStream acoustic tokens (50 frames/s at 16 kHz, 600 tokens/s).</p>
+      <p><b>Why this method:</b> long-term coherence from semantic tokens plus quality from acoustic ones: coherent speech and piano continuations with no text at all.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Full-duplex dialogue</b> <span class="tag oss">🧰 Kyutai · 2024</span> <a href="https://arxiv.org/abs/2410.00037" target="_blank" rel="noopener">Défossez et al.: Moshi</a></div>
+      <p><b>How:</b> Mimi codec (12.5 Hz, 8 codebooks of 2,048, first level distilled from WavLM), Helium (a 7B text LLM) as the main transformer plus a small Depth Transformer, two audio streams plus inner-monologue text.</p>
+      <p><b>Why this method:</b> no turns, no cascade: 160 ms theoretical latency, and overlap and interruptions handled naturally.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>An audio encoder feeding an LLM</b> <span class="tag co">🏢 Alibaba Qwen · 2024</span> <a href="https://arxiv.org/abs/2407.10759" target="_blank" rel="noopener">Chu et al.: Qwen2-Audio Technical Report</a></div>
+      <p><b>How:</b> Whisper-large-v3-initialized encoder, pooling to ~40 ms per vector, into Qwen-7B; trained for voice chat and audio analysis.</p>
+      <p><b>Why this method:</b> reuses the best open speech encoder and a strong LLM; one model answers questions about speech, sounds and music in text.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a model that can't stop listening</span>
+    <p>Moshi's text and audio tokens are offset by a small <b>delay</b>. The paper shows that this single hyperparameter turns the same recipe into different products: put text a little ahead of audio and you get streaming text-to-speech (they delay audio by 2 seconds), put audio ahead of text and you get streaming speech recognition, “with no changes in the loss, architecture, or training data”.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Vector quantization and discrete visual tokens are Lesson 7.8; autoencoders are 7.1; GAN losses 7.3. Codec tokens are what VALL-E generated in 8.3; the audio-encoder + projector design is the same as the vision-language models in 8.5. Context windows and long context are 6.11; efficient decoding (KV cache) is 6.9. For production voice agents (latency budgets, realtime APIs, turn detection), see <a href="../../ai-engineer/phase8/4-multimodal.html">AI Engineer 8.4 Multimodal AI</a>; for the information-theory meaning of “bits per frame”, see <a href="../../math-course/phase6/2-entropy.html">math 6.2 entropy</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2107.03312" target="_blank" rel="noopener">SoundStream (2021)</a>. Section III explains RVQ and the 2⁸⁰ problem in one page.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/kyutai-labs/moshi" target="_blank" rel="noopener">kyutai-labs/moshi</a>. Open weights, the Mimi codec and a local demo.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2209.03143" target="_blank" rel="noopener">AudioLM (2022)</a>. The clearest argument for semantic plus acoustic tokens, with listening examples.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A codec runs at 50 frames per second with 4 codebooks of 1,024 entries. What are its bitrate and token rate?</div>
+    <div class="opts"><button class="opt">500 bps, 50 tokens/s</button><button class="opt" data-ok>2,000 bps, 200 tokens/s</button><button class="opt">200 kbps, 4,096 tokens/s</button></div>
+    <div class="explain">1,024 entries = 10 bits per code. 50 frames × 4 codes = <b>200 tokens a second</b>; × 10 bits = <b>2,000 bps</b> (2 kbps). A 5-minute call would be 60,000 tokens if flattened.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your speech LM trained only on EnCodec tokens produces audio that sounds like a real voice, with the right accent, but the words are gibberish after a second or two. What's the most likely fix?</div>
+    <div class="opts"><button class="opt">Use more codebooks for higher audio quality</button><button class="opt" data-ok>Add semantic tokens (from a self-supervised speech model) or text tokens, and generate those first</button><button class="opt">Switch the codec's decoder to HiFi-GAN</button></div>
+    <div class="explain">Acoustic tokens spend their bits on how it sounds, so the model learns voice texture but not long-range linguistic structure. AudioLM's fix is a semantic layer generated first; Moshi adds text tokens (Inner Monologue). More codebooks make the babble sound even more realistic.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Why does residual vector quantization use several small codebooks instead of one big one?</div>
+    <div class="opts"><button class="opt">Small codebooks are faster to look up on GPUs</button><button class="opt">One big codebook can't be trained with gradients</button><button class="opt" data-ok>The same bits per frame need exponentially fewer stored vectors (8 × 1,024 instead of 2⁸⁰), and later stages can be dropped to lower the bitrate</button></div>
+    <div class="explain">Each stage quantizes what the previous ones missed, so bits add up while codebook sizes add up only linearly. 8 codebooks of 10 bits give 80 bits per frame from 8,192 vectors; one flat 80-bit codebook would need about 10²⁴. Because stages go coarse to fine, dropping the last ones still gives a usable, lower-bitrate sound.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Neural codecs (SoundStream, EnCodec, Mimi) are autoencoders: conv encoder → residual vector quantizer → decoder, trained with GAN losses. Tokens per second = frame rate × codebooks.</li>
+      <li>RVQ quantizes the leftover error stage by stage: bits add up, codebook sizes don't explode, and dropping stages lowers the bitrate.</li>
+      <li>Acoustic tokens rebuild sound; semantic tokens (self-supervised features, or the first Mimi level) carry what's said. AudioLM generates semantic first, then acoustic.</li>
+      <li>Audio into LLMs: cascade, audio encoder + projector (Qwen2-Audio: Whisper encoder, ~25 vectors/s), or native speech-to-speech (Moshi, GPT-4o).</li>
+      <li>Full duplex models both speakers' streams at once (Moshi: 12.5 Hz, 160 ms theoretical latency), so interruptions and back-channels need no turn logic. Budget the context: 5 minutes at 100 tokens/s = 30,000 tokens.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plane.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const fmt = v => Math.round(v).toLocaleString("en-US");
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+
+  /* ---------- 1. RVQ: train 4 codebooks of 8 with k-means on residuals (seeded) ---------- */
+  const d2 = (a, b) => (a[0] - b[0]) * (a[0] - b[0]) + (a[1] - b[1]) * (a[1] - b[1]);
+  const near = (C, p) => { let b = 0, bd = Infinity; C.forEach((c, k) => { const d = d2(p, c); if (d < bd) { bd = d; b = k; } }); return b; };
+  function kmeans(P, K, r, it = 25) {
+    let C = Array.from({ length: K }, () => P[r.int(P.length)].slice());
+    for (let t = 0; t < it; t++) {
+      const S = C.map(() => [0, 0, 0]);
+      P.forEach(p => { const b = near(C, p); S[b][0] += p[0]; S[b][1] += p[1]; S[b][2]++; });
+      C = C.map((c, k) => (S[k][2] ? [S[k][0] / S[k][2], S[k][1] / S[k][2]] : P[r.int(P.length)].slice()));
+    }
+    return C;
+  }
+  const r = NN.rng(7), P = Array.from({ length: 1500 }, () => [2 * r.u() - 1, 2 * r.u() - 1]);
+  const books = []; let RES = P.map(p => p.slice());
+  for (let s = 0; s < 4; s++) { const C = kmeans(RES, 8, r); books.push(C); RES = RES.map(p => { const c = C[near(C, p)]; return [p[0] - c[0], p[1] - c[1]]; }); }
+  const STC = ["--c-w", "--c-ac", "--c-at", "--c-gr"];
+  let X = [0.62, -0.35], everDropped = false, lastS = 1;
+  const quant = (x, S) => { let res = x.slice(), sum = [0, 0]; const ids = [], sums = [[0, 0]], errs = [];
+    for (let j = 0; j < S; j++) { const k = near(books[j], res), c = books[j][k]; ids.push(k); sum = [sum[0] + c[0], sum[1] + c[1]]; sums.push(sum.slice()); res = [res[0] - c[0], res[1] - c[1]]; errs.push(Math.hypot(res[0], res[1])); }
+    return { ids, sums, errs, xh: sum }; };
+  const plane = new Plane($("qPlane"), { range: 1.25, onDrag: (k, p) => { X = [Math.max(-1.2, Math.min(1.2, p[0])), Math.max(-1.2, Math.min(1.2, p[1]))]; drawQ(); } });
+  function drawQ() {
+    const S = +$("qS").value; $("qSV").textContent = S;
+    if (S < lastS) everDropped = true; lastS = S;
+    const Q = quant(X, S), all = quant(X, 4), items = [];
+    for (let j = 0; j < S; j++) books[j].forEach((c, k) => items.push({ type: "pt", at: [Q.sums[j][0] + c[0], Q.sums[j][1] + c[1]], color: STC[j], r: k === Q.ids[j] ? 5 : 2.5 }));
+    for (let j = 0; j < S; j++) items.push({ type: "vec", from: Q.sums[j], to: Q.sums[j + 1], color: STC[j], width: 2.5 });
+    items.push({ type: "seg", from: Q.xh, to: X, color: "--c-dead", width: 2, dash: [4, 3] });
+    items.push({ type: "pt", at: Q.xh, color: "--c-y", r: 5, label: "x̂" });
+    items.push({ type: "pt", at: X, color: "--c-w", r: 8, drag: "x", label: "x" });
+    plane.draw(items);
+    const err = Q.errs[S - 1];
+    $("qTable").innerHTML = `<tr><th>stage</th>${[1, 2, 3, 4].map(j => `<th>${j}</th>`).join("")}</tr><tr><td>code chosen</td>${[0, 1, 2, 3].map(j => `<td>${j < S ? Q.ids[j] : "–"}</td>`).join("")}</tr><tr><td>error after</td>${[0, 1, 2, 3].map(j => `<td class="${j < S ? "" : "muted"}">${all.errs[j].toFixed(3)}</td>`).join("")}</tr>`;
+    $("qErr").textContent = err.toFixed(3); $("qBits").textContent = `${3 * S} (${S} × 3)`;
+    $("qStore").textContent = 8 * S; $("qFlat").textContent = fmt(Math.pow(2, 3 * S));
+    const minS = all.errs.findIndex(e => e < 0.05) + 1;   // 0 if never
+    win("gFew", minS > 0 && S === minS); win("gLucky", all.errs[0] < 0.05); win("gDrop", everDropped);
+    $("qMsg").textContent = minS === 0 ? "This target needs more than 4 stages to get under 0.05. Real codecs use 8 or more." :
+      S === minS ? `${S} stage${S > 1 ? "s" : ""}: the fewest that get this target under 0.05.` :
+      S > minS ? `Under 0.05 already, but ${minS} stage${minS > 1 ? "s were" : " was"} enough: drop to save bits.` : `Error ${err.toFixed(3)}: add a stage to quantize what's left.`;
+  }
+  $("qS").oninput = drawQ;
+  const rq = NN.rng(21);
+  $("qRand").onclick = () => { X = [2 * rq.u() - 1, 2 * rq.u() - 1]; drawQ(); };
+  drawQ();
+
+  /* ---------- 2. token budget ---------- */
+  let tMode = "flat", lastPreset = null;
+  const PRE = { pEnc: [75, 8, 1024], pEnc15: [75, 2, 1024], pSS: [50, 12, 1024], pMimi: [12.5, 8, 2048], pSem: [25, 1, 1024] };
+  Object.keys(PRE).forEach(id => ($(id).onclick = () => { const [f, c, s] = PRE[id]; $("tFr").value = f; $("tCb").value = c; $("tSize").value = s; lastPreset = { f, br: f * c * Math.log2(s) }; drawT(); }));
+  function drawT() {
+    const f = +$("tFr").value, cb = +$("tCb").value, size = +$("tSize").value, min = +$("tMin").value, ctx = +$("tCtx").value;
+    $("tFrV").textContent = f; $("tCbV").textContent = cb; $("tMinV").textContent = min + " min";
+    const br = f * cb * Math.log2(size), tps = f * cb, tot = tps * 60 * min, steps = tMode === "flat" ? tps : f;
+    $("tBr").textContent = br >= 1000 ? (br / 1000).toFixed(br % 1000 ? 2 : 0) + " kbps" : fmt(br) + " bps";
+    $("tTps").textContent = fmt(tps); $("tTot").textContent = fmt(tot); $("tSt").textContent = steps % 1 ? steps.toFixed(1) : fmt(steps);
+    const share = tot / ctx;
+    $("tBar").classList.toggle("over", share > 1); $("tBar").firstElementChild.style.width = Math.min(100, 100 * share) + "%";
+    win("gFit", min >= 5 && ctx <= 32768 && tot <= ctx);
+    win("gHalf", lastPreset && f === lastPreset.f && Math.abs(br - lastPreset.br / 2) < 1);
+    win("gSteps", steps <= 12.5);
+    $("tMsg").textContent = `${share > 1 ? "Doesn't fit" : "Fits"}: the call uses ${(100 * share).toFixed(share < 0.1 ? 1 : 0)}% of a ${fmt(ctx)}-token window, before any instructions or replies. ` +
+      (tMode === "flat" ? `The model must generate ${fmt(tps)} tokens every second to speak in real time.` : `The big model takes ${f} steps a second; a small depth model fills in ${cb} codes per step.`);
+  }
+  ["tFr", "tCb", "tMin"].forEach(id => ($(id).oninput = drawT));
+  ["tSize", "tCtx"].forEach(id => ($(id).onchange = drawT));
+  seg("tMode", v => { tMode = v; drawT(); });
+  drawT();
+
+  /* ---------- 3. barge-in timeline (toy, assumed timings) ---------- */
+  let bMode = "half";
+  function drawB() {
+    const at = +$("bAt").value, L = 4, W = 5; $("bAtV").textContent = at.toFixed(1) + " s";
+    const stop = bMode === "half" ? Math.min(L, Math.ceil(at / 3 - 1e-9) * 3 || 3) : bMode === "vad" ? at + 0.3 : at + 0.16;
+    const over = Math.max(0, stop - at), pct = t => (100 * t / W) + "%";
+    $("bTl").innerHTML = `<span class="who" style="top:14px">agent</span><span class="who" style="top:54px">you</span>
+      <div class="lane" style="top:12px"><span style="left:0;width:${pct(stop)};background:var(--c-y)">answer…</span>${stop < L ? `<span style="left:${pct(stop)};width:${pct(L - stop)};background:var(--panel);color:var(--muted)">(cut)</span>` : ""}<span class="ov" style="left:${pct(at)};width:${pct(over)}"></span></div>
+      <div class="lane" style="top:52px"><span style="left:${pct(at)};width:${pct(1)};background:var(--c-x)">“wait, no”</span></div>`;
+    $("bOver").textContent = over.toFixed(2) + " s"; $("bStop").textContent = stop.toFixed(2) + " s";
+    win("gTalk", over < 0.2); win("gWorst", bMode === "half" && over >= 2 - 1e-9);
+    $("bMsg").textContent = bMode === "half" ? "Half-duplex: the agent isn't listening while it plays its current chunk." :
+      bMode === "vad" ? "Barge-in: the cascade keeps a VAD running during playback and stops when it fires." : "Full-duplex: your audio is in the model's input stream every 80 ms, even while it talks.";
+  }
+  seg("bMode", v => { bMode = v; drawB(); });
+  $("bAt").oninput = drawB;
+  drawB();
+})();
+</script>
+</body>
+</html>

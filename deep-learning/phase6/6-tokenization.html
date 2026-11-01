@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.6 Tokenization: BPE and friends · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .toks { display: flex; flex-wrap: wrap; gap: 3px; margin: 6px 0; font-family: var(--mono); font-size: .88rem; }
+  .toks span { padding: 2px 6px; border-radius: 5px; border: 1px solid var(--c-x); background: color-mix(in srgb, var(--c-x) 12%, var(--bg2)); }
+  .toks span.unk { border-color: var(--c-dead); color: var(--c-dead); }
+  .toks span.byte { border-color: var(--c-w); background: color-mix(in srgb, var(--c-w) 14%, var(--bg2)); }
+  .pairs { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; }
+  .pairs button { font: inherit; font-family: var(--mono); font-size: .82rem; padding: 3px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); cursor: pointer; }
+  .pairs button:first-child { border-color: var(--accent); }
+  textarea.corp { width: 100%; min-height: 54px; font-family: var(--mono); font-size: .85rem; background: var(--bg2); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 6px; box-sizing: border-box; }
+  input.tw { font-family: var(--mono); }
+  .mlist { font-family: var(--mono); font-size: .8rem; color: var(--muted); max-height: 64px; overflow-y: auto; }
+  canvas.chart.vs { height: 200px; }
+</style>
+</head>
+<body data-lesson="d6-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 6</div>
+  <h1>Tokenization: BPE and friends</h1>
+  <p class="subtitle">A language model never sees letters or words. It sees integers from a fixed vocabulary of word pieces, learned by a 1990s compression trick. That choice quietly sets your context length, your bill and some of the model's strangest mistakes.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Each token id picks one row of the <b>embedding table</b> (V rows × d columns), and the output layer scores all V entries (Lessons 5.1 and 6.4).</li>
+      <li>Attention cost grows with the <b>square</b> of the number of tokens n (Lesson 6.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Translate the same text into different languages and run each through the same tokenizer. A 2023 study found the token counts can differ by <b>up to 15 times</b>. Since APIs charge per token and context windows are counted in tokens, some languages pay more and fit less, before the model has done anything.</p>
+    <p>And when Meta built Llama 3, one of its upgrades wasn't in the network at all: a bigger tokenizer (128K tokens instead of Llama 2's) packed English into <b>3.94</b> characters per token instead of 3.17, so the model “reads” more text for the same compute.</p>
+    <p><b>How does a model decide what a “token” is, and why not just use letters or words?</b> You're about to run the algorithm by hand, merge by merge.</p>
+  </div>
+
+  <h2>Numbers first: letters are too long, words are too many</h2>
+  <p>Take the sentence “the tokenizer learns which pieces of text are common” (52 characters, 9 words).</p>
+  <table>
+    <tr><th>Unit</th><th>Sequence length</th><th>Vocabulary needed</th><th>New word “tokenizers”?</th></tr>
+    <tr><td>Characters</td><td class="dead">52 tokens (attention: 52² = 2,704 scores)</td><td class="ev">~100 symbols for English</td><td>Fine, letter by letter</td></tr>
+    <tr><td>Whole words</td><td class="ev">9 tokens (81 scores)</td><td class="dead">hundreds of thousands, and still not every word</td><td class="dead">[UNK]: unknown word</td></tr>
+    <tr><td>Subword pieces</td><td>a few more than the word count</td><td>tens of thousands</td><td class="ev">pieces, e.g. “token” + “izers”</td></tr>
+  </table>
+  <p>Characters make sequences long (and attention is quadratic in length). Words make the vocabulary enormous and still fail on typos, names and new words. Subwords sit in between: common words stay whole, rare words split into reusable pieces.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Subword tokens</span></span>
+    <ol>
+      <li><b>The problem before</b> Word-level translation models had a fixed vocabulary and mapped everything else to an unknown token; Sennrich et al. (2015) note translation is an “open-vocabulary problem” (names, compounds, new words).</li>
+      <li><b>What people tried</b> Back-off dictionaries for unknown words; character-level models, which handle anything but make sequences several times longer (about 4× versus a modern tokenizer's ~4 characters per token).</li>
+      <li><b>Why this works</b> Learn a vocabulary of frequent pieces from data: “the” is one token, “tokenizers” is two or three. No word is ever unknown (in the worst case it's spelled out in small pieces) and typical English needs about 4 characters per token in modern tokenizers.</li>
+      <li><b>What it costs, when it fails</b> The model sees pieces, not letters, so spelling, counting letters and character-level edits get harder. Pieces depend on the training data: languages and domains underrepresented there split into many more tokens.</li>
+      <li><b>What refined it</b> BPE (below), WordPiece, Unigram/SentencePiece, and byte-level fallback so nothing is unknown.</li>
+    </ol>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A tokenizer is <b>compression learned from data</b>: start from single characters (or bytes), and repeatedly glue together the pair that appears most often. Frequent strings become single tokens; rare ones stay in pieces. The vocabulary size is the dial between short sequences and a big embedding table.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: texting shorthand</span>
+    <p>If you text “see you later” fifty times a day, you start typing “cu l8r”. You didn't plan a code; you noticed what repeats and shortened it. BPE does that systematically: count every adjacent pair of symbols, invent a new symbol for the most common pair, repeat. After enough rounds, frequent words are a single symbol and the rest are spelled with common chunks.</p>
+  </div>
+
+  <h2>Byte-pair encoding, by hand</h2>
+  <p>BPE (Sennrich, Haddow and Birch, 2015, borrowing a 1994 compression algorithm by Gage) trains like this:</p>
+  <ol>
+    <li>Split every word in the corpus into characters, plus an end-of-word marker “_”.</li>
+    <li>Count every adjacent pair across the corpus (weighted by how often each word occurs).</li>
+    <li><b>Merge</b> the most frequent pair into one new symbol and record the merge rule. Repeat until the vocabulary is the size you want.</li>
+  </ol>
+  <p>To tokenize new text, apply the recorded merges in the same order. The AI Engineer course runs the original paper's corpus (<a href="../../ai-engineer/phase0/3-tokens-cost.html">AI Engineer 0.3</a>); here you can edit the corpus, pick merges yourself and break things.</p>
+  <p class="predict">🔮 <b>Predict:</b> “lowest” is <b>not</b> in this corpus. After how many greedy merges will it be just 2 tokens? And will greedy BPE ever make it a single token?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Run BPE merges live</span>
+    <p class="hint">Edit the corpus if you like (words separated by spaces; repeats count). <b>Merge</b> takes the most frequent pair (that's BPE). Or click any pair in the list to merge it yourself. The test word is tokenized with your merges, in order. Unknown characters become <span class="dead">[UNK]</span>, unless you turn on byte fallback.</p>
+    <div class="goals"><span class="goal" id="gTwo">🎯 Encode “lowest” in ≤ 2 tokens</span><span class="goal" id="gOne">🎯 “lowest” as ONE token within 8 merges (pick merges yourself)</span><span class="goal" id="gByte">🎯 Make a word with no [UNK] that has a character the corpus never saw</span></div>
+    <textarea class="corp" id="corp">low low low lower lower slow slow slower slowest newest newest newest widest widest fast fastest fastest</textarea>
+    <div class="controls">
+      <button class="btn primary" id="bMerge">Merge most frequent pair</button>
+      <button class="btn" id="bMerge5">Merge ×5</button>
+      <button class="btn" id="bUndo">↶ Undo</button>
+      <button class="btn" id="bReset">↺ Reset (re-read corpus)</button>
+      <label>test word <input type="text" id="tw" class="btn small tw" value="lowest" style="width:120px"></label>
+      <span class="seg" id="fbSeg"><button data-v="unk" class="on">unknown → [UNK]</button><button data-v="byte">byte fallback</button></span>
+    </div>
+    <div class="hint">All pairs right now, most frequent first (click any to merge it):</div>
+    <div class="pairs" id="pairs"></div>
+    <div class="stat-row">
+      <div class="stat">merges <b id="sM">0</b></div>
+      <div class="stat">vocabulary size <b id="sV" class="w">–</b></div>
+      <div class="stat">tokens for the whole corpus <b id="sC" class="x">–</b></div>
+      <div class="stat">test word tokens <b id="sT" class="x">–</b></div>
+    </div>
+    <div class="toks" id="twToks"></div>
+    <div class="mlist" id="mlist"></div>
+    <p class="hint" id="bMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the first merges are s+t (11 times), l+o and lo+w. After <b>5 greedy merges</b> “lowest” is “low” + “est_”, even though the corpus never contains it: the pieces come from <i>slowest</i>, <i>newest</i>, <i>low</i>. Greedy BPE only makes “lowest_” one token at merge 21, as a side effect of <i>slowest</i>. Pick the merges yourself (s+t, l+o, lo+w, st+_, e+st_, low+est_) and it takes 6. Then type “lowest!” or “zoo”: characters the corpus never saw become [UNK] until you switch on byte fallback.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Byte-pair encoding (BPE)</span></span>
+    <ol>
+      <li><b>The problem before</b> A fixed word list can't cover an open vocabulary; character models make sequences long.</li>
+      <li><b>What people tried</b> Hand-made morphology rules; dictionaries for rare words; character n-grams.</li>
+      <li><b>Why this works</b> Merging the most frequent pair is the greedy way to shorten the corpus fastest (in the playground, each merge saved as many tokens as the pair's count: 105 → 94 → 85 → 76…). It's simple, deterministic and language-agnostic, and the vocabulary size is exactly the number of merges plus the base symbols.</li>
+      <li><b>What it costs, when it fails</b> It's greedy: it never asks which pieces <i>mean</i> something, so splits can be odd (“lower_” before “lowest”). Merges reflect the training corpus, so other languages and domains get fewer merges and more tokens. Tokenizing must apply merges in order, which is slower than a lookup.</li>
+      <li><b>What refined it</b> Byte-level BPE (GPT-2) for full coverage; WordPiece (BERT), which scores pairs by frequency relative to their parts; Unigram (SentencePiece), which starts big and prunes; pre-tokenization rules (splitting digits, not merging across letters and punctuation).</li>
+    </ol>
+  </div>
+
+  <h2>Bytes, so nothing is unknown</h2>
+  <p>Basic BPE starts from characters. But Unicode has a huge number of characters; GPT-2's paper notes that covering them all would mean a base vocabulary “of over 130,000” before a single merge. Their answer: run BPE on <b>UTF-8 bytes</b>. There are only 256 possible bytes, every string is a sequence of them, and the merges are learned on top. “ï” becomes two byte-tokens, an emoji four, and nothing is ever [UNK].</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Byte-level fallback</span></span>
+    <ol>
+      <li><b>The problem before</b> Character-level BPE either needs every Unicode character in its base vocabulary (over 130,000) or maps unseen characters (emoji, rare scripts, binary junk) to [UNK], losing information.</li>
+      <li><b>What people tried</b> Huge base vocabularies; an [UNK] token and hope.</li>
+      <li><b>Why this works</b> Any text is UTF-8 bytes, so a base of 256 byte tokens covers everything; frequent byte sequences still merge into normal subwords. GPT-2 also stopped merges across character categories, so “dog”, “dog.” and “dog!” don't each eat a vocabulary slot (it allowed spaces to stick to the next word).</li>
+      <li><b>What it costs, when it fails</b> Rare characters cost several tokens each (an emoji is 4 bytes); a token can be half a character, so some token sequences aren't valid text on their own.</li>
+      <li><b>What refined it</b> The same idea everywhere: Qwen3 uses byte-level BPE (151,669 tokens); Gemma 3's SentencePiece tokenizer adds “byte-level encodings” as a fallback; pre-tokenizers that cap number chunks (below).</li>
+    </ol>
+  </div>
+
+  <h2>The friends: WordPiece and Unigram (SentencePiece)</h2>
+  <table>
+    <tr><th>Algorithm</th><th>How it builds the vocabulary</th><th>Used by</th></tr>
+    <tr><td><b>BPE</b></td><td>Start small, merge the most <b>frequent</b> pair</td><td>GPT-2 and later GPTs, Llama 3, Qwen3 (byte-level)</td></tr>
+    <tr><td><b>WordPiece</b></td><td>Start small, merge the pair with the best score: pair count ÷ (count of part 1 × count of part 2), so it prefers pairs whose parts are rare on their own</td><td>BERT (a 30,000-token vocabulary; word-internal pieces are marked “##”)</td></tr>
+    <tr><td><b>Unigram</b></td><td>Start <b>big</b> and repeatedly remove the tokens whose loss hurts the corpus likelihood least (Kudo 2018)</td><td>Often via SentencePiece: T5 (32,000 pieces) and many multilingual models</td></tr>
+    <tr><td><b>SentencePiece</b> (a library)</td><td>Trains BPE or Unigram on raw text, treating the space as an ordinary symbol (“▁”), so no language-specific word splitting is needed</td><td>T5, Gemma 3 (262k entries, with split digits and byte fallback)</td></tr>
+  </table>
+
+  <h2>Vocabulary size: the dial</h2>
+  <p>More merges → shorter sequences (cheaper attention, more text per context window) but a bigger embedding table and output layer, and rarer tokens that the model sees less often in training.</p>
+  <p class="predict">🔮 <b>Predict:</b> train a tokenizer on English only. Will a Spanish sentence of the same meaning get the same number of tokens per character as the English one?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Vocabulary size vs sequence length</span>
+    <p class="hint">A BPE tokenizer trained live on a 184-word English paragraph (written for this course). Slide the number of merges and watch three held-out texts it never trained on: English, Spanish with the same meaning, and a sentence full of numbers. Below: what the same trade-off costs at real scale.</p>
+    <div class="goals"><span class="goal" id="g2ch">🎯 Get English to ≥ 2 characters per token</span><span class="goal" id="gEs">🎯 Max merges: Spanish needs ≥ 2× the tokens of English</span><span class="goal" id="gEmb">🎯 Real scale: make the embedding table ≥ 25% of a 1B model</span></div>
+    <div class="controls">
+      <label>merges <input type="range" id="vM" min="0" max="300" step="5" value="0"> <b class="mono" id="vMV"></b></label>
+    </div>
+    <div id="vRows"></div>
+    <canvas class="chart vs" id="vChart"></canvas>
+    <div class="controls">
+      <label>real vocabulary V <select id="vV" class="btn small"><option value="30522">30,522 (BERT)</option><option value="32000">32,000 (T5)</option><option value="50257" selected>50,257 (GPT-2)</option><option value="128000">128,000 (Llama 3)</option><option value="151669">151,669 (Qwen3)</option><option value="262000">≈262,000 (Gemma 3)</option></select></label>
+      <label>model width d <select id="vD" class="btn small"><option>768</option><option selected>2048</option><option>4096</option></select></label>
+      <label>model size <select id="vN" class="btn small"><option value="1e9" selected>1B</option><option value="8e9">8B</option><option value="70e9">70B</option></select></label>
+      <span class="seg" id="vTie"><button data-v="tied" class="on">tied</button><button data-v="untied">untied (input + output tables)</button></span>
+    </div>
+    <div class="stat-row">
+      <div class="stat">embedding parameters <b id="vE" class="w">–</b></div>
+      <div class="stat">share of the model <b id="vS">–</b></div>
+    </div>
+    <p class="hint" id="vMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at 0 merges every character is a token (about 0.8 characters per token, counting the end-of-word marker). English improves fast and crosses 2 characters per token after roughly 100 merges, ending near 3. Spanish stalls below 1.5: the merges are English pieces. At the end, the Spanish sentence (same meaning, same 15 words) needs <b>46 tokens</b> to English's <b>22</b>, about 2×. The digits never merge at all, since the corpus has none. That's the 15× effect from the hook, in miniature. At real scale, a 262k vocabulary with d = 2,048 is 537 million parameters: over half of a 1B model even when tied (double that untied), which is why small models keep vocabularies modest and tie the tables.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what a bigger vocabulary buys</span>
+    <ul>
+      <li>Llama 3's paper: moving to a 128K vocabulary raised English compression from 3.17 to 3.94 characters per token. The same 8,000-word document (about 48,000 characters) drops from ≈ 15,100 tokens to ≈ 12,200: <b>19% fewer</b>.</li>
+      <li>Attention on that document: 15,100² ≈ 228 million scores vs 12,200² ≈ 149 million, about <b>35% fewer</b>.</li>
+      <li>The price: the embedding table goes from 32,000 × 4,096 ≈ 131 million to 128,000 × 4,096 ≈ 524 million parameters (and the same again for an untied output layer). For an 8B model that's affordable; for a 100M model it would be most of the network.</li>
+    </ul>
+  </div>
+
+  <h2>Quirks you'll actually hit</h2>
+  <ul>
+    <li><b>Numbers.</b> Pre-tokenizers decide how digits group. OpenAI's cl100k_base and o200k_base encodings split runs of digits into chunks of at most 3 (the <code>\p{N}{1,3}</code> rule in tiktoken's source); Gemma 3 splits every digit. Arithmetic is harder when “1234567” is “123” “456” “7”.</li>
+    <li><b>Spaces are part of tokens.</b> In GPT-style tokenizers “ cat” (with a leading space) and “cat” are different tokens; trailing spaces in prompts change the tokens the model sees.</li>
+    <li><b>Letters are hidden.</b> A word that is one token gives the model no direct view of its letters, which is why “how many r's in this word?” trips models up.</li>
+    <li><b>Languages and code cost differently.</b> Measure with the real tokenizer on real traffic; the cost side is <a href="../../ai-engineer/phase0/3-tokens-cost.html">AI Engineer 0.3</a>.</li>
+  </ul>
+
+  <h2>Side by side: tokenizers in use (from their papers, 2018–2025)</h2>
+  <table>
+    <tr><th>Model</th><th>Algorithm</th><th>Vocabulary</th></tr>
+    <tr><td>BERT (2018)</td><td>WordPiece</td><td>30,000 (30,522 in the released config)</td></tr>
+    <tr><td>GPT-2 (2019)</td><td>Byte-level BPE</td><td>50,257</td></tr>
+    <tr><td>T5 (2019)</td><td>SentencePiece</td><td>32,000</td></tr>
+    <tr><td>Llama 3 (2024)</td><td>BPE (100K tiktoken tokens + 28K added for other languages)</td><td>128K</td></tr>
+    <tr><td>Qwen3 (2025)</td><td>Byte-level BPE</td><td>151,669</td></tr>
+    <tr><td>Gemma 3 (2025)</td><td>SentencePiece, split digits, byte fallback</td><td>262k</td></tr>
+    <tr><td>GPT-4o, GPT-5 (per tiktoken, 2026)</td><td>Byte-level BPE, <code>o200k_base</code></td><td>~200k (the name)</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Hugging Face <code>tokenizers</code> trains a real byte-level BPE in a second, no downloads:</p>
+<pre><code><span class="k">from</span> tokenizers <span class="k">import</span> Tokenizer, models, trainers, pre_tokenizers, decoders
+
+corpus = [<span class="s">"low lower slow slower slowest newest widest fast fastest"</span>] * <span class="n">50</span>
+tok = Tokenizer(models.BPE())
+tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=<span class="k">True</span>)   <span class="c"># GPT-2 style: bytes, space glued to the word</span>
+tok.decoder = decoders.ByteLevel()
+trainer = trainers.BpeTrainer(vocab_size=<span class="n">300</span>, initial_alphabet=pre_tokenizers.ByteLevel.alphabet())
+tok.train_from_iterator(corpus, trainer)
+
+print(tok.get_vocab_size())
+<span class="k">for</span> text <span class="k">in</span> [<span class="s">"lowest"</span>, <span class="s">"slowest!"</span>, <span class="s">"naïve 🙂"</span>]:
+    enc = tok.encode(text)
+    print(enc.tokens, <span class="s">"->"</span>, tok.decode(enc.ids))
+
+<span class="c"># What we got (tokenizers 0.22):</span>
+<span class="c"># 279</span>
+<span class="c"># ['Ġlow', 'est'] ->  lowest</span>
+<span class="c"># ['Ġslowest', '!'] ->  slowest!</span>
+<span class="c"># ['Ġ', 'n', 'a', 'Ã', '¯', 'v', 'e', 'Ġ', 'ð', 'Ł', 'Ļ', 'Ĥ'] ->  naïve 🙂</span></code></pre>
+    <p>“Ġ” is how byte-level BPE displays a space; “ï” became two byte tokens and the emoji four, and decoding still gives the exact text back. To count tokens for a real model, use its own tokenizer. These <b>download</b> the vocabulary files on first use, so we didn't run them here:</p>
+<pre><code><span class="k">import</span> tiktoken
+enc = tiktoken.get_encoding(<span class="s">"o200k_base"</span>)          <span class="c"># or tiktoken.encoding_for_model("gpt-4o")</span>
+print(len(enc.encode(<span class="s">"How many tokens is this?"</span>)))
+
+<span class="k">from</span> transformers <span class="k">import</span> AutoTokenizer
+tok = AutoTokenizer.from_pretrained(<span class="s">"openai-community/gpt2"</span>)
+print(tok.tokenize(<span class="s">"Tokenizers split rare words"</span>))</code></pre>
+    <p class="hint">Gotcha: a model only works with the exact tokenizer it was trained with. Swapping tokenizers (or adding tokens) means new embedding rows that must be trained.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Bigger vocabulary</td><td>Shorter sequences, more text per context, cheaper attention</td><td>Bigger embedding and output layers; rare tokens undertrained</td></tr>
+      <tr><td>Smaller vocabulary</td><td>Small tables; every token well trained</td><td>Longer sequences; more compute per document</td></tr>
+      <tr><td>Byte-level base</td><td>Never unknown; any language or binary</td><td>Rare characters cost several tokens; tokens can split characters</td></tr>
+      <tr><td>Splitting digits</td><td>Consistent number handling, helps arithmetic</td><td>Numbers take more tokens</td></tr>
+      <tr><td>Multilingual training data for the tokenizer</td><td>Fairer token counts across languages</td><td>Fewer slots for English and code at the same size</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How does BPE work, and how would you choose a vocabulary size?” A strong answer:</p>
+    <ul>
+      <li>Start from bytes or characters; repeatedly merge the most frequent adjacent pair; record merges; tokenize by applying them in order.</li>
+      <li>Byte-level base (256) means no unknown tokens; pre-tokenization rules (no merges across letters/punctuation, digit splitting) shape the result.</li>
+      <li>Vocabulary size trades sequence length (attention ∝ n², context capacity) against embedding/output parameters and rare-token training; typical 2024–25 choices are 128K–262K for large models.</li>
+      <li>Mentions consequences: language unfairness (up to 15× token counts), letter-level blindness, number splitting, and that WordPiece and Unigram/SentencePiece are the alternatives.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Subword units for open-vocabulary translation</b> <span class="tag hist">📜 History · 2015</span> <a href="https://arxiv.org/abs/1508.07909" target="_blank" rel="noopener">Sennrich, Haddow &amp; Birch: Neural Machine Translation of Rare Words with Subword Units</a></div>
+      <p><b>How:</b> adapted the byte-pair-encoding compression algorithm to learn word pieces from the training corpus.</p>
+      <p><b>Why this method:</b> rare and unknown words (names, compounds) can be translated piece by piece, beating a back-off dictionary.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Byte-level BPE</b> <span class="tag co">🏢 OpenAI · 2019</span> <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" target="_blank" rel="noopener">Radford et al.: GPT-2</a></div>
+      <p><b>How:</b> BPE over UTF-8 bytes (base vocabulary 256), with merges blocked across character categories; 50,257 tokens.</p>
+      <p><b>Why this method:</b> any string can be modelled, with no unknown token and no lowercasing or other preprocessing.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A tokenizer that doesn't need spaces</b> <span class="tag oss">🧰 Open source</span> <a href="https://arxiv.org/abs/1808.06226" target="_blank" rel="noopener">Kudo &amp; Richardson: SentencePiece</a></div>
+      <p><b>How:</b> trains BPE or Unigram directly from raw sentences, treating whitespace as a normal symbol.</p>
+      <p><b>Why this method:</b> works the same for languages without spaces between words (Japanese, Chinese); used by T5 and Gemma.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A bigger vocabulary for a better model</b> <span class="tag co">🏢 Meta · 2024</span> <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></div>
+      <p><b>How:</b> 100K tokens from tiktoken plus 28K tokens for non-English languages.</p>
+      <p><b>Why this method:</b> 3.17 → 3.94 characters per token on English, and the extra tokens improved both compression and downstream results in other languages “with no impact on English tokenization”.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Measuring the language gap</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2305.15425" target="_blank" rel="noopener">Petrov et al.: Language Model Tokenizers Introduce Unfairness Between Languages</a></div>
+      <p><b>How:</b> tokenized the same parallel text in many languages with many tokenizers.</p>
+      <p><b>Why this method:</b> found differences of up to 15× in token count, even for tokenizers trained to be multilingual, which means different costs and context limits per language.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · dog. dog! dog?</span>
+    <p>When OpenAI first ran plain BPE on bytes for GPT-2, the greedy merges filled the vocabulary with many copies of common words glued to punctuation, like “dog.”, “dog!” and “dog?”. Their fix was one rule: never merge across character categories (letters, digits, punctuation), except to let a space stick to the following word. That's why “ dog” is a token and the “!” after it is separate.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Tokens are the rows of the embedding table (5.1, 6.4) and the length n in every attention cost (6.1). Next: what the model is trained to do with those tokens, masked vs next-token prediction (6.7); vocabulary size also shows up in scaling-law parameter counts (6.8). Images and audio get “tokenized” too: patches (Phase 3) and audio frames (Phase 8). For token pricing, context budgets and latency in production, see <a href="../../ai-engineer/phase0/3-tokens-cost.html">AI Engineer 0.3</a>; for how prompts become tokens in chat models, <a href="../../ai-engineer/phase0/2-how-llms-work.html">AI Engineer 0.2</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Course</span> <a href="https://huggingface.co/learn/llm-course/chapter6/5" target="_blank" rel="noopener">Hugging Face LLM course: BPE, WordPiece and Unigram</a>. Each algorithm implemented step by step (chapters 6.5–6.7).</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1508.07909" target="_blank" rel="noopener">Neural Machine Translation of Rare Words with Subword Units (2015)</a>. The BPE paper; Algorithm 1 is ten lines of Python.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/openai/tiktoken" target="_blank" rel="noopener">tiktoken</a>. OpenAI's fast BPE tokenizer; the pre-tokenization regexes are in <code>tiktoken_ext/openai_public.py</code>.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A document is 40,000 characters. Tokenizer A averages 3.2 characters per token, tokenizer B 4.0. Roughly how much less attention work (∝ n²) does B need for one pass?</div>
+    <div class="opts"><button class="opt">20% less (it has 20% fewer tokens)</button><button class="opt" data-ok>About 36% less: 12,500² vs 10,000² tokens squared</button><button class="opt">The same: attention cost depends on characters, not tokens</button></div>
+    <div class="explain">A gives 40,000 / 3.2 = 12,500 tokens, B gives 40,000 / 4.0 = 10,000 (20% fewer). Attention scores scale with n²: 10,000² / 12,500² = 0.64, so about 36% less work. Fewer tokens also leave more room in a fixed context window.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your chatbot works well in English but users writing in Hindi complain that long messages get cut off and replies are slower. The model is fine. What's the likely cause?</div>
+    <div class="opts"><button class="opt">Hindi text is longer in characters</button><button class="opt" data-ok>The tokenizer was trained mostly on English, so Hindi splits into many more tokens per word: more tokens hit the context limit sooner and take longer to process and generate</button><button class="opt">The model's attention doesn't work on non-Latin scripts</button></div>
+    <div class="explain">Tokenizers learn merges from their training text. Scripts that were rare there get few merges, so each word becomes many small (often byte-level) tokens. Studies found up to 15× differences for the same content. Measure token counts per language; a tokenizer with multilingual merges (like Llama 3's added 28K tokens) narrows the gap.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You're designing a 120M-parameter model with d = 768. A colleague wants a 256,000-token vocabulary “because big models use it”. What's the main problem?</div>
+    <div class="opts"><button class="opt" data-ok>The embedding table alone would be 256,000 × 768 ≈ 197M parameters, more than the whole budget; a small model needs a much smaller vocabulary (or tied embeddings and a smaller V)</button><button class="opt">Big vocabularies make sequences longer</button><button class="opt">Vocabulary size has no effect on parameter count</button></div>
+    <div class="explain">Embedding parameters are V × d: 256,000 × 768 = 196.6M, already above 120M before a single transformer block (and doubled if the output layer is untied). Large models can afford 128K–262K vocabularies because the table is a small share of billions of parameters. GPT-2 small, at 124M, uses 50,257 tokens and still spends 31% of its parameters on the table.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Characters make sequences long; words need huge vocabularies and still meet unknown words. Subword tokens sit in between.</li>
+      <li>BPE: start from characters or bytes, repeatedly merge the most frequent pair, apply merges in order to tokenize.</li>
+      <li>Byte-level BPE (GPT-2, base 256) means nothing is ever unknown; WordPiece (BERT) and Unigram/SentencePiece (T5, Gemma) are the main alternatives.</li>
+      <li>Vocabulary size trades sequence length against embedding size: GPT-2 50,257; Llama 3 128K (3.17 → 3.94 chars/token); Qwen3 151,669; Gemma 3 262k.</li>
+      <li>Quirks: languages can differ up to 15× in token count; digits get chunked or split; spaces are part of tokens; models don't see letters.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const SEP = "\u0001";
+  const apply = (sym, a, b) => { const o = []; for (let i = 0; i < sym.length; i++) { if (i + 1 < sym.length && sym[i] === a && sym[i + 1] === b) { o.push(a + b); i++; } else o.push(sym[i]); } return o; };
+  const countWords = t => { const c = {}; t.toLowerCase().split(/\s+/).filter(Boolean).forEach(w => (c[w] = (c[w] || 0) + 1)); return c; };
+  const pairCounts = V => { const p = new Map(); V.forEach(({ sym, n }) => { for (let i = 0; i + 1 < sym.length; i++) { const k = sym[i] + SEP + sym[i + 1]; p.set(k, (p.get(k) || 0) + n); } }); return [...p.entries()].sort((a, b) => b[1] - a[1] || (a[0] < b[0] ? -1 : 1)); };
+  const hex = ch => [...new TextEncoder().encode(ch)].map(b => "<0x" + b.toString(16).toUpperCase().padStart(2, "0") + ">");
+
+  /* ---------- 1. BPE merges live ---------- */
+  let base, V, merges, hist, fallback = "unk", picked = false;
+  function bReset() {
+    const c = countWords($("corp").value);
+    V = Object.entries(c).map(([w, n]) => ({ sym: [...w, "_"], n }));
+    base = new Set(["_"]); Object.keys(c).forEach(w => [...w].forEach(ch => base.add(ch)));
+    merges = []; hist = []; picked = false;
+    bDraw("");
+  }
+  function doMerge(a, b, byHand) {
+    hist.push(V); merges.push([a, b]); if (byHand) picked = true;
+    V = V.map(v => ({ sym: apply(v.sym, a, b), n: v.n }));
+  }
+  function encodeWord(w) {
+    let s = [];
+    [...w].forEach(ch => { if (base.has(ch)) s.push(ch); else if (fallback === "byte") s.push(...hex(ch)); else s.push("[UNK]"); });
+    s.push("_");
+    merges.forEach(([a, b]) => (s = apply(s, a, b)));
+    return s;
+  }
+  function bDraw(msg) {
+    const P = pairCounts(V);
+    $("pairs").innerHTML = P.slice(0, 40).map(([k, n]) => { const [a, b] = k.split(SEP); return `<button data-a="${a}" data-b="${b}">${a} + ${b} <span class="muted">×${n}</span></button>`; }).join("") || `<span class="muted">No pairs left: every word is a single token.</span>`;
+    [...$("pairs").querySelectorAll("button")].forEach(btn => (btn.onclick = () => { doMerge(btn.dataset.a, btn.dataset.b, true); bDraw(`You merged ${btn.dataset.a} + ${btn.dataset.b}.`); }));
+    const w = $("tw").value.trim().toLowerCase() || "lowest", t = encodeWord(w);
+    $("sM").textContent = merges.length;
+    $("sV").textContent = base.size + merges.length;
+    $("sC").textContent = V.reduce((s, v) => s + v.sym.length * v.n, 0);
+    $("sT").textContent = t.length;
+    $("twToks").innerHTML = t.map(x => `<span class="${x === "[UNK]" ? "unk" : x.startsWith("<0x") ? "byte" : ""}">${x.replace(/</g, "&lt;")}</span>`).join("");
+    $("mlist").textContent = merges.length ? "merge rules, in order: " + merges.map(([a, b], i) => `${i + 1}. ${a}+${b}`).join("  ") : "";
+    const isLowest = w === "lowest";
+    win("gTwo", isLowest && t.length <= 2);
+    win("gOne", isLowest && t.length === 1 && merges.length <= 8);
+    const unseen = [...w].some(ch => !base.has(ch));
+    win("gByte", unseen && !t.includes("[UNK]"));
+    $("bMsg").textContent = msg || (t.includes("[UNK]") ? "A character the corpus never saw: with a character-level base it's simply unknown. Try byte fallback." :
+      unseen ? "Unseen characters were spelled out as UTF-8 bytes: nothing is lost, it just costs more tokens." :
+      isLowest && t.length === 1 ? `“lowest” is a single token after ${merges.length} merges${picked ? " (you chose some yourself)" : ""}.` :
+      isLowest && t.length === 2 ? "Two tokens, built from pieces of other words. Greedy BPE never needed “lowest” in the corpus." : "");
+  }
+  $("bMerge").onclick = () => { const P = pairCounts(V); if (!P.length) return; const [a, b] = P[0][0].split(SEP); doMerge(a, b, false); bDraw(`Merged the most frequent pair: ${a} + ${b} (×${P[0][1]}).`); };
+  $("bMerge5").onclick = () => { for (let i = 0; i < 5; i++) { const P = pairCounts(V); if (!P.length) break; const [a, b] = P[0][0].split(SEP); doMerge(a, b, false); } bDraw(""); };
+  $("bUndo").onclick = () => { if (!hist.length) return; V = hist.pop(); merges.pop(); bDraw("Undid the last merge."); };
+  $("bReset").onclick = bReset;
+  $("tw").oninput = () => bDraw("");
+  seg("fbSeg", v => { fallback = v; bDraw(""); });
+  bReset();
+
+  /* ---------- 2. vocabulary size vs sequence length ---------- */
+  const CORPUS = "the model reads the text one token at a time and learns to predict the next token. the training data is a large pile of text, and the model sees each sentence many times. when the model predicts the next word well, the loss goes down. when it predicts badly, the loss goes up and the weights change a little. a tokenizer turns the text into tokens before the model ever sees it. a good tokenizer keeps common words whole and splits rare words into smaller pieces. the pieces are learned from the data: the most common pairs of symbols are merged first. after many merges the vocabulary holds whole words like the, model and token, and pieces like ing, ed and er. longer sequences cost more compute, because attention compares every token with every other token. a bigger vocabulary makes sequences shorter, but the embedding table grows, and rare tokens are seen less often during training. choosing the vocabulary size is a trade between these costs. people training large models today choose vocabularies with tens of thousands to a few hundred thousand tokens.";
+  const TESTS = [
+    ["English", "the tokenizer learns which pieces of text are common and merges them into new tokens", "--c-x"],
+    ["Spanish", "el tokenizador aprende qué trozos de texto son comunes y los une en tokens nuevos", "--c-w"],
+    ["Numbers", "in 2026 the training run cost 1234567 dollars", "--c-gr"],
+  ];
+  const cw = countWords(CORPUS);
+  let VV = Object.entries(cw).map(([w, n]) => ({ sym: [...w, "_"], n }));
+  const M2 = [];
+  for (let k = 0; k < 300; k++) { const P = pairCounts(VV); if (!P.length) break; const [a, b] = P[0][0].split(SEP); M2.push([a, b]); VV = VV.map(v => ({ sym: apply(v.sym, a, b), n: v.n })); }
+  const enc2 = (t, m) => t.toLowerCase().split(/\s+/).filter(Boolean).reduce((s, w) => { let x = [...w, "_"]; for (let i = 0; i < m; i++) x = apply(x, M2[i][0], M2[i][1]); return s + x.length; }, 0);
+  const chars = t => t.replace(/\s/g, "").length;
+  const curve = TESTS.map(([, t]) => Array.from({ length: Math.floor(M2.length / 5) + 1 }, (_, i) => [5 * i, chars(t) / enc2(t, Math.min(5 * i, M2.length))]));
+  $("vM").max = M2.length;
+  let tieV = "tied";
+  function vDraw() {
+    const m = Math.min(+$("vM").value, M2.length);
+    $("vMV").textContent = m;
+    const res = TESTS.map(([name, t, c]) => { const n = enc2(t, m); return { name, t, c, n, cpt: chars(t) / n, words: t.split(" ").length }; });
+    $("vRows").innerHTML = res.map(r => `<div class="stat-row"><div class="stat"><span style="color:var(${r.c})">${r.name}</span> (${r.words} words) <b>${r.n} tokens</b></div><div class="stat">characters per token <b>${r.cpt.toFixed(2)}</b></div><div class="stat">attention scores (n²) <b>${(r.n * r.n).toLocaleString("en-US")}</b></div></div>`).join("");
+    Plot.line($("vChart"), { series: TESTS.map(([name, , c], i) => ({ label: name, color: MX.css(c), data: curve[i], width: 2.5 })), yMin: 0, xLabel: "merges (vocabulary size − base)", yLabel: "chars per token", hlines: [{ y: 2, label: "2 chars/token", color: MX.css("--muted") }] });
+    win("g2ch", res[0].cpt >= 2);
+    win("gEs", m >= M2.length - 5 && res[1].n >= 2 * res[0].n);
+    const Vr = +$("vV").value, d = +$("vD").value, N = +$("vN").value, E = Vr * d * (tieV === "tied" ? 1 : 2), share = E / N;
+    $("vE").textContent = (E / 1e6).toFixed(0) + " M";
+    $("vS").innerHTML = share >= 0.25 ? `<span class="dead">${(100 * share).toFixed(1)}%</span>` : (100 * share).toFixed(1) + "%";
+    win("gEmb", N === 1e9 && share >= 0.25);
+    $("vMsg").textContent = m === 0 ? "No merges: every character (plus the end-of-word marker) is its own token." :
+      res[1].n >= 1.5 * res[0].n ? `Same meaning, same ${res[1].words} words, but Spanish needs ${(res[1].n / res[0].n).toFixed(1)}× the tokens: the merges are English pieces.` :
+      `Embedding table: V × d = ${Vr.toLocaleString("en-US")} × ${d}${tieV === "tied" ? "" : " × 2 (input and output)"}.`;
+  }
+  $("vM").oninput = vDraw;
+  ["vV", "vD", "vN"].forEach(id => ($(id).onchange = vDraw));
+  seg("vTie", v => { tieV = v; vDraw(); });
+  vDraw();
+})();
+</script>
+</body>
+</html>

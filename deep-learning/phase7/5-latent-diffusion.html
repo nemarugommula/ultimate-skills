@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.5 Latent diffusion and Stable Diffusion · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.scene { width: 100%; max-width: 330px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 10px; border: 1px solid var(--line); cursor: pointer; }
+  .words { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .words button { font: 700 .9rem var(--mono); padding: 4px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); cursor: pointer; }
+  .words button.on { background: var(--c-at); color: #111; border-color: var(--c-at); }
+  .words button.off { text-decoration: line-through; opacity: .45; }
+  .wbars { display: grid; gap: 4px; }
+  .wbar { display: grid; grid-template-columns: 70px 1fr 48px; gap: 8px; align-items: center; font: .85rem var(--mono); }
+  .wbar .meterbar i { background: var(--c-at); }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .pipe { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 10px 0; font-size: .9rem; }
+  .pipe span.n { padding: 6px 10px; border-radius: 10px; border: 1.5px solid var(--line); background: var(--bg2); }
+  .pipe span.a { color: var(--muted); }
+</style>
+</head>
+<body data-lesson="d7-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 5</div>
+  <h1>Latent diffusion and Stable Diffusion</h1>
+  <p class="subtitle">Diffusing raw pixels is gorgeous and absurdly expensive. Squeeze the image 48× with an autoencoder first, diffuse in that small space, and let the picture read your prompt through cross-attention. That recipe put image generation on gaming laptops in 2022, and its descendants (SD3, FLUX) swapped the U-Net for a transformer.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>A diffusion model predicts the noise in x<sub>t</sub> with MSE and samples by denoising step by step; each step is one network call (Lesson 7.4).</li>
+      <li>A VAE-style autoencoder compresses an image to a small latent and decodes it back; latent diffusion uses one with only a slight KL (Lesson 7.2).</li>
+      <li><b>Attention</b>: each query scores every key, softmaxes the scores and takes a weighted mix of values; cost grows with (number of tokens)² (Lesson 6.1). CLIP turns text into embeddings that line up with images (Lesson 4.6).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In December 2021, Robin Rombach and colleagues pointed out an uncomfortable number: training a powerful diffusion model directly on pixels “often takes hundreds of GPU days (e.g. 150–1000 V100 days)”, and generating with it is slow too. Their fix was to stop diffusing pixels.</p>
+    <p>On 22 August 2022, that recipe was released as <b>Stable Diffusion</b> (v1.4), open weights from CompVis, Stability AI and Runway: an 860-million-parameter U-Net plus a 123-million-parameter text encoder, small enough to run on a consumer graphics card. Anyone could now type a sentence and get a 512×512 image on their own machine.</p>
+    <p><b>Where did the savings come from, how does a U-Net “read” a sentence, and why did every big model since 2024 replace that U-Net with a transformer?</b> You'll compute the savings yourself, then poke at a cross-attention map to see which words each region of an image listens to.</p>
+  </div>
+
+  <h2>Numbers first: 786,432 vs 16,384</h2>
+  <p>A 512×512 color image is 512 × 512 × 3 = <b>786,432 numbers</b>. Stable Diffusion's autoencoder shrinks each side by a factor f = 8 and keeps 4 channels: 64 × 64 × 4 = <b>16,384 numbers</b>.</p>
+  <div class="calc">786,432 ÷ 16,384 = <b>48× fewer numbers</b> for the diffusion model to denoise, at every one of its tens of steps</div>
+  <p>Most of what's in those 786,432 numbers is detail that a decoder can repaint reliably (smooth gradients, fine texture); the latent keeps what's hard: what is where, its shape, its color. Compression and generation are split between two networks that are each good at one job.</p>
+  <div class="pipe">
+    <span class="n"><span class="x">text</span> → CLIP text encoder → 77 token vectors</span>
+    <span class="a">+</span>
+    <span class="n"><span class="x">noise</span> 64×64×4</span>
+    <span class="a">→</span>
+    <span class="n"><span class="w">U-Net</span> × ~25–50 steps, reading the text by <span class="at">cross-attention</span></span>
+    <span class="a">→</span>
+    <span class="n">clean latent</span>
+    <span class="a">→</span>
+    <span class="n"><span class="w">VAE decoder</span> → <span class="y">512×512×3 image</span></span>
+  </div>
+  <p>The VAE <b>encoder</b> is only needed during training (to turn training images into latents) and for image-to-image editing. Plain text-to-image generation uses only the text encoder, the denoiser and the decoder.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Separate “compressing an image” from “imagining one”.</b> Train an autoencoder once to map images to a small latent grid and back (with perceptual and adversarial losses so the decoder paints sharp details). Then run the whole diffusion process in that grid. The denoiser sees 48× fewer numbers, so training and sampling get dramatically cheaper, and the decoder handles the pixels in one pass at the end.
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Diffusion in a latent space</span></span>
+    <ol>
+      <li><b>The problem before</b> Pixel-space diffusion spends most of its capacity on imperceptible detail and runs a huge network on every pixel, at every step: hundreds of GPU days to train, slow to sample, and high resolution meant cascades of separate upsampling models.</li>
+      <li><b>What people tried</b> Cascades (a small image, then diffusion super-resolution stages); two-stage models with discrete tokens (VQ-VAE + transformer, Lesson 7.8), whose aggressive compression lost detail.</li>
+      <li><b>Why this works</b> A good autoencoder removes the redundancy first, so the generative model only learns the semantic, hard part. Rombach et al. compared compression factors and found f = 4 to 16 “strike a good balance between efficiency and perceptually faithful results”. The latent is still a grid, so a convolutional U-Net works on it unchanged, and one decoder pass at the end costs almost nothing compared with 50 denoising passes.</li>
+      <li><b>What it costs, when it fails</b> The decoder sets a quality ceiling: anything the autoencoder can't represent (tiny text, small faces, fine patterns), the generator can't produce. With 4 channels, early SD struggled with text and hands. And you now train and version two models.</li>
+      <li><b>What refined it</b> More latent channels (SD3 compared 4, 8 and 16 and chose 16; FLUX's autoencoder also has 16), a transformer denoiser (DiT, below), and video autoencoders that compress time as well (Wan's 3D causal VAE squeezes 4 × 8 × 8: frames × height × width).</li>
+    </ol>
+  </div>
+
+  <h2>How a picture reads a prompt: cross-attention</h2>
+  <p>The text encoder turns the prompt into a list of token vectors: for SD 1.x, CLIP's tokenizer pads or cuts every prompt to <b>77 tokens</b>, each a 768-number vector. Inside the U-Net, at several resolutions, a <b>cross-attention</b> layer lets every latent position look up the words:</p>
+  <ul>
+    <li><b>Queries</b> come from the image: each of the 64 × 64 = 4,096 positions asks “what should I be?”</li>
+    <li><b>Keys and values</b> come from the text: each of the 77 tokens says “here's what I'm about” and “here's what to add if you listen to me”.</li>
+    <li>Each position takes a softmax-weighted mix of the token values and adds it to its features. A region that matches “dog” pulls in dog information; the sky pulls in “sun” and “sky”.</li>
+  </ul>
+  <p>It's exactly the encoder–decoder attention of the original transformer (Lesson 6.5), with an image as the decoder side. Below is a hand-built toy so you can see what such a map looks like.</p>
+  <p class="predict">🔮 <b>Predict:</b> if you delete the word “sun” from the prompt, what happens to the attention of the sun region? Does it go to zero, or does it go somewhere else?</p>
+
+  <div class="playground" id="pgXA">
+    <span class="label">🎮 Playground · A cross-attention map (labelled toy)</span>
+    <p class="hint">A 6×6 latent “image” of a scene and the prompt below. Each cell's query is scored against every word's key, then softmaxed over the words. <b>Click a word</b> to see how much each cell attends to it (gold = more). <b>Click a cell</b> to see its attention split across words. <b>Double-click a word</b> to delete it from the prompt. Honest note: the queries and keys are hand-made 7-number vectors (one dimension per concept); a real model learns its own, but its maps look strikingly similar, which is what prompt-to-prompt editing exploits.</p>
+    <div class="goals"><span class="goal" id="gFind">🎯 Find a cell that gives “dog” over 60% of its attention</span><span class="goal" id="gDel">🎯 Delete “sun” and see where the sun region's attention goes</span></div>
+    <div class="words" id="xWords"></div>
+    <div class="controls"><label>sharpness (score scale) <input type="range" id="xS" min="0.5" max="8" step="0.5" value="4"> <b class="mono" id="xSV"></b></label></div>
+    <div class="pg-cols">
+      <div><canvas class="scene" id="xCan"></canvas><p class="hint" id="xCap"></p></div>
+      <div><div class="hint" id="xCellLab"></div><div class="wbars" id="xBars"></div><p class="hint" id="xMsg"></p></div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> “dog” lights up the dog cells and almost nothing else; filler words like “a” and “on” get a thin, even share everywhere. Each cell's attention always adds up to 100% over the words still in the prompt, so when you delete “sun” its region doesn't go dark: its attention <b>redistributes</b> to the next-best matches (“sky”, then filler words). That's why removing a word changes, rather than deletes, part of an image. Lower the sharpness and every cell spreads its attention evenly: the prompt stops steering anything.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Cross-attention conditioning</span></span>
+    <ol>
+      <li><b>The problem before</b> Early conditional generators took a single class label or one sentence vector, concatenated or added to the features. One vector for a whole sentence can't say “red cube <i>left of</i> a blue sphere”: where each thing goes is lost.</li>
+      <li><b>What people tried</b> Class embeddings added to the timestep embedding (fine for 1,000 ImageNet classes); a pooled sentence embedding.</li>
+      <li><b>Why this works</b> Attention lets <b>each position</b> pick <b>its own words</b>: the dog region reads “dog”, the sky reads “sun”. It handles any number of tokens, any order, and any modality that can be turned into tokens (text, layouts, segmentation maps); Rombach et al. presented it as a general-purpose conditioning mechanism. The cost is small: 4,096 queries × 77 keys = 315,392 scores per head, versus 16.8 million for self-attention over the same latent.</li>
+      <li><b>What it costs, when it fails</b> The model only knows what the text encoder can express: CLIP's 77-token limit truncates long prompts, and CLIP is weak at counting and word order, which is why early SD scrambled “a red cube on a blue sphere”. Binding attributes to the right object (“red” to the cube) stays hard.</li>
+      <li><b>What refined it</b> Bigger and more text encoders (SDXL: OpenCLIP ViT-bigG + CLIP ViT-L; Imagen and SD3: the T5-XXL language model); and MMDiT (SD3), which drops separate cross-attention and puts text and image tokens into <b>one joint attention</b>, each with its own weights.</li>
+    </ol>
+  </div>
+
+  <h2>The cost calculator</h2>
+  <p>Why do image sizes, compression factors and patch sizes matter so much? Because a transformer's attention compares every token with every other one. Play with the knobs.</p>
+  <p class="predict">🔮 <b>Predict:</b> a transformer working directly on the pixels of a 512×512 image, one token per pixel. Roughly how many attention scores does one layer compute: a million, a billion, or tens of billions?</p>
+
+  <div class="playground" id="pgCost">
+    <span class="label">🎮 Playground · Pixel vs latent: numbers, tokens, attention</span>
+    <p class="hint">Choose a resolution, an autoencoder (f = 1 means “no autoencoder, raw pixels”), and the patch size a transformer cuts the latent into (each p × p patch becomes one token). Attention pairs = tokens², per layer per head.</p>
+    <div class="goals"><span class="goal" id="gK">🎯 A 1024×1024 image in ≤ 4,096 tokens</span><span class="goal" id="gB">🎯 Find a pixel-space setup over 10 billion attention pairs</span></div>
+    <div class="controls">
+      <label>image side <select id="cR" class="btn small"><option>256</option><option selected>512</option><option>768</option><option>1024</option><option>2048</option></select></label>
+      <label>autoencoder <select id="cF" class="btn small"><option value="1|3">none (pixels, 3 ch)</option><option value="4|3">f = 4, 3 ch</option><option value="8|4" selected>f = 8, 4 ch (SD 1.x, SDXL)</option><option value="8|16">f = 8, 16 ch (SD3, FLUX)</option><option value="16|16">f = 16, 16 ch</option></select></label>
+      <label>patch size p <select id="cP" class="btn small"><option selected>1</option><option>2</option><option>4</option></select></label>
+      <label>sampling steps <input type="range" id="cS" min="1" max="100" step="1" value="30"> <b class="mono" id="cSV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">numbers per image <b id="cN" class="x">–</b></div>
+      <div class="stat">vs pixels <b id="cRat">–</b></div>
+      <div class="stat">tokens <b id="cT" class="at">–</b></div>
+      <div class="stat">attention pairs per layer <b id="cA" class="at">–</b></div>
+      <div class="stat">pairs × steps <b id="cAS">–</b></div>
+    </div>
+    <p class="hint" id="cMsg"></p>
+  </div>
+  <p><b>What you should see:</b> pixel-space 512×512 with one token per pixel is 262,144 tokens and <b>68.7 billion</b> attention pairs per layer: hopeless. SD's latent (f = 8) is 4,096 positions, 16.8 million pairs. A DiT-style transformer with 2 × 2 patches cuts that to 1,024 tokens and about 1 million pairs. For 1024×1024, SD3's recipe (f = 8, 16 channels, p = 2) gives 4,096 tokens: the same sequence length SD 1.x's U-Net attended over at 512².</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: SD3 at 1024×1024</span>
+    <p><b>Latent:</b> 1024 ÷ 8 = 128, so 128 × 128 × 16 = 262,144 numbers: 3,145,728 ÷ 262,144 = <b>12× compression</b> (less than SD 1.x's 48×, because 16 channels keep more detail).</p>
+    <p><b>Tokens:</b> 2 × 2 patches → 64 × 64 = <b>4,096 image tokens</b>, each the 2 × 2 × 16 = 64 latent numbers of its patch, projected to the model's width.</p>
+    <p><b>Attention:</b> 4,096² ≈ <b>16.8 million</b> image–image pairs per head per layer, plus the text tokens joined into the same sequence (MMDiT). Doubling the resolution to 2048² would mean 16,384 tokens and 16× the attention cost.</p>
+  </div>
+
+  <h2>From U-Net to diffusion transformers (DiT, MMDiT)</h2>
+  <p>In December 2022, William Peebles and Saining Xie replaced the U-Net with a plain <b>Vision Transformer</b> (Lesson 4.5) on latent patches: the <b>DiT</b>. The timestep and class steer every block through <b>adaLN-Zero</b> (layer norm whose scale and shift are computed from the conditioning, initialized so each block starts as the identity). They found that sample quality tracked compute very consistently, and their largest model, DiT-XL/2, reached an FID of <b>2.27</b> on class-conditional ImageNet 256×256, the best at the time.</p>
+  <p>Stable Diffusion 3 (2024) took this further with <b>MMDiT</b> (multimodal DiT): text tokens and image tokens are concatenated into one sequence for attention, but each modality has its own weights, and the model is trained with rectified flow (Lesson 7.6). FLUX.1 (Black Forest Labs, August 2024) is described as a 12-billion-parameter rectified flow transformer. Video models do the same with spacetime patches (Lesson 7.8).</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">A transformer backbone (DiT) instead of a U-Net</span></span>
+    <ol>
+      <li><b>The problem before</b> U-Nets have hand-designed resolution levels, channel counts and attention placements; scaling them up (SDXL's 2.6B U-Net was 3× SD's) means re-engineering the architecture, and gains were hard to predict.</li>
+      <li><b>What people tried</b> Bigger U-Nets with more attention blocks and more text encoders (SDXL).</li>
+      <li><b>Why this works</b> A transformer is one block repeated: scale width, depth or tokens and you get a predictable family, just like LLMs (Lesson 6.8). Peebles &amp; Xie found a strong correlation between compute (Gflops) and FID. Attention mixes information globally from the first layer, text and image tokens can share one sequence (MMDiT), and the whole LLM toolbox (FlashAttention, parallelism, mixed precision) applies.</li>
+      <li><b>What it costs, when it fails</b> Attention is quadratic in tokens, so patch size and latent compression become critical (the calculator); no built-in multi-scale bias like a U-Net's, so it needs more data and compute to learn local structure; positional encodings must handle changing aspect ratios.</li>
+      <li><b>What refined it</b> MMDiT with joint text–image attention (SD3), large rectified-flow transformers (FLUX), spacetime-patch video DiTs (Sora's report calls Sora “a diffusion transformer”; Movie Gen, Wan), and efficient-attention tricks from Lesson 6.9.</li>
+    </ol>
+  </div>
+
+  <h2>Stable Diffusion and friends: a short, dated timeline</h2>
+  <table>
+    <tr><th>Date</th><th>Release</th><th>What changed</th></tr>
+    <tr><td>Dec 2021</td><td>Latent Diffusion paper (Rombach et al.)</td><td>Diffusion in an autoencoder's latent; cross-attention conditioning</td></tr>
+    <tr><td>22 Aug 2022</td><td>Stable Diffusion v1.4</td><td>Open weights: 860M U-Net, CLIP ViT-L/14 text encoder, 512×512, latent 64×64×4</td></tr>
+    <tr><td>24 Nov 2022</td><td>Stable Diffusion 2.0</td><td>New OpenCLIP text encoder; 512 and 768 resolutions</td></tr>
+    <tr><td>26 Jul 2023</td><td>SDXL 1.0</td><td>U-Net 3× larger (2.6B), two text encoders, optional refiner</td></tr>
+    <tr><td>22 Feb 2024</td><td>Stable Diffusion 3 (preview; paper in March)</td><td>MMDiT transformer + rectified flow, 800M–8B, 16-channel latent, T5-XXL text encoder</td></tr>
+    <tr><td>12 Jun 2024</td><td>SD3 Medium (open weights)</td><td>2B parameters</td></tr>
+    <tr><td>1 Aug 2024</td><td>FLUX.1 (Black Forest Labs)</td><td>12B rectified flow transformer; [pro], [dev] (guidance-distilled), [schnell] (1–4 steps)</td></tr>
+    <tr><td>22 Oct 2024</td><td>Stable Diffusion 3.5</td><td>Large (8.1B), Large Turbo (4 steps); Medium (2.5B) a week later</td></tr>
+    <tr><td>25 Nov 2025</td><td>FLUX.2</td><td>[dev] is a 32B open-weight model; new autoencoder</td></tr>
+  </table>
+  <p class="muted">As of late 2026 Black Forest Labs has announced FLUX 3, a multimodal model covering images, video and audio. Check release notes before you quote any number: this table will be out of date within months.</p>
+
+  <h2>Two tricks everyone uses: negative prompts and LoRA</h2>
+  <p><b>Negative prompts.</b> Text-to-image pipelines run the denoiser twice per step, with the prompt and without it, and push the result away from the “without” version (classifier-free guidance, Lesson 7.7). A negative prompt (“blurry, extra fingers”) simply <b>replaces the empty prompt</b> in that second call, so each step is pushed away from what you described. It's not a filter; it's a direction.</p>
+  <p><b>LoRA fine-tunes.</b> To teach a model your product, style or face, you don't retrain 2–12 billion weights. LoRA (low-rank adaptation) freezes them and learns small low-rank update matrices for the attention layers, often a few megabytes, that can be loaded, mixed and swapped at run time. It's the same LoRA as for LLMs (<a href="../../ai-engineer/phase7/1-fine-tuning.html">AI Engineer 7.1</a>); the SD3 paper used rank-128 LoRAs for its own fine-tuning experiments.</p>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the encoder is optional</span>
+    <p>Stable Diffusion is “a VAE”, yet plain text-to-image generation never runs the VAE's encoder: it starts from random latent noise, denoises, and only calls the <b>decoder</b>. The encoder is needed to make training latents, and for image-to-image editing, where your photo is encoded, noised to some t and denoised again: exactly the “denoise from here” button in Lesson 7.4.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Cross-attention is one call to <code>F.scaled_dot_product_attention</code> with queries from the image and keys/values from the text. Here at SD 1.x's real sizes (first U-Net level: 64 × 64 positions, 320 channels, 8 heads; CLIP: 77 tokens × 768):</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn, torch.nn.functional <span class="k">as</span> F
+
+torch.manual_seed(<span class="n">0</span>)
+B, H, W, C = <span class="n">1</span>, <span class="n">64</span>, <span class="n">64</span>, <span class="n">320</span>            <span class="c"># latent features in SD 1.x's first U-Net block</span>
+img = torch.randn(B, H * W, C)         <span class="c"># 4,096 image positions, 320 channels each</span>
+txt = torch.randn(B, <span class="n">77</span>, <span class="n">768</span>)          <span class="c"># 77 CLIP text-token embeddings, 768 dims each</span>
+
+heads, d = <span class="n">8</span>, C // <span class="n">8</span>
+to_q, to_k, to_v = nn.Linear(C, C), nn.Linear(<span class="n">768</span>, C), nn.Linear(<span class="n">768</span>, C)
+split = <span class="k">lambda</span> x: x.view(B, -<span class="n">1</span>, heads, d).transpose(<span class="n">1</span>, <span class="n">2</span>)   <span class="c"># (B, heads, tokens, d)</span>
+
+q, k, v = split(to_q(img)), split(to_k(txt)), split(to_v(txt))
+out = F.scaled_dot_product_attention(q, k, v)               <span class="c"># image queries, text keys/values</span>
+attn = (q @ k.transpose(-<span class="n">1</span>, -<span class="n">2</span>) / d ** <span class="n">0.5</span>).softmax(-<span class="n">1</span>)     <span class="c"># the map, for inspection only</span>
+print(<span class="s">"queries"</span>, tuple(q.shape), <span class="s">"keys"</span>, tuple(k.shape))
+print(<span class="s">"attention map"</span>, tuple(attn.shape), <span class="s">f"row sum {attn[0, 0, 0].sum().item():.2f}"</span>)
+print(<span class="s">"output"</span>, tuple(out.transpose(<span class="n">1</span>, <span class="n">2</span>).reshape(B, H * W, C).shape))
+print(<span class="s">f"cross-attention scores per head: {4096 * 77:,}; self-attention over the same latent: {4096 ** 2:,}"</span>)
+
+<span class="c"># What we got (torch 2.8, CPU):</span>
+<span class="c"># queries (1, 8, 4096, 40) keys (1, 8, 77, 40)</span>
+<span class="c"># attention map (1, 8, 4096, 77) row sum 1.00</span>
+<span class="c"># output (1, 4096, 320)</span>
+<span class="c"># cross-attention scores per head: 315,392; self-attention over the same latent: 16,777,216</span></code></pre>
+    <p>And the real pipeline in Hugging Face <code>diffusers</code> (not run here: <code>from_pretrained</code> downloads several GB of weights and wants a GPU):</p>
+<pre><code><span class="k">import</span> torch
+<span class="k">from</span> diffusers <span class="k">import</span> AutoPipelineForText2Image
+
+pipe = AutoPipelineForText2Image.from_pretrained(
+    <span class="s">"stabilityai/stable-diffusion-xl-base-1.0"</span>, dtype=torch.float16).to(<span class="s">"cuda"</span>)
+image = pipe(<span class="s">"a corgi astronaut, studio lighting"</span>,
+             negative_prompt=<span class="s">"blurry, low quality"</span>,   <span class="c"># replaces the empty prompt in guidance</span>
+             num_inference_steps=<span class="n">30</span>, guidance_scale=<span class="n">5.0</span>).images[<span class="n">0</span>]
+pipe.load_lora_weights(<span class="s">"&lt;a LoRA repo or file&gt;"</span>)          <span class="c"># a few-MB fine-tune on top</span></code></pre>
+    <p class="hint">Current diffusers (0.42, Oct 2026) takes <code>dtype=</code>; older tutorials write <code>torch_dtype=</code>, which still works with a deprecation warning. The autoencoder is <code>pipe.vae</code> (an <code>AutoencoderKL</code>), the text encoders are <code>pipe.text_encoder</code>/<code>text_encoder_2</code>, the denoiser is <code>pipe.unet</code> (or <code>pipe.transformer</code> for SD3 and FLUX).</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Latent vs pixel diffusion</td><td>~48× fewer numbers (f = 8, 4 ch), far cheaper training and sampling</td><td>Autoencoder sets a quality ceiling (small text, faces); two models to train</td></tr>
+      <tr><td>More latent channels (16 vs 4)</td><td>Finer detail, better text rendering</td><td>Less compression (12× vs 48×); generator must model a richer latent</td></tr>
+      <tr><td>Cross-attention to a text encoder</td><td>Each region picks its own words; any token-based condition</td><td>Limited by the text encoder (77 tokens for CLIP; weak counting and word order)</td></tr>
+      <tr><td>U-Net</td><td>Strong multi-scale bias, data-efficient</td><td>Hand-designed, harder to scale predictably</td></tr>
+      <tr><td>DiT / MMDiT</td><td>Scales like an LLM, joint text–image attention, LLM tooling</td><td>Quadratic in tokens: patch size and compression matter</td></tr>
+      <tr><td>LoRA fine-tune vs full fine-tune</td><td>MB-sized, cheap, swappable</td><td>Lower capacity; can overfit a style and leak it into everything</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Walk me through what happens when Stable Diffusion turns a prompt into an image.” A strong answer:</p>
+    <ul>
+      <li>Tokenize the prompt (77 tokens for CLIP) → text encoder → token embeddings. Start from Gaussian noise in latent space (64×64×4 for 512² in SD 1.x).</li>
+      <li>For ~25–50 steps: the denoiser (U-Net with cross-attention, or an MMDiT/DiT) predicts the noise, twice (with prompt and with empty/negative prompt) for classifier-free guidance; a scheduler (DDIM, Euler…) takes the step.</li>
+      <li>Decode the final latent with the VAE decoder to pixels. The encoder is used only for training and img2img.</li>
+      <li>Why latent: 48× fewer numbers, f = 4–16 balance; why transformers now: predictable scaling, joint attention; costs: autoencoder ceiling, quadratic attention, text-encoder limits.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The latent diffusion recipe</b> <span class="tag res">🧪 Research · 2021</span> <a href="https://arxiv.org/abs/2112.10752" target="_blank" rel="noopener">Rombach et al.: High-Resolution Image Synthesis with Latent Diffusion Models</a></div>
+      <p><b>How:</b> a perceptual + adversarial autoencoder (KL- or VQ-regularized), a U-Net denoiser in its latent, cross-attention for text, layouts and other conditions.</p>
+      <p><b>Why this method:</b> pixel-space models cost 150–1000 V100 days; f = 4–16 latents keep quality while cutting compute drastically.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Stable Diffusion goes public</b> <span class="tag oss">🧰 Open source · 2022</span> <a href="https://huggingface.co/CompVis/stable-diffusion-v1-4" target="_blank" rel="noopener">Stable Diffusion v1-4 model card</a></div>
+      <p><b>How:</b> autoencoder with downsampling factor 8 (H × W × 3 → H/8 × W/8 × 4), a U-Net with cross-attention, a frozen CLIP ViT-L/14 text encoder.</p>
+      <p><b>Why this method:</b> small enough for consumer GPUs, so open weights spawned an ecosystem of fine-tunes, LoRAs and tools.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Transformers replace the U-Net</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2212.09748" target="_blank" rel="noopener">Peebles &amp; Xie: Scalable Diffusion Models with Transformers (DiT)</a></div>
+      <p><b>How:</b> patchify the latent, run a ViT with adaLN-Zero conditioning on timestep and class.</p>
+      <p><b>Why this method:</b> FID tracked Gflops tightly; DiT-XL/2 hit 2.27 FID on ImageNet 256.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>MMDiT and rectified flow at scale</b> <span class="tag co">🏢 Stability AI · 2024</span> <a href="https://arxiv.org/abs/2403.03206" target="_blank" rel="noopener">Esser et al.: Scaling Rectified Flow Transformers for High-Resolution Image Synthesis (SD3)</a></div>
+      <p><b>How:</b> separate weights for text and image tokens joined in one attention, 2 × 2 latent patches, a 16-channel autoencoder, three text encoders (CLIP L/14, OpenCLIP bigG/14, T5-XXL), models up to 8B.</p>
+      <p><b>Why this method:</b> lets text and image representations interact in every layer while keeping each modality's own processing; scales smoothly.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>FLUX</b> <span class="tag co">🏢 Black Forest Labs · 2024</span> <a href="https://huggingface.co/black-forest-labs/FLUX.1-dev" target="_blank" rel="noopener">FLUX.1 [dev] model card</a></div>
+      <p><b>How:</b> a 12-billion-parameter rectified flow transformer, trained with guidance distillation (Lesson 7.7); [schnell] samples in 1–4 steps.</p>
+      <p><b>Why this method:</b> the transformer + flow recipe of SD3 at larger scale, with distillation for practical speed.</p>
+    </div>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The compressor is 7.2's VAE sharpened with 7.3's adversarial loss; the denoiser is 7.4's, run on latents. Cross-attention is 6.1/6.5's attention with image queries and text keys; CLIP is 4.6; ViT patches are 4.5; scaling behaviour is 6.8. Next: rectified flow, which SD3 and FLUX train with (7.6); classifier-free guidance and negative prompts in detail (7.7); spacetime patches for video (7.8). LoRA is <a href="../../ai-engineer/phase7/1-fine-tuning.html">AI Engineer 7.1</a>; using image models in products is <a href="../../ai-engineer/phase8/4-multimodal.html">AI Engineer 8.4</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2112.10752" target="_blank" rel="noopener">Latent Diffusion Models (2021)</a>. Figure 2's “perceptual vs semantic compression” plot is the whole argument in one picture.</li>
+      <li><span class="kind">Docs</span> <a href="https://huggingface.co/docs/diffusers/using-diffusers/write_own_pipeline" target="_blank" rel="noopener">diffusers: Understanding pipelines, models and schedulers</a>. Builds a text-to-image loop by hand from the VAE, text encoder, U-Net and scheduler.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2208.01626" target="_blank" rel="noopener">Prompt-to-Prompt (2022)</a>. Edits images by editing cross-attention maps: the playground above, for real.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A 768×768 RGB image goes through an f = 8 autoencoder with 4 latent channels. How many numbers does the diffusion model work on, and what's the compression?</div>
+    <div class="opts"><button class="opt">96 × 96 × 3 = 27,648; 64×</button><button class="opt" data-ok>96 × 96 × 4 = 36,864; 48×</button><button class="opt">192 × 192 × 4 = 147,456; 12×</button></div>
+    <div class="explain">768 ÷ 8 = 96 per side, times 4 channels = 36,864. Pixels: 768 × 768 × 3 = 1,769,472. 1,769,472 ÷ 36,864 = 48×: with f = 8 and 4 channels the ratio is 8 × 8 × 3 ÷ 4 = 48 at any resolution.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your fine-tuned SD 1.x model renders product labels as garbled text, even though the denoiser's training loss is low. Which component most likely sets this limit?</div>
+    <div class="opts"><button class="opt">The noise schedule</button><button class="opt" data-ok>The autoencoder: a 4-channel, f = 8 latent can't represent small sharp glyphs, so the decoder can't paint them. A higher-channel autoencoder (as in SD3/FLUX) helps</button><button class="opt">The number of sampling steps</button></div>
+    <div class="explain">Encode and decode a real photo of the label with the VAE alone: if the text is already garbled, no denoiser can fix it. That's the quality ceiling of latent diffusion, and why SD3 moved to 16 channels (and better text encoders helped too).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You add “in the style of watercolor” to a 70-word prompt for an SD 1.x model and nothing changes. What's the likely reason?</div>
+    <div class="opts"><button class="opt">Watercolor isn't in the training data</button><button class="opt" data-ok>CLIP's tokenizer keeps only 77 tokens; words past the limit are truncated and never reach cross-attention. Put important words first, or use a pipeline that chunks long prompts</button><button class="opt">The guidance scale is too low</button></div>
+    <div class="explain">70 words is often more than 77 tokens once split into sub-words (Lesson 6.6). Everything after the cut is silently dropped, so the U-Net never sees it. Models with T5 encoders (Imagen, SD3, FLUX) accept much longer prompts.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Latent diffusion = autoencoder (compress) + diffusion in the latent (imagine) + decoder (paint). 512×512×3 → 64×64×4 is 48× fewer numbers; f = 4–16 balances cost and fidelity.</li>
+      <li>Text enters through cross-attention: image positions are queries, the text encoder's tokens (77 for CLIP) are keys and values; each region picks its own words.</li>
+      <li>The decoder caps quality (text, faces): SD3 and FLUX use 16-channel latents.</li>
+      <li>DiT replaced the U-Net with a ViT on latent patches (FID 2.27); SD3's MMDiT joins text and image tokens in one attention; FLUX is a 12B rectified flow transformer. Tokens² attention makes patch size and compression decisive.</li>
+      <li>Negative prompts replace the empty prompt in classifier-free guidance (7.7); LoRA fine-tunes are small swappable adapters.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const fmt = n => n >= 1e12 ? (n / 1e12).toFixed(1) + " trillion" : n >= 1e9 ? (n / 1e9).toFixed(1) + " billion" : n >= 1e6 ? (n / 1e6).toFixed(1) + " million" : n.toLocaleString("en-US");
+
+  /* ---------- 1. cross-attention toy ---------- */
+  // concept dimensions: dog, grass, house, sun, sky, tree, filler
+  const C = { dog: 0, grass: 1, house: 2, sun: 3, sky: 4, tree: 5, fill: 6 };
+  const WORDS = ["a", "dog", "on", "grass", "near", "a", "house", "under", "the", "sun", "sky"];
+  const KEY = w => { const k = Array(7).fill(0); if (C[w] != null) { k[C[w]] = 1; if (w === "sun") k[C.sky] = 0.35; if (w === "sky") k[C.sun] = 0.35; } else k[C.fill] = 1; return k; };
+  // the 6×6 scene: region type per cell
+  const SCENE = [
+    "s s s s u u", "s s s s u u",
+    "t t s h h h", "t t g h h h",
+    "g g d d g g", "g g d d g g",
+  ].map(r => r.split(" "));
+  const REG = { s: "sky", u: "sun", t: "tree", h: "house", g: "grass", d: "dog" };
+  const REGCOL = { s: "#6fa8dc", u: "#f6c343", t: "#3c8d40", h: "#c0392b", g: "#7dbb5b", d: "#8d6e63" };
+  const QRY = reg => { const q = Array(7).fill(0); q[C[REG[reg]]] = 1; q[C.fill] = 0.25; if (reg === "u") q[C.sky] = 0.5; if (reg === "t") q[C.grass] = 0.3; return q; };
+  const removed = new Set();
+  let selWord = 1, selCell = null;
+  const dot = (a, b) => a.reduce((s, v, i) => s + v * b[i], 0);
+  function attn(r, c) {
+    const sc = +$("xS").value, q = QRY(SCENE[r][c]);
+    const sco = WORDS.map((w, i) => (removed.has(i) ? -Infinity : sc * dot(q, KEY(w))));
+    const m = Math.max(...sco), e = sco.map(v => (v === -Infinity ? 0 : Math.exp(v - m))), s = e.reduce((a, b) => a + b, 0);
+    return e.map(v => v / s);
+  }
+  $("xWords").innerHTML = WORDS.map((w, i) => `<button data-i="${i}">${w}</button>`).join("");
+  const wbtn = [...$("xWords").querySelectorAll("button")];
+  let clickTimer = null;
+  wbtn.forEach(b => {
+    b.onclick = () => { const i = +b.dataset.i; clearTimeout(clickTimer); clickTimer = setTimeout(() => { if (!removed.has(i)) { selWord = i; selCell = null; drawXA(); } }, 220); };
+    b.ondblclick = () => { clearTimeout(clickTimer); const i = +b.dataset.i; removed.has(i) ? removed.delete(i) : removed.add(i); if (removed.has(selWord)) selWord = WORDS.findIndex((_, k) => !removed.has(k)); drawXA(); };
+  });
+  const cv = $("xCan");
+  function drawXA() {
+    $("xSV").textContent = (+$("xS").value).toFixed(1);
+    wbtn.forEach((b, i) => { b.classList.toggle("on", i === selWord && selCell == null); b.classList.toggle("off", removed.has(i)); });
+    const { ctx, w, h } = NN.fit(cv), cw = w / 6, ch = h / 6;
+    ctx.clearRect(0, 0, w, h);
+    for (let r = 0; r < 6; r++) for (let c = 0; c < 6; c++) {
+      const a = attn(r, c)[selWord] || 0;
+      ctx.globalAlpha = 0.35; ctx.fillStyle = REGCOL[SCENE[r][c]]; ctx.fillRect(c * cw, r * ch, cw, ch);
+      ctx.globalAlpha = selCell == null ? Math.min(0.9, a) : 0; ctx.fillStyle = MX.css("--c-at"); ctx.fillRect(c * cw + 3, r * ch + 3, cw - 6, ch - 6);
+      ctx.globalAlpha = 1; ctx.fillStyle = MX.css("--text"); ctx.font = "11px " + MX.css("--mono"); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(selCell == null ? Math.round(100 * a) + "%" : REG[SCENE[r][c]], c * cw + cw / 2, r * ch + ch / 2);
+    }
+    if (selCell) { ctx.strokeStyle = MX.css("--accent"); ctx.lineWidth = 3; ctx.strokeRect(selCell[1] * cw + 1.5, selCell[0] * ch + 1.5, cw - 3, ch - 3); }
+    $("xCap").textContent = selCell == null ? `Each cell's share of attention on “${WORDS[selWord]}”.` : "Region names shown; the outlined cell's attention is on the right.";
+    const [r, c] = selCell || [0, 4], A = attn(r, c);
+    $("xCellLab").textContent = `Cell (${r + 1}, ${c + 1}), a “${REG[SCENE[r][c]]}” region, attends to:`;
+    $("xBars").innerHTML = WORDS.map((wd, i) => `<div class="wbar"><span>${removed.has(i) ? "<s>" + wd + "</s>" : wd}</span><div class="meterbar"><i style="width:${(100 * A[i]).toFixed(1)}%"></i></div><span>${removed.has(i) ? "–" : Math.round(100 * A[i]) + "%"}</span></div>`).join("");
+    const sunGone = WORDS.every((wd, i) => wd !== "sun" || removed.has(i));
+    win("gDel", sunGone && SCENE[r][c] === "u");
+    $("xMsg").textContent = sunGone && SCENE[r][c] === "u" ? "“sun” is gone, so this cell's attention moved to “sky” and the filler words: softmax always hands out 100%." : sunGone ? "“sun” deleted: click a sun cell (top right) to see where its attention went." : "";
+  }
+  cv.addEventListener("click", e => {
+    const b = cv.getBoundingClientRect(), c = Math.floor((e.clientX - b.left) / (b.width / 6)), r = Math.floor((e.clientY - b.top) / (b.height / 6));
+    if (r < 0 || r > 5 || c < 0 || c > 5) return;
+    selCell = selCell && selCell[0] === r && selCell[1] === c ? null : [r, c];
+    const A = attn(r, c); win("gFind", A[1] > 0.6 && !removed.has(1));
+    drawXA();
+  });
+  $("xS").oninput = drawXA;
+  window.addEventListener("resize", drawXA);
+  drawXA();
+
+  /* ---------- 2. cost calculator ---------- */
+  function drawCost() {
+    const R = +$("cR").value, [f, ch] = $("cF").value.split("|").map(Number), p = +$("cP").value, S = +$("cS").value;
+    const side = R / f, nums = side * side * ch, tok = Math.pow(side / p, 2), pairs = tok * tok;
+    $("cSV").textContent = S;
+    $("cN").textContent = fmt(nums);
+    $("cRat").textContent = f === 1 ? "pixels" : (R * R * 3 / nums).toFixed(0) + "× fewer";
+    $("cT").textContent = fmt(tok);
+    $("cA").textContent = fmt(pairs);
+    $("cAS").textContent = fmt(pairs * S);
+    win("gK", R === 1024 && tok <= 4096);
+    win("gB", f === 1 && pairs > 1e10);
+    $("cMsg").textContent = f === 1 && pairs > 1e9 ? "Pixel-space attention at this size is hopeless: this is why early diffusion used U-Nets with attention only at low resolution, and why latents won." :
+      tok <= 4096 && R >= 1024 ? "A 1024² image in 4,096 tokens: SD3's recipe (f = 8, 2 × 2 patches)." :
+      p === 1 && f > 1 ? "One token per latent position is what a U-Net's attention sees at its top level. A DiT usually uses 2 × 2 patches: 4× fewer tokens, 16× fewer pairs." : "";
+  }
+  ["cR", "cF", "cP"].forEach(id => ($(id).onchange = drawCost));
+  $("cS").oninput = drawCost;
+  drawCost();
+})();
+</script>
+</body>
+</html>

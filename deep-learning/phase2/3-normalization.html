@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.3 Normalization: BatchNorm → LayerNorm → RMSNorm · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.grid6 { width: 100%; max-width: 420px; height: 190px; display: block; border-radius: 10px; border: 1px solid var(--line); cursor: pointer; }
+  canvas.grid6.one { height: 80px; }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .strip { position: relative; height: 70px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--line); overflow: hidden; }
+  .strip i { position: absolute; width: 7px; height: 7px; border-radius: 50%; background: var(--c-ac); opacity: .55; transform: translate(-50%, -50%); }
+  .strip .target { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--c-y); }
+  .strip .tick { position: absolute; bottom: 2px; font-size: .7rem; color: var(--muted); transform: translateX(-50%); }
+  table.houses td, table.houses th { text-align: center; }
+</style>
+</head>
+<body data-lesson="d2-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 3</div>
+  <h1>Normalization: BatchNorm → LayerNorm → RMSNorm</h1>
+  <p class="subtitle">Subtract a mean, divide by a spread: the oldest trick in statistics, applied inside the network at every layer. It let image models train 14× faster, and its descendant runs at every layer of today's LLMs. The whole story is <i>which numbers you average over</i>.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Mean</b> and <b>standard deviation</b> (spread) of a list of numbers; “standardizing” = (x − mean) / std (<a href="../../math-course/phase5/1-describing-data.html">math 5.1</a>).</li>
+      <li>Activations that drift too big or too small make gradients explode or vanish (Lesson 2.1); a residual sum grows with depth unless something rescales it (Lesson 2.2).</li>
+      <li>A <b>mini-batch</b> is the handful of examples processed together in one training step (Lesson 1.7).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2015 Sergey Ioffe and Christian Szegedy at Google added one operation after the layers of their Inception image classifier: normalize each feature using the mean and variance of the current mini-batch. The new network reached the same accuracy in <b>14 times fewer training steps</b>, and an ensemble hit 4.9% top-5 error on ImageNet, which they reported as “exceeding the accuracy of human raters”.</p>
+    <p>Their explanation (“internal covariate shift”) was later challenged: a 2018 MIT paper argued that stable layer inputs have “little to do with” why it works. And for transformers, the batch version was replaced by <b>LayerNorm</b>, then by the even simpler <b>RMSNorm</b> that LLaMA uses.</p>
+    <p><b>Why normalize at all, why did the field switch from averaging over the batch to averaging over each example, and what bug does BatchNorm hide in your eval code?</b> You'll see exactly which cells get averaged, watch batch statistics fall apart at batch size 2, and catch a classic train/eval bug.</p>
+  </div>
+
+  <h2>Numbers first: features on wildly different scales</h2>
+  <p>Imagine a layer whose 4 units output, for one batch:</p>
+  <table>
+    <tr><th>Unit</th><th>Values across the batch</th><th>Mean</th><th>Spread</th></tr>
+    <tr><td>1</td><td>0.01, 0.02, 0.015, 0.012</td><td>0.014</td><td>0.004</td></tr>
+    <tr><td>2</td><td>310, 280, 355, 290</td><td>309</td><td>29</td></tr>
+    <tr><td>3</td><td>−4, 3, −1, 2</td><td>0</td><td>2.7</td></tr>
+  </table>
+  <p>The next layer sees one input that barely moves and one in the hundreds. A learning rate small enough for unit 2 is useless for unit 1. If a sigmoid or tanh follows, unit 2 is saturated (slope ≈ 0). And as the earlier layers train, these scales <b>keep changing</b>, so the next layer chases a moving target.</p>
+  <p>The fix is the same one you'd use on a spreadsheet column: <b>standardize</b>. Subtract the mean, divide by the spread, and every unit lands around 0 with spread 1.</p>
+  <div class="calc">x̂ = (x − mean) / √(variance + ε) &nbsp;&nbsp;then&nbsp;&nbsp; y = <span class="w">γ</span>·x̂ + <span class="w">β</span></div>
+  <p>ε (about 10⁻⁵) avoids dividing by zero. <span class="w">γ</span> (scale) and <span class="w">β</span> (shift) are learned, one pair per feature, starting at 1 and 0, so the network can undo the normalization if that's what it needs. The only real question is: <b>mean and variance of which numbers?</b></p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Every normalization layer computes the same thing, (x − mean)/std then γ, β. They differ only in <b>which cells they average over</b>: BatchNorm averages one feature <b>across the batch</b>; LayerNorm averages one example <b>across its features</b>; RMSNorm does LayerNorm's job but skips the mean; GroupNorm averages one example across a <b>group</b> of channels. That one choice decides batch-size sensitivity, train/eval behaviour and where each one is used.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: grading on a curve</span>
+    <p>BatchNorm grades each exam question on a curve <b>using this week's class</b>: your score depends on who else sat the exam that day. A class of two and the curve is meaningless. LayerNorm grades each student <b>against their own scores</b> on all questions: no classmates needed, and a class of one works fine. RMSNorm does the same but only asks “how big are your scores overall?”, not “what's your average?”.</p>
+  </div>
+
+  <h2>Playground: which cells get averaged together?</h2>
+  <p>Below is a tiny activation tensor: <b>4 examples</b> (rows) × <b>6 features</b> (columns), each feature on its own scale. Left: raw values. Right: after normalization. Click any cell: the outlined cells are the ones whose mean and variance were used to normalize it.</p>
+  <p class="predict">🔮 <b>Predict:</b> you make example 1 an outlier (×10). Under BatchNorm, do the normalized values of <i>example 2</i> change? Under LayerNorm?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The normalization grid</span>
+    <div class="goals">
+      <span class="goal" id="gLeak">🎯 See an outlier change other examples' values (BN)</span>
+      <span class="goal" id="gIso">🎯 See LayerNorm ignore it</span>
+      <span class="goal" id="gOne">🎯 Break BatchNorm with a batch of 1</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="nMode"><button data-v="bn" class="on">BatchNorm</button><button data-v="ln">LayerNorm</button><button data-v="rms">RMSNorm</button><button data-v="gn">GroupNorm (2 groups)</button></span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="nBatch"><button data-v="4" class="on">batch of 4</button><button data-v="1">batch of 1</button></span>
+      <button class="btn" id="nOut">Make example 1 an outlier (×10)</button>
+    </div>
+    <div class="pg-cols">
+      <div><div class="hint">raw <span class="ac">activations</span> (rows = examples, columns = features)</div><canvas class="grid6" id="nRaw"></canvas></div>
+      <div><div class="hint">normalized (γ = 1, β = 0)</div><canvas class="grid6" id="nNorm"></canvas></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">selected <b id="nSel">–</b></div>
+      <div class="stat">averaged over <b id="nGroup">–</b></div>
+      <div class="stat">group mean <b id="nMean">–</b></div>
+      <div class="stat">group spread <b id="nStd">–</b></div>
+      <div class="stat">example 2, feature 1 → <b id="nWatch" class="ac">–</b></div>
+    </div>
+    <p class="hint" id="nMsg"></p>
+  </div>
+  <p><b>What you should see:</b> BatchNorm outlines a <b>column</b> (one feature, all 4 examples), so every column ends up with mean 0 and spread 1, whatever its original scale. LayerNorm and RMSNorm outline a <b>row</b> (one example, all its features). Now press the outlier button and watch the “example 2, feature 1” readout: under BatchNorm it jumps (from −1.35 to −0.65 here), because example 1's huge values shift the batch mean that example 2 is measured against. Under LayerNorm it doesn't move at all. Finally pick <b>batch of 1</b> under BatchNorm: every normalized value becomes exactly <b>0</b>. One example has no spread, so x − mean = 0. (PyTorch's <code>BatchNorm1d</code> refuses outright in training mode: “Expected more than 1 value per channel”.)</p>
+
+  <h2>BatchNorm: average over the batch</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: one feature, a batch of 4</span>
+    <p>A feature takes the values <b>2, 4, 6, 8</b> across the batch.</p>
+    <ul>
+      <li>Mean = (2 + 4 + 6 + 8)/4 = <b>5</b>. Variance = (9 + 1 + 1 + 9)/4 = <b>5</b>, std = √5 ≈ <b>2.236</b>.</li>
+      <li>x̂ = (x − 5)/2.236 → <b>−1.34, −0.45, 0.45, 1.34</b>: mean 0, spread 1.</li>
+      <li>With learned <span class="w">γ</span> = 2, <span class="w">β</span> = 1: y = 2x̂ + 1 → −1.68, 0.11, 1.89, 3.68.</li>
+      <li>Parameters: 2 per feature (γ, β). A 512-feature BatchNorm has 1,024 learned numbers, plus 1,024 <b>running statistics</b> (mean and variance) that are not learned by gradients.</li>
+    </ul>
+  </div>
+  <p><b>Running statistics.</b> At test time you may predict one image at a time, so there's no batch to average. During training BatchNorm keeps a moving average of each feature's mean and variance (PyTorch: running = 0.9 × running + 0.1 × batch, momentum 0.1). <code>model.eval()</code> switches to those stored numbers; <code>model.train()</code> switches back to batch statistics. Forget the switch and you get the bug at the end of this lesson.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Batch normalization (Ioffe &amp; Szegedy, 2015)</span></span>
+    <ol>
+      <li><b>The problem before</b> Deep networks needed small learning rates and careful init; as earlier layers learned, later layers' inputs kept changing scale, and saturating activations got stuck. Ioffe &amp; Szegedy named this <b>internal covariate shift</b>: “the change in the distribution of network activations due to the change in network parameters during training”.</li>
+      <li><b>What people tried</b> Careful initialization (Lesson 1.4), standardizing only the input data, lower learning rates, ReLU (0.4).</li>
+      <li><b>Why this works</b> Standardize every feature with the batch's mean and variance, then let γ, β rescale. Activations stay in a good range however the earlier weights move, so you can use “much higher learning rates and be less careful about initialization”: 14× fewer steps for Inception. The batch noise also acts as a mild regularizer. Later, Santurkar et al. (2018) showed BN works even when they <i>add</i> distribution shift back, and argued the real effect is a <b>smoother loss landscape</b> with more predictable gradients. Both stories agree on what it does to training; they disagree on why.</li>
+      <li><b>What it costs, when it fails</b> Each example's output <b>depends on its batch-mates</b>. Small batches make the statistics noisy (next playground: at batch 2 the output can only be ±1). Train and eval behave differently (running stats), a classic source of bugs. Batch size 1 is impossible in training. Variable-length sequences and RNNs are awkward (statistics per time step), and multi-GPU training needs synchronized statistics (<code>SyncBatchNorm</code>) when per-GPU batches are small.</li>
+      <li><b>What refined it</b> LayerNorm (2016) for sequences and transformers; GroupNorm (2018) for small-batch vision; RMSNorm (2019) for speed; and normalizer-free ResNets with adaptive gradient clipping (2021, Lesson 2.1) for people who wanted BN gone entirely. BN is still standard in CNNs trained with decent batch sizes (Phase 3).</li>
+    </ol>
+  </div>
+
+  <h2>Playground: batch statistics at batch size 2 vs 64</h2>
+  <p>Take one feature whose true mean is 2 and spread 1. One particular example has the value 3, so its “true” normalized value is (3 − 2)/1 = <b>1.0</b>. But BatchNorm doesn't know the true mean: it uses whatever examples happen to share the batch. Each dot is one random batch.</p>
+  <p class="predict">🔮 <b>Predict:</b> with a batch of 2 (this example + one random partner), what values can its normalized output take?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · How noisy are batch statistics?</span>
+    <div class="goals"><span class="goal" id="gNoisy">🎯 Find the size where the spread drops below 0.2</span><span class="goal" id="gPm1">🎯 See the “only ±1” batch</span></div>
+    <div class="controls"><label>batch size <input type="range" id="sB" min="0" max="7" step="1" value="1"> <b class="mono" id="sBV"></b></label></div>
+    <div class="strip" id="sStrip"></div>
+    <div class="stat-row">
+      <div class="stat">average of 200 batches <b id="sMean" class="ac">–</b></div>
+      <div class="stat">spread across batches <b id="sSd" class="dead">–</b></div>
+      <div class="stat">within ±0.25 of the true 1.0 <b id="sNear">–</b></div>
+      <div class="stat">largest possible |x̂| = √(B−1) <b id="sMax">–</b></div>
+    </div>
+    <p class="hint" id="sMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at batch size 2, the dots sit at <b>−1 or +1</b>: with two values, standardizing always gives ±1, whatever they are (the one stray dot had a partner so close that ε took over). The spread across batches is 0.67. At 4 it's 0.50, at 16 it's 0.27, and only at <b>64</b> does it drop to about 0.15. That noise is why BatchNorm gets worse as batches shrink, and why detection and segmentation models, which often fit only 1 or 2 large images per GPU, are where GroupNorm was designed to help. (Fun corner: with B examples, |x̂| can never exceed √(B − 1).)</p>
+
+  <h2>LayerNorm: average over each example's features</h2>
+  <p>Ba, Kiros and Hinton (2016) simply turned the averaging 90°. Each example is normalized using the mean and variance of <b>its own features</b>. No batch involved: the same computation at training and test time, any batch size, and in a transformer, each token is normalized on its own. Same numbers 2, 4, 6, 8, but now they're the 4 features of one token: x̂ = −1.34, −0.45, 0.45, 1.34, computed without looking at any other token.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Layer normalization (Ba, Kiros &amp; Hinton, 2016)</span></span>
+    <ol>
+      <li><b>The problem before</b> BatchNorm “is dependent on the mini-batch size and it is not obvious how to apply it to recurrent neural networks”. An RNN applying BN naively would need separate statistics for every time step, which fails for a test sequence longer than any training sequence. Language models also predict one sequence at a time.</li>
+      <li><b>What people tried</b> BN per time step, or no normalization at all in RNNs (with careful init and gradient clipping, Lesson 2.1).</li>
+      <li><b>Why this works</b> Average over the features of one example (one token). It “performs exactly the same computation at training and test times”, works at batch size 1, needs no running statistics and doesn't leak information between examples. In transformers, every token at every layer gets its scale reset, which keeps the residual stream (Lesson 2.2) in range.</li>
+      <li><b>What it costs, when it fails</b> It assumes the features of a layer are comparable enough to share one mean and variance. In convolutional networks that's often false (edge pixels' units behave very differently), and the LayerNorm authors themselves found BN better for CNNs: on ResNet-50 ImageNet with batch 32 per GPU, Wu &amp; He measured 25.3% error for LN vs 23.6% for BN. It needs two passes over each token's features (mean, then variance).</li>
+      <li><b>What refined it</b> RMSNorm (drop the mean, next), and moving it from after the residual add (post-norm, the 2017 transformer) to inside the branch (pre-norm, which the LLaMA paper credits to GPT-3), which trains deep transformers far more stably (Lesson 6.4).</li>
+    </ol>
+  </div>
+
+  <h2>RMSNorm: skip the mean</h2>
+  <p>Zhang and Sennrich (2019) asked whether LayerNorm's re-centering (subtracting the mean) matters, or only its re-scaling. RMSNorm keeps only the scaling: divide by the <b>root mean square</b>, then multiply by γ. No mean, usually no β.</p>
+  <div class="calc">RMS(x) = √(mean(x²) + ε) &nbsp;&nbsp;·&nbsp;&nbsp; y = <span class="w">γ</span> · x / RMS(x)</div>
+  <p>For 2, 4, 6, 8: mean of squares = (4 + 16 + 36 + 64)/4 = 30, RMS = √30 ≈ 5.48, so y = <b>0.37, 0.73, 1.10, 1.46</b>. Not centered at 0 any more, but the overall size is fixed at 1.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">RMSNorm (Zhang &amp; Sennrich, 2019)</span></span>
+    <ol>
+      <li><b>The problem before</b> LayerNorm runs at every layer, for every token, and its extra work “significantly slows the underlying network”, especially RNNs, in their measurements.</li>
+      <li><b>What people tried</b> LayerNorm everywhere; fused GPU kernels to hide its cost.</li>
+      <li><b>Why this works</b> Their hypothesis: “re-centering invariance in LayerNorm is dispensable”; what stabilizes training is controlling the <b>scale</b>. Dropping the mean removes one reduction and one subtraction per value. In their experiments RMSNorm matched LayerNorm's quality while cutting running time by <b>7% to 64%</b> depending on the model.</li>
+      <li><b>What it costs, when it fails</b> Outputs aren't centered, so if a zero mean matters, the network has to learn it elsewhere. The speedup is smaller in modern fused kernels than in the paper's 2019 setups. It's still a per-token reduction that must happen in higher precision for stability.</li>
+      <li><b>What refined it</b> LLaMA (2023): “we normalize the input of each transformer sub-layer… We use the RMSNorm normalizing function”. Llama 2 kept the same recipe, and many open LLMs followed. It's built into PyTorch as <code>nn.RMSNorm</code>.</li>
+    </ol>
+  </div>
+
+  <h2>GroupNorm: the small-batch vision fix</h2>
+  <p>CNN features are channels × height × width. GroupNorm (Wu &amp; He, 2018) splits each example's channels into groups (32 by default) and normalizes within each group, over the channels and all pixels. Like LayerNorm it ignores the batch; unlike LayerNorm it doesn't force all channels to share one mean. With batches of 2 images per GPU on ImageNet ResNet-50, GN had <b>24.1%</b> error vs BatchNorm's <b>34.7%</b>; at the usual 32 per GPU they're close (24.1% vs 23.6%). GroupNorm with 1 group is LayerNorm; with one channel per group it's instance norm.</p>
+
+  <table>
+    <tr><th></th><th>BatchNorm</th><th>LayerNorm</th><th>RMSNorm</th><th>GroupNorm</th></tr>
+    <tr><td>Averages over</td><td>batch (and pixels), per feature</td><td>features of one example</td><td>features of one example (no mean)</td><td>a group of channels (and pixels) of one example</td></tr>
+    <tr><td>Depends on batch?</td><td class="dead">yes</td><td class="ev">no</td><td class="ev">no</td><td class="ev">no</td></tr>
+    <tr><td>Train ≠ eval?</td><td class="dead">yes (running stats)</td><td class="ev">no</td><td class="ev">no</td><td class="ev">no</td></tr>
+    <tr><td>Learned params</td><td>γ, β per feature</td><td>γ, β per feature</td><td>γ per feature</td><td>γ, β per channel</td></tr>
+    <tr><td>Where (2026)</td><td>CNNs with decent batches (ResNet, many detectors)</td><td>BERT, original transformer, ViT</td><td>LLaMA-style LLMs</td><td>Detection, segmentation, diffusion U-Nets</td></tr>
+  </table>
+
+  <h2>The train/eval bug</h2>
+  <p>A BatchNorm model trained on house sizes, deciding “bigger than average?”. During training it learned running statistics: mean <b>120 m²</b>, spread <b>40 m²</b>. The answer is “big” when the normalized size is above 0. We score it on 8 houses, the 4 largest of which really are big.</p>
+  <p class="predict">🔮 <b>Predict:</b> you forget <code>model.eval()</code> and send the houses one at a time. What does it predict?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Forgot model.eval()?</span>
+    <div class="goals"><span class="goal" id="gBug">🎯 Get a different answer for the same house by changing its batch-mates</span><span class="goal" id="gFix">🎯 8 / 8 with the right mode</span></div>
+    <div class="controls">
+      <span class="seg" id="hMode"><button data-v="train" class="on">forgot: model.train() mode</button><button data-v="eval">model.eval()</button></span>
+      <span class="seg" id="hBatch"><button data-v="one" class="on">one house at a time</button><button data-v="all">all 8 together</button><button data-v="big">only the 4 biggest</button></span>
+    </div>
+    <table class="houses" id="hTable"></table>
+    <div class="stat-row"><div class="stat">correct <b id="hAcc">–</b></div><div class="stat">statistics used <b id="hStats">–</b></div></div>
+    <p class="hint" id="hMsg"></p>
+  </div>
+  <p><b>What you should see:</b> in train mode, one house at a time, every house normalizes to exactly 0 and the model calls them all “small” (4/8, right only by luck). All 8 together: the batch mean is 130 m², so the 130 m² house is called small (7/8). Only the 4 biggest: their mean is 170 m², so two genuinely big houses are called small. Same house, same weights, different answer depending on its batch-mates. Switch to <code>model.eval()</code>: running statistics, <b>8/8</b> in every batching. In real code this bug looks like “validation accuracy is great in the training loop and terrible in production”.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><code>nn.BatchNorm1d/2d</code> (features / image channels), <code>nn.LayerNorm(d)</code>, <code>nn.RMSNorm(d)</code>, <code>nn.GroupNorm(groups, channels)</code>. This snippet checks each one against the formula by hand, then shows the train/eval switch.</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn
+
+torch.manual_seed(<span class="n">0</span>)
+x = torch.randn(<span class="n">4</span>, <span class="n">6</span>) * <span class="n">3</span> + <span class="n">5</span>          <span class="c"># a batch of 4 examples, 6 features</span>
+
+<span class="c"># BatchNorm: average each FEATURE over the batch (dim 0)</span>
+bn = nn.BatchNorm1d(<span class="n">6</span>)                 <span class="c"># γ = 1, β = 0 at init</span>
+y = bn(x)                              <span class="c"># train mode: uses this batch's mean and variance</span>
+mine = (x - x.mean(<span class="n">0</span>)) / torch.sqrt(x.var(<span class="n">0</span>, unbiased=<span class="k">False</span>) + bn.eps)
+print(<span class="s">"BatchNorm matches:"</span>, torch.allclose(y, mine, atol=<span class="n">1e-5</span>))
+
+<span class="c"># LayerNorm: average each EXAMPLE over its features (last dim)</span>
+ln = nn.LayerNorm(<span class="n">6</span>)
+mine = (x - x.mean(-<span class="n">1</span>, keepdim=<span class="k">True</span>)) / torch.sqrt(x.var(-<span class="n">1</span>, unbiased=<span class="k">False</span>, keepdim=<span class="k">True</span>) + ln.eps)
+print(<span class="s">"LayerNorm matches:"</span>, torch.allclose(ln(x), mine, atol=<span class="n">1e-5</span>))
+
+<span class="c"># RMSNorm: no mean subtraction, divide by the root mean square</span>
+rms = nn.RMSNorm(<span class="n">6</span>, eps=<span class="n">1e-6</span>)
+mine = x / torch.sqrt(x.pow(<span class="n">2</span>).mean(-<span class="n">1</span>, keepdim=<span class="k">True</span>) + <span class="n">1e-6</span>)
+print(<span class="s">"RMSNorm matches:  "</span>, torch.allclose(rms(x), mine, atol=<span class="n">1e-5</span>))
+
+<span class="c"># The train/eval switch only matters for BatchNorm</span>
+print(<span class="s">"running mean after 1 batch:"</span>, bn.running_mean[:<span class="n">3</span>])   <span class="c"># 0.9·0 + 0.1·batch mean</span>
+print(<span class="s">"train output, example 0:"</span>, y[<span class="n">0</span>, :<span class="n">3</span>].detach())
+bn.eval()                                                    <span class="c"># uses running stats now</span>
+print(<span class="s">"eval output,  example 0:"</span>, bn(x)[<span class="n">0</span>, :<span class="n">3</span>].detach())
+
+<span class="c"># What we got on a laptop CPU (torch 2.8):</span>
+<span class="c"># BatchNorm matches: True</span>
+<span class="c"># LayerNorm matches: True</span>
+<span class="c"># RMSNorm matches:   True</span>
+<span class="c"># running mean after 1 batch: tensor([0.5547, 0.3245, 0.5519])</span>
+<span class="c"># train output, example 0: tensor([-1.1385, -0.4977, -1.1274])</span>
+<span class="c"># eval output,  example 0: tensor([0.6774, 0.7767, 3.5744])</span></code></pre>
+    <p class="hint">After one batch the running mean has moved only 10% of the way to the true mean (about 5), so the eval output is badly off. It converges over hundreds of steps. Gotchas: call <code>model.eval()</code> before validation and inference (and <code>model.train()</code> after); BatchNorm uses the <b>biased</b> variance in the forward pass; set <code>bias=False</code> on a linear/conv layer right before a BatchNorm (β already shifts it); for multi-GPU training with small per-GPU batches, convert with <code>nn.SyncBatchNorm.convert_sync_batchnorm(model)</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>BatchNorm</td><td>Big speedups for CNNs, mild regularization, folds into the previous conv at inference (free)</td><td>Batch-size dependent, train/eval difference, sync across GPUs, awkward for sequences</td></tr>
+      <tr><td>LayerNorm</td><td>Batch-independent, same at train and test, works per token</td><td>Assumes features are comparable; usually behind BN on CNNs; a runtime cost at inference</td></tr>
+      <tr><td>RMSNorm</td><td>Simpler and cheaper than LayerNorm, same quality in LLMs</td><td>No centering; gains depend on kernels</td></tr>
+      <tr><td>GroupNorm</td><td>Stable at 1 or 2 images per GPU</td><td>Group count to choose; slightly behind BN at large batches</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“BatchNorm vs LayerNorm: what's the difference, and why do transformers use LayerNorm or RMSNorm?” A strong answer:</p>
+    <ul>
+      <li>Draws the tensor: BN averages each feature over the batch (and spatial positions); LN averages each example over its features; both then apply learned γ, β.</li>
+      <li>Consequences: BN depends on batch size and batch-mates, needs running statistics for eval (train/eval bug), and struggles with small batches and variable-length sequences; LN is per token, identical at train and test.</li>
+      <li>RMSNorm drops the mean (only rescales), is cheaper and is what LLaMA-style models use, in pre-norm position (6.4). GroupNorm is the small-batch vision answer.</li>
+      <li>Is honest about <i>why</i> normalization helps: the original “internal covariate shift” story vs the smoother-landscape view (Santurkar et al., 2018). Both agree it allows higher learning rates.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>14× fewer steps for Inception</b> <span class="tag co">🏢 Google · 2015</span> <a href="https://arxiv.org/abs/1502.03167" target="_blank" rel="noopener">Ioffe &amp; Szegedy: Batch Normalization</a></div>
+      <p><b>How:</b> normalize every layer's inputs per mini-batch, with learned γ, β and running statistics for inference; raise the learning rate and remove dropout.</p>
+      <p><b>Why this method:</b> the same accuracy in 14 times fewer steps, and an ensemble reached 4.9% top-5 validation error on ImageNet.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Why does BN really work?</b> <span class="tag res">🧪 Research · 2018</span> <a href="https://arxiv.org/abs/1805.11604" target="_blank" rel="noopener">Santurkar, Tsipras, Ilyas &amp; Madry: How Does Batch Normalization Help Optimization?</a></div>
+      <p><b>How:</b> injected noise after BN layers to re-create distribution shift, then measured the loss landscape's smoothness and gradient predictability.</p>
+      <p><b>Why this method:</b> it separated two explanations: BN still worked with the shift added back, pointing to a smoother optimization landscape rather than stable input distributions.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>RMSNorm in LLaMA</b> <span class="tag co">🏢 Meta · 2023</span> <a href="https://arxiv.org/abs/2302.13971" target="_blank" rel="noopener">Touvron et al.: LLaMA</a></div>
+      <p><b>How:</b> pre-normalization: the input of each attention and feed-forward sub-layer goes through RMSNorm, instead of normalizing the output.</p>
+      <p><b>Why this method:</b> “to improve the training stability”, with RMSNorm as the cheaper normalizer; the recipe became the template for many open LLMs.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Small batches in detection</b> <span class="tag res">🧪 Research · 2018</span> <a href="https://arxiv.org/abs/1803.08494" target="_blank" rel="noopener">Wu &amp; He: Group Normalization</a></div>
+      <p><b>How:</b> normalize over groups of channels within each image; also tested on COCO detection and segmentation and video classification.</p>
+      <p><b>Why this method:</b> these tasks fit only a few high-resolution images per GPU, exactly where batch statistics fall apart (10.6 points better than BN at batch 2 on ImageNet).</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · batch size 2 is a coin</span>
+    <p>Standardize any two different numbers and you always get exactly −1 and +1. So a BatchNorm layer trained with batch size 2 turns every feature of every example into a binary ±1 signal (before γ and β), throwing away how far apart the values were. With B examples, no normalized value can ever exceed √(B − 1) in size: you saw that limit in the noise playground.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Mean, variance and standardizing are <a href="../../math-course/phase5/1-describing-data.html">math 5.1</a>; loss landscapes and smoothness are <a href="../../math-course/phase7/1-loss-landscapes.html">math 7.1</a>; ε and float precision are <a href="../../math-course/phase8/5-numerics.html">math 8.5</a>. Normalization keeps the factors of Lesson 2.1 near 1 and the residual sums of 2.2 in range. BN layers appear in every CNN of Phase 3; pre-norm vs post-norm and RMSNorm in transformers are Lesson 6.4; batch size effects are 1.7; the train/eval switch is back as a debugging check in 2.6 (and again for dropout in 2.4).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Book</span> <a href="https://d2l.ai/chapter_convolutional-modern/batch-norm.html" target="_blank" rel="noopener">Dive into Deep Learning: Batch Normalization</a>. BN from scratch, with the debate about why it works.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1803.08494" target="_blank" rel="noopener">Group Normalization (2018)</a>. Its Figure 2 is the clearest picture of BN vs LN vs IN vs GN.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.RMSNorm.html" target="_blank" rel="noopener">PyTorch nn.RMSNorm</a>. The formula and arguments, next to <code>nn.LayerNorm</code>.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A feature has values 1, 3, 5, 7 across a batch of 4. What is the BatchNorm output (γ = 1, β = 0, ignore ε) for the example with value 7?</div>
+    <div class="opts"><button class="opt">1.0</button><button class="opt" data-ok>About 1.34</button><button class="opt">3.0</button></div>
+    <div class="explain">Mean = 4; variance = (9 + 1 + 1 + 9)/4 = 5; std ≈ 2.236. (7 − 4)/2.236 ≈ <b>1.34</b>. Same as 2, 4, 6, 8: shifting all values doesn't change the normalized output.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your image classifier with BatchNorm scores 92% in the training script's validation loop but 60% in the serving code, which predicts one image at a time. What's the likely bug?</div>
+    <div class="opts"><button class="opt">The serving machine has a different GPU</button><button class="opt" data-ok>The serving code never calls model.eval(), so BatchNorm normalizes with the statistics of a single image instead of the running averages</button><button class="opt">BatchNorm needs a bigger learning rate at inference</button></div>
+    <div class="explain">In train mode BN uses the current batch's statistics; with one image (or a batch of similar images) those are meaningless. <code>model.eval()</code> switches to running statistics (and turns off dropout too, Lesson 2.4). Check mode first whenever train-time and deploy-time numbers disagree.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You're building a language model that will generate text one token at a time for a single user. Which normalization fits best?</div>
+    <div class="opts"><button class="opt">BatchNorm, because it gave ImageNet a 14× speedup</button><button class="opt" data-ok>LayerNorm or RMSNorm: they normalize each token over its own features, so batch size and sequence length don't matter</button><button class="opt">No normalization: transformers don't need it</button></div>
+    <div class="explain">Generation runs at batch size 1 with sequences of any length; batch statistics don't exist there. Per-token normalization behaves identically in training and generation, which is why transformers use LayerNorm and LLaMA-style models use RMSNorm (Lesson 6.4).</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Normalization = (x − mean)/√(var + ε), then learned γ, β. It keeps every layer's inputs in a good range, so you can use higher learning rates.</li>
+      <li>BatchNorm averages each feature over the batch: 14× faster Inception training, but depends on batch-mates, is noisy at small batches (±1 at batch 2), and needs running statistics, so <code>model.eval()</code> matters.</li>
+      <li>Why it helps is debated: “internal covariate shift” (2015) vs a smoother loss landscape (2018).</li>
+      <li>LayerNorm averages each example over its features: batch-independent, same at train and test, the transformer default. RMSNorm drops the mean: cheaper, equally good, used in LLaMA-style LLMs.</li>
+      <li>GroupNorm normalizes groups of channels per image: the fix for 1 or 2 images per GPU (24.1% vs BN's 34.7% error at batch 2).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const EPS = 1e-5;
+
+  /* ---------- 1. the normalization grid ---------- */
+  const r = NN.rng(5), MU = [5, -2, 0.5, 30, 1, -8], SD = [2, 1, 0.3, 10, 0.5, 3];
+  const BASE = Array.from({ length: 4 }, () => MU.map((m, j) => +(m + SD[j] * r.n()).toFixed(2)));
+  let mode = "bn", B = 4, outlier = false, sel = [1, 0], everLeak = false;
+  const X = () => BASE.slice(0, B).map((row, i) => row.map(v => (outlier && i === 0 ? v * 10 : v)));
+  // which cells normalize cell (i, j)?
+  const group = (i, j, rows) => {
+    if (mode === "bn") return Array.from({ length: rows }, (_, k) => [k, j]);
+    if (mode === "gn") { const g0 = j < 3 ? 0 : 3; return [0, 1, 2].map(k => [i, g0 + k]); }
+    return Array.from({ length: 6 }, (_, k) => [i, k]);
+  };
+  function normalize(M) {
+    return M.map((row, i) => row.map((v, j) => {
+      const cells = group(i, j, M.length).map(([a, b]) => M[a][b]), n = cells.length;
+      if (mode === "rms") return v / Math.sqrt(cells.reduce((s, c) => s + c * c, 0) / n + EPS);
+      const m = cells.reduce((s, c) => s + c, 0) / n, va = cells.reduce((s, c) => s + (c - m) ** 2, 0) / n;
+      return (v - m) / Math.sqrt(va + EPS);
+    }));
+  }
+  function outline(canvas, cells) {
+    const g = canvas._heat, ctx = canvas.getContext("2d"), cw = (g.w - g.padL) / g.cols, ch = (g.h - g.padT) / g.rows;
+    ctx.strokeStyle = MX.css("--accent"); ctx.lineWidth = 3;
+    cells.forEach(([a, b]) => ctx.strokeRect(g.padL + b * cw + 1.5, g.padT + a * ch + 1.5, cw - 4, ch - 4));
+  }
+  function nDraw() {
+    const M = X(), N = normalize(M), rows = M.length;
+    if (sel[0] >= rows) sel = [0, sel[1]];
+    ["nRaw", "nNorm"].forEach(id => $(id).classList.toggle("one", rows === 1));
+    const rl = Array.from({ length: rows }, (_, i) => "ex " + (i + 1)), cl = Array.from({ length: 6 }, (_, j) => "f" + (j + 1));
+    const mx = Math.max(...M.flat().map(Math.abs));
+    NN.heat($("nRaw"), M, { cmap: "div", lo: -mx, hi: mx, text: true, fmt: v => (Math.abs(v) >= 100 ? v.toFixed(0) : Math.abs(v) >= 10 ? v.toFixed(1) : v.toFixed(2)), rowLabels: rl, colLabels: cl, padLeft: 40 });
+    NN.heat($("nNorm"), N, { cmap: "div", lo: -2.5, hi: 2.5, text: true, fmt: v => v.toFixed(2), rowLabels: rl, colLabels: cl, padLeft: 40 });
+    const cells = group(sel[0], sel[1], rows);
+    outline($("nRaw"), cells); outline($("nNorm"), cells);
+    const vals = cells.map(([a, b]) => M[a][b]), n = vals.length, m = vals.reduce((s, c) => s + c, 0) / n;
+    const sp = mode === "rms" ? Math.sqrt(vals.reduce((s, c) => s + c * c, 0) / n) : Math.sqrt(vals.reduce((s, c) => s + (c - m) ** 2, 0) / n);
+    $("nSel").textContent = `ex ${sel[0] + 1}, f${sel[1] + 1}: ${M[sel[0]][sel[1]].toFixed(2)} → ${N[sel[0]][sel[1]].toFixed(2)}`;
+    $("nGroup").textContent = mode === "bn" ? `feature ${sel[1] + 1} across ${rows} example${rows > 1 ? "s" : ""}` : mode === "gn" ? `features ${sel[1] < 3 ? "1–3" : "4–6"} of example ${sel[0] + 1}` : `all 6 features of example ${sel[0] + 1}`;
+    $("nMean").textContent = mode === "rms" ? "not used" : m.toFixed(2);
+    $("nStd").textContent = (mode === "rms" ? "RMS " : "") + sp.toFixed(2);
+    $("nWatch").textContent = rows > 1 ? N[1][0].toFixed(2) : "– (no example 2)";
+    if (outlier && rows > 1 && mode === "bn") { everLeak = true; win("gLeak", true); }
+    win("gIso", outlier && rows > 1 && mode === "ln");
+    win("gOne", rows === 1 && mode === "bn");
+    $("nOut").textContent = outlier ? "Undo the outlier" : "Make example 1 an outlier (×10)";
+    $("nMsg").textContent = rows === 1 && mode === "bn" ? "Batch of 1 under BatchNorm: each feature's ‘batch’ is a single number, so x − mean = 0 everywhere. All information is gone." :
+      rows === 1 ? "Batch of 1 is no problem here: this method never looks at other examples." :
+      outlier && mode === "bn" ? "Example 1's huge values moved every column's mean and spread, so all the other examples' normalized values changed too." :
+      outlier ? "The outlier only changes its own row: other examples are untouched." :
+      mode === "rms" ? "RMSNorm divides each row by its root mean square: sizes become comparable, but rows are not centered at 0." : "Click any cell to see which cells it was normalized with.";
+  }
+  ["nRaw", "nNorm"].forEach(id => $(id).addEventListener("click", e => {
+    const c = $(id), g = c._heat; if (!g) return;
+    const rect = c.getBoundingClientRect(), x = e.clientX - rect.left - g.padL, y = e.clientY - rect.top - g.padT;
+    const col = Math.floor(x / ((rect.width - g.padL) / g.cols)), row = Math.floor(y / ((rect.height - g.padT) / g.rows));
+    if (row >= 0 && row < g.rows && col >= 0 && col < g.cols) { sel = [row, col]; nDraw(); }
+  }));
+  seg("nMode", v => { mode = v; nDraw(); });
+  seg("nBatch", v => { B = +v; nDraw(); });
+  $("nOut").onclick = () => { outlier = !outlier; nDraw(); };
+  nDraw();
+  window.addEventListener("resize", nDraw);
+
+  /* ---------- 2. batch statistics noise ---------- */
+  const SIZES = [1, 2, 4, 8, 16, 32, 64, 128];
+  function sim(Bs, n = 200, seed = 3) {
+    const q = NN.rng(seed), vals = [];
+    for (let k = 0; k < n; k++) {
+      const xs = [3]; for (let i = 1; i < Bs; i++) xs.push(2 + q.n());
+      const m = xs.reduce((a, b) => a + b, 0) / Bs, v = xs.reduce((a, b) => a + (b - m) ** 2, 0) / Bs;
+      vals.push((3 - m) / Math.sqrt(v + EPS));
+    }
+    return vals;
+  }
+  function sDraw() {
+    const Bs = SIZES[+$("sB").value]; $("sBV").textContent = Bs;
+    const vals = sim(Bs), n = vals.length, m = vals.reduce((a, b) => a + b, 0) / n, sd = Math.sqrt(vals.reduce((a, b) => a + (b - m) ** 2, 0) / n);
+    const lo = -2, hi = 3, X = v => 100 * (Math.max(lo, Math.min(hi, v)) - lo) / (hi - lo), jit = NN.rng(9);
+    $("sStrip").innerHTML = vals.map(v => `<i style="left:${X(v)}%;top:${15 + 55 * jit.u()}%"></i>`).join("") +
+      `<span class="target" style="left:${X(1)}%"></span>` + [-2, -1, 0, 1, 2, 3].map(t => `<span class="tick" style="left:${X(t)}%">${t}</span>`).join("");
+    $("sMean").textContent = m.toFixed(2);
+    $("sSd").textContent = sd.toFixed(2);
+    $("sNear").textContent = Math.round(100 * vals.filter(v => Math.abs(v - 1) < 0.25).length / n) + "%";
+    $("sMax").textContent = Math.sqrt(Math.max(0, Bs - 1)).toFixed(2);
+    win("gNoisy", sd < 0.2 && Bs > 1);
+    win("gPm1", Bs === 2);
+    $("sMsg").textContent = Bs === 1 ? "Batch of 1: the mean is the value itself, so the output is always 0." : Bs === 2 ? "Two numbers always standardize to −1 and +1. The green line (the true 1.0) is only hit by luck." : sd < 0.2 ? "Now the batch is big enough that its statistics are close to the true ones." : "Each dot should sit on the green line (1.0). The scatter is pure batch noise.";
+  }
+  $("sB").oninput = sDraw; sDraw();
+
+  /* ---------- 3. train/eval bug ---------- */
+  const HOUSES = [60, 85, 100, 115, 130, 150, 180, 220], RM = 120, RS = 40;
+  let hMode = "train", hBatch = "one", seen = {};
+  function hDraw() {
+    const groups = hBatch === "one" ? HOUSES.map(h => [h]) : hBatch === "all" ? [HOUSES] : [HOUSES.slice(4)];
+    const rows = []; let statTxt = "";
+    groups.forEach(gp => {
+      const m = gp.reduce((a, b) => a + b, 0) / gp.length, sd = Math.sqrt(gp.reduce((a, b) => a + (b - m) ** 2, 0) / gp.length);
+      gp.forEach(h => {
+        const z = hMode === "eval" ? (h - RM) / Math.sqrt(RS * RS + EPS) : (h - m) / Math.sqrt(sd * sd + EPS);
+        rows.push({ h, z, pred: z > 0, truth: h > RM });
+      });
+      statTxt = hMode === "eval" ? `running: mean ${RM}, spread ${RS}` : hBatch === "one" ? "each house's own value (spread 0)" : `this batch: mean ${m.toFixed(0)}, spread ${sd.toFixed(0)}`;
+    });
+    $("hTable").innerHTML = `<tr><th>size (m²)</th><th>normalized</th><th>prediction</th><th>truth</th><th></th></tr>` + rows.map(o =>
+      `<tr><td class="x">${o.h}</td><td class="ac">${o.z.toFixed(2)}</td><td>${o.pred ? "big" : "small"}</td><td>${o.truth ? "big" : "small"}</td><td>${o.pred === o.truth ? "✅" : "❌"}</td></tr>`).join("");
+    const ok = rows.filter(o => o.pred === o.truth).length;
+    $("hAcc").textContent = `${ok} / ${rows.length}`;
+    $("hStats").textContent = statTxt;
+    if (hMode === "train") rows.forEach(o => { const k = o.h; seen[k] = seen[k] || new Set(); seen[k].add(o.pred); if (seen[k].size > 1) win("gBug", true); });
+    win("gFix", hMode === "eval" && ok === rows.length && rows.length === 8);
+    $("hMsg").textContent = hMode === "eval" ? "Eval mode uses the running statistics learned in training: every house gets the same answer whatever its batch." :
+      hBatch === "one" ? "Train mode with one house: it's compared only with itself, so it normalizes to 0 and is never ‘big’." :
+      hBatch === "all" ? "Train mode: the houses are graded against this batch's average (130 m²), not the training average (120 m²)." :
+      "Train mode with only big houses: half of them look ‘below average’ compared with their batch-mates.";
+  }
+  seg("hMode", v => { hMode = v; hDraw(); });
+  seg("hBatch", v => { hBatch = v; hDraw(); });
+  hDraw();
+})();
+</script>
+</body>
+</html>

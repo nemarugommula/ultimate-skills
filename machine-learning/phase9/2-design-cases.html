@@ -1,0 +1,596 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9.2 Design cases: fraud detection, churn, ads click-through · Machine Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🌲</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .tl { display: flex; gap: 4px; margin: 10px 0 4px; font-size: .82rem; font-weight: 700; }
+  .tl > div { padding: 8px 10px; border-radius: 8px; text-align: center; border: 1px solid var(--line); }
+  .tl .obs { flex: 6; background: color-mix(in srgb, var(--c-ft) 16%, var(--bg2)); }
+  .tl .cut { flex: 0 0 auto; background: var(--c-bd); color: #000; }
+  .tl .gap { flex: 1; background: var(--bg2); color: var(--muted); }
+  .tl .pred { flex: 3; background: color-mix(in srgb, var(--c-tg) 18%, var(--bg2)); }
+  .tl-cap { display: flex; justify-content: space-between; font-size: .78rem; color: var(--muted); }
+  .pgcols { display: grid; grid-template-columns: auto 1fr; gap: 14px; align-items: center; }
+  @media (max-width: 640px) { .pgcols { grid-template-columns: 1fr; } }
+  table.cmp td.best { font-weight: 800; color: var(--good); }
+  table.cmp td.worst { color: var(--c-lo); }
+</style>
+</head>
+<body data-lesson="ml9-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 9 · Lesson 2</div>
+  <h1>Design cases: fraud detection, churn and ads click-through</h1>
+  <p class="subtitle">Three problems every ML interviewer loves, and every big company runs in production. Each one looks like “just train a classifier”, and each one is really decided by something else: what a mistake costs, when the labels arrive, and what the prediction is used for.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>False positives and false negatives</b>, precision and recall, from the confusion matrix (Lesson 5.3); thresholds on rare classes (Lesson 5.5).</li>
+      <li><b>Calibration</b>: a predicted 0.2 should come true about 20% of the time (Lesson 5.6). <b>Log loss</b> punishes confident wrong probabilities (<a href="../../math-course/phase6/3-cross-entropy.html">Math 6.3</a>).</li>
+      <li>The design framework: goal → metric → labels → features → baseline → model → offline and online evaluation → serving → monitoring (Lesson 9.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook: 100 milliseconds to catch a thief</span>
+    <p>Every time you pay on a site that uses Stripe, a model called <b>Radar</b> looks at <b>more than 1,000 characteristics</b> of the payment and decides, in <b>less than 100 milliseconds</b>, whether to let it through, block it or send it to extra checks. Fraud is rare, on the order of <b>1 in every 1,000 payments</b>, and Stripe says Radar wrongly blocks just <b>0.1%</b> of legitimate ones.</p>
+    <p>Here's the puzzle. A model that simply says “never fraud” would be right 999 times out of 1,000. So what is Radar actually optimizing, where do its labels come from (nobody tells Stripe “that one was fraud” at payment time), and how do you build anything in 100 ms? This lesson walks through that design and two other classics.</p>
+  </div>
+
+  <div class="predict" data-answer="2">
+    <span class="label">🔮 Predict first</span>
+    <p>A famous public fraud dataset (European card payments, two days of September 2013) has <b>492 frauds among 284,807 transactions</b>. What accuracy does a “model” that always answers “not fraud” get?</p>
+    <div class="choices"><button>About 50%</button><button>About 90%</button><button>About 99.8%</button></div>
+    <div class="reveal"><b>99.83%</b> (1 − 492/284,807), while catching <b>zero</b> fraud. Accuracy is the wrong scoreboard when one class is 0.17% of the data. The right one counts what each kind of mistake <i>costs</i>. You'll find that cost-minimizing threshold yourself in Playground 1.</div>
+  </div>
+
+  <h2>Numbers first: three problems, three different constraints</h2>
+  <table>
+    <tr><th></th><th>💳 Fraud</th><th>📉 Churn</th><th>📢 Ads click-through</th></tr>
+    <tr><td>Decision</td><td>allow / review / block, per payment</td><td>who gets a retention offer, per customer</td><td>which ad to show and how much to charge, per impression</td></tr>
+    <tr><td>Positive rate</td><td class="lo">~0.1–0.2% (Stripe: about 1 in 1,000)</td><td>depends on product and window</td><td class="lo">small (the Facebook paper's example uses a 0.1% CTR)</td></tr>
+    <tr><td>Label arrives</td><td class="lo">weeks to months later (disputes up to ~120 days)</td><td>at the end of the prediction window (you choose: 30, 60, 90 days)</td><td class="mt">seconds to minutes (a click, or no click)</td></tr>
+    <tr><td>Latency budget</td><td>&lt; 100 ms, online</td><td>none: a nightly or weekly batch</td><td>milliseconds, for many candidate ads per request</td></tr>
+    <tr><td>What the score is used for</td><td>a <span class="bd">threshold</span> set by costs</td><td>a <b>ranking</b> of who to treat</td><td>a <b>probability</b> plugged into an auction</td></tr>
+    <tr><td>Metric that matters</td><td>expected $ cost, precision–recall</td><td>net value of the campaign (uplift)</td><td>log loss, normalized cross-entropy, calibration</td></tr>
+  </table>
+  <p>Same toolbox (gradient-boosted trees and logistic regression would make a fine first model for all three), completely different systems. The column you read decides the design, not the model.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Before choosing a model, answer three questions: <b>what does each kind of mistake cost</b> (that sets the metric and the <span class="bd">threshold</span>), <b>where and when do the <span class="tg">labels</span> come from</b> (that sets the training data, the validation split and the bias you inherit), and <b>how is the <span class="pd">score</span> used and how fast</b> (a threshold, a ranking or a calibrated probability; online in milliseconds or a nightly batch). The model is the easy part once those are pinned down.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the smoke detector in your kitchen</span>
+    <p>A smoke detector beeps at burnt toast, and you put up with it. Why not make it “more accurate” so it only beeps at real fires? Because a missed fire costs a house and a false beep costs a waved tea towel. The right sensitivity comes from those two prices, not from the detector's accuracy.</p>
+    <p>A fraud system is a smoke detector with prices you can measure. A churn campaign is a fire brigade with a budget, sent only where water helps. An ad auction is a weather forecast: if “30% rain” doesn't mean 30%, everyone who plans on it loses money.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? Why design from costs, labels and serving, not from the model?</span>
+    <ol>
+      <li><b>The problem before.</b> Teams start with “train the best classifier” and optimize accuracy or AUC (area under the ROC curve, Lesson 5.4). The fraud model scores 99.8% and catches nothing; the churn model finds customers who were leaving anyway; the ad model ranks well but overpredicts clicks 2×, so the auction overcharges.</li>
+      <li><b>What people tried.</b> Bigger models, more features, resampling the data to 50:50. Those help ranking a little, but the gap was never in the model: it was the threshold (set at 0.5 by default), the label (propensity instead of response to the offer) and the probability scale (destroyed by resampling).</li>
+      <li><b>Why this works.</b> Put prices on mistakes and the decision falls out. With a calibrated fraud probability p, a missed fraud costing $150 and a false block costing $10, blocking pays when p × $150 &gt; (1 − p) × $10, that is when <b>p &gt; 10 / 160 = 0.0625</b>, not 0.5. On Playground 1's data that one change cuts the cost from <b>$459 to $287</b> per 1,000 payments.</li>
+      <li><b>What it costs, when it fails.</b> Costs are estimates and change (fraud amounts, review staff); labels arrive late and only for what you allowed; uplift needs randomized experiments you must pay for; calibration drifts as the world changes. The design must re-measure all of these, not just retrain.</li>
+      <li><b>What came next.</b> Tools that bake this in: <code>TunedThresholdClassifierCV</code> picks a threshold by business cost (scikit-learn 1.5+), uplift models target response to treatment (Lesson 8.4), online learning and daily retraining keep CTR models fresh, and drift monitoring catches the rest (Lesson 8.6). Lesson 9.3 runs one project end to end.</li>
+    </ol>
+  </div>
+
+  <h2>Case 1 · Fraud detection: a smoke detector with prices</h2>
+  <div class="cases">
+    <div class="case"><h4>🎯 Goal and metric</h4><p>Minimize <b>expected money lost</b> = missed fraud × its cost + false blocks × their cost (lost sale, angry customer) + reviews × analyst time. Report precision and recall at the chosen threshold, and the PR curve (precision–recall, Lesson 5.4), never accuracy.</p></div>
+    <div class="case"><h4>🏷️ Labels</h4><p>Mostly <b>chargebacks</b>: the cardholder disputes a payment with their bank. Card networks typically allow disputes within <b>120 days</b>, so last month's labels are incomplete. And you never learn the truth about payments you <b>blocked</b>.</p></div>
+    <div class="case"><h4>🧮 Features</h4><p><b>Velocity</b> (payments on this card in the last hour), amount vs this customer's usual, country mismatches, <b>graph</b> links (how many cards one IP or device has used), history of the merchant.</p></div>
+    <div class="case"><h4>⚡ Serving</h4><p>Online, inside the payment request: &lt; 100 ms including fetching the velocity counters from a fast store. A rules layer stays in front for hard blocks and business policy.</p></div>
+  </div>
+
+  <h3>The features fraudsters can't hide</h3>
+  <p>A single payment rarely looks suspicious: $49 for headphones is normal. What gives fraud away is <b>context</b>: the same card tried 14 times in 10 minutes (<b>card testing</b>), a brand-new account shipping to an address shared by 30 other accounts, one device used with 9 different cards. Stripe's write-up names features like payment velocity, “unusual volume on a card” and the number of cards previously associated with an IP address.</p>
+  <table>
+    <tr><th>Feature family</th><th>Example</th><th>Why it helps</th><th>Engineering cost</th></tr>
+    <tr><td><span class="ft">Velocity</span></td><td>payments per card in last 1 h / 24 h</td><td>card testing and bursts</td><td>streaming counters, updated per event</td></tr>
+    <tr><td><span class="ft">Deviation</span></td><td>amount ÷ customer's median amount</td><td>“this isn't like you”</td><td>per-customer history lookup</td></tr>
+    <tr><td><span class="ft">Graph</span></td><td>distinct cards per device / IP / email</td><td>fraud rings share infrastructure</td><td>link tables, connected components</td></tr>
+    <tr><td><span class="ft">Context</span></td><td>billing country ≠ IP country, hour of day</td><td>cheap and always available</td><td>none</td></tr>
+  </table>
+  <p class="muted">Every one of these must be computed <b>as of the payment time</b>, from data that existed then. A velocity count computed in a nightly batch over the whole day leaks the future into training (Lesson 0.6) and is unavailable at serving time: the classic training–serving skew of Lesson 9.1.</p>
+
+  <h3>Labels arrive late, and only for what you let through</h3>
+  <p>Two traps hide in the labels. <b>Delay</b>: if you evaluate on last week's payments, most frauds haven't been disputed yet, so they look legitimate: recall looks better and precision worse than reality. Use a <b>time-based split</b> (Lesson 7.1) and only evaluate on periods old enough for labels to have matured. <b>Selection</b>: blocked payments never get a label, so the next model learns only from what the last model allowed. A common fix is to let a tiny random slice of risky-but-not-certain payments through (or send them to review) to keep learning about the region the model blocks.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the threshold from two prices</span>
+    <p>A payment scores <span class="pd">p = 0.10</span> (a calibrated probability of fraud). Missing a fraud costs <span class="lo">$150</span> (the chargeback plus a fee); blocking a good customer costs <span class="lo">$10</span> (lost margin and goodwill).</p>
+    <ul>
+      <li>Allow it: expected loss = 0.10 × $150 = <b>$15.00</b>.</li>
+      <li>Block it: expected loss = 0.90 × $10 = <b>$9.00</b>. Blocking is cheaper.</li>
+      <li>The break-even point: p × 150 = (1 − p) × 10 → <span class="bd">p* = 10 / (10 + 150) = 0.0625</span>. Block everything above 6.25%.</li>
+    </ul>
+    <p>The rule works only if p is <b>calibrated</b> (Lesson 5.6). If your model was trained on resampled 50:50 data, its 0.10 might really mean 0.002; recalibrate first, or pick the threshold directly by measured cost on validation data.</p>
+  </div>
+
+  <div class="predict" data-answer="1">
+    <span class="label">🔮 Predict first</span>
+    <p>Fraud rate 0.5%, a decent model (AUC 0.98). Compared with the default threshold of 0.5, how does the cost-minimizing threshold behave if fraud becomes <b>four times more common</b> (2%)?</p>
+    <div class="choices"><button>It drops a lot: more fraud means block more</button><button>It stays at 0.0625: the probabilities already include the base rate</button><button>It rises: more fraud means the model is less sure</button></div>
+    <div class="reveal">For calibrated probabilities the best threshold depends only on the two costs: <b>0.0625</b> at 0.1%, 0.5% and 2% fraud. What changes is how many payments cross it (the probabilities themselves shift up). Switch the fraud rate in the playground and watch the gold line stay put while the costs move.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Threshold vs cost</span>
+    <p class="hint">Model scores for legitimate and fraudulent payments (a smooth synthetic model with AUC 0.98; scores are calibrated probabilities). Move the <span class="bd">threshold</span>: payments scoring above it are blocked. Set what a missed fraud and a false block cost, and watch the expected cost per 1,000 payments.</p>
+    <div class="controls">
+      <label>threshold <span class="bd">t</span> <input type="range" id="thr" min="-3" max="-0.05" step="0.01" value="-0.30"> <b class="mono" id="thrv"></b></label>
+      <span class="goal" id="fGoal">🎯 Goal: cost within 1% of the minimum</span>
+    </div>
+    <div class="controls">
+      <label>missed fraud costs <input type="range" id="cfn" min="20" max="500" step="10" value="150"> <b class="mono" id="cfnv"></b></label>
+      <label>false block costs <input type="range" id="cfp" min="1" max="50" step="1" value="10"> <b class="mono" id="cfpv"></b></label>
+      <span class="seg" id="rate"><button data-v="0.001">fraud 0.1%</button><button data-v="0.005" class="on">0.5%</button><button data-v="0.02">2%</button></span>
+    </div>
+    <canvas class="chart" id="costChart" style="height:230px"></canvas>
+    <div class="pgcols">
+      <table class="cm">
+        <tr><th>per 10,000</th><th>blocked</th><th>allowed</th></tr>
+        <tr><th>fraud</th><td class="tp" id="cmTp">–</td><td class="fn" id="cmFn">–</td></tr>
+        <tr><th>legit</th><td class="fp" id="cmFp">–</td><td class="tn" id="cmTn">–</td></tr>
+      </table>
+      <div class="stat-row">
+        <div class="stat">cost per 1,000 <b id="fCost">–</b></div>
+        <div class="stat">best threshold → cost <b id="fBestV">–</b></div>
+        <div class="stat">block nothing <b id="fNone">–</b></div>
+        <div class="stat">precision · recall <b id="fPR">–</b></div>
+      </div>
+    </div>
+    <div class="controls"><button class="btn" id="fJump">Jump to the best threshold</button><button class="btn" id="fHalf">Back to 0.5</button></div>
+    <p class="hint" id="fMsg"></p>
+  </div>
+  <p>What you should see: at 0.5 the model is timid, catching only <b>40%</b> of fraud (20 of every 50 per 10,000 payments) and costing <b>$459</b> per 1,000. At the cost-optimal <b>0.0625</b> it catches <b>74%</b> (37 of 50) at the price of about 90 false blocks per 10,000, and the cost falls to <b>$287</b>; doing nothing costs <b>$750</b>. Precision at the best threshold is only about <b>29%</b>, and that's fine: most blocks are false alarms, but each one is cheap. Now make false blocks expensive ($50, a luxury merchant) and watch the optimum climb.</p>
+
+  <h2>Case 2 · Churn: predict who leaves, or who you can keep?</h2>
+  <div class="cases">
+    <div class="case"><h4>🎯 Goal and metric</h4><p>Not “predict churn”, but <b>keep the most value per dollar of retention budget</b>. Metric: net value of a campaign = customers actually kept × their value − cost of offers, measured against a random control group.</p></div>
+    <div class="case"><h4>🏷️ Labels</h4><p>You <b>define</b> churn. Contractual (subscriptions): a cancellation event. Non-contractual (shops, apps): “no purchase or login in N days”, a choice you must justify. The label is known only after the prediction window closes.</p></div>
+    <div class="case"><h4>🧮 Features</h4><p>Usage trends (logins this month vs last), support tickets, failed payments, plan and price changes, tenure, engagement with key features. All computed <b>before the cutoff date</b>.</p></div>
+    <div class="case"><h4>⚡ Serving</h4><p>A batch job (nightly or weekly) scores every customer and writes a list to the CRM or email tool. No latency budget; the hard part is the experiment design.</p></div>
+  </div>
+
+  <h3>Windows: the leak that hides in a date</h3>
+  <p>A churn dataset is built around a <b>cutoff date</b>. Features use only the <b>observation window</b> before it; the label asks “did they churn in the <b>prediction window</b> after it?”. A short gap in between gives the business time to act on the prediction.</p>
+  <div class="tl"><div class="obs">observation window: features (e.g. last 90 days)</div><div class="cut">cutoff</div><div class="gap">gap</div><div class="pred">prediction window: label (next 30 days)</div></div>
+  <div class="tl-cap"><span>Jan 1</span><span>Apr 1</span><span>May 7</span></div>
+  <p>The leak: a feature like “support tickets in the last 30 days” computed when you <i>extract</i> the data (May 10) instead of as of the cutoff (Apr 1) includes the angry “please cancel my account” ticket. Validation AUC looks amazing; production is useless. Build features as of the cutoff, and validate on a <b>later</b> cutoff than you train on (Lesson 5.1).</p>
+
+  <h3>Propensity vs uplift: the four kinds of customer</h3>
+  <p>A churn model ranks people by <b>propensity</b>: P(churn). But a retention offer only creates value where it <b>changes</b> the outcome. That difference is the <b>uplift</b>: P(churn without offer) − P(churn with offer).</p>
+  <table>
+    <tr><th></th><th>Leaves without an offer</th><th>Stays without an offer</th></tr>
+    <tr><td><b>Stays if offered</b></td><td class="mt">🎯 <b>Persuadables</b>: the only people worth paying for</td><td>😌 <b>Sure things</b>: the offer is wasted money</td></tr>
+    <tr><td><b>Leaves if offered</b></td><td>🚪 <b>Lost causes</b>: already decided; high propensity, no uplift</td><td class="lo">🐕 <b>Sleeping dogs</b>: the offer reminds them to cancel</td></tr>
+  </table>
+  <p>Targeting by propensity fills your list with lost causes. Eva Ascarza showed exactly this with two field experiments (“Retention Futility: Targeting High-Risk Customers Might Be Ineffective”, <i>Journal of Marketing Research</i>, 2018): the highest-risk customers were not the best targets, and targeting by measured sensitivity to the offer worked significantly better. Estimating uplift needs a <b>randomized</b> test (some customers get the offer at random, some don't), then a model of the difference (Lesson 8.4).</p>
+
+  <div class="predict" data-answer="1">
+    <span class="label">🔮 Predict first</span>
+    <p>You have 1,000 offers ($20 each) for 10,000 customers; keeping a customer is worth $300. Who should get them?</p>
+    <div class="choices"><button>The 1,000 most likely to churn</button><button>The 1,000 with the highest estimated uplift (mostly medium-risk)</button><button>1,000 at random: models are overrated</button></div>
+    <div class="reveal">On the playground's customers, the top-risk list contains <b>858 future churners</b> but keeps only <b>25</b> of them (net <b>−$12,503</b>), because most are lost causes. The uplift list keeps <b>196</b> (net <b>+$38,903</b>); even random targeting (74 kept, +$2,195) beats “highest risk”.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Spend a retention budget</span>
+    <p class="hint">10,000 synthetic customers. Each has a churn risk and a hidden true uplift (how much the offer lowers their risk; a few are sleeping dogs with negative uplift). Rank them by a <b>noisy</b> risk model, by a <b>noisy</b> uplift model (estimated from a past A/B test), or at random, then send offers down the list.</p>
+    <div class="controls">
+      <span class="seg" id="rule"><button data-v="risk" class="on">Highest risk first</button><button data-v="uplift" id="ruleUp">Highest uplift first</button><button data-v="random">Random</button></span>
+      <span class="goal" id="cGoal">🎯 Goal: net value above $75,000</span>
+    </div>
+    <div class="controls">
+      <label>offers sent <span class="bd">K</span> <input type="range" id="kk" min="0" max="10000" step="50" value="1000"> <b class="mono" id="kkv"></b></label>
+      <label>cost per offer <input type="range" id="oc" min="5" max="60" step="1" value="20"> <b class="mono" id="ocv"></b></label>
+      <label>value of a kept customer <input type="range" id="cv" min="100" max="600" step="10" value="300"> <b class="mono" id="cvv"></b></label>
+    </div>
+    <canvas class="chart" id="netChart" style="height:230px"></canvas>
+    <div class="stat-row">
+      <div class="stat">future churners on the list <b id="cTg">–</b></div>
+      <div class="stat">customers kept (uplift) <b id="cSaved">–</b></div>
+      <div class="stat">money spent <b id="cSpend">–</b></div>
+      <div class="stat">net value <b id="cNet">–</b></div>
+    </div>
+    <table class="cmp" id="cCmp"></table>
+    <p class="hint" id="cMsg"></p>
+  </div>
+  <p>Two lessons hide in the curves. First, the risk list starts <b>negative</b>: the first few thousand offers go to lost causes, and the risk rule needs about 6,000 offers before it even turns a profit. Second, every curve eventually <b>turns down</b>: past some point you're paying sure things and sleeping dogs, so “send more offers” has an optimum, and on these numbers the uplift list peaks near <b>3,850 offers and about $80,000</b>.</p>
+
+  <h2>Case 3 · Ads click-through rate: probabilities that are spent</h2>
+  <p>An ad system shows an ad when it wins an auction, and a common ranking is <b>bid × predicted CTR</b> (click-through rate: clicks ÷ impressions). The predicted probability isn't a score to sort by; it's multiplied into money. A model that ranks perfectly but predicts every CTR twice too high makes the system overvalue ads against everything else it could show and price them wrong. So the CTR design is about <b>calibrated probabilities at enormous scale</b>.</p>
+  <div class="cases">
+    <div class="case"><h4>🎯 Goal and metric</h4><p>Offline: <b>log loss</b> and <b>normalized cross-entropy</b> (NE), plus <b>calibration</b> = average predicted CTR ÷ observed CTR (want 1.0). Online: an A/B test on revenue, advertiser value and user experience.</p></div>
+    <div class="case"><h4>🏷️ Labels</h4><p>Fast and plentiful: a click within some window after the impression. Billions a day, heavily imbalanced, and shaped by position (the top slot gets clicked more for being on top).</p></div>
+    <div class="case"><h4>🧮 Features</h4><p>Huge sparse categoricals (ad id, advertiser, query words, user segments) and their <b>crosses</b> (ad × country), plus <b>historical</b> CTRs of this ad and this user so far.</p></div>
+    <div class="case"><h4>⚡ Serving</h4><p>Score hundreds of candidate ads per request in milliseconds; retrain constantly because new ads and trends appear every day.</p></div>
+  </div>
+
+  <h3>Normalized cross-entropy: log loss you can compare</h3>
+  <p>Log loss depends heavily on the base rate: predicting a 2% event is “easier” than a 50% one, so a log loss of 0.08 means little on its own. Facebook's 2014 paper divides it by the log loss of a dumb model that always predicts the <b>background CTR</b>:</p>
+  <div class="eq">NE = <span class="lo">average log loss of the model</span> ⁄ <span class="lo">log loss of always predicting the base CTR</span>
+    <span class="say">“How much of the uncertainty the base rate leaves does the model remove? 1.0 means nothing; lower is better.”</span></div>
+  <p class="muted">The denominator is the entropy of the base CTR, H(p) = −p ln p − (1 − p) ln(1 − p) (<a href="../../math-course/phase6/2-entropy.html">Math 6.2</a>). Google's 2013 paper makes the same point from the other side: they always report <b>relative changes</b> against a baseline on exactly the same data, because absolute log loss moves with click rates that differ by country and hour.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: NE and the downsampling fix by hand</span>
+    <ul>
+      <li>Base CTR 2%: H = −0.02 ln 0.02 − 0.98 ln 0.98 = 0.0782 + 0.0198 = <b>0.0980</b> nats per impression.</li>
+      <li>Your model's log loss is 0.0900 → NE = 0.0900 ÷ 0.0980 = <b>0.918</b>: it removes about 8% of the uncertainty. In ads that's a decent model; Facebook calls a relative NE gain of a few tenths of a percent a typical feature-engineering win.</li>
+      <li>To cut training cost you keep every click but only <span class="bd">w = 1%</span> of non-clicks. A true CTR of 0.1% now looks like 0.001 ÷ (0.001 + 0.999 × 0.01) = <b>9.1%</b> in the training data, so the model learns to say about 9%.</li>
+      <li>Fix it at serving time with Facebook's formula q = p ⁄ (p + (1 − p) ⁄ w): 0.091 ⁄ (0.091 + 0.909 ⁄ 0.01) = <b>0.001</b>. Back to 0.1%.</li>
+    </ul>
+  </div>
+
+  <div class="predict" data-answer="0">
+    <span class="label">🔮 Predict first</span>
+    <p>Your CTR model predicts exactly <b>twice</b> the true probability for every impression. You multiply every prediction by 0.5. What happens to AUC and to NE?</p>
+    <div class="choices"><button>AUC unchanged, NE improves</button><button>Both improve</button><button>Neither changes: it's the same model</button></div>
+    <div class="reveal">Multiplying by a constant keeps the <b>order</b> of the predictions, so AUC can't move (0.846 in the playground). Log loss cares about the <b>values</b>: NE drops from <b>0.893 to 0.803</b>. Facebook's paper uses this very example to explain why NE reflects calibration and AUC doesn't.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Calibration, NE and downsampling</span>
+    <p class="hint">A synthetic population of impressions. <b>Signal</b> is how much the features really tell you (the spread of true log-odds). The <span class="bd">multiplier</span> distorts the model's predictions; it starts at 2×, a model that overpredicts. The plot compares predicted CTR with actual CTR in 10 groups of impressions (a reliability diagram): on the diagonal = calibrated.</p>
+    <div class="controls">
+      <label>base CTR <input type="range" id="ctr" min="-3" max="-0.7" step="0.01" value="-1.70"> <b class="mono" id="ctrv"></b></label>
+      <label>signal <input type="range" id="sharp" min="0" max="3" step="0.1" value="1.5"> <b class="mono" id="sharpv"></b></label>
+      <label>prediction multiplier <span class="bd">m</span> <input type="range" id="mult" min="-2" max="2" step="0.05" value="1"> <b class="mono" id="multv"></b></label>
+      <span class="goal" id="nGoal">🎯 Goal: calibration within 1.00 ± 0.05</span>
+    </div>
+    <canvas class="chart" id="relChart" style="height:240px"></canvas>
+    <div class="stat-row">
+      <div class="stat">log loss <b id="nLL">–</b></div>
+      <div class="stat">base-rate log loss H <b id="nH">–</b></div>
+      <div class="stat">NE <b id="nNE">–</b></div>
+      <div class="stat">calibration <b id="nCal">–</b></div>
+      <div class="stat">AUC <b id="nAUC">–</b></div>
+    </div>
+    <p class="hint" id="nMsg"></p>
+    <div class="controls">
+      <span class="hint">Negative downsampling: keep all clicks and a share <span class="bd">w</span> of non-clicks</span>
+      <span class="seg" id="ds"><button data-v="1">w = 1 (none)</button><button data-v="0.1">0.1</button><button data-v="0.025" class="on">0.025</button><button data-v="0.01">0.01</button></span>
+    </div>
+    <div class="stat-row">
+      <div class="stat">CTR the model trains on <b id="dTr">–</b></div>
+      <div class="stat">served without the fix <b id="dRaw">–</b></div>
+      <div class="stat">after q = p ⁄ (p + (1 − p) ⁄ w) <b id="dFix">–</b></div>
+    </div>
+  </div>
+  <p>Play with it: at base CTR 2% and signal 1.5, the calibrated model has log loss <b>0.079</b> and NE <b>0.803</b>. Raise the base CTR to 20%: log loss jumps to about <b>0.38</b> (five times worse-looking) while NE says the model got slightly <i>better</i> (0.766). That's why the absolute number is useless across markets and NE is not. At <span class="bd">w = 0.025</span> (the rate Facebook found worked best), a 2% CTR looks like <b>45%</b> during training: serve that without the fix and every bid is off by more than 20×.</p>
+
+  <h3>The model: trees for features, a linear model for speed and freshness</h3>
+  <p>Facebook's design concatenates two models. <b>Gradient-boosted decision trees</b> (GBDT, Lessons 4.3–4.4) are trained on the raw features; each tree's <b>leaf index</b> becomes a one-hot feature, so a 600-leaf forest turns every impression into a sparse vector of “which leaf in each tree”. A <b>logistic regression</b> (Lesson 2.3) on top learns a weight per leaf. The trees find interactions and thresholds; the linear model is cheap to retrain online as new clicks arrive.</p>
+  <svg id="gbdtFlow" role="img" aria-label="Pipeline: features go into boosted trees, leaf indices become one-hot features for logistic regression, whose prediction is recalibrated and sent to the auction"></svg>
+  <table>
+    <tr><th>Model (Facebook, 2014)</th><th>NE relative to trees only</th></tr>
+    <tr><td>Boosted trees only</td><td>100% (reference)</td></tr>
+    <tr><td>Logistic regression only</td><td>99.43%</td></tr>
+    <tr><td><b>Trees → logistic regression</b></td><td class="mt"><b>96.58%</b>: more than 3% better than either alone</td></tr>
+  </table>
+  <p>Three more lessons from the same paper shape the design. <b>Freshness</b>: models degrade day by day after training, and going from weekly to daily retraining cuts NE by about 1%. <b>Historical features dominate</b>: past CTR of the ad and the user beat contextual features like time of day; the top 10 features carry about half of the total importance. <b>Downsampling</b>: keeping a share of the non-clicks speeds training, but you must recalibrate. Google's paper took the other route, one giant <b>logistic regression</b> trained online with <b>FTRL-Proximal</b> (Follow The Regularized Leader, an online optimizer whose L1 penalty gives many exactly-zero weights) and <b>per-coordinate learning rates</b> (rare features get bigger steps), plus an isotonic <b>calibration layer</b> on top.</p>
+
+  <h3>Feature crosses and the hashing trick</h3>
+  <p>A linear model can't learn that “sports ad × user in Brazil” behaves differently unless you give it that combination as a feature: a <b>feature cross</b>. Crosses of high-cardinality columns explode (a million ads × 200 countries = 200 million columns). The <b>hashing trick</b> maps each feature string into a fixed number of buckets, <code>hash("ad=123|country=BR") mod 2²⁴</code>, so memory is bounded and new values need no vocabulary. The price is collisions, where unrelated features share a weight. It's a size-versus-accuracy dial, not free memory: Google reported that for them hashing couldn't go below several billion features without a measurable loss, so they kept interpretable unhashed features.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>scikit-learn</b> (1.9 as of late 2026): <code>TunedThresholdClassifierCV</code> picks the threshold that maximizes a business score by cross-validation (Lesson 5.5); <code>CalibratedClassifierCV</code> and <code>calibration_curve</code> fix and check calibration (Lesson 5.6); <code>FeatureHasher</code> does the hashing trick; <code>log_loss</code> gives you NE in one line. At ad scale teams use Vowpal Wabbit, XGBoost/LightGBM and deep learning frameworks; uplift has <code>scikit-uplift</code> and <code>causalml</code> (Lesson 8.4).</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+<span class="k">from</span> sklearn.datasets <span class="k">import</span> make_classification
+<span class="k">from</span> sklearn.ensemble <span class="k">import</span> HistGradientBoostingClassifier
+<span class="k">from</span> sklearn.metrics <span class="k">import</span> confusion_matrix, log_loss, make_scorer
+<span class="k">from</span> sklearn.model_selection <span class="k">import</span> TunedThresholdClassifierCV, train_test_split
+
+<span class="c"># 1% positives, like a (generous) fraud problem</span>
+X, y = make_classification(n_samples=<span class="n">20_000</span>, n_features=<span class="n">20</span>, n_informative=<span class="n">6</span>,
+                           weights=[<span class="n">0.99</span>], class_sep=<span class="n">0.8</span>, random_state=<span class="n">0</span>)
+X_tr, X_te, y_tr, y_te = train_test_split(X, y, test_size=<span class="n">0.3</span>, stratify=y, random_state=<span class="n">0</span>)
+
+<span class="k">def</span> cost(y, y_pred, c_fn=<span class="n">150</span>, c_fp=<span class="n">10</span>):        <span class="c"># $150 per missed fraud, $10 per false alarm</span>
+    tn, fp, fn, tp = confusion_matrix(y, y_pred, labels=[<span class="n">0</span>, <span class="n">1</span>]).ravel()
+    <span class="k">return</span> c_fn * fn + c_fp * fp
+
+gbm = HistGradientBoostingClassifier(random_state=<span class="n">0</span>)
+tuned = TunedThresholdClassifierCV(gbm, scoring=make_scorer(cost, greater_is_better=<span class="k">False</span>), cv=<span class="n">5</span>).fit(X_tr, y_tr)
+p = tuned.estimator_.predict_proba(X_te)[:, <span class="n">1</span>]
+<span class="k">print</span>(<span class="s">f"tuned threshold {tuned.best_threshold_:.3f}"</span>)
+<span class="k">print</span>(<span class="s">f"cost at 0.5: ${cost(y_te, p >= 0.5)}   tuned: ${cost(y_te, tuned.predict(X_te))}"</span>)
+
+<span class="c"># Calibration and normalized cross-entropy (NE), as in the Facebook CTR paper</span>
+<span class="k">print</span>(<span class="s">f"calibration (avg predicted / avg observed) {p.mean() / y_te.mean():.2f}"</span>)
+ne = log_loss(y_te, p) / log_loss(y_te, np.full_like(p, y_tr.mean()))
+<span class="k">print</span>(<span class="s">f"NE {ne:.3f}  (1.0 = no better than predicting the base rate)"</span>)</code></pre>
+    <p class="hint">On our runs the tuned threshold came out near <b>0.05</b> (theory for calibrated scores: 10/160 = 0.0625) and cut the test cost by about a quarter to a third versus 0.5; exact numbers differ a little between scikit-learn versions. The calibration ratio printed well below 1 (0.6–0.7): a reminder to <i>check</i> calibration before trusting a cost formula, and to fix it with <code>CalibratedClassifierCV</code> if needed.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Fraud: block vs send to review</td><td>Review catches fraud without insulting good customers</td><td>Analyst time per case; adds delay; review capacity caps how low the threshold can go</td></tr>
+      <tr><td>Fraud: real-time velocity features</td><td>The strongest signals (bursts, card testing)</td><td>A streaming feature store; training–serving skew if batch and stream logic differ</td></tr>
+      <tr><td>Churn: uplift vs propensity</td><td>Spends the budget where it changes outcomes</td><td>Needs randomized experiments and more data; uplift is noisier to estimate</td></tr>
+      <tr><td>CTR: trees → logistic regression</td><td>Interactions from trees, cheap online updates of the linear layer</td><td>Two models to train and keep in sync; trees go stale between retrains</td></tr>
+      <tr><td>CTR: feature hashing</td><td>Bounded memory, no vocabulary, handles new ids</td><td>Collisions; uninterpretable weights; may lose accuracy at small table sizes</td></tr>
+      <tr><td>Negative downsampling</td><td>Much faster training on billions of rows</td><td>Predictions must be recalibrated; too aggressive a rate hurts NE</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p><b>Fraud</b>: use your payment provider's built-in tool plus a few rules; add a gradient-boosted model when you have a few hundred labelled frauds. <b>Churn</b>: a simple propensity model and a <b>random holdout</b> on every campaign, so next quarter you can measure uplift. <b>Ads</b>: you probably buy ads rather than sell them; if you rank anything, logistic regression on counts and crosses goes a long way.</p></div>
+      <div><h4>At scale</h4><p>Streaming feature platforms for velocity and graph features, dedicated label pipelines that wait for disputes to mature, uplift models refreshed from always-on experiments, and CTR models retrained daily or online with calibration layers, all monitored per slice (country, device, advertiser). Stripe moved Radar from an XGBoost + neural network ensemble to a neural network only, partly to retrain faster.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Design a fraud detection system for a payments company.” A strong answer:</p>
+    <ul>
+      <li>Starts with the <b>decision and the costs</b>: allow / review / block, the dollar cost of each mistake, and a threshold set from them (p* = c<sub>FP</sub> ⁄ (c<sub>FP</sub> + c<sub>FN</sub>) for calibrated scores), not 0.5 and not accuracy.</li>
+      <li>Explains the <b>labels</b>: chargebacks arrive over months, blocked payments are never labelled; time-based validation on matured data and a small exploration slice.</li>
+      <li>Names <b>features</b> computed as of event time: velocity, deviation from the customer's history, graph links between cards, devices and accounts.</li>
+      <li>Gives the <b>serving</b> plan: online scoring inside a ~100 ms budget, a rules layer, a fast store for counters, fallbacks if the model is down.</li>
+      <li>Ends with <b>monitoring</b>: fraudsters adapt, so track score distributions, block rate, review queue size and matured precision/recall weekly (Lesson 8.6). Swap “fraud” for churn and the same answer turns into uplift and experiments; for ads, into calibration and NE.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Stripe Radar</b> <span class="tag co">🏢 Stripe · 2023</span> <a href="https://stripe.com/blog/how-we-built-it-stripe-radar" target="_blank" rel="noopener">How we built it: Stripe Radar</a></div>
+      <p><b>How:</b> scores every payment on more than 1,000 characteristics in under 100 ms; features include payment velocity and how many cards an IP has used. In mid-2022 they replaced an XGBoost + deep neural network ensemble with a neural network only, cutting training time by over 85% to under two hours.</p>
+      <p><b>Why this method:</b> fraud is rare and adversarial, so speed of retraining and new features matter as much as the model; the business cost of blocking good payments is tracked as closely as missed fraud.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Disputes and their timing</b> <span class="tag co">🏢 Stripe docs</span> <a href="https://docs.stripe.com/disputes/how-disputes-work" target="_blank" rel="noopener">How disputes work</a></div>
+      <p><b>How:</b> card networks typically allow cardholders to dispute a payment within 120 days, sometimes longer.</p>
+      <p><b>Why this method:</b> that window is your label delay; a fraud model's “last month” of data is not fully labelled yet, which shapes validation and retraining.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Clicks at Facebook</b> <span class="tag res">🧪 Research · 2014</span> <a href="https://quinonero.net/Publications/predicting-clicks-facebook.pdf" target="_blank" rel="noopener">Practical Lessons from Predicting Clicks on Ads at Facebook (He et al., PDF)</a></div>
+      <p><b>How:</b> boosted trees transform features into leaf indices for an online logistic regression; evaluated with normalized entropy and calibration, with daily retraining and negative downsampling (best rate 0.025) followed by recalibration.</p>
+      <p><b>Why this method:</b> with over 750 million daily active users and over 1 million advertisers, the hybrid beat either model alone by more than 3% NE while keeping the linear part cheap to update.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Ad click prediction at Google</b> <span class="tag res">🧪 Research · 2013</span> <a href="https://research.google.com/pubs/archive/41159.pdf" target="_blank" rel="noopener">Ad Click Prediction: a View from the Trenches (McMahan et al., PDF)</a></div>
+      <p><b>How:</b> FTRL-Proximal logistic regression with per-coordinate learning rates over billions of features, probabilistic feature inclusion, 16-bit weights, relative metrics and a calibration layer.</p>
+      <p><b>Why this method:</b> predictions run many billions of times a day, so sparsity and memory are design constraints; the paper also lists ideas that didn't pay off for them (aggressive hashing, dropout, feature bagging).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The public fraud benchmark</b> <span class="tag res">🧪 Research · 2015</span> <a href="https://www.openml.org/d/1597" target="_blank" rel="noopener">Credit card fraud dataset (Dal Pozzolo et al., OpenML)</a></div>
+      <p><b>How:</b> 284,807 European card transactions over two days, 492 frauds (0.172%), features anonymized with PCA.</p>
+      <p><b>Why this method:</b> its accompanying paper is about calibrating probabilities after undersampling, the same fix as Facebook's: resampling changes the probability scale.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 16 bits were enough</span>
+    <p>Google stored its ad-model weights not as 64-bit floats but in a 16-bit fixed-point format called <b>q2.13</b> (a sign bit, two bits before the binary point, thirteen after). They saw <b>no measurable loss</b> in accuracy and saved <b>75%</b> of the memory for coefficients. Meanwhile Facebook noted that a typical feature-engineering experiment improves NE by a couple of tenths of a percent, which is why a 3% jump from adding trees was a big deal.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The fraud threshold is Lesson 5.5's threshold moving with real prices, scored with Lessons 5.3–5.4's precision–recall. CTR depends on calibration (5.6) and log loss (<a href="../../math-course/phase6/3-cross-entropy.html">Math 6.3: cross-entropy</a>); its trees are Lesson 4.4's boosters and its sparse categoricals Lesson 1.3's encodings. Churn uplift is Lesson 8.4's causal toolkit, measured with randomized experiments (<a href="../../math-course/phase5/5-ab-tests.html">Math 5.5: A/B tests</a>). Time-based validation is Lesson 7.1, and drift monitoring for adaptive fraudsters is Lesson 8.6. The framework behind all three is Lesson 9.1; Lesson 9.3 runs a whole project end to end.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://quinonero.net/Publications/predicting-clicks-facebook.pdf" target="_blank" rel="noopener">He et al. (2014): Practical Lessons from Predicting Clicks on Ads at Facebook</a>. Eight pages, very practical: NE, freshness, trees as features, downsampling.</li>
+      <li><span class="kind">Paper</span> <a href="https://research.google.com/pubs/archive/41159.pdf" target="_blank" rel="noopener">McMahan et al. (2013): Ad Click Prediction: a View from the Trenches</a>. The engineering side of a giant online logistic regression, including what didn't work.</li>
+      <li><span class="kind">Docs</span> <a href="https://scikit-learn.org/stable/auto_examples/model_selection/plot_cost_sensitive_learning.html" target="_blank" rel="noopener">scikit-learn: post-tuning the decision threshold for cost-sensitive learning</a>. A full worked example on credit and fraud data with <code>TunedThresholdClassifierCV</code>.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A missed fraud costs $200 and a manual review of a flagged payment costs $5. Your scores are calibrated. Roughly which threshold minimizes expected cost?</div>
+    <div class="opts"><button class="opt">0.5, the standard default</button><button class="opt" data-ok>About 0.024</button><button class="opt">About 0.976</button></div>
+    <div class="explain">Review when p × $200 &gt; (1 − p) × $5, so p* = 5 / (5 + 200) ≈ <b>0.024</b>. Cheap reviews and expensive misses push the threshold far below 0.5. 0.976 is the same fraction upside down (it would be right only if reviews cost 40× more than misses).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. The retention team sent a 20% discount to the 5% of customers with the highest predicted churn risk. A comparison with similar customers who got nothing shows almost no difference in churn. What's the best next step?</div>
+    <div class="opts"><button class="opt">Train a more accurate churn model, since the risk scores must be wrong</button><button class="opt" data-ok>Run a randomized test across risk levels and target by estimated uplift (who responds to the offer), not by risk</button><button class="opt">Double the discount for the same customers</button></div>
+    <div class="explain">The highest-risk customers are often lost causes: already leaving, whatever you offer (Ascarza, 2018). A better propensity model finds them even more precisely. Randomize who gets the offer, estimate the treatment effect per customer (Lesson 8.4), and spend the budget where it changes behaviour, as in Playground 2.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You evaluate a new fraud model on <b>last week's</b> payments and find its precision is much lower than on data from four months ago. What's the most likely explanation?</div>
+    <div class="opts"><button class="opt" data-ok>Labels haven't matured: many of last week's frauds haven't been disputed yet, so correctly flagged frauds count as false positives</button><button class="opt">The model is overfitting to recent data</button><button class="opt">Fraud suddenly became rarer last week</button></div>
+    <div class="explain">Chargebacks arrive over weeks to months (disputes are typically allowed within 120 days). On fresh data, true frauds still look legitimate, so precision looks worse than it is (and recall can look better). Evaluate on periods old enough for labels to have settled, with a time-based split (Lesson 7.1), and track label maturity explicitly.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Design from three questions: what mistakes cost, where and when labels come from, and how and how fast the score is used.</li>
+      <li>Fraud: rare, adversarial, late labels. Pick the threshold from costs (p* = c<sub>FP</sub> ⁄ (c<sub>FP</sub> + c<sub>FN</sub>) for calibrated scores), use velocity and graph features as of event time, serve online in ~100 ms.</li>
+      <li>Churn: define it, build features before a cutoff, and target by <b>uplift</b> measured with randomized tests, not by risk: high-risk customers are often lost causes.</li>
+      <li>Ads CTR: probabilities are spent in auctions, so judge by log loss, <b>NE</b> and calibration; trees → logistic regression, crosses or hashing, fresh retrains, and recalibrate after downsampling.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script src="../assets/ml.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const pct = (v, d = 0) => (100 * v).toFixed(d) + "%";
+  const usd = v => (v < 0 ? "−$" : "$") + Math.round(Math.abs(v)).toLocaleString("en-US");
+  const erf = x => { const s = Math.sign(x); x = Math.abs(x); const t = 1 / (1 + 0.3275911 * x);
+    return s * (1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x)); };
+  const Phi = z => 0.5 * (1 + erf(z / Math.SQRT2));
+  const logit = p => Math.log(p / (1 - p));
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+
+  /* ---------- Playground 1: threshold vs cost ----------
+     Model log-odds: legit z ~ N(0,1), fraud z ~ N(d,1), d = 3 (AUC 0.983). The calibrated probability is
+     logit P(fraud | z) = logit(rate) + d·z − d²/2, monotone in z, so a probability threshold maps to a z cut. */
+  const D = 3;
+  let rate = 0.005;
+  function fraudAt(t, cFN, cFP) {
+    const zs = (logit(t) - logit(rate) + D * D / 2) / D;
+    const tpr = 1 - Phi(zs - D), fpr = 1 - Phi(zs);
+    return { tpr, fpr, cost: 1000 * (rate * (1 - tpr) * cFN + (1 - rate) * fpr * cFP), prec: rate * tpr / (rate * tpr + (1 - rate) * fpr || 1) };
+  }
+  function bestFraud(cFN, cFP) { let b = { cost: Infinity, t: 0.5 }; for (let lt = -3; lt <= -0.05; lt += 0.002) { const t = 10 ** lt, r = fraudAt(t, cFN, cFP); if (r.cost < b.cost) b = { cost: r.cost, t }; } return b; }
+  function renderFraud() {
+    const t = 10 ** +$("thr").value, cFN = +$("cfn").value, cFP = +$("cfp").value, r = fraudAt(t, cFN, cFP), b = bestFraud(cFN, cFP), none = 1000 * rate * cFN;
+    $("thrv").textContent = t < 0.01 ? t.toFixed(4) : t.toFixed(3); $("cfnv").textContent = "$" + cFN; $("cfpv").textContent = "$" + cFP;
+    const n = 1e4;
+    $("cmTp").textContent = (n * rate * r.tpr).toFixed(0); $("cmFn").textContent = (n * rate * (1 - r.tpr)).toFixed(0);
+    $("cmFp").textContent = (n * (1 - rate) * r.fpr).toFixed(0); $("cmTn").textContent = (n * (1 - rate) * (1 - r.fpr)).toFixed(0);
+    $("fCost").textContent = usd(r.cost); $("fBestV").textContent = `${b.t.toFixed(3)} → ${usd(b.cost)}`; $("fNone").textContent = usd(none);
+    $("fPR").textContent = `${pct(r.prec)} · ${pct(r.tpr)}`;
+    const hit = r.cost <= b.cost * 1.01;
+    $("fGoal").classList.toggle("hit", hit);
+    $("fGoal").textContent = hit ? "🎯 Goal reached: within 1% of the minimum cost 🎉" : "🎯 Goal: cost within 1% of the minimum";
+    const xs = []; for (let lt = -3; lt <= -0.05; lt += 0.03) xs.push(lt);
+    const theory = cFP / (cFP + cFN);
+    Plot.line($("costChart"), {
+      series: [
+        { label: "expected cost", color: MX.css("--c-lo"), data: xs.map(lt => [lt, fraudAt(10 ** lt, cFN, cFP).cost]), width: 3 },
+        { label: "you", color: MX.css("--c-pd"), data: [[Math.log10(t), r.cost]], dots: true, width: 0.01 },
+      ],
+      hlines: [{ y: none, label: "block nothing", color: MX.css("--muted") }],
+      vlines: [{ x: Math.log10(theory), label: "p*", color: MX.css("--c-bd") }],
+      xLabel: "threshold (log scale)", yLabel: "$ per 1,000", yMin: 0, xMin: -3, xMax: -0.05, xTicks: [-3, -2, -1, Math.log10(0.5)], xFmt: v => +(10 ** v).toPrecision(1) + "",
+    });
+    const far = r.cost / b.cost;
+    $("fMsg").innerHTML = hit
+      ? `At ${t.toFixed(3)} you block payments above a ${pct(t, 1)} fraud chance: ${pct(r.tpr)} of fraud caught, ${(n * (1 - rate) * r.fpr).toFixed(0)} good payments blocked per 10,000. Most blocks are false alarms (precision ${pct(r.prec)}), and that's the cheapest place to be. The best threshold sits at the gold line, c_FP ⁄ (c_FP + c_FN).`
+      : t > b.t ? `Too timid: you only block above ${pct(t, 1)}, so ${(n * rate * (1 - r.tpr)).toFixed(0)} of every ${(n * rate).toFixed(0)} frauds per 10,000 slip through at ${usd(cFN)} each. Cost is ${far.toFixed(2)}× the minimum. Slide left.`
+      : `Too jumpy: ${(n * (1 - rate) * r.fpr).toFixed(0)} good payments blocked per 10,000 at ${usd(cFP)} each. Cost is ${far.toFixed(2)}× the minimum. Slide right.`;
+  }
+  ["thr", "cfn", "cfp"].forEach(id => ($(id).oninput = renderFraud));
+  seg("rate", v => { rate = +v; renderFraud(); });
+  $("fJump").onclick = () => { $("thr").value = Math.log10(bestFraud(+$("cfn").value, +$("cfp").value).t).toFixed(2); renderFraud(); };
+  $("fHalf").onclick = () => { $("thr").value = "-0.30"; renderFraud(); };
+  renderFraud();
+
+  /* ---------- Playground 2: retention budget (propensity vs uplift) ---------- */
+  const C = (() => { const r = ML.rng(9), out = [];
+    for (let i = 0; i < 10000; i++) {
+      r(); r();
+      const risk = Math.min(0.97, Math.max(0.01, Math.pow(r(), 1.8) * 0.95 + 0.02 * ML.randn(r)));
+      let up = 0.03 + 0.19 * Math.exp(-(((risk - 0.4) / 0.18) ** 2)) + 0.02 * ML.randn(r);   // persuadables sit at medium risk
+      up = Math.max(0, Math.min(up, 0.8 * risk));
+      if (r() < 0.06) up = -0.03 - 0.04 * r();                                                 // sleeping dogs
+      const est = up + 0.06 * ML.randn(r);                                                      // noisy uplift model
+      const riskHat = Math.min(0.99, Math.max(0.001, risk + 0.05 * ML.randn(r)));               // noisy churn model
+      out.push({ risk, up, est, riskHat });
+    }
+    return out; })();
+  const ORD = {
+    risk: ML.range(C.length).sort((a, b) => C[b].riskHat - C[a].riskHat),
+    uplift: ML.range(C.length).sort((a, b) => C[b].est - C[a].est),
+    random: ML.shuffle(ML.range(C.length), ML.rng(4)),
+  };
+  const CUM = {}, CUMR = {};
+  Object.keys(ORD).forEach(k => { let s = 0, sr = 0; CUM[k] = [0]; CUMR[k] = [0]; ORD[k].forEach(i => { s += C[i].up; sr += C[i].risk; CUM[k].push(s); CUMR[k].push(sr); }); });
+  const NAMES = { risk: "Highest risk first", uplift: "Highest uplift first", random: "Random" };
+  const COLR = { risk: "--c-lo", uplift: "--c-mt", random: "--muted" };
+  let rule = "risk";
+  function renderChurn() {
+    const K = +$("kk").value, c = +$("oc").value, V = +$("cv").value;
+    $("kkv").textContent = K.toLocaleString("en-US"); $("ocv").textContent = "$" + c; $("cvv").textContent = "$" + V;
+    const net = (k, n) => V * CUM[k][n] - c * n;
+    $("cTg").textContent = CUMR[rule][K].toFixed(0); $("cSaved").textContent = CUM[rule][K].toFixed(0);
+    $("cSpend").textContent = usd(c * K); $("cNet").textContent = usd(net(rule, K));
+    const rows = Object.keys(ORD).map(k => [k, net(k, K)]), bestK = rows.reduce((a, b) => (b[1] > a[1] ? b : a))[0], worstK = rows.reduce((a, b) => (b[1] < a[1] ? b : a))[0];
+    $("cCmp").innerHTML = `<tr><th>At ${K.toLocaleString("en-US")} offers</th><th>future churners on list</th><th>kept</th><th>net value</th></tr>` +
+      rows.map(([k, v]) => `<tr><td>${NAMES[k]}</td><td>${CUMR[k][K].toFixed(0)}</td><td>${CUM[k][K].toFixed(0)}</td><td class="${k === bestK ? "best" : k === worstK ? "worst" : ""}">${usd(v)}</td></tr>`).join("");
+    const xs = []; for (let n = 0; n <= 10000; n += 100) xs.push(n);
+    Plot.line($("netChart"), {
+      series: Object.keys(ORD).map(k => ({ label: NAMES[k], color: MX.css(COLR[k]), data: xs.map(n => [n, net(k, n) / 1000]), width: k === rule ? 3.5 : 1.8, dash: k === "random" ? [5, 4] : undefined })),
+      vlines: [{ x: K, label: "your budget", color: MX.css("--c-bd") }], hlines: [{ y: 0, label: "", color: MX.css("--line") }],
+      xLabel: "offers sent", yLabel: "net value ($ thousands)", xMin: 0, xMax: 10000,
+    });
+    const v = net(rule, K), hit = v >= 75000;
+    $("cGoal").classList.toggle("hit", hit);
+    $("cGoal").textContent = hit ? "🎯 Goal reached: net value above $75,000 🎉" : "🎯 Goal: net value above $75,000";
+    $("cMsg").innerHTML = K === 0 ? "No offers sent: nothing spent, nothing gained. Slide the budget up." :
+      rule === "risk" ? `Your list holds ${CUMR.risk[K].toFixed(0)} people who would churn, but the offer changes the mind of only ${CUM.risk[K].toFixed(0)}: the rest are lost causes. That's the propensity trap. Try the uplift ranking at the same budget.` :
+      rule === "uplift" ? `Fewer future churners on the list (${CUMR.uplift[K].toFixed(0)}), but ${CUM.uplift[K].toFixed(0)} actually kept: these are the persuadables. ${v < net("uplift", Math.min(10000, K + 500)) ? "More offers would still pay." : "Past the peak, extra offers reach sure things and sleeping dogs: net value falls."}` :
+      `Random targeting keeps ${CUM.random[K].toFixed(0)} customers for ${usd(c * K)}: the average uplift times the budget. It's the baseline every targeting model must beat, and the control group that lets you measure uplift at all.`;
+  }
+  ["kk", "oc", "cv"].forEach(id => ($(id).oninput = renderChurn));
+  seg("rule", v => { rule = v; renderChurn(); });
+  renderChurn();
+
+  /* ---------- Playground 3: calibration, NE and downsampling ---------- */
+  const sig = z => 1 / (1 + Math.exp(-z));
+  const H = p => -(p * Math.log(p) + (1 - p) * Math.log(1 - p));
+  const GN = 161, GZ = [], GW = [];
+  for (let i = 0; i < GN; i++) { const x = -5 + 10 * i / (GN - 1); GZ.push(x); GW.push(Math.exp(-x * x / 2)); }
+  const WS = GW.reduce((a, b) => a + b, 0); for (let i = 0; i < GN; i++) GW[i] /= WS;
+  let dsW = 0.025;
+  function ctrStats(base, s, m) {
+    let lo = -15, hi = 5;
+    for (let it = 0; it < 60; it++) { const a = (lo + hi) / 2; let mp = 0; for (let i = 0; i < GN; i++) mp += GW[i] * sig(a + s * GZ[i]); if (mp > base) hi = a; else lo = a; }
+    const a = (lo + hi) / 2, p = GZ.map(z => sig(a + s * z)), q = p.map(v => Math.min(0.999, Math.max(1e-6, m * v)));
+    let ll = 0, Eq = 0, Ep = 0, P = 0, N = 0;
+    p.forEach((pi, i) => { ll += GW[i] * (-pi * Math.log(q[i]) - (1 - pi) * Math.log(1 - q[i])); Eq += GW[i] * q[i]; Ep += GW[i] * pi; P += GW[i] * pi; N += GW[i] * (1 - pi); });
+    let num = 0;
+    for (let i = 0; i < GN; i++) for (let j = 0; j < GN; j++) { const w = GW[i] * p[i] * GW[j] * (1 - p[j]); if (q[i] > q[j]) num += w; else if (q[i] === q[j]) num += 0.5 * w; }
+    // reliability diagram: 10 groups with equal impression weight
+    const bins = []; let acc = 0, wq = 0, wp = 0, ww = 0, k = 1;
+    for (let i = 0; i < GN; i++) { acc += GW[i]; ww += GW[i]; wq += GW[i] * q[i]; wp += GW[i] * p[i];
+      if (acc >= k / 10 - 1e-9 || i === GN - 1) { bins.push([wq / ww, wp / ww]); wq = wp = ww = 0; k++; } }
+    return { ll, H: H(Ep), NE: ll / H(Ep), cal: Eq / Ep, auc: num / (P * N), bins };
+  }
+  function renderCtr() {
+    const base = 10 ** +$("ctr").value, s = +$("sharp").value, m = 2 ** +$("mult").value, r = ctrStats(base, s, m);
+    $("ctrv").textContent = pct(base, base < 0.01 ? 2 : 1); $("sharpv").textContent = s.toFixed(1); $("multv").textContent = m.toFixed(2) + "×";
+    $("nLL").textContent = r.ll.toFixed(4); $("nH").textContent = r.H.toFixed(4); $("nNE").textContent = r.NE.toFixed(3);
+    $("nCal").textContent = r.cal.toFixed(2); $("nAUC").textContent = s === 0 ? "0.500" : r.auc.toFixed(3);
+    const top = Math.max(...r.bins.map(b => Math.max(b[0], b[1]))) * 1.08;
+    Plot.line($("relChart"), {
+      series: [
+        { label: "perfect calibration", color: MX.css("--muted"), data: [[0, 0], [top, top]], dash: [5, 4] },
+        { label: "model: predicted vs actual CTR per group", color: MX.css("--c-pd"), data: r.bins.map(b => [b[0], b[1]]), dots: true, width: 2.5 },
+      ],
+      xLabel: "predicted CTR", yLabel: "actual CTR", xMin: 0, xMax: top, yMin: 0, yMax: top, xFmt: v => pct(v, top < 0.03 ? 1 : 0), yFmt: v => pct(v, top < 0.03 ? 1 : 0),
+    });
+    const hit = Math.abs(r.cal - 1) <= 0.05 && s > 0;
+    $("nGoal").classList.toggle("hit", hit);
+    $("nGoal").textContent = hit ? "🎯 Goal reached: calibrated 🎉" : "🎯 Goal: calibration within 1.00 ± 0.05";
+    $("nMsg").innerHTML = s === 0 ? "Signal 0: the features say nothing, so the best possible model predicts the base rate for everyone and NE is 1.0 at best. That's what NE's denominator measures." :
+      Math.abs(r.cal - 1) > 0.05 ? `The model ${r.cal > 1 ? "overpredicts" : "underpredicts"} by ${r.cal.toFixed(2)}×: the dots sit ${r.cal > 1 ? "below" : "above"} the diagonal. AUC is ${r.auc.toFixed(3)} whatever the multiplier (the order never changes), but NE is ${r.NE.toFixed(3)}. Slide the multiplier back toward 1×.` :
+      `Calibrated: the dots sit on the diagonal and NE is ${r.NE.toFixed(3)}, the best this signal allows. Now move the base CTR: log loss swings a lot, NE much less, which is why ad teams compare NE (or relative changes) across markets.`;
+    // negative downsampling at this base CTR
+    const tr = base / (base + (1 - base) * dsW), fix = tr / (tr + (1 - tr) / dsW);
+    $("dTr").textContent = pct(tr, 1); $("dRaw").textContent = `${pct(tr, 1)} (${(tr / base).toFixed(1)}× too high)`; $("dFix").textContent = pct(fix, base < 0.01 ? 2 : 1);
+  }
+  ["ctr", "sharp", "mult"].forEach(id => ($(id).oninput = renderCtr));
+  seg("ds", v => { dsW = +v; renderCtr(); });
+  renderCtr();
+
+  /* ---------- the GBDT → logistic regression diagram (static) ---------- */
+  const F = new Flow($("gbdtFlow"), { width: 760, height: 130 });
+  F.node("x", { x: 70, y: 65, w: 110, label: "Features", sub: "ad, user, context", kind: "ft" })
+   .node("t", { x: 210, y: 65, w: 120, label: "Boosted trees", sub: "retrained daily", kind: "mo" })
+   .node("l", { x: 355, y: 65, w: 120, label: "Leaf indices", sub: "one-hot, sparse", kind: "ft" })
+   .node("lr", { x: 500, y: 65, w: 120, label: "Logistic reg.", sub: "updated online", kind: "mo" })
+   .node("p", { x: 640, y: 40, w: 120, h: 40, label: "pCTR", sub: "recalibrated", kind: "pd" })
+   .node("m", { x: 640, y: 100, w: 120, h: 36, label: "NE, calibration", kind: "mt" })
+   .edge("x", "t").edge("t", "l").edge("l", "lr").edge("lr", "p").edge("lr", "m", { dashed: true }).render();
+})();
+</script>
+</body>
+</html>

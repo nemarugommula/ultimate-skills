@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9.4 Interpretability: saliency, probes, circuits, SAEs · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.bd { width: 100%; max-width: 340px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 10px; border: 1px solid var(--line); touch-action: none; }
+  canvas.hm { width: 100%; max-width: 340px; height: 150px; display: block; border-radius: 8px; border: 1px solid var(--line); }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .bars2 .nb span:first-child { width: 120px; }
+</style>
+</head>
+<body data-lesson="d9-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 9 · Lesson 4</div>
+  <h1>Interpretability: saliency, probes, circuits, SAEs</h1>
+  <p class="subtitle">A trained network is millions of numbers that work. Interpretability asks which inputs mattered, what the network knows inside, and which mechanism produced an answer. The tools range from a one-line gradient to dictionaries of millions of features pulled out of a frontier LLM.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>A <span class="gr">gradient</span> with respect to an <b>input</b> says how much the output changes if you nudge that input (<a href="../../math-course/phase3/3-gradients.html">math 3.3</a>); backprop computes it (Lesson 1.2).</li>
+      <li>Visualizing CNN filters and activations (Lesson 3.6); hidden layers hold <span class="ac">activations</span>, one number per neuron.</li>
+      <li>An <b>autoencoder</b> compresses then rebuilds its input (Lesson 7.1); L1 regularization pushes values to exactly zero (<a href="../../math-course/phase7/4-regularization.html">math 7.4</a>).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In May 2024, Anthropic found a direction inside Claude 3 Sonnet's activations that lights up for the <b>Golden Gate Bridge</b>: for the words, and for pictures of it. Then they turned that one feature up. For a day, the public could chat with “Golden Gate Claude”, which brought the bridge into nearly every answer. The feature was one of <b>34 million</b> that a <b>sparse autoencoder</b> pulled out of the model.</p>
+    <p>A year later, Anthropic traced how Claude 3.5 Haiku answers “the capital of the state containing Dallas”: inside, it represents “Texas” as an intermediate step before saying “Austin”. And when writing a rhyming couplet, it picks the rhyming word (“rabbit”) <b>before</b> it writes the line.</p>
+    <p><b>How do you look inside a network and find things like that, and how do you know the picture isn't fooling you?</b> You'll compute saliency maps and watch them fail a classic test, then pack 5 features into 2 neurons and pull them apart again with your own sparse autoencoder.</p>
+  </div>
+
+  <h2>Why look inside at all?</h2>
+  <p>Accuracy on a test set tells you <i>that</i> a model works, not <i>why</i>. The why matters when:</p>
+  <ul>
+    <li><b>It might be cheating.</b> A classifier can learn a hospital's watermark instead of the disease (a <b>spurious feature</b>). Test accuracy won't show it until it's deployed at a new hospital.</li>
+    <li><b>Someone needs a reason.</b> A doctor or a loan applicant asks which inputs drove the decision.</li>
+    <li><b>You want to fix or steer it.</b> Find the feature for “deception” or “bridge”, then monitor it or turn it down.</li>
+    <li><b>Safety.</b> For very capable models, “it passed our tests” isn't enough; you want to check the mechanism.</li>
+  </ul>
+  <table>
+    <tr><th>Question</th><th>Tool</th><th>Cost</th></tr>
+    <tr><td>Which input pixels or words mattered for this output?</td><td>Saliency maps, integrated gradients</td><td>one or a few backward passes</td></tr>
+    <tr><td>Does layer 12 “know” the sentiment / the part of speech / the depth?</td><td>Linear probes</td><td>train one linear layer</td></tr>
+    <tr><td>Which neurons and heads implement this behaviour?</td><td>Circuits (mechanistic interpretability)</td><td>weeks of careful analysis</td></tr>
+    <tr><td>What concepts does the model represent at all?</td><td>Sparse autoencoders (dictionary learning)</td><td>a training run on billions of activations</td></tr>
+  </table>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Interpretability methods answer different questions at different depths: <b>attribution</b> (which inputs mattered), <b>probing</b> (what's decodable inside), <b>mechanism</b> (which parts compute it) and <b>features</b> (what concepts exist). Every method can mislead, so each comes with a <b>sanity check</b>: does the explanation change when the model changes?
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: diagnosing a car</span>
+    <p>Saliency is pressing each pedal and seeing what the engine does. A probe is plugging a meter into a wire to see if it carries “speed”. Circuit analysis is tracing the wiring diagram from pedal to wheels. A sparse autoencoder is discovering that one bundle of wires actually carries 20 different signals multiplexed together, and building a demultiplexer to separate them.</p>
+  </div>
+
+  <h2>Saliency maps: ask the gradient</h2>
+  <p>The simplest explanation: take the gradient of the output score with respect to every input. Big gradient = “nudging this input would change the answer a lot”. For an image, plot |∂score/∂pixel| as a heat map: that's a <b>saliency map</b> (Simonyan, Vedaldi and Zisserman, 2013). One backward pass, any model.</p>
+  <p>Its weakness is in the name: a gradient is <b>local</b>. If the model is already 99.99% sure, the output is flat around the input (the sigmoid is saturated, Lesson 0.4), so every gradient is near zero, even for the inputs that made it sure. <b>Integrated gradients</b> (Sundararajan, Taly and Yan, 2017) fixes that: walk in a straight line from a <b>baseline</b> (a blank input) to the real input, average the gradient along the way, and multiply by how far each input moved. In words: “how much did each input contribute to the change from blank to here?” A nice guarantee, called <b>completeness</b>: the attributions add up exactly to output(input) − output(baseline).</p>
+  <div class="calc">IG<sub>i</sub> = (<span class="x">x<sub>i</sub></span> − baseline<sub>i</sub>) × average over the path of ∂output/∂<span class="x">x<sub>i</sub></span></div>
+  <p class="predict">🔮 <b>Predict:</b> a small network has learned “class 1 inside the circle”. Drag the probe far outside the circle, where the model is certain. Will the gradient say the inputs matter? Will integrated gradients?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Saliency and integrated gradients on a trained network</span>
+    <p class="hint">A 2 → 12 → 12 → 1 tanh network, trained live in your browser on the circle data (blue inside = class 1). Arrows show the input gradient ∂p/∂<span class="x">x</span> on a grid (bigger arrow = more sensitive). <b>Drag the white probe.</b> The star is the baseline (0, 0) for integrated gradients; the dashed line is the path IG integrates along.</p>
+    <div class="goals">
+      <span class="goal" id="gSat">🎯 Find a spot where the gradient is ~0 but IG says the inputs mattered</span>
+      <span class="goal" id="gX2">🎯 Find a spot where x₂ matters 3× more than x₁</span>
+      <span class="goal" id="gSan">🎯 Run the sanity check</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="sData"><button data-v="circle" class="on">Circle</button><button data-v="moons">Moons</button></span>
+      <button class="btn" id="sRand">🎲 Sanity check: randomize the weights</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="bd" id="sCan"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">probe <span class="x">x</span> <b class="mono" id="sX">–</b></div>
+          <div class="stat">p(class 1) <b class="y" id="sP">–</b></div>
+          <div class="stat">model <b id="sModel">trained</b></div>
+        </div>
+        <div class="hint">Gradient (saliency), size of ∂p/∂x<sub>i</sub>:</div>
+        <div class="netbars bars2" id="sG"></div>
+        <div class="hint">Integrated gradients, contribution of each input:</div>
+        <div class="netbars bars2" id="sIG"></div>
+        <div class="stat-row">
+          <div class="stat">IG₁ + IG₂ <b id="sSum">–</b></div>
+          <div class="stat">p(probe) − p(baseline) <b id="sDiff">–</b></div>
+          <div class="stat">grid points with |gradient| &lt; 0.01 <b class="dead" id="sTiny">–</b></div>
+        </div>
+        <p class="hint" id="sMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> the arrows live only on a thin ring at the boundary; on the circle data <b>85.4%</b> of the 144 arrow points have a gradient smaller than 0.01. Drag the probe to (1.1, 1.1): p ≈ 0, gradient about 10⁻⁸, so plain saliency says “nothing matters here”. Integrated gradients says x₁ contributed −0.76 and x₂ −0.24, and they add up to −1.00, exactly the drop from the baseline. At (0, 0.6), right on the boundary, the gradient for x₂ is about 2.3× that for x₁ (9.2 vs 4.0); move a little to find 3×. Now press 🎲: a network with random weights gives a completely different arrow field (the correlation between the two maps' arrow sizes is 0.08). That's what you <i>want</i>: an explanation that doesn't change when the model changes isn't explaining the model.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Saliency maps and integrated gradients</span></span>
+    <ol>
+      <li><b>The problem before</b> A CNN says “dog, 97%” and gives no reason. Visualizing filters (Lesson 3.6) shows what units like in general, not why <i>this</i> image got <i>this</i> label.</li>
+      <li><b>What people tried</b> Occlusion: grey out patches one by one and watch the score (honest but needs one forward pass per patch); deconvolution-based visualizations.</li>
+      <li><b>Why this works</b> The input gradient is the first-order answer to “which pixels would change the score?”, for the price of one backward pass. Integrated gradients sums gradients along a path from a baseline, so saturated inputs still get credit, and the credits add up to the change in output (−0.76 − 0.24 = −1.00 in your playground).</li>
+      <li><b>What it costs, when it fails</b> Raw gradients are noisy and vanish in saturated regions (85% of your grid). IG needs a baseline (black image? blurred image? the answer changes with it) and 20–300 backward passes. Worst of all, Adebayo et al.'s 2018 “Sanity Checks for Saliency Maps” found that some popular saliency methods produce nearly the same map after the model's weights are <b>randomized</b>, or after training on random labels: they were mostly showing edges in the image, not the model's reasoning.</li>
+      <li><b>What refined it</b> SmoothGrad (average gradients over noisy copies), Grad-CAM for CNNs (Lesson 3.6), the randomization sanity checks themselves as a standard test, and attention-based or circuit-based explanations for transformers (below).</li>
+    </ol>
+  </div>
+
+  <h2>Linear probes: what's written inside?</h2>
+  <p>Saliency looks at inputs. A <b>probe</b> looks at hidden layers. Freeze the network, collect its activations at some layer for many inputs, and train a <b>linear classifier</b> to predict a property (part of speech, sentiment, object depth, whether a sentence is true). If a straight line separates the classes, that information is <b>linearly decodable</b> at that layer. Alain and Bengio (2016) used probes to show that later layers of image networks make the class more and more linearly separable.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: probe size and a warning</span>
+    <p>A layer of a 7B-parameter LLM has 4,096 activations per token. A probe for “is this statement true?” is 4,096 weights + 1 bias = <b>4,097 parameters</b>, trained on a few thousand labelled sentences in seconds. Compare the model: 7,000,000,000 parameters. The probe is far too small to learn the task itself, so if it scores 90%, the information was already there.</p>
+    <p>The warning, from this lesson's PyTorch snippet: a probe on the first hidden layer of a small classifier decoded a <b>pure noise input</b> that the task never used with <b>97%</b> accuracy. “Decodable” does not mean “used”: the network just hadn't bothered to throw it away. To show a model <i>uses</i> a representation, intervene: change it and see if the output changes.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Linear probes</span></span>
+    <ol>
+      <li><b>The problem before</b> You can't read a 4,096-number activation vector by eye, and individual neurons rarely mean one clean thing.</li>
+      <li><b>What people tried</b> Looking at the top-activating examples for each neuron; non-linear (MLP) probes.</li>
+      <li><b>Why this works</b> A linear probe is so small that it can't compute much itself: success means the property is laid out along a direction in activation space. It's cheap (seconds), works at every layer, and tells you <b>where</b> in the network information appears. It's also how self-supervised features are scored (Lesson 9.1).</li>
+      <li><b>What it costs, when it fails</b> Decodable ≠ used (97% on a noise feature, above). A probe needs labelled data for each property and only finds properties you thought to ask about. A powerful non-linear probe can learn the task itself, so stay linear.</li>
+      <li><b>What refined it</b> Causal interventions (activation patching: copy an activation from another input and see what changes), steering vectors (add a direction to change behaviour), and unsupervised feature discovery with sparse autoencoders (below), which doesn't need you to know what to look for.</li>
+    </ol>
+  </div>
+
+  <h2>Circuits: reverse-engineering the mechanism</h2>
+  <p><b>Mechanistic interpretability</b> tries to explain a behaviour as an algorithm made of the network's own parts. The 2020 “Zoom In” article (Olah and colleagues, Distill) traced <b>curve detectors</b> in an image network back to the earlier edge detectors that build them, weight by weight.</p>
+  <p>The best-known transformer circuit is the <b>induction head</b> (Olsson et al., 2022). In words: “find the previous time the current token appeared, look at what came right after it, and predict that again”, completing the pattern [A][B] … [A] → [B]. If the text earlier said “Harry Potter” and now says “Harry”, an induction head boosts “Potter”. They are built from two attention heads working together, appear during training in a sudden <b>phase change</b> that coincides with a jump in in-context learning, and are a big part of how LLMs copy from their context (the thing state-space models struggle with, Lesson 9.3).</p>
+
+  <h2>Superposition: more features than neurons</h2>
+  <p>If every neuron meant one thing, interpretability would be easy: label the neurons. But many neurons are <b>polysemantic</b>: the same neuron fires for cat faces, car fronts and the letter “S”. Anthropic's <b>Toy Models of Superposition</b> (2022) explained why with a tiny experiment you can rerun below: ask a model to store 5 features in only 2 neurons. If features are <b>rarely active at the same time</b> (sparse), the model can cram them in at angles to each other and accept a little interference when two happen to be on together. Neurons then mix several features: polysemantic.</p>
+  <p class="predict">🔮 <b>Predict:</b> 5 features (feature 1 most important), 2 neurons. When every feature is usually on (sparsity 0), how many features will the model store? When each is on only 10% of the time (sparsity 0.9)?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Superposition, then a sparse autoencoder (a toy)</span>
+    <p class="hint"><b>Step 1.</b> The toy model: features <span class="x">x</span> (5 numbers, each zero with probability = sparsity) → <span class="ac">h</span> = <span class="w">W</span><span class="x">x</span> (2 neurons) → rebuild <span class="x">x</span>′ = ReLU(<span class="w">W</span>ᵀ<span class="ac">h</span> + b). Arrows are each feature's direction in the 2-neuron space (darker = more important). Set the sparsity and train.</p>
+    <div class="controls">
+      <label>sparsity <select id="uS" class="btn small"><option>0</option><option>0.5</option><option>0.7</option><option>0.8</option><option selected>0.9</option><option>0.95</option></select></label>
+      <button class="btn primary" id="uTrain">▶ Train toy model</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="bd" id="uCan"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">features stored (of 5) <b class="ac" id="uRep">–</b></div>
+          <div class="stat">smallest angle between stored features <b id="uAng">–</b></div>
+          <div class="stat">interference (largest positive cosine) <b class="dead" id="uOv">–</b></div>
+        </div>
+        <p class="hint">How each of the 2 neurons responds to each feature on its own (rows = features, columns = neurons):</p>
+        <canvas class="hm" id="uHeat"></canvas>
+        <p class="hint" id="uMsg"></p>
+      </div>
+    </div>
+    <p class="hint" style="margin-top:14px"><b>Step 2.</b> Take the sparse model (sparsity 0.9, all 5 features squeezed into 2 neurons) and train a <b>sparse autoencoder</b> on its 2-neuron activations: <span class="ac">f</span> = ReLU(<span class="w">W<sub>enc</sub></span><span class="ac">h</span> + b), rebuild <span class="ac">h</span> ≈ <span class="w">W<sub>dec</sub></span><span class="ac">f</span>, with an L1 penalty λ·Σ<span class="ac">f</span> that pushes most latents to exactly 0. A feature is <b>recovered</b> when it has its own latent; <b>interference</b> = how much of a feature's response leaks into other latents.</p>
+    <div class="goals"><span class="goal" id="gSAE">🎯 Recover all 5 features with &lt; 10% interference</span><span class="goal" id="gDead">🎯 Kill every latent with too much L1</span></div>
+    <div class="controls">
+      <label>dictionary size <select id="kS" class="btn small"><option>5</option><option>8</option><option>10</option></select></label>
+      <label>L1 strength λ <select id="lS" class="btn small"><option>0</option><option selected>0.1</option><option>0.3</option><option>0.5</option><option>1</option><option>2</option><option>3</option></select></label>
+      <button class="btn primary" id="kTrain">▶ Train the SAE</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">features recovered <b class="y" id="kRec">–</b></div>
+      <div class="stat">interference <b id="kInt">–</b></div>
+      <div class="stat">dead latents <b class="dead" id="kDead">–</b></div>
+    </div>
+    <canvas class="hm" id="kHeat" style="max-width:100%"></canvas>
+    <p class="hint" id="kMsg">Rows = the 5 true features, columns = SAE latents. A clean result looks like one bright cell per row, each in a different column.</p>
+  </div>
+  <p><b>What you should see</b> (seeded): at sparsity 0 the model stores just the <b>2</b> most important features, at right angles, and drops the rest. At 0.5–0.8 it stores <b>4</b>, as two opposite pairs at right angles (smallest angle about 90°, interference ≈ 0: ReLU and a negative bias cancel a feature pointing the opposite way). At 0.9 all <b>5</b> fit, as a <b>pentagon</b> (about 72° apart, interference about 0.3, since cos 72° = 0.31), the kinds of geometry the Anthropic paper reports (“digons, triangles, pentagons”). Each neuron now responds to several features: polysemantic. In step 2, a 5-latent SAE with λ = 0.1 is still muddled (4 recovered, 34% interference). A dictionary of 10 with λ = 1 gives <b>5 of 5, 0% interference</b>; 8 with λ = 0.5 also works (4%). Push λ to 3 and every latent dies. Real SAEs face the same trade: Anthropic's 34-million-latent SAE had about 65% dead latents.</p>
+  <p class="muted">This is a toy: 5 hand-made features in 2 dimensions. Real models are thought to pack far more features into thousands of dimensions; the toy just shows the geometry.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Sparse autoencoders (dictionary learning)</span></span>
+    <ol>
+      <li><b>The problem before</b> Neurons are polysemantic because of superposition (your pentagon: 5 features in 2 neurons), so labelling neurons fails, and probes only find concepts you already thought of.</li>
+      <li><b>What people tried</b> Studying single neurons and their top examples; PCA on activations (finds at most as many directions as dimensions, and they're dense mixtures).</li>
+      <li><b>Why this works</b> If the true features are sparse directions, learn an <b>overcomplete</b> set of directions (more latents than neurons) with an L1 penalty so each input is explained by only a few. Each latent then tends to be <b>monosemantic</b>. Anthropic's “Towards Monosemanticity” (2023) trained SAEs on a one-layer transformer's 512-neuron MLP layer, with 512 to 131,072 latents; “Scaling Monosemanticity” (2024) reached 34 million latents on Claude 3 Sonnet, finding abstract, multilingual and multimodal features (the Golden Gate Bridge, code bugs, deception), and showed that turning a feature up changes behaviour.</li>
+      <li><b>What it costs, when it fails</b> A big training run on billions of activations; dead latents (65% at 34M); the reconstruction is imperfect, so some of the model's computation is missed; latents can split one concept into many or merge several; labelling millions of latents needs automation. Your playground showed the λ knife-edge: too low is muddled, too high is dead.</li>
+      <li><b>What refined it</b> Transcoders and cross-layer transcoders that replace MLP layers with sparse, readable ones, and <b>attribution graphs</b> (2025) that chain features across layers into a circuit for a single prompt (below).</li>
+    </ol>
+  </div>
+
+  <h2>Attribution graphs: following one thought</h2>
+  <p>In March 2025 Anthropic published “circuit tracing”. They replace the model's MLP layers with a <b>cross-layer transcoder</b> (a sparse, interpretable stand-in trained to imitate them), then draw an <b>attribution graph</b>: which features caused which other features, from the prompt to the answer. Applied to Claude 3.5 Haiku, it showed the Dallas → Texas → Austin step, and that the model chooses a rhyming word before writing the line that ends with it.</p>
+  <p>Its authors are frank about the limits: they estimate the graphs gave “satisfying insight for about a quarter of the prompts” they tried, and their largest replacement model matched the real model's next token on about half of a test set. Interpretability in 2026 is a working microscope with a narrow field of view.</p>
+
+  <h2>Side by side</h2>
+  <table>
+    <tr><th>Method</th><th>Answers</th><th>Needs</th><th>Main pitfall</th></tr>
+    <tr><td>Saliency (gradient)</td><td>which inputs, locally</td><td>1 backward pass</td><td>saturation; may not depend on the model (sanity checks)</td></tr>
+    <tr><td>Integrated gradients</td><td>which inputs, with credits that add up</td><td>a baseline + 20–300 passes</td><td>baseline choice changes the answer</td></tr>
+    <tr><td>Linear probe</td><td>is X decodable at layer L?</td><td>labels for X</td><td>decodable ≠ used</td></tr>
+    <tr><td>Circuits</td><td>which parts compute it</td><td>lots of expert time</td><td>hard to scale; small models first</td></tr>
+    <tr><td>Sparse autoencoder</td><td>which concepts exist</td><td>a big training run</td><td>dead latents, imperfect reconstruction</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Captum</b> (PyTorch's attribution library: <code>Saliency</code>, <code>IntegratedGradients</code>, <code>LayerGradCam</code>), <b>TransformerLens</b> for poking at transformer internals, and open SAE suites and viewers (for example Neuronpedia) for features in open models. The core methods are a few lines of autograd:</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn
+
+torch.manual_seed(<span class="n">0</span>)
+X = torch.randn(<span class="n">2000</span>, <span class="n">4</span>)
+y = (X[:, <span class="n">0</span>] + <span class="n">0.5</span> * X[:, <span class="n">1</span>] &gt; <span class="n">0</span>).long()        <span class="c"># features 2 and 3 are pure noise</span>
+net = nn.Sequential(nn.Linear(<span class="n">4</span>, <span class="n">32</span>), nn.ReLU(), nn.Linear(<span class="n">32</span>, <span class="n">32</span>), nn.ReLU(), nn.Linear(<span class="n">32</span>, <span class="n">2</span>))
+opt = torch.optim.Adam(net.parameters(), lr=<span class="n">1e-2</span>)
+<span class="k">for</span> _ <span class="k">in</span> range(<span class="n">300</span>):
+    opt.zero_grad(); nn.functional.cross_entropy(net(X), y).backward(); opt.step()
+
+<span class="k">def</span> saliency(model, x, cls):                       <span class="c"># |d score / d input|</span>
+    x = x.clone().requires_grad_(<span class="k">True</span>)
+    model(x)[:, cls].sum().backward()
+    <span class="k">return</span> x.grad.abs().mean(<span class="n">0</span>)
+
+<span class="k">def</span> integrated_gradients(model, x, cls, steps=<span class="n">64</span>):  <span class="c"># (x − baseline) × average gradient on the path</span>
+    base = torch.zeros_like(x)
+    alphas = torch.linspace(<span class="n">0</span>, <span class="n">1</span>, steps)[:, <span class="k">None</span>, <span class="k">None</span>]
+    path = (base + alphas * (x - base)).requires_grad_(<span class="k">True</span>)       <span class="c"># steps × N × 4</span>
+    model(path.reshape(-<span class="n">1</span>, <span class="n">4</span>))[:, cls].sum().backward()
+    <span class="k">return</span> ((x - base) * path.grad.mean(<span class="n">0</span>)).abs().mean(<span class="n">0</span>)
+
+x = X[:<span class="n">200</span>]
+print(<span class="s">"saliency per feature:"</span>, saliency(net, x, <span class="n">1</span>).numpy().round(<span class="n">2</span>))
+print(<span class="s">"IG per feature:      "</span>, integrated_gradients(net, x, <span class="n">1</span>).numpy().round(<span class="n">2</span>))
+
+<span class="c"># sanity check (Adebayo et al.): a fresh, untrained network should give a different map</span>
+rand = nn.Sequential(nn.Linear(<span class="n">4</span>, <span class="n">32</span>), nn.ReLU(), nn.Linear(<span class="n">32</span>, <span class="n">32</span>), nn.ReLU(), nn.Linear(<span class="n">32</span>, <span class="n">2</span>))
+print(<span class="s">"saliency, random net:"</span>, saliency(rand, x, <span class="n">1</span>).numpy().round(<span class="n">2</span>))
+
+<span class="c"># linear probe: is a noise feature linearly readable from the first hidden layer?</span>
+<span class="k">with</span> torch.no_grad():
+    H = net[<span class="n">1</span>](net[<span class="n">0</span>](X))
+probe = nn.Linear(<span class="n">32</span>, <span class="n">2</span>); popt = torch.optim.Adam(probe.parameters(), lr=<span class="n">1e-2</span>)
+target = (X[:, <span class="n">2</span>] &gt; <span class="n">0</span>).long()                       <span class="c"># a noise feature the task never needed</span>
+<span class="k">for</span> _ <span class="k">in</span> range(<span class="n">300</span>):
+    popt.zero_grad(); nn.functional.cross_entropy(probe(H[:<span class="n">1500</span>]), target[:<span class="n">1500</span>]).backward(); popt.step()
+acc = (probe(H[<span class="n">1500</span>:]).argmax(<span class="n">1</span>) == target[<span class="n">1500</span>:]).float().mean().item()
+print(<span class="s">f"probe accuracy for a noise feature: {acc:.2f}"</span>)
+
+<span class="c"># What we got on a laptop CPU (torch 2.8):</span>
+<span class="c"># saliency per feature: [31.12 15.64  1.56  0.88]</span>
+<span class="c"># IG per feature:       [24.8  17.65  0.94  0.81]</span>
+<span class="c"># saliency, random net: [0.04 0.04 0.02 0.03]</span>
+<span class="c"># probe accuracy for a noise feature: 0.97</span></code></pre>
+    <p class="hint">Both attributions correctly rank features 0 and 1 far above the noise features, and the random network's map is completely different (it passes the sanity check). The probe line is the warning from the worked example: decodable is not the same as used.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Gradient saliency</td><td>Instant, any differentiable model</td><td>Noisy, saturates, can fail sanity checks</td></tr>
+      <tr><td>Integrated gradients</td><td>Credits sum to the output change; handles saturation</td><td>Baseline-dependent; 20–300× the cost</td></tr>
+      <tr><td>Linear probes</td><td>Cheap; shows where information lives</td><td>Correlational: decodable ≠ used; needs labels</td></tr>
+      <tr><td>SAEs / attribution graphs</td><td>Finds concepts you didn't know to look for; mechanisms for one prompt</td><td>Big compute; partial coverage (about a quarter of prompts); dead latents</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“A radiologist asks why your model flagged this X-ray. What can you show, and how much would you trust it?” A strong answer:</p>
+    <ul>
+      <li>Attribution: Grad-CAM or integrated gradients over the image, with the baseline stated; check that highlighted regions are anatomy, not text markers or rulers (spurious features).</li>
+      <li>Trust: run the randomization sanity check (maps must change when weights are randomized), and confirm with interventions: occlude the region and see the score drop.</li>
+      <li>Explain superposition and why individual neurons aren't labels; SAEs find more monosemantic features; probes show decodability, not use.</li>
+      <li>Honest limits: explanations are partial; pair them with calibration and out-of-distribution checks (Lesson 9.6).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Millions of features in a production LLM</b> <span class="tag co">🏢 Anthropic · 2024</span> <a href="https://transformer-circuits.pub/2024/scaling-monosemanticity/index.html" target="_blank" rel="noopener">Templeton et al.: Scaling Monosemanticity</a></div>
+      <p><b>How:</b> sparse autoencoders with about 1M, 4M and 34M latents trained on a middle layer of Claude 3 Sonnet.</p>
+      <p><b>Why this method:</b> superposition hides concepts from neuron-by-neuron analysis; dictionary learning recovered interpretable, steerable features, including the one behind <a href="https://www.anthropic.com/news/golden-gate-claude" target="_blank" rel="noopener">Golden Gate Claude</a>.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Tracing a model's reasoning step by step</b> <span class="tag co">🏢 Anthropic · 2025</span> <a href="https://transformer-circuits.pub/2025/attribution-graphs/biology.html" target="_blank" rel="noopener">Lindsey et al.: On the Biology of a Large Language Model</a></div>
+      <p><b>How:</b> attribution graphs over a cross-layer transcoder replacement of Claude 3.5 Haiku, checked by intervening on the features found.</p>
+      <p><b>Why this method:</b> SAEs list concepts but not how they connect; graphs showed multi-step reasoning (Dallas → Texas → Austin) and planning ahead in poems.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The circuit behind in-context copying</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://transformer-circuits.pub/2022/in-context-learning-and-induction-heads/index.html" target="_blank" rel="noopener">Olsson et al.: In-context Learning and Induction Heads</a></div>
+      <p><b>How:</b> traced pairs of attention heads that implement [A][B] … [A] → [B], and tracked when they form during training.</p>
+      <p><b>Why this method:</b> a mechanism you can point to explains a capability (in-context learning) better than any benchmark score.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The test every saliency method should pass</b> <span class="tag res">🧪 Research · 2018</span> <a href="https://arxiv.org/abs/1810.03292" target="_blank" rel="noopener">Adebayo et al.: Sanity Checks for Saliency Maps</a></div>
+      <p><b>How:</b> randomize the model's weights layer by layer, or train on random labels, and compare the maps.</p>
+      <p><b>Why this method:</b> it exposed that some widely used methods were “independent of both the data the model was trained on, and the model parameters”: pictures of edges, not explanations.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · features that dial up obsession</span>
+    <p>Golden Gate Claude wasn't a fine-tune or a prompt. Anthropic clamped one SAE feature to a high value inside the network, and the model started steering most conversations toward the bridge. It was available to the public on claude.ai for a short time in May 2024 as a demonstration that the features found by interpretability are causally real: change the feature, change the behaviour.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Input gradients are backprop run to the input (1.2, <a href="../../math-course/phase3/5-backprop.html">math 3.5</a>); saturation is the sigmoid story from 0.4; Grad-CAM and filter visualization are 3.6. SAEs are autoencoders (7.1) with L1 (<a href="../../math-course/phase7/4-regularization.html">math 7.4</a>). Induction heads live in attention (6.1, 6.2) and explain copying, the SSM weak spot (9.3). Probes are how SSL features are scored (9.1). Adversarial examples (9.5) are the dark twin of saliency: the same input gradient, used to attack. Responsible-AI practice around explanations: <a href="../../ai-engineer/phase8/5-responsible-ai.html">AI Engineer 8.5</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Interactive</span> <a href="https://transformer-circuits.pub/2022/toy_model/index.html" target="_blank" rel="noopener">Toy Models of Superposition</a>. The full version of your step-1 playground, with phase diagrams.</li>
+      <li><span class="kind">Paper</span> <a href="https://transformer-circuits.pub/2023/monosemantic-features/index.html" target="_blank" rel="noopener">Towards Monosemanticity</a>. The first big SAE study, with a feature browser.</li>
+      <li><span class="kind">Article</span> <a href="https://distill.pub/2020/circuits/zoom-in/" target="_blank" rel="noopener">Zoom In: An Introduction to Circuits</a>. Curve detectors and the case for reverse-engineering networks.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Integrated gradients with a black-image baseline gives a cat photo's pixels attributions summing to 0.62. The model says p(cat) = 0.71 for the photo. What must p(cat) be for the black image?</div>
+    <div class="opts"><button class="opt">0.62</button><button class="opt" data-ok>0.09</button><button class="opt">1.33</button></div>
+    <div class="explain">Completeness: the attributions add up to output(input) − output(baseline). 0.71 − p(black) = 0.62, so p(black) = 0.09. If your IG numbers don't satisfy this, you used too few integration steps.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your team's new saliency method produces beautiful, sharp maps. After you randomize all the model's weights, the maps look almost the same. What does that tell you?</div>
+    <div class="opts"><button class="opt">The method is robust, which is good</button><button class="opt" data-ok>The method fails the sanity check: it's mostly showing structure in the image (like edges), not what the model computes, so it can't explain the model</button><button class="opt">The randomization didn't work; the weights must have been restored</button></div>
+    <div class="explain">Adebayo et al. proposed exactly this test. An explanation of a model must depend on the model. If randomizing the parameters (or training on random labels) leaves the map unchanged, the map is driven by the input alone, however nice it looks.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A layer has 512 neurons, and analysis suggests the model represents thousands of distinct concepts there. Most neurons respond to several unrelated things. Which approach is designed for this?</div>
+    <div class="opts"><button class="opt">Label each of the 512 neurons by its top examples</button><button class="opt">Run PCA and keep the top 512 directions</button><button class="opt" data-ok>Train a sparse autoencoder with many more latents than neurons and an L1 penalty, so each latent captures one (more monosemantic) feature</button></div>
+    <div class="explain">That's superposition: more features than neurons, stored as sparse, non-orthogonal directions, so neurons are polysemantic. PCA finds at most 512 dense directions. An overcomplete, sparse dictionary can pull thousands apart, as in Towards Monosemanticity (512 neurons, up to 131,072 latents).</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Saliency = input gradient: one backward pass, but local, noisy and blind where the model is saturated. Integrated gradients averages along a path from a baseline; credits add up to the output change.</li>
+      <li>Always run the <b>sanity check</b>: randomize the weights; a real explanation must change.</li>
+      <li>Linear probes show what's linearly decodable at a layer; decodable ≠ used (intervene to show use).</li>
+      <li>Circuits explain mechanisms (curve detectors, induction heads [A][B]…[A]→[B]). Superposition packs more features than neurons, making neurons polysemantic.</li>
+      <li>Sparse autoencoders (overcomplete + L1) recover monosemantic features: 34M in Claude 3 Sonnet, Golden Gate Claude; 2025 attribution graphs chain them into circuits, for about a quarter of prompts.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const sci = v => (Math.abs(v) >= 0.01 || v === 0 ? v.toFixed(3) : v.toExponential(1));
+
+  /* ---------- 1. saliency + integrated gradients ---------- */
+  function inputGrad(net, x) {
+    const { zs, as } = net.forward(x), Ls = net.layers, p = as[as.length - 1][0];
+    let delta = [p * (1 - p)];
+    for (let l = Ls.length - 1; l >= 0; l--) {
+      const L = Ls[l], prev = new Array(L.nIn).fill(0);
+      for (let j = 0; j < L.nOut; j++) for (let i = 0; i < L.nIn; i++) prev[i] += L.W[j * L.nIn + i] * delta[j];
+      if (l > 0) for (let i = 0; i < L.nIn; i++) prev[i] *= net.d(zs[l - 1][i], as[l][i]);
+      delta = prev;
+    }
+    return delta;
+  }
+  function ig(net, x, base, steps = 128) { const g = [0, 0]; for (let s = 1; s <= steps; s++) { const a = (s - 0.5) / steps, gg = inputGrad(net, [base[0] + a * (x[0] - base[0]), base[1] + a * (x[1] - base[1])]); g[0] += gg[0] / steps; g[1] += gg[1] / steps; } return [(x[0] - base[0]) * g[0], (x[1] - base[1]) * g[1]]; }
+  const R = 1.25, BASE = [0, 0];
+  let data, trained, randNet, useRand = false, probe = [0, 0.6], dragging = false;
+  function sTrain(name) { data = NN.data[name](200); trained = new NN.MLP({ sizes: [2, 12, 12, 1], act: "tanh", out: "sigmoid", init: "xavier", seed: 1 }); for (let t = 0; t < 400; t++) trained.train(data, { lr: 0.03, opt: "adam" }); randNet = new NN.MLP({ sizes: [2, 12, 12, 1], act: "tanh", out: "sigmoid", init: "xavier", seed: 99 }); }
+  const net = () => (useRand ? randNet : trained);
+  const bar = (label, v, mx, cls) => `<div class="nb"><span>${label}</span><div class="meterbar"><i style="width:${Math.min(100, 100 * Math.abs(v) / (mx || 1))}%;background:var(${cls})"></i></div><span>${sci(v)}</span></div>`;
+  function sDraw() {
+    const cv = $("sCan"), N = net();
+    NN.drawBoundary(cv, (x, y) => N.predict([x, y])[0], data, { range: R, res: 50 });
+    const { ctx, w, h } = NN.fit(cv), X = x => (x + R) / (2 * R) * w, Y = y => (R - y) / (2 * R) * h;
+    // gradient arrows
+    const G = 12, cells = [];
+    for (let i = 0; i < G; i++) for (let j = 0; j < G; j++) { const p = [-R + 2 * R * (i + 0.5) / G, -R + 2 * R * (j + 0.5) / G]; cells.push([p, inputGrad(N, p)]); }
+    const mx = Math.max(1e-12, ...cells.map(c => Math.hypot(...c[1])));
+    ctx.strokeStyle = css("--c-gr"); ctx.fillStyle = css("--c-gr"); ctx.lineWidth = 1.6;
+    cells.forEach(([p, g]) => { const m = Math.hypot(...g) / mx; if (m < 0.02) return; const L = 0.45 * (w / G) * Math.sqrt(m), ux = g[0] / Math.hypot(...g), uy = g[1] / Math.hypot(...g), x0 = X(p[0]), y0 = Y(p[1]), x1 = x0 + L * ux, y1 = y0 - L * uy;
+      ctx.beginPath(); ctx.moveTo(x0, y0); ctx.lineTo(x1, y1); ctx.stroke(); const a = Math.atan2(y1 - y0, x1 - x0); ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x1 - 5 * Math.cos(a - 0.5), y1 - 5 * Math.sin(a - 0.5)); ctx.lineTo(x1 - 5 * Math.cos(a + 0.5), y1 - 5 * Math.sin(a + 0.5)); ctx.fill(); });
+    // IG path, baseline, probe
+    ctx.setLineDash([5, 4]); ctx.strokeStyle = css("--text"); ctx.lineWidth = 1.5; ctx.beginPath(); ctx.moveTo(X(BASE[0]), Y(BASE[1])); ctx.lineTo(X(probe[0]), Y(probe[1])); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = css("--c-at"); ctx.font = "18px " + css("--font"); ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText("★", X(BASE[0]), Y(BASE[1]));
+    ctx.beginPath(); ctx.arc(X(probe[0]), Y(probe[1]), 8, 0, 7); ctx.fillStyle = "#fff"; ctx.fill(); ctx.lineWidth = 2.5; ctx.strokeStyle = "#111"; ctx.stroke();
+    // readouts
+    const g = inputGrad(N, probe), I = ig(N, probe, BASE), p = N.predict(probe)[0], pb = N.predict(BASE)[0];
+    const gm = Math.max(Math.abs(g[0]), Math.abs(g[1]), 1e-12), im = Math.max(Math.abs(I[0]), Math.abs(I[1]), 1e-12);
+    $("sX").textContent = `(${probe[0].toFixed(2)}, ${probe[1].toFixed(2)})`; $("sP").textContent = p.toFixed(4); $("sModel").innerHTML = useRand ? `<span class="dead">random weights</span>` : "trained";
+    $("sG").innerHTML = bar("∂p/∂x₁", g[0], gm, "--c-gr") + bar("∂p/∂x₂", g[1], gm, "--c-gr");
+    $("sIG").innerHTML = bar("IG₁", I[0], im, "--c-x") + bar("IG₂", I[1], im, "--c-x");
+    $("sSum").textContent = (I[0] + I[1]).toFixed(3); $("sDiff").textContent = (p - pb).toFixed(3);
+    $("sTiny").textContent = (100 * cells.filter(c => Math.hypot(...c[1]) < 0.01).length / cells.length).toFixed(1) + "%";
+    const gn = Math.hypot(...g);
+    if (!useRand && gn < 0.001 && Math.abs(I[0] + I[1]) > 0.5) win("gSat", true);
+    if (!useRand && gn > 0.1 && Math.abs(g[1]) >= 3 * Math.abs(g[0])) win("gX2", true);
+    $("sMsg").textContent = useRand ? "Random weights: a totally different arrow field. The explanation depends on the model, as it should. Press again to restore the trained net." :
+      gn < 0.001 && Math.abs(I[0] + I[1]) > 0.5 ? "Saturated: the gradient says nothing matters, yet IG shows these inputs moved the output from the baseline's value to here." :
+      gn > 0.1 ? "Near the boundary: small nudges change the answer, so the gradient is big." : "";
+  }
+  const toData = e => { const r = $("sCan").getBoundingClientRect(); return [-R + 2 * R * (e.clientX - r.left) / r.width, R - 2 * R * (e.clientY - r.top) / r.height]; };
+  $("sCan").addEventListener("pointerdown", e => { dragging = true; $("sCan").setPointerCapture(e.pointerId); probe = toData(e); sDraw(); e.preventDefault(); });
+  $("sCan").addEventListener("pointermove", e => { if (dragging) { probe = toData(e).map(v => Math.max(-R, Math.min(R, v))); sDraw(); } });
+  $("sCan").addEventListener("pointerup", () => (dragging = false));
+  seg("sData", v => { useRand = false; $("sRand").textContent = "🎲 Sanity check: randomize the weights"; sTrain(v); sDraw(); });
+  $("sRand").onclick = () => { useRand = !useRand; if (useRand) win("gSan", true); $("sRand").textContent = useRand ? "↺ Back to the trained network" : "🎲 Sanity check: randomize the weights"; sDraw(); };
+  sTrain("circle"); sDraw();
+
+  /* ---------- 2. superposition toy + SAE ---------- */
+  const NF = 5, IMP = Array.from({ length: NF }, (_, i) => Math.pow(0.9, i));
+  function makeToy(S, seed = 1) {
+    const r = NN.rng(seed), W = Array.from({ length: 2 }, () => Array.from({ length: NF }, () => 0.3 * r.n()));
+    return { S, r, W, b: new Array(NF).fill(0), opt: NN.optim("adam", { lr: 0.05 }), Wf: new Float64Array(2 * NF), bf: new Float64Array(NF), t: 0 };
+  }
+  function toySteps(T, n) {
+    const { r, W, b, S } = T;
+    for (let it = 0; it < n; it++) {
+      const gW = new Float64Array(2 * NF), gb = new Float64Array(NF), B = 128;
+      for (let s = 0; s < B; s++) {
+        const x = Array.from({ length: NF }, () => (r.u() < S ? 0 : r.u()));
+        const h = [0, 1].map(k => W[k].reduce((a, w, i) => a + w * x[i], 0));
+        const pre = Array.from({ length: NF }, (_, i) => W[0][i] * h[0] + W[1][i] * h[1] + b[i]);
+        const d = pre.map((v, i) => (v > 0 ? 2 * IMP[i] * (v - x[i]) : 0));
+        const dh = [0, 1].map(k => d.reduce((a, di, i) => a + di * W[k][i], 0));
+        for (let k = 0; k < 2; k++) for (let i = 0; i < NF; i++) gW[k * NF + i] += d[i] * h[k] + dh[k] * x[i];
+        for (let i = 0; i < NF; i++) gb[i] += d[i];
+      }
+      for (let k = 0; k < 2; k++) for (let i = 0; i < NF; i++) T.Wf[k * NF + i] = W[k][i];
+      gW.forEach((v, i) => (gW[i] = v / B)); gb.forEach((v, i) => (gb[i] = v / B)); T.bf.set(b);
+      T.opt.tick(); T.opt.step(T.Wf, gW, "W"); T.opt.step(T.bf, gb, "b");
+      for (let k = 0; k < 2; k++) for (let i = 0; i < NF; i++) W[k][i] = T.Wf[k * NF + i]; for (let i = 0; i < NF; i++) b[i] = T.bf[i];
+      T.t++;
+    }
+  }
+  let toy = makeToy(0.9);
+  function uDraw() {
+    const { ctx, w, h } = NN.fit($("uCan")), cx = w / 2, cy = h / 2, sc = w * 0.33;
+    ctx.clearRect(0, 0, w, h); ctx.fillStyle = css("--bg2"); ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = css("--line"); ctx.lineWidth = 1; ctx.beginPath(); ctx.moveTo(10, cy); ctx.lineTo(w - 10, cy); ctx.moveTo(cx, 10); ctx.lineTo(cx, h - 10); ctx.stroke();
+    ctx.fillStyle = css("--muted"); ctx.font = "11px " + css("--font"); ctx.fillText("neuron 1 →", w - 72, cy - 6); ctx.fillText("neuron 2 ↑", cx + 6, 18);
+    const cols = Array.from({ length: NF }, (_, i) => [toy.W[0][i], toy.W[1][i]]), norms = cols.map(c => Math.hypot(...c));
+    cols.forEach((c, i) => { const x1 = cx + sc * c[0], y1 = cy - sc * c[1]; ctx.globalAlpha = 0.35 + 0.65 * IMP[i]; ctx.strokeStyle = css("--c-ac"); ctx.fillStyle = css("--c-ac"); ctx.lineWidth = 3;
+      ctx.beginPath(); ctx.moveTo(cx, cy); ctx.lineTo(x1, y1); ctx.stroke(); ctx.beginPath(); ctx.arc(x1, y1, 4, 0, 7); ctx.fill();
+      ctx.globalAlpha = 1; ctx.fillStyle = css("--text"); ctx.font = "bold 12px " + css("--mono"); ctx.fillText("f" + (i + 1), x1 + (c[0] >= 0 ? 6 : -22), y1 + (c[1] >= 0 ? -6 : 14)); });
+    ctx.globalAlpha = 1;
+    const rep = norms.map((v, i) => (v > 0.5 ? i : -1)).filter(i => i >= 0);
+    let ov = 0, ang = 180; rep.forEach(i => rep.forEach(j => { if (i < j) { const c = (cols[i][0] * cols[j][0] + cols[i][1] * cols[j][1]) / (norms[i] * norms[j]); ov = Math.max(ov, c); ang = Math.min(ang, Math.acos(Math.max(-1, Math.min(1, c))) * 180 / Math.PI); } }));
+    $("uRep").textContent = `${rep.length} / 5`; $("uOv").textContent = rep.length > 1 ? ov.toFixed(2) : "–"; $("uAng").textContent = rep.length > 1 ? ang.toFixed(0) + "°" : "–";
+    NN.heat($("uHeat"), cols.map(c => c.map(v => +v.toFixed(2))), { cmap: "div", text: true, rowLabels: ["f1", "f2", "f3", "f4", "f5"], colLabels: ["neuron 1", "neuron 2"], padLeft: 30 });
+    $("uMsg").textContent = toy.t === 0 ? "Press ▶ Train toy model." : toy.t < 3000 ? `Training… step ${toy.t}` :
+      rep.length === 5 ? "All 5 features squeezed into 2 neurons: a pentagon. Every neuron now responds to several features (polysemantic)." :
+      rep.length === 2 ? "Dense features: only the 2 most important are stored, at right angles. The others are dropped." : `${rep.length} features stored, in opposite pairs: two features share a line, pointing opposite ways.`;
+  }
+  const uLoop = NN.loop(() => { toySteps(toy, 150); uDraw(); if (toy.t >= 3000) return false; }, { onStop: () => ($("uTrain").textContent = "▶ Train toy model") });
+  $("uTrain").onclick = () => { uLoop.stop(); toy = makeToy(+$("uS").value); uLoop.start(); $("uTrain").textContent = "⏸ Training…"; };
+  $("uS").onchange = () => { uLoop.stop(); toy = makeToy(+$("uS").value); uDraw(); };
+  uDraw();
+
+  let sparseW = null;
+  function trainSAE(W, k, lam, steps = 3000, seed = 1, S = 0.9) {
+    const r = NN.rng(seed), We = new Float64Array(k * 2).map(() => 0.5 * r.n()), be = new Float64Array(k), Wd = new Float64Array(2 * k).map(() => 0.5 * r.n()), opt = NN.optim("adam", { lr: 0.02 });
+    const norm = () => { for (let j = 0; j < k; j++) { const a = Wd[j], b = Wd[k + j], l = Math.hypot(a, b) || 1; Wd[j] = a / l; Wd[k + j] = b / l; } };
+    norm();
+    for (let t = 0; t < steps; t++) {
+      const gWe = new Float64Array(k * 2), gbe = new Float64Array(k), gWd = new Float64Array(2 * k), B = 64;
+      for (let s = 0; s < B; s++) {
+        const x = Array.from({ length: NF }, () => (r.u() < S ? 0 : r.u())), h = [0, 1].map(q => W[q].reduce((a, w, i) => a + w * x[i], 0));
+        const pre = Array.from({ length: k }, (_, j) => We[j * 2] * h[0] + We[j * 2 + 1] * h[1] + be[j]), f = pre.map(v => Math.max(0, v));
+        const dr = [0, 1].map(q => 2 * (f.reduce((a, fj, j) => a + Wd[q * k + j] * fj, 0) - h[q]));
+        for (let q = 0; q < 2; q++) for (let j = 0; j < k; j++) gWd[q * k + j] += dr[q] * f[j];
+        for (let j = 0; j < k; j++) { if (pre[j] <= 0) continue; const df = dr[0] * Wd[j] + dr[1] * Wd[k + j] + lam; gWe[j * 2] += df * h[0]; gWe[j * 2 + 1] += df * h[1]; gbe[j] += df; }
+      }
+      [gWe, gbe, gWd].forEach(g => g.forEach((v, i) => (g[i] = v / B)));
+      opt.tick(); opt.step(We, gWe, "We"); opt.step(be, gbe, "be"); opt.step(Wd, gWd, "Wd"); norm();
+    }
+    return { We, be, Wd, k };
+  }
+  $("kTrain").onclick = () => {
+    if (!sparseW) { const T = makeToy(0.9); toySteps(T, 3000); sparseW = T.W; }
+    const k = +$("kS").value, lam = +$("lS").value, sae = trainSAE(sparseW, k, lam);
+    const resp = Array.from({ length: NF }, (_, i) => Array.from({ length: k }, (_, j) => Math.max(0, sae.We[j * 2] * sparseW[0][i] + sae.We[j * 2 + 1] * sparseW[1][i] + sae.be[j])));
+    let pur = 0; const arg = [];
+    resp.forEach(f => { const s = f.reduce((a, b) => a + b, 0), m = Math.max(...f); pur += s ? m / s : 0; arg.push(s ? f.indexOf(m) : -1); });
+    const inter = 1 - pur / NF, rec = new Set(arg.filter(a => a >= 0)).size;
+    // dead latents: never active on 1,000 sampled inputs
+    const r = NN.rng(5), alive = new Array(k).fill(false);
+    for (let s = 0; s < 1000; s++) { const x = Array.from({ length: NF }, () => (r.u() < 0.9 ? 0 : r.u())), h = [0, 1].map(q => sparseW[q].reduce((a, w, i) => a + w * x[i], 0));
+      for (let j = 0; j < k; j++) if (sae.We[j * 2] * h[0] + sae.We[j * 2 + 1] * h[1] + sae.be[j] > 0) alive[j] = true; }
+    const dead = alive.filter(a => !a).length;
+    $("kRec").textContent = `${rec} / 5`; $("kInt").innerHTML = `<span class="${inter < 0.1 ? "y" : "dead"}">${(100 * inter).toFixed(0)}%</span>`; $("kDead").textContent = `${dead} / ${k}`;
+    NN.heat($("kHeat"), resp.map(row => row.map(v => +v.toFixed(2))), { cmap: "seq", color: "--c-ac", lo: 0, text: true, rowLabels: ["f1", "f2", "f3", "f4", "f5"], colLabels: Array.from({ length: k }, (_, j) => "L" + (j + 1)), padLeft: 30 });
+    win("gSAE", rec === 5 && inter < 0.1);
+    win("gDead", dead === k);
+    $("kMsg").textContent = dead === k ? "Too much L1: switching any latent on costs more than it saves, so all of them died." :
+      rec === 5 && inter < 0.1 ? "Monosemantic: each true feature has its own latent. The SAE undid the superposition." :
+      lam === 0 ? "No sparsity pressure: latents are dense mixtures, as tangled as the neurons." : "Not clean yet: some features share latents or leak into several. Try a bigger dictionary or a different λ.";
+  };
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.1 Predicting other agents: multimodal futures · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+</style>
+</head>
+<body data-lesson="s7-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 1</div>
+  <h1>Predicting other agents: multimodal futures</h1>
+  <p class="subtitle">Before a car can plan, it has to guess what everyone else will do next. The catch: a car at a junction might go left, straight or right, and the “average” of those is a path nobody drives. Here's how prediction went from straight lines to sets of weighted guesses, and how Waymo's research measures them.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Tracking</b>: perception gives every nearby car, cyclist and pedestrian an ID, a position and a velocity, updated about 10 times a second (Lesson 6.5, multi-object tracking).</li>
+      <li><b>A trajectory</b> is a list of future positions at fixed times, e.g. one point every 0.5 s for the next 5 s.</li>
+      <li><b>Probability</b>: several outcomes, each with a chance, summing to 1. Refresher: <a href="../../math-course/phase4/1-probability.html">probability</a> and <a href="../../math-course/phase4/4-expectation.html">expectation (averages)</a> in the Math course.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>A car is 26 m before a junction, doing 10 m/s (36 km/h). <b>Where will it be in 5 seconds?</b> The simplest answer, “it keeps going exactly as it is”, says 50 m straight ahead. If it actually turns left, how wrong is that guess? 2 m? 10 m? 20 m? Lock in a number in the first playground.</p>
+    <p>That simple guess is called the <b>constant-velocity</b> baseline, and Waymo's 2021 motion-forecasting dataset paper measured it: on their standard validation set, for vehicles 8 seconds ahead, constant velocity was off by <b>11.0 m</b> on average, while a learned model allowed six guesses was off by <b>1.34 m</b> (<a href="https://arxiv.org/abs/2104.10133" target="_blank" rel="noopener">Ettinger et al., WOMD</a>). This lesson is about that gap: why one guess isn't enough, and how to grade a set of guesses.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Constant velocity vs reality</span>
+    <p class="hint">Guess first: how far off (in meters) will “keep going straight at 10 m/s” be after 5 s, if the car <b>turns left</b>? Lock it in, then switch the scenario and the horizon. The <b class="ag">red</b> line is what the car really does; <b class="be">purple</b> is the constant-velocity prediction; the gap at the horizon is the error.</p>
+    <div class="controls">
+      <label>my guess <input type="range" id="guess" min="0" max="30" step="0.5" value="5"> <b class="mono" id="guessV"></b></label>
+      <button class="btn primary" id="lock">🔒 Lock in my guess</button>
+    </div>
+    <div class="verdict" id="guessVerdict"></div>
+    <canvas class="sim tall" id="cvW"></canvas>
+    <div class="controls" id="cvCtl" style="opacity:.45; pointer-events:none">
+      <span class="seg" id="scSeg"><button id="scStraight">cruise straight</button><button id="scStop">brake for a red light</button><button id="scLeft" class="on">turn left</button><button id="scRight">turn right</button></span>
+      <label>horizon <input type="range" id="hor" min="0.5" max="5" step="0.5" value="5"> <b class="mono" id="horV"></b></label>
+    </div>
+    <canvas class="chart" id="cvChart" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">error at the horizon <b id="cvE">?</b></div>
+      <div class="stat">error after 1 s <b id="cvE1">?</b></div>
+      <div class="stat">error after 5 s <b id="cvE5">?</b></div>
+    </div>
+    <p class="hint">Notice the shape: for the first second constant velocity is nearly perfect (cars can't change much in 1 s), then the error explodes. Short horizons are easy; planning needs long ones.</p>
+  </div>
+
+  <h2>Why one guess can't work</h2>
+  <p>A car approaching a junction has a handful of distinct futures: straight, left, right, stop. These are <b>modes</b>: separate bumps in the probability of where it will be, with nothing in between. Nobody drives “40% left”. Now think about how you'd train a network to output <i>one</i> trajectory. The natural loss is the squared distance to what really happened, and the single answer that minimizes average squared distance is the <b>average</b> of the futures (that's what an average is: see <a href="../../math-course/phase4/4-expectation.html">expectation</a>).</p>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> half the drivers at this junction turn left and half turn right. A network trained with plain squared error outputs the average path. Where does that path end after 5 s?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">Roughly <b>in the middle of the junction, nearly stopped</b>: the left-turners end up to the west, the right-turners to the east, and their average sits between them. It's a perfectly “optimal” prediction by the squared-error loss, and a physically absurd one: no driver parks in the box. A planner trusting it would happily drive around both real futures. Try it in the next playground.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · The average trap</span>
+    <p class="hint">Set how often drivers go left, straight or right here (the three are rescaled to add up to 100%). Thick <b class="ag">red</b> lines are the real futures (thicker = more common); the dashed <b class="un">gold</b> line is the single “average” prediction. Try 50/0/50.</p>
+    <canvas class="sim tall" id="avgW"></canvas>
+    <div class="controls">
+      <label><span class="ag">left</span> <input type="range" id="pL" min="0" max="100" step="5" value="30"> <b class="mono" id="pLV"></b></label>
+      <label><span class="ag">straight</span> <input type="range" id="pS" min="0" max="100" step="5" value="40"> <b class="mono" id="pSV"></b></label>
+      <label><span class="ag">right</span> <input type="range" id="pR" min="0" max="100" step="5" value="30"> <b class="mono" id="pRV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">average path ends at <b id="avgEnd">–</b></div>
+      <div class="stat">nearest real ending <b id="avgNear">–</b></div>
+      <div class="stat">its speed at 5 s <b id="avgV">–</b></div>
+      <div class="stat">verdict <b id="avgVer">–</b></div>
+    </div>
+  </div>
+
+  <h2>Numbers first: grading a set of guesses</h2>
+  <p>The fix is to let the model output <b>K trajectories, each with a probability</b>. But how do you score that? You can't compare the truth with all K (most are <i>supposed</i> to be wrong). The standard answer: <b>score the closest guess</b>.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: minADE, minFDE and a miss, by hand</span>
+    <p>Three future time steps. The car really goes (0, 10) → (−2, 18) → (−8, 22): a left turn. The model offers K = 2 guesses (meters):</p>
+    <table>
+      <tr><th></th><th>t = 1</th><th>t = 2</th><th>t = 3</th><th>ADE (average error)</th><th>FDE (final error)</th></tr>
+      <tr><td><span class="ag">truth</span></td><td>(0, 10)</td><td>(−2, 18)</td><td>(−8, 22)</td><td></td><td></td></tr>
+      <tr><td><span class="be">guess A</span> straight</td><td>(0, 10)</td><td>(0, 20)</td><td>(0, 30)</td><td>(0 + 2.83 + 11.31) ÷ 3 = <b>4.71</b></td><td><b>11.31</b></td></tr>
+      <tr><td><span class="be">guess B</span> left</td><td>(0, 9)</td><td>(−3, 17)</td><td>(−9, 21)</td><td>(1 + 1.41 + 1.41) ÷ 3 = <b>1.28</b></td><td><b>1.41</b></td></tr>
+      <tr><td><span class="un">average</span> of A and B</td><td>(0, 9.5)</td><td>(−1.5, 18.5)</td><td>(−4.5, 25.5)</td><td>(0.5 + 0.71 + 4.95) ÷ 3 = <b>2.05</b></td><td><b>4.95</b></td></tr>
+    </table>
+    <ol>
+      <li><b>minADE</b> (minimum average displacement error) = the best guess's ADE = <b>1.28 m</b>.</li>
+      <li><b>minFDE</b> (minimum final displacement error) = the best final error = <b>1.41 m</b>.</li>
+      <li><b>Miss</b>: no guess ends within a tolerance of the truth. With a 2 m tolerance, guess B is inside, so this is <i>not</i> a miss. The <b>miss rate</b> is the fraction of cases that are misses.</li>
+      <li>The single average of A and B scores 2.05 m and ends 4.95 m off: a miss. Two honest guesses beat one compromise.</li>
+    </ol>
+    <p>Waymo's benchmark uses a smarter tolerance: it rotates the error into the car's own direction and allows more slack along the road than across it, growing with time (1 m across and 2 m along at 3 s; 1.8 m and 3.6 m at 5 s; 3 m and 6 m at 8 s), scaled down for slow agents (<a href="https://waymo.com/open/challenges/2024/motion-prediction/" target="_blank" rel="noopener">WOMD challenge</a>). This lesson's playgrounds use the 5 s values.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    The future is <b>multimodal</b>: a few distinct outcomes, not one blurry one. So predict a <b>set</b> of K trajectories with <b>probabilities</b>, train so the <i>closest</i> one fits, and grade with minADE, minFDE and miss rate. The probabilities matter too: the planner needs to know that “left” is 25% and “U-turn” is 0.1%, which is what metrics like mAP (mean average precision) reward.
+  </div>
+
+  <div class="eq">
+    <b>minADE<sub>K</sub></b> = min over k of &nbsp;(1/T) Σ<sub>t</sub> ‖ <span class="pl">ŝ<sub>t</sub><sup>k</sup></span> − <span class="ag">s<sub>t</sub></span> ‖ &nbsp;&nbsp;&nbsp; <b>minFDE<sub>K</sub></b> = min over k of ‖ <span class="pl">ŝ<sub>T</sub><sup>k</sup></span> − <span class="ag">s<sub>T</sub></span> ‖
+    <span class="say">For each of the K predicted trajectories, average the distance to the truth over the T future steps (or take only the last one); keep the best. Miss rate = share of cases where even the best guess ends outside the tolerance.</span>
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a weather forecast that says “40% rain”</span>
+    <p>A forecaster who must give one number for tomorrow's rainfall, half the days dry and half the days stormy, would say “a light drizzle” every day and be wrong every day. A good forecaster says “40% chance of storms, otherwise dry”. You can't plan a picnic around a drizzle that never comes; you can plan around “bring an umbrella just in case”. Multimodal prediction is the storm-or-dry forecast for every car on the road.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> A planner needs to know where everyone will be for the next several seconds. Early systems extrapolated each track with physics (constant velocity, or a Kalman filter's motion model): fine for 1 s, badly wrong at junctions, lane changes and stops.</li>
+      <li><b>What people tried.</b> <i>Physics models</i> (constant velocity or constant turn rate). <i>Maneuver classifiers</i> that pick “left/straight/right” and then draw a hand-made path. <i>One learned trajectory</i> trained with squared error, which collapses to the impossible average. <i>Sampling many futures</i> from a generative model, which works but needs lots of samples.</li>
+      <li><b>Why this works.</b> Predict K weighted trajectories and train only the best-matching one (plus the probabilities). Waymo's MultiPath (2019) fixed a set of <b>anchor</b> trajectories, typical shapes found in data, predicted a probability for each plus small corrections, and matched sampling methods with an order of magnitude fewer trajectories. On the Waymo dataset, vehicles at 8 s: constant velocity 11.0 m minADE with a 95% miss rate; a learned model with K = 6, 1.34 m and 25%.</li>
+      <li><b>What it costs, when it fails.</b> minADE rewards spraying guesses (K = 100 always “covers” something), so benchmarks fix K (6 on Waymo's) and add probability-aware scores. Predicting each agent separately gives <b>inconsistent</b> futures: two cars both predicted to go first through the same gap. Rare maneuvers (U-turns, reversing out of a driveway) have little data. And prediction can't be perfect: other drivers react to <i>you</i>.</li>
+      <li><b>What came next.</b> <b>Wayformer</b> (2022) fused map, traffic lights and agent histories with plain attention; <b>MotionLM</b> (2023) turned trajectories into discrete “motion tokens” and predicted all interacting agents jointly, like a language model writing a sentence; and the newest work predicts and plans in one model (Lesson 7.7, and Phase 9).</li>
+    </ol>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · How many guesses do you need?</span>
+    <p class="hint">A model predicts this car's future with a set of anchors, ranked by the probability it learned: <b>straight 40%</b>, <b>left 25%</b>, <b>right 20%</b>, <b>stop 15%</b>, <b>U-turn ~0%</b>. Slide K to keep its top K guesses (<b class="pl">teal</b>). The stats grade them on 40 recorded drives (faint red); <b>🎲 Next car</b> draws one new drive and checks whether any guess covers it.</p>
+    <canvas class="sim tall" id="kW"></canvas>
+    <div class="controls">
+      <label>number of guesses K <input type="range" id="K" min="1" max="5" step="1" value="1"> <b class="mono" id="KV"></b></label>
+      <button class="btn primary" id="nextCar">🎲 Next car</button>
+    </div>
+    <canvas class="chart" id="kChart" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">minADE <b id="kAde">–</b></div>
+      <div class="stat">minFDE <b id="kFde">–</b></div>
+      <div class="stat">miss rate <b id="kMr">–</b></div>
+      <div class="stat">one average path: ADE · miss <b id="kMean">–</b></div>
+    </div>
+    <div class="verdict" id="kVerdict"></div>
+    <div class="verdict" id="kCar"></div>
+    <p class="hint">🏆 <b>Challenge:</b> find the <b>smallest K</b> that gets the miss rate down to <b>10% or less</b>. Why does adding the U-turn guess change nothing?</p>
+  </div>
+
+  <h2>What the state of the art looks like</h2>
+  <table>
+    <tr><th>Model (Waymo research)</th><th>Year</th><th>The idea in one line</th></tr>
+    <tr><td><a href="https://arxiv.org/abs/1910.05449" target="_blank" rel="noopener">MultiPath</a></td><td>2019</td><td>A fixed set of anchor trajectories; predict a probability for each plus offsets with uncertainty, giving a mixture of bell curves at each time step, in one forward pass.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2104.10133" target="_blank" rel="noopener">Waymo Open Motion Dataset</a></td><td>2021</td><td>Over 100,000 scenes of 20 s at 10 Hz (more than 570 hours, 1,750 km of roads, six US cities), mined for merges, lane changes and unprotected turns, with labels for which agents interact.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2207.05844" target="_blank" rel="noopener">Wayformer</a></td><td>2022</td><td>A simple, uniform attention model; just concatenating map, signals and agents early (“early fusion”) and attending over everything gave state-of-the-art results on Waymo's and Argoverse's benchmarks.</td></tr>
+    <tr><td><a href="https://arxiv.org/abs/2309.16534" target="_blank" rel="noopener">MotionLM</a></td><td>2023</td><td>Trajectories as sequences of discrete motion tokens; one language-modeling objective, no anchors; agents' futures decoded jointly, ranking 1st on the dataset's interactive leaderboard when published.</td></tr>
+  </table>
+  <p>The attention machinery behind Wayformer and MotionLM is explained in <span class="dlref" data-href="phase6/1-self-attention.html">the Deep Learning course, Phase 6 (self-attention)</span>. The benchmark task: given 1 s of history and the map, predict up to 8 agents 8 s into the future, leaderboard ranked by a probability-aware score (Soft mAP) with miss rate as a secondary metric.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>The metrics are a few lines of NumPy; write them once (the Phase 7 lab does). For real data, the <b>Waymo Open Dataset</b> repository has the motion data format, tutorials and the official metric code; other public benchmarks include Argoverse 2 and nuScenes prediction.</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+
+<span class="k">def</span> min_ade_fde(preds, truth):
+    <span class="s">"""preds: (K, T, 2) guesses; truth: (T, 2). Returns minADE, minFDE, index of best guess."""</span>
+    err = np.linalg.norm(preds - truth[<span class="k">None</span>], axis=-<span class="n">1</span>)   <span class="c"># (K, T) distances</span>
+    ade, fde = err.mean(axis=<span class="n">1</span>), err[:, -<span class="n">1</span>]
+    <span class="k">return</span> ade.min(), fde.min(), int(ade.argmin())
+
+<span class="k">def</span> is_miss(preds, truth, heading, lat_tol=<span class="n">1.8</span>, lon_tol=<span class="n">3.6</span>):
+    <span class="s">"""Waymo-style miss at the final step: rotate errors into the agent's frame."""</span>
+    c, s = np.cos(heading), np.sin(heading)
+    d = preds[:, -<span class="n">1</span>] - truth[-<span class="n">1</span>]                         <span class="c"># (K, 2) final offsets</span>
+    lon, lat = d[:, <span class="n">0</span>] * c + d[:, <span class="n">1</span>] * s, -d[:, <span class="n">0</span>] * s + d[:, <span class="n">1</span>] * c
+    <span class="k">return not</span> np.any((np.abs(lat) &lt; lat_tol) &amp; (np.abs(lon) &lt; lon_tol))
+
+truth = np.array([[<span class="n">0</span>, <span class="n">10</span>], [-<span class="n">2</span>, <span class="n">18</span>], [-<span class="n">8</span>, <span class="n">22</span>]], float)
+preds = np.array([[[<span class="n">0</span>, <span class="n">10</span>], [<span class="n">0</span>, <span class="n">20</span>], [<span class="n">0</span>, <span class="n">30</span>]], [[<span class="n">0</span>, <span class="n">9</span>], [-<span class="n">3</span>, <span class="n">17</span>], [-<span class="n">9</span>, <span class="n">21</span>]]], float)
+print(min_ade_fde(preds, truth))      <span class="c"># (1.276..., 1.414..., 1): the worked example</span></code></pre>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚕 Waymo</h4><p>Waymo publishes the most here: MultiPath (anchors), the Waymo Open Motion Dataset and its challenge, Wayformer (attention), MotionLM (joint futures as tokens), and a 2025 technical report showing motion forecasting and planning models improve as a power law with compute, trained on 500,000 hours of driving. In a December 2025 post, Waymo described its foundation model's “World Decoder”, which predicts other road users' behaviour and generates trajectories for the car from the same encoders.</p>
+        <p class="src">Sources: <a href="https://arxiv.org/abs/1910.05449" target="_blank" rel="noopener">MultiPath</a>, <a href="https://arxiv.org/abs/2309.16534" target="_blank" rel="noopener">MotionLM</a>, <a href="https://arxiv.org/abs/2506.08228" target="_blank" rel="noopener">Scaling laws (2025)</a>, <a href="https://waymo.com/blog/2025/12/demonstrably-safe-ai-for-autonomous-driving" target="_blank" rel="noopener">Waymo, Dec 2025</a></p></div>
+      <div><h4>🚘 Tesla</h4><p>At AI Day 2021, Tesla said its planner doesn't just plan for its own car: “we literally run the Autopilot planner on every single relevant object in the scene”, so other cars' likely moves come from asking “what would a sensible driver do there?”. Since FSD v12, Tesla's release notes describe city driving as a single end-to-end network trained on video, so there's no longer a separate, published prediction module to describe.</p>
+        <p class="src">Sources: <a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a>, <a href="https://www.notateslaapp.com/software-updates/version/2024.3.10/release-notes" target="_blank" rel="noopener">FSD v12.3.3 release notes (copy)</a></p></div>
+      <div><h4>🛸 Drones</h4><p>Consumer and enterprise drones mostly <b>don't</b> predict other agents. Skydio's X10 operator manual (July 2026) warns that cars, boats, people, animals, drones, crewed aircraft and other moving objects may not be avoided. PX4's collision prevention slows and stops the drone near obstacles its distance sensors see, with no forecast of where they'll be. In open sky, keeping big margins is cheaper than predicting.</p>
+        <p class="src">Sources: <a href="https://support.skydio.com/hc/article_attachments/53407038170651" target="_blank" rel="noopener">Skydio X10 Operator Manual</a>, <a href="https://docs.px4.io/main/en/computer_vision/collision_prevention.html" target="_blank" rel="noopener">PX4 Collision Prevention</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> a robotaxi in a city shares the road with hundreds of agents whose choices decide whether it can go, so Waymo invested in explicit, measurable prediction with public benchmarks. Tesla folds prediction into one learned driving network, trading inspectability for end-to-end training. A drone usually has empty air around it, so it avoids rather than predicts.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Constant velocity</td><td>Free, explainable, good for ~1 s</td><td>11 m off at 8 s on real data; blind to junctions and stops</td></tr>
+      <tr><td>One learned trajectory</td><td>Simple output for the planner</td><td>Collapses to the average of modes: an impossible path</td></tr>
+      <tr><td>K weighted trajectories</td><td>Covers distinct futures; probabilities let the planner weigh risk</td><td>More output to check; K too small misses, K too large is noise</td></tr>
+      <tr><td>Per-agent (marginal) prediction</td><td>Cheap, parallel</td><td>Futures of interacting agents can contradict each other</td></tr>
+      <tr><td>Joint prediction (MotionLM-style)</td><td>Consistent scenes: who yields to whom</td><td>Many more combinations; harder to train and evaluate</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you build and evaluate a motion-prediction model?” A strong answer:</p>
+    <ul>
+      <li>Starts from the <b>constant-velocity baseline</b> and explains why it fails beyond a second or two.</li>
+      <li>Explains <b>multimodality</b> and why an L2 loss on one trajectory averages modes; proposes K trajectories with probabilities (anchors, mixture models, or token decoding).</li>
+      <li>Defines <b>minADE, minFDE, miss rate</b> and why probability-aware metrics (mAP) are needed, and fixes K for fair comparison.</li>
+      <li>Raises <b>interaction</b> (joint vs marginal futures), map and traffic-light inputs, rare-event slices (U-turns, pedestrians), and closed-loop evaluation: does the planner do better with it?</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Waymo Open Motion Dataset &amp; challenge</b> <span class="tag co">🏢 Company · 2021</span> <a href="https://waymo.com/open/data/motion/" target="_blank" rel="noopener">waymo.com/open</a></div>
+      <p><b>How:</b> 100,000+ mined scenes with auto-labelled 3D boxes and HD maps; predict 8 s from 1 s, scored per object type at 3, 5 and 8 s.</p>
+      <p><b>Why this method:</b> ordinary driving is mostly straight lines; mining for interactions makes the benchmark measure the hard part.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Anchors: MultiPath</b> <span class="tag res">🧪 Research · 2019</span> <a href="https://arxiv.org/abs/1910.05449" target="_blank" rel="noopener">arXiv 1910.05449</a></div>
+      <p><b>How:</b> fixed anchor trajectories from data; the network picks among them and refines them, outputting a Gaussian mixture per time step.</p>
+      <p><b>Why this method:</b> one pass, compact output a planner can query; far fewer trajectories than sampling.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Joint futures as tokens: MotionLM</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2309.16534" target="_blank" rel="noopener">arXiv 2309.16534</a></div>
+      <p><b>How:</b> motion becomes a vocabulary of small moves; the model writes all agents' futures step by step, each conditioned on the others so far.</p>
+      <p><b>Why this method:</b> consistent multi-agent futures (who goes first) without hand-made interaction rules.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Tesla: plan for everyone</b> <span class="tag co">🏢 Company · 2021</span> <a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a></div>
+      <p><b>How:</b> the planner was run for other relevant agents too, to anticipate what they'd sensibly do, and plans were optimized jointly for the scene.</p>
+      <p><b>Why this method:</b> in dense traffic, your plan and theirs depend on each other, so predicting and planning become one problem (Lesson 7.7).</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the dataset was mined with SQL</span>
+    <p>To build the Waymo Open Motion Dataset, the authors hand-wrote predicates like “agent A changed lanes at time t” and “agents A and B crossed paths with time gap t”, then queried a far larger driving log with them in a relational database, keeping the scenes with merges, unprotected turns and close encounters (<a href="https://arxiv.org/abs/2104.10133" target="_blank" rel="noopener">Ettinger et al. 2021</a>). Good benchmarks are curated, not just collected.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Prediction sits between perception (tracks from 6.5, lanes and topology from 6.4) and planning. The next lessons plan paths around static obstacles (7.2–7.4); predictions become <b>moving</b> obstacles with probabilities in the Frenet planner (7.5) and the cost functions of 7.6; and 7.7 closes the loop: other drivers react to you, so prediction and planning merge. Phase 9 shows end-to-end and world models that learn all of it together (9.2, 9.3). Probability refreshers: <a href="../../math-course/phase4/5-joint-chain.html">joint probability and the chain rule</a>, the idea behind MotionLM's step-by-step joint decoding.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2104.10133" target="_blank" rel="noopener">Large Scale Interactive Motion Forecasting: the Waymo Open Motion Dataset</a>. The metrics and baselines used throughout this lesson.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2309.16534" target="_blank" rel="noopener">MotionLM: Multi-Agent Motion Forecasting as Language Modeling</a>. Prediction meets language models.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/waymo-research/waymo-open-dataset" target="_blank" rel="noopener">waymo-research/waymo-open-dataset</a>. Data format, tutorials and the official metrics.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A model makes K = 3 guesses. Their ADEs against the true path are 3.2 m, 0.9 m and 5.0 m, and their final errors are 6.0 m, 2.1 m and 1.7 m. What are minADE and minFDE?</div>
+    <div class="opts"><button class="opt">3.03 m and 3.27 m (the averages)</button><button class="opt" data-ok>0.9 m and 1.7 m</button><button class="opt">0.9 m and 2.1 m (both from the same guess)</button></div>
+    <div class="explain">Each metric takes its own minimum over the guesses: minADE = <b>0.9 m</b> (guess 2), minFDE = <b>1.7 m</b> (guess 3). They can come from different guesses. Averaging over guesses would punish the model for the guesses that were supposed to cover other futures.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your single-trajectory model has great average error on highway data but, at junctions, its predictions cut across corners where no lane exists. Most likely cause?</div>
+    <div class="opts"><button class="opt">Not enough training epochs</button><button class="opt" data-ok>A squared-error loss on one output averages the turning modes into a path between them; predict several weighted trajectories instead</button><button class="opt">The map input is missing</button></div>
+    <div class="explain">On the highway there's essentially one mode, so the average is right. At a junction the futures split, and the mean of “left” and “straight” cuts the corner. Multi-modal outputs (anchors, mixtures, or tokens) with best-of-K training fix it.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A team reports minADE falling from 1.3 m to 0.6 m after raising K from 6 to 64. Is the model better?</div>
+    <div class="opts"><button class="opt">Yes, error halved</button><button class="opt" data-ok>Not necessarily: more guesses always lower min-of-K errors; compare at the same K and check probability-aware metrics (mAP) and the planner's results</button><button class="opt">No, minADE can't go below 1 m</button></div>
+    <div class="explain">With 64 guesses you can cover almost anything and still give the planner useless, unranked noise. That's why benchmarks fix K (6 on Waymo's) and rank by probability-aware scores such as Soft mAP.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Constant velocity is perfect for ~1 s and terrible at 5–8 s: 11.0 m minADE vs 1.34 m for a learned K = 6 model on Waymo's data (vehicles, 8 s).</li>
+      <li>The future is multimodal; one squared-error prediction averages modes into an impossible path.</li>
+      <li>Predict K weighted trajectories; grade with minADE, minFDE and miss rate (along/across tolerances), plus probability-aware mAP.</li>
+      <li>Waymo's line: MultiPath (anchors) → WOMD (benchmark) → Wayformer (attention) → MotionLM (joint tokens) → joint forecasting-and-planning models.</li>
+      <li>Other agents react to you; that's where prediction turns into interactive planning (7.7).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+  const segOn = (segId, btnId) => $(segId).querySelectorAll("button").forEach(b => b.classList.toggle("on", b.id === btnId));
+
+  // ---------- the junction and its maneuvers (car drives north in the lane x = +1.75, from y = -30 at 10 m/s) ----------
+  const LANE = 1.75, Y0 = -30, V0 = 10, DT = 0.5, NT = 10, STOP_Y = -5.5, ROADW = 4;
+  function pathPoint(mode, s) {
+    const s0 = -4 - Y0;
+    if (mode === "straight" || mode === "stop" || s <= s0) return [LANE, Y0 + Math.min(s, mode === "stop" ? STOP_Y - Y0 : 1e9)];
+    const u = s - s0;
+    if (mode === "left") { const R = 4 + LANE, cx = -4, cy = -4, arc = Math.PI / 2 * R; if (u <= arc) { const a = u / R; return [cx + R * Math.cos(a), cy + R * Math.sin(a)]; } return [cx - (u - arc), cy + R]; }
+    if (mode === "right") { const R = 4 - LANE, cx = 4, cy = -4, arc = Math.PI / 2 * R; if (u <= arc) { const a = Math.PI - u / R; return [cx + R * Math.cos(a), cy + R * Math.sin(a)]; } return [cx + (u - arc), cy + R]; }
+    const R = LANE, cx = 0, cy = -4, arc = Math.PI * R; if (u <= arc) { const a = u / R; return [cx + R * Math.cos(a), cy + R * Math.sin(a)]; } return [-LANE, cy - (u - arc)]; // U-turn
+  }
+  function dist(mode, t, k) {
+    k = k || 1; const s0 = -4 - Y0, v = V0 * k;
+    if (mode === "straight") return v * t;
+    if (mode === "stop") { const D = STOP_Y - Y0, a = v * v / (2 * D), ts = v / a; return t >= ts ? D : v * t - a * t * t / 2; }
+    const vt = { left: 6, right: 4.5, uturn: 3 }[mode] * k, a = (v * v - vt * vt) / (2 * s0), tb = (v - vt) / a;
+    return t < tb ? v * t - a * t * t / 2 : s0 + vt * (t - tb);
+  }
+  const traj = (mode, k, lat, dt, n) => { dt = dt || DT; n = n || NT; const out = []; for (let i = 1; i <= n; i++) { const p = pathPoint(mode, dist(mode, i * dt, k)); out.push([p[0] + (lat || 0), p[1]]); } return out; };
+  const cvTraj = (dt, n) => { const o = []; for (let i = 1; i <= n; i++) o.push([LANE, Y0 + V0 * i * dt]); return o; };
+  const ade = (a, b) => a.reduce((s, p, i) => s + Math.hypot(p[0] - b[i][0], p[1] - b[i][1]), 0) / a.length;
+  const fde = (a, b) => Math.hypot(a[a.length - 1][0] - b[b.length - 1][0], a[a.length - 1][1] - b[b.length - 1][1]);
+  function drawJunction(w) {
+    w.clear();
+    w.rect(-ROADW, -40, 2 * ROADW, 80, { fill: "--panel", alpha: 1 }); w.rect(-40, -ROADW, 80, 2 * ROADW, { fill: "--panel", alpha: 1 });
+    w.line([[0, -40], [0, -ROADW]], { color: "--c-un", width: 1.5, dash: [8, 6], alpha: 0.7 }); w.line([[0, ROADW], [0, 40]], { color: "--c-un", width: 1.5, dash: [8, 6], alpha: 0.7 });
+    w.line([[-40, 0], [-ROADW, 0]], { color: "--c-un", width: 1.5, dash: [8, 6], alpha: 0.7 }); w.line([[ROADW, 0], [40, 0]], { color: "--c-un", width: 1.5, dash: [8, 6], alpha: 0.7 });
+    w.line([[0.2, -ROADW - 0.3], [ROADW, -ROADW - 0.3]], { color: "--text", width: 3, alpha: 0.6 });
+    [[-20, -18], [20, -18], [-20, 14], [20, 14]].forEach(([x, y]) => w.text([x, y], "sidewalk / buildings", { color: "--muted", size: 10 }));
+  }
+  const carAt = (w, p, q, col) => w.car({ x: p[0], y: p[1], th: Math.atan2(q[1] - p[1], q[0] - p[0]) }, { color: col, alpha: 0.9 });
+  const VIEW = { xRange: [-36, 36], yRange: [-32, 22] };
+
+  // ---------- Playground 1: constant velocity vs reality ----------
+  let locked = false, scen = "left";
+  const W1 = new Sim($("cvW"), VIEW);
+  W1.render(w => {
+    drawJunction(w);
+    const H = +$("hor").value, n = Math.round(H / 0.1), tr = traj(scen, 1, 0, 0.1, n), cv = cvTraj(0.1, n);
+    const start = [LANE, Y0];
+    if (locked) w.line([start, ...tr], { color: "--c-ag", width: 4 });
+    w.line([start, ...cv], { color: "--c-be", width: 3, dash: [8, 6] });
+    if (locked) { const a = tr[n - 1], b = cv[n - 1]; w.line([a, b], { color: "--c-un", width: 2 }); w.dot(a, { color: "--c-ag", r: 6 }); }
+    w.dot(cv[n - 1], { color: "--c-be", r: 6 });
+    carAt(w, start, [LANE, Y0 + 1], "--c-ag");
+    w.text([LANE + 9, Y0 + 2], "10 m/s", { color: "--muted", size: 11 });
+  });
+  function cvErr(sc, H) { const n = Math.round(H / 0.1); return fde(traj(sc, 1, 0, 0.1, n), cvTraj(0.1, n)); }
+  function draw1() {
+    $("guessV").textContent = $("guess").value + " m"; $("horV").textContent = $("hor").value + " s";
+    const H = +$("hor").value;
+    if (locked) {
+      $("cvE").textContent = fmt(cvErr(scen, H), 1) + " m"; $("cvE1").textContent = fmt(cvErr(scen, 1), 1) + " m"; $("cvE5").textContent = fmt(cvErr(scen, 5), 1) + " m";
+      const series = ["straight", "stop", "left", "right"].map((m, i) => ({ label: { straight: "cruise", stop: "brake", left: "turn left", right: "turn right" }[m],
+        color: MX.css(["--c-mp", "--c-un", "--c-ag", "--c-se"][i]), data: MX.linspace(0.5, 5, 10).map(h => [h, cvErr(m, h)]), width: m === scen ? 3.5 : 1.5, dots: m === scen }));
+      Plot.line($("cvChart"), { series, xMin: 0.5, xMax: 5, yMin: 0, yMax: 30, xLabel: "horizon (s)", yLabel: "CV error (m)", legendLeft: true });
+    } else Plot.line($("cvChart"), { series: [{ label: "locked until you guess", color: MX.css("--muted"), data: [[0.5, 0], [5, 0]] }], xMin: 0.5, xMax: 5, yMin: 0, yMax: 30, xLabel: "horizon (s)", yLabel: "CV error (m)" });
+    W1.render();
+  }
+  $("lock").onclick = () => {
+    if (locked) return; locked = true;
+    const truth = cvErr("left", 5), g = +$("guess").value, off = Math.abs(g - truth);
+    $("guessVerdict").innerHTML = (off <= 2 ? `<span class="badge-win">🎯 Within ${fmt(off, 1)} m!</span>` : `<span class="badge-lose">Off by ${fmt(off, 1)} m</span>`) +
+      ` Turning left, the car ends up <b>${fmt(truth, 1)} m</b> from where constant velocity put it: it slowed down and drove off sideways, both at once.`;
+    $("cvCtl").style.opacity = 1; $("cvCtl").style.pointerEvents = "auto"; $("lock").textContent = "✅ Locked"; $("lock").disabled = true; draw1();
+  };
+  [["scStraight", "straight"], ["scStop", "stop"], ["scLeft", "left"], ["scRight", "right"]].forEach(([id, m]) => ($(id).onclick = () => { scen = m; segOn("scSeg", id); draw1(); }));
+  $("guess").oninput = draw1; $("hor").oninput = draw1; draw1();
+
+  // ---------- Playground 2: the average trap ----------
+  const W2 = new Sim($("avgW"), VIEW); let st2 = null;
+  const modes3 = ["left", "straight", "right"], A3 = Object.fromEntries(modes3.map(m => [m, traj(m, 1, 0, 0.25, 20)]));
+  W2.render(w => {
+    if (!st2) return; drawJunction(w);
+    modes3.forEach(m => { if (st2.p[m] > 0) w.line([[LANE, Y0], ...A3[m]], { color: "--c-ag", width: 1.5 + 9 * st2.p[m], alpha: 0.75 }); });
+    w.line([[LANE, Y0], ...st2.mean], { color: "--c-un", width: 3.5, dash: [9, 6] });
+    const e = st2.mean[st2.mean.length - 1], e2 = st2.mean[st2.mean.length - 2];
+    carAt(w, e, [e[0] + (e[0] - e2[0]) * 3 + 1e-6, e[1] + (e[1] - e2[1]) * 3], "--c-un");
+    w.text([e[0], e[1] + 3.4], "average", { color: "--c-un", size: 12, bold: true });
+    carAt(w, [LANE, Y0], [LANE, Y0 + 1], "--c-ag");
+  });
+  function draw2() {
+    const raw = { left: +$("pL").value, straight: +$("pS").value, right: +$("pR").value }, tot = raw.left + raw.straight + raw.right || 1;
+    const p = Object.fromEntries(modes3.map(m => [m, raw[m] / tot]));
+    modes3.forEach(m => ($({ left: "pLV", straight: "pSV", right: "pRV" }[m]).textContent = fmt(100 * p[m], 0) + "%"));
+    const mean = A3.left.map((_, i) => [0, 1].map(c => modes3.reduce((s, m) => s + p[m] * A3[m][i][c], 0)));
+    st2 = { p, mean };
+    const e = mean[mean.length - 1], near = Math.min(...modes3.filter(m => p[m] > 0).map(m => Math.hypot(A3[m][19][0] - e[0], A3[m][19][1] - e[1])));
+    const v = Math.hypot(e[0] - mean[18][0], e[1] - mean[18][1]) / 0.25;
+    const inBox = Math.abs(e[0]) < ROADW && Math.abs(e[1]) < ROADW;
+    $("avgEnd").textContent = `(${fmt(e[0], 1)}, ${fmt(e[1], 1)}) m`; $("avgNear").textContent = fmt(near, 1) + " m away"; $("avgV").textContent = fmt(v, 1) + " m/s";
+    $("avgVer").innerHTML = near < 1.8 ? `<span class="badge-win">matches a real future</span>` : inBox ? `<span class="badge-lose">parked in the junction</span>` : `<span class="badge-lose">nobody drives this</span>`;
+    W2.render();
+  }
+  ["pL", "pS", "pR"].forEach(id => ($(id).oninput = draw2)); draw2();
+
+  // ---------- Playground 3: K guesses ----------
+  const RANK = ["straight", "left", "right", "stop", "uturn"], PROB = { straight: 0.4, left: 0.25, right: 0.2, stop: 0.15, uturn: 0 };
+  const ANCH = Object.fromEntries(RANK.map(m => [m, traj(m, 1, 0)]));
+  const MEAN = ANCH.straight.map((_, i) => [0, 1].map(c => RANK.reduce((s, m) => s + PROB[m] * ANCH[m][i][c], 0)));
+  const sampleDrive = R => { let u = R(), m = RANK[0]; for (const mm of RANK) { if (u < PROB[mm]) { m = mm; break; } u -= PROB[mm]; } return { m, tr: traj(m, 1 + 0.05 * Sim.randn(R), 0.15 * Sim.randn(R)) }; };
+  const R3 = Sim.rng(3), TEST = Array.from({ length: 40 }, () => sampleDrive(R3)); let R4 = Sim.rng(17), car = null;
+  function missOf(set, T) { const n = T.length, hd = Math.atan2(T[n - 1][1] - T[n - 2][1], T[n - 1][0] - T[n - 2][0]);
+    const h = Math.hypot(T[n - 1][1] - T[n - 2][1], T[n - 1][0] - T[n - 2][0]) < 1e-6 ? Math.PI / 2 : hd;
+    return !set.some(s => { const dx = s[n - 1][0] - T[n - 1][0], dy = s[n - 1][1] - T[n - 1][1], lon = dx * Math.cos(h) + dy * Math.sin(h), lat = -dx * Math.sin(h) + dy * Math.cos(h); return Math.abs(lat) < 1.8 && Math.abs(lon) < 3.6; }); }
+  function grade(set) { let A = 0, F = 0, M = 0; TEST.forEach(t => { A += Math.min(...set.map(s => ade(s, t.tr))); F += Math.min(...set.map(s => fde(s, t.tr))); if (missOf(set, t.tr)) M++; });
+    return { ade: A / TEST.length, fde: F / TEST.length, mr: M / TEST.length }; }
+  const W3 = new Sim($("kW"), VIEW);
+  W3.render(w => {
+    drawJunction(w); const K = +$("K").value;
+    TEST.forEach(t => w.line([[LANE, Y0], ...t.tr], { color: "--c-ag", width: 1, alpha: 0.18 }));
+    RANK.slice(0, K).forEach(m => { w.line([[LANE, Y0], ...ANCH[m]], { color: "--c-pl", width: 2 + 8 * PROB[m], alpha: 0.85 }); const e = ANCH[m][NT - 1]; const off = { straight: [6, -2], left: [-1, 2.2], right: [1, 2.2], stop: [7, -1.5], uturn: [-6, -3] }[m]; w.text([e[0] + off[0], e[1] + off[1]], `${m} ${fmt(100 * PROB[m], 0)}%`, { color: "--c-pl", size: 11, bold: true }); });
+    if (car) { w.line([[LANE, Y0], ...car.tr], { color: "--c-ag", width: 4 }); w.dot(car.tr[NT - 1], { color: car.miss ? "--bad" : "--good", r: 7 }); }
+    carAt(w, [LANE, Y0], [LANE, Y0 + 1], "--c-ag");
+  });
+  function draw3() {
+    const K = +$("K").value; $("KV").textContent = K;
+    const set = RANK.slice(0, K).map(m => ANCH[m]), g = grade(set), gm = grade([MEAN]);
+    $("kAde").textContent = fmt(g.ade, 2) + " m"; $("kFde").textContent = fmt(g.fde, 2) + " m"; $("kMr").textContent = fmt(100 * g.mr, 1) + "%";
+    $("kMean").textContent = fmt(gm.ade, 2) + " m · " + fmt(100 * gm.mr, 0) + "%";
+    const bars = [1, 2, 3, 4, 5].map(k => ({ label: "K=" + k, value: grade(RANK.slice(0, k).map(m => ANCH[m])).ade, color: k === K ? MX.css("--c-pl") : MX.css("--muted") }));
+    bars.push({ label: "average path", value: gm.ade, color: MX.css("--c-un") });
+    Plot.bars($("kChart"), { bars, yMin: 0, yLabel: "minADE (m)" });
+    const firstOK = [1, 2, 3, 4, 5].find(k => grade(RANK.slice(0, k).map(m => ANCH[m])).mr <= 0.1);
+    $("kVerdict").innerHTML = g.mr <= 0.1 ? (K === firstOK ? `<span class="badge-win">✅ K = ${K}: miss rate ${fmt(100 * g.mr, 1)}% with the fewest guesses</span>` : `<span class="badge-lose">Works (${fmt(100 * g.mr, 1)}%), but you can use fewer guesses</span>`) :
+      `<span class="badge-lose">K = ${K} misses ${fmt(100 * g.mr, 0)}% of drives</span>`;
+    if (car) car.miss = missOf(set, car.tr);
+    $("kCar").innerHTML = car ? (car.miss ? `🎲 This driver went <b>${car.m}</b>: <span class="badge-lose">missed</span>` : `🎲 This driver went <b>${car.m}</b>: <span class="badge-win">covered</span>`) : "";
+    W3.render();
+  }
+  $("K").oninput = draw3;
+  $("nextCar").onclick = () => { car = sampleDrive(R4); draw3(); };
+  draw3();
+})();
+</script>
+</body>
+</html>

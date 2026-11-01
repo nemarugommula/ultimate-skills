@@ -1,0 +1,417 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.3 Positional encodings: sinusoidal → RoPE · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .chips { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0; }
+  .chips button { font: inherit; font-weight: 700; padding: 6px 14px; border-radius: 8px; border: 1px solid var(--c-x); background: color-mix(in srgb, var(--c-x) 12%, var(--bg2)); color: var(--text); cursor: pointer; }
+  .chips button.pick { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent); }
+  canvas.vec { width: 100%; height: 90px; display: block; border-radius: 8px; border: 1px solid var(--line); }
+  canvas.bar { width: 100%; height: 260px; display: block; border-radius: 10px; border: 1px solid var(--line); }
+  canvas.chart.sim { height: 150px; }
+  table.log td { font-family: var(--mono); font-size: .82rem; text-align: center; }
+</style>
+</head>
+<body data-lesson="d6-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 3</div>
+  <h1>Positional encodings: sinusoidal → RoPE</h1>
+  <p class="subtitle">Self-attention can't tell “dog bites man” from “man bites dog”. Here's how transformers learn where each word sits, ending with the rotation trick almost every open LLM uses today.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Self-attention scores every pair with q·k and mixes values (Lesson 6.1); multi-head runs several of these (6.2).</li>
+      <li>Rotating a 2D vector by angle a: [x, y] → [x cos a − y sin a, x sin a + y cos a]. Rotation keeps lengths; the dot product of two vectors depends only on their lengths and the <b>angle between</b> them (<a href="../../math-course/phase1/3-dot-product.html">math 1.3</a>).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Feed a transformer with no position information “dog bites man”, then “man bites dog”. The vector it computes for <b>dog</b> is <b>exactly the same</b> both times, to the last digit. Every word just gets reshuffled. To the bare attention layer, a sentence is a bag of words.</p>
+    <p>The fixes came in quick succession: sine waves (the 2017 Transformer), learned position tables (BERT, GPT-2), relative distances (2018), and in 2021 rotations. That last one, <b>RoPE</b>, is what Meta's Llama 3, Alibaba's Qwen3 and Google's Gemma 3 use (per their 2024–2025 technical reports).</p>
+    <p><b>How do you tell a model “this word is 3 places before that one” without breaking everything else?</b> By the end you'll rotate vectors by hand and see why the dot product suddenly cares only about distance.</p>
+  </div>
+
+  <h2>Numbers first: attention is permutation-blind</h2>
+  <p>Look at what self-attention computes for one token: a score with every other token (q·k), a softmax, a weighted sum. Nothing in that recipe mentions <i>where</i> a token is. Shuffle the input rows and you get the same output rows, shuffled the same way. Mathematicians call that <b>permutation equivariance</b>; your users call it “the model can't read”.</p>
+  <p class="predict">🔮 <b>Predict:</b> click two words to swap them and turn “dog bites man” into “man bites dog”. Will the vector for “dog” change?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Shuffle the sentence</span>
+    <p class="hint">Click two words to swap them (or press Shuffle). Below: the self-attention output vector for <b>dog</b> (8 numbers, blue = negative, red = positive) in the original order and in your order. Then switch positions on.</p>
+    <div class="goals"><span class="goal" id="gSame">🎯 Swap words and confirm “dog” is identical</span><span class="goal" id="gDiff">🎯 With positions on, make “dog” change</span></div>
+    <div class="controls">
+      <span class="seg" id="posSeg"><button data-v="off" class="on">No positions</button><button data-v="on">Add sinusoidal positions</button></span>
+      <button class="btn" id="shuf">🔀 Shuffle</button>
+      <button class="btn" id="unshuf">↺ Original order</button>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="pg-cols">
+      <div><p class="hint">“dog” in <b>dog bites man</b></p><canvas class="vec" id="v0"></canvas></div>
+      <div><p class="hint">“dog” in <b id="curS"></b></p><canvas class="vec" id="v1"></canvas></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">difference between the two “dog” vectors <b id="pDiff" class="at">–</b></div>
+      <div class="stat">can the model tell who bit whom? <b id="pTell">–</b></div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> with no positions, any order gives a difference of exactly <b>0.000</b>: “dog” sees the same bag of words. Turn sinusoidal positions on and swapping “dog” and “man” changes its vector, because “dog at position 0” and “dog at position 2” are now different inputs.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Positional encoding</span></span>
+    <ol>
+      <li><b>The problem before</b> RNNs read in order, so order was free. Self-attention dropped the recurrence (6.1) and with it every sense of order: “dog bites man” and “man bites dog” give identical per-word vectors (difference 0.000 above).</li>
+      <li><b>What people tried</b> Convolutions (which see order inside their window), or keeping an RNN layer under the attention.</li>
+      <li><b>Why this works</b> Give each position its own signal and combine it with the token, so “dog@0” and “dog@2” differ. The attention machinery stays the same, fully parallel.</li>
+      <li><b>What it costs, when it fails</b> The model only knows the positions it trained on. Learned tables have no row for position 1,025 if you trained on 1,024; most schemes degrade past the training length (6.11).</li>
+      <li><b>What refined it</b> From adding a position vector to the input (learned or sinusoidal), to putting distance directly into the attention score (relative positions, RoPE, ALiBi), below.</li>
+    </ol>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    What attention really needs is <b>relative</b> position: “this word is 3 before me” matters more than “I am word 517”. The history of positional encodings is a march from absolute addresses toward scores that depend only on the distance between query and key, which RoPE achieves with a rotation.
+  </div>
+
+  <h2>Generation 1: a learned position table</h2>
+  <p>The simplest idea: a second embedding table with one learned vector per position, added to the token embedding. BERT has 512 rows; GPT-2 has 1,024. It works well inside that range and is what both used. Its limit is literal: <b>there is no row 1,025</b>. You can't run GPT-2 on a longer text without inventing new rows it never trained.</p>
+
+  <h2>Generation 2: sine waves (the original Transformer)</h2>
+  <p>Vaswani et al. instead built a fixed pattern: dimension pair i of position <i>pos</i> holds sin and cos of pos / 10000<sup>2i/d</sup>. In words: <b>each pair of dimensions is a clock hand turning at its own speed</b>. The first pair spins fast (a full turn about every 6 positions), the last pair barely moves over thousands. Read all the hands together and you know the position, like reading hours, minutes and seconds.</p>
+  <p class="predict">🔮 <b>Predict:</b> in the picture below, which side changes faster as you go down the positions, the low dimensions or the high ones?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The sinusoid barcode</span>
+    <p class="hint">Rows = positions 0–99, columns = the 64 dimensions of the encoding (red = +1, blue = −1). Slide the highlighted position: the chart shows how similar its encoding is to every other position (dot product, scaled so “itself” = 1). Try the base: the original uses 10,000.</p>
+    <div class="goals"><span class="goal" id="gFar">🎯 With base 10,000, check that position 50 looks most like its neighbours</span><span class="goal" id="gAlias">🎯 Find a base where positions 5 apart already look unrelated (similarity ≤ 0.05)</span></div>
+    <div class="controls">
+      <label>position <input type="range" id="bP" min="0" max="99" step="1" value="10"> <b class="mono" id="bPV"></b></label>
+      <label>base <select id="bB" class="btn small"><option>10</option><option>30</option><option>100</option><option>1000</option><option selected>10000</option></select></label>
+    </div>
+    <canvas class="bar" id="barcode"></canvas>
+    <canvas class="chart sim" id="simC"></canvas>
+    <p class="hint" id="bMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the left columns flicker every few rows; the right columns barely change across all 100: <b>fast clocks on the left, slow on the right</b>. The similarity curve peaks at the chosen position and falls off on both sides, so nearby positions look alike. The base sets how fast that falls off. At 10,000, a position 40 away still looks 48% alike: slow clocks give a smooth sense of “far”. Drop the base to 10 and every clock is fast: similarity hits about 0 just 5 positions away and then wobbles around zero, so distance 10 and distance 40 look equally “unrelated”. Long-context models go the other way and raise the base (Llama 3: 500,000).</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Sinusoidal position encodings</span></span>
+    <ol>
+      <li><b>The problem before</b> A learned table only covers positions seen in training (512 rows for BERT, 1,024 for GPT-2) and costs a vector of parameters per position.</li>
+      <li><b>What people tried</b> Learned absolute embeddings, which Vaswani et al. also tested and found “nearly identical” in quality.</li>
+      <li><b>Why this works</b> No parameters, any length can be computed, and the waves have a neat property: for a fixed offset k, the encoding of pos + k is a <b>linear function</b> (a rotation of each clock hand) of the encoding of pos. The authors hoped this would let the model learn relative offsets and extrapolate to longer inputs.</li>
+      <li><b>What it costs, when it fails</b> The position is <b>added</b> to the word vector, so word meaning and position share the same numbers and the model must untangle them. And the hope of extrapolation didn't come true: Press et al. (2021) found sinusoidal models have “very weak extrapolation abilities” past their training length.</li>
+      <li><b>What refined it</b> Relative positions inside attention (Shaw et al. 2018), then RoPE, which keeps the rotating clocks but applies them to queries and keys instead of adding them to the input.</li>
+    </ol>
+  </div>
+
+  <h2>Generation 3: relative positions</h2>
+  <p>Shaw, Uszkoreit and Vaswani (2018) asked: why tell the model absolute addresses at all? They added a learned vector for each <b>distance</b> (clipped at some maximum) directly into the attention computation. On English→German translation that beat absolute positions by <b>1.3 BLEU</b> (0.3 on English→French), and adding absolute positions on top brought no further gain. The cost: extra per-distance terms inside every attention score, which complicates fast kernels.</p>
+
+  <h2>Generation 4: RoPE, rotate the query and the key</h2>
+  <p>Su et al.'s <b>rotary position embedding</b> (2021) keeps the clock hands but uses them differently. Nothing is added to the input. Instead, right before the dot product, each pair of numbers in a query at position m is <b>rotated</b> by angle m·θ, and each pair in a key at position n by n·θ (one θ per pair, fast to slow, like the sine waves).</p>
+  <p>Why does that help? Rotating both vectors changes their angles, but the angle <i>between</i> them changes by (n − m)·θ. A dot product only cares about lengths and the angle between, so the score depends on the words and their <b>distance</b>, never on the absolute positions.</p>
+  <div class="calc">(R<sub>mθ</sub> q) · (R<sub>nθ</sub> k) = q · R<sub>(n−m)θ</sub> k</div>
+  <p class="predict">🔮 <b>Predict:</b> put the query at position 3 and the key at position 1. Then move them to 10 and 8. Will the score change?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · RoPE: rotate by position</span>
+    <p class="hint">One 2D pair of a <span class="at">query</span> (gold) and a <span class="x">key</span> (blue). Dashed = the raw vectors (drag their tips to change the words). Solid = after rotating by their positions. Slide the positions: the score only cares about the angle between the solid arrows. Every pair you try is logged.</p>
+    <div class="goals"><span class="goal" id="gEq">🎯 Two different position pairs, same distance, equal scores</span><span class="goal" id="gNeg">🎯 Find a distance that makes the score negative</span><span class="goal" id="gWrap">🎯 Find a distance &gt; 0 that scores like distance 0 (a full turn)</span></div>
+    <div class="controls">
+      <label>query position m <input type="range" id="rM" min="0" max="40" step="1" value="3"> <b class="mono" id="rMV"></b></label>
+      <label>key position n <input type="range" id="rN" min="0" max="40" step="1" value="1"> <b class="mono" id="rNV"></b></label>
+      <label>θ per position <input type="range" id="rT" min="0.05" max="1.6" step="0.05" value="0.3"> <b class="mono" id="rTV"></b></label>
+      <button class="btn" id="rClear">↺ Clear log</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="plane" id="ropePlane"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">distance n − m <b id="rDist" class="at">–</b></div>
+          <div class="stat">score q<sub>m</sub>·k<sub>n</sub> <b id="rScore" class="at">–</b></div>
+          <div class="stat">score at distance 0 <b id="rZero">–</b></div>
+        </div>
+        <table class="log"><thead><tr><th>m</th><th>n</th><th>n − m</th><th>θ</th><th>score</th></tr></thead><tbody id="rLog"></tbody></table>
+        <p class="hint" id="rMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> (3, 1), (10, 8) and (40, 38) all give the same score: both arrows turn, the angle between them doesn't. Push the distance far enough and the rotated key swings past 90° from the query: the score goes negative. With θ = 0.3 a distance of 21 is a full turn (21 × 0.3 ≈ 2π) and scores like distance 0; that's why real RoPE uses <b>many</b> pairs with different speeds. The slow ones only complete a turn after thousands of positions, so far-apart tokens can't be confused with neighbours.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">RoPE (rotary position embedding)</span></span>
+    <ol>
+      <li><b>The problem before</b> Added positions (learned or sinusoidal) mix position into the word vector and extrapolate poorly. Relative-position terms (Shaw et al.) work but add extra pieces to every attention score.</li>
+      <li><b>What people tried</b> Learned tables, sine waves, per-distance biases (Shaw 2018, the T5 bias).</li>
+      <li><b>Why this works</b> Rotating q by mθ and k by nθ makes q·k depend only on n − m: relative position for free, inside the normal dot product, with <b>zero</b> new parameters and no change to the attention kernel. It touches only Q and K, so values (what gets handed over) stay position-free. Pairs spin at different speeds, so both fine (next word) and coarse (500 words back) distances are visible.</li>
+      <li><b>What it costs, when it fails</b> Distances beyond the training length produce rotation angles the model never saw, so plain RoPE models still degrade past their trained context. A few extra multiplies per query and key.</li>
+      <li><b>What refined it</b> Raising the base “clock speed” (Llama 3 uses 500,000; Qwen3 and Gemma 3's global layers 1,000,000) and rescaling tricks to stretch a trained model to longer contexts (Lesson 6.11). Meta's Llama 4 (2025) even interleaves layers with <b>no</b> position encoding between its RoPE layers.</li>
+    </ol>
+  </div>
+
+  <h3>ALiBi, briefly: just penalize distance</h3>
+  <p>Press, Smith and Lewis (2021) went even simpler: no position vectors at all, just subtract a penalty proportional to the distance from each attention score (a different slope per head). A 1.3B-parameter model trained on 1,024-token inputs matched the perplexity of a sinusoidal model trained on 2,048 when tested at 2,048, while training 11% faster. BLOOM (2022) used it. The large open models in this lesson's table chose RoPE instead, but ALiBi's lesson stuck: <b>a recency bias helps extrapolation</b>.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: RoPE on one pair, by hand</span>
+    <p>q = [1, 0] and k = [1, 0] (identical words), θ = 90° per position. Query at m = 1, key at n = 2:</p>
+    <ul>
+      <li>Rotate q by 1 × 90°: [1, 0] → [0, 1]. Rotate k by 2 × 90° = 180°: [1, 0] → [−1, 0].</li>
+      <li>Score = 0 × (−1) + 1 × 0 = <b>0</b>.</li>
+      <li>Now m = 5, n = 6 (same distance 1): q turns 450° (= 90°) → [0, 1]; k turns 540° (= 180°) → [−1, 0]. Score = <b>0</b> again.</li>
+      <li>Distance 0 (m = n): both turn the same, score = 1 × 1 = <b>1</b>.</li>
+    </ul>
+    <p>Same words, different distance, different score; same distance, anywhere in the text, same score. Real models use θ<sub>i</sub> = base<sup>−2i/d</sup> radians for pair i: with d = 128 and base 10,000, the fastest pair turns 1 radian per position and the slowest about 0.0001.</p>
+  </div>
+
+  <h2>Side by side</h2>
+  <table>
+    <tr><th>Method</th><th>Where position enters</th><th>Parameters</th><th>Relative?</th><th>Longer than training?</th><th>Used by</th></tr>
+    <tr><td>Learned absolute</td><td>Added to input</td><td>1 vector per position</td><td>No</td><td class="dead">No row for it</td><td>BERT (512), GPT-2 (1,024)</td></tr>
+    <tr><td>Sinusoidal</td><td>Added to input</td><td>0</td><td>Indirectly</td><td class="dead">Weak in practice</td><td>Original Transformer</td></tr>
+    <tr><td>Relative (Shaw)</td><td>Inside the score</td><td>1 vector per clipped distance</td><td class="ev">Yes</td><td>Better</td><td>Research; T5 uses a related learned bias</td></tr>
+    <tr><td>RoPE</td><td>Rotates Q and K</td><td>0</td><td class="ev">Yes</td><td>Degrades; fixable by rescaling (6.11)</td><td>Llama 3, Qwen3, Gemma 3 (2024–25)</td></tr>
+    <tr><td>ALiBi</td><td>Distance penalty on the score</td><td>0</td><td class="ev">Yes</td><td class="ev">Designed for it</td><td>BLOOM</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>RoPE is a few lines: rotate each consecutive pair of numbers by position × its own frequency. (Libraries differ on which numbers form a pair; this version pairs neighbours.) The second half checks the permutation problem directly:</p>
+<pre><code><span class="k">import</span> torch
+torch.manual_seed(<span class="n">0</span>)
+
+<span class="k">def</span> rope(x, pos, base=<span class="n">10000.0</span>):
+    <span class="s">"""Rotate pairs (x[0],x[1]), (x[2],x[3]), ... by angle pos * theta_i."""</span>
+    d = x.shape[-<span class="n">1</span>]
+    theta = base ** (-torch.arange(<span class="n">0</span>, d, <span class="n">2</span>) / d)          <span class="c"># d/2 frequencies, fast -> slow</span>
+    ang = pos[:, <span class="k">None</span>] * theta[<span class="k">None</span>, :]                    <span class="c"># (n, d/2)</span>
+    cos, sin = ang.cos(), ang.sin()
+    x1, x2 = x[..., <span class="n">0</span>::<span class="n">2</span>], x[..., <span class="n">1</span>::<span class="n">2</span>]
+    out = torch.empty_like(x)
+    out[..., <span class="n">0</span>::<span class="n">2</span>] = x1 * cos - x2 * sin
+    out[..., <span class="n">1</span>::<span class="n">2</span>] = x1 * sin + x2 * cos
+    <span class="k">return</span> out
+
+q, k = torch.randn(<span class="n">64</span>), torch.randn(<span class="n">64</span>)                   <span class="c"># one query, one key</span>
+<span class="k">def</span> score(m, n):                                           <span class="c"># q at position m, k at position n</span>
+    <span class="k">return</span> (rope(q[<span class="k">None</span>], torch.tensor([float(m)])) @ rope(k[<span class="k">None</span>], torch.tensor([float(n)])).T).item()
+
+print(<span class="s">f"{score(3, 1):.4f} {score(10, 8):.4f} {score(1000, 998):.4f}"</span>)   <span class="c"># distance 2 every time</span>
+print(<span class="s">f"{score(3, 0):.4f}"</span>)                                             <span class="c"># distance 3: different</span>
+
+<span class="c"># without positions, attention can't see order: shuffle in -> same rows, shuffled, out</span>
+x = torch.randn(<span class="n">5</span>, <span class="n">16</span>); W = torch.randn(<span class="n">16</span>, <span class="n">16</span>)
+att = <span class="k">lambda</span> x: torch.softmax((x @ W) @ (x @ W).T / <span class="n">4</span>, -<span class="n">1</span>) @ x
+perm = torch.tensor([<span class="n">3</span>, <span class="n">0</span>, <span class="n">4</span>, <span class="n">1</span>, <span class="n">2</span>])
+print(torch.allclose(att(x)[perm], att(x[perm]), atol=<span class="n">1e-6</span>))
+
+<span class="c"># What we got on a laptop CPU (torch 2.8):</span>
+<span class="c"># -10.1427 -10.1427 -10.1427</span>
+<span class="c"># -8.2811</span>
+<span class="c"># True</span></code></pre>
+    <p class="hint">In Hugging Face <code>transformers</code>, the RoPE base lives in the model config (often <code>rope_theta</code>, with a <code>rope_scaling</code> entry for context extension); loading a real config downloads it from the Hub. Gotcha: if you ever cache keys for fast generation (6.9), cache them <b>after</b> rotating, with their true positions.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Learned absolute</td><td>Simplest; flexible within range</td><td>Hard length limit; parameters per position</td></tr>
+      <tr><td>Sinusoidal</td><td>No parameters; any length computable</td><td>Mixed into word vectors; extrapolates weakly</td></tr>
+      <tr><td>RoPE</td><td>Relative, no parameters, works with standard fast kernels</td><td>Still degrades past training length without rescaling</td></tr>
+      <tr><td>ALiBi</td><td>Very simple; extrapolates by design</td><td>Strong recency bias; less common in recent large models</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Why do transformers need positional encodings, and how does RoPE work?” A strong answer:</p>
+    <ul>
+      <li>Self-attention is permutation-equivariant: shuffle inputs, outputs shuffle the same way; order is invisible.</li>
+      <li>Absolute options (learned, sinusoidal) add a position vector to the input; learned ones cap the length.</li>
+      <li>RoPE rotates each 2D pair of q and k by position × frequency; since rotations preserve dot products up to the relative angle, q<sub>m</sub>·k<sub>n</sub> depends only on n − m. No parameters; values untouched.</li>
+      <li>Extrapolation caveat: unseen distances still hurt; base-frequency increases and rescaling (or ALiBi) are the usual answers.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>RoPE with a 500,000 base</b> <span class="tag co">🏢 Meta · 2024</span> <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></div>
+      <p><b>How:</b> rotary embeddings in every layer, with the base frequency raised from 10,000 to 500,000.</p>
+      <p><b>Why this method:</b> the authors say the larger base “enables us to better support longer contexts”: slower clocks keep far-apart positions distinguishable.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>RoPE plus long-context extensions</b> <span class="tag co">🏢 Alibaba · 2025</span> <a href="https://arxiv.org/abs/2505.09388" target="_blank" rel="noopener">Qwen3 Technical Report</a></div>
+      <p><b>How:</b> RoPE with the base raised from 10,000 to 1,000,000, plus YaRN and Dual Chunk Attention at inference for a four-fold longer context.</p>
+      <p><b>Why this method:</b> RoPE's frequencies can be adjusted after training, which makes context extension a configuration change plus a little extra training rather than a new model.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Different bases for local and global layers</b> <span class="tag co">🏢 Google · 2025</span> <a href="https://arxiv.org/abs/2503.19786" target="_blank" rel="noopener">Gemma 3 Technical Report</a></div>
+      <p><b>How:</b> global attention layers use a RoPE base of 1M; sliding-window local layers keep 10k.</p>
+      <p><b>Why this method:</b> local layers only ever see short distances, so fast clocks are fine there; global layers need slow clocks for long range.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>ALiBi in a 176B open model</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2211.05100" target="_blank" rel="noopener">BigScience: BLOOM</a></div>
+      <p><b>How:</b> no position embeddings; attention scores are penalized in proportion to query–key distance.</p>
+      <p><b>Why this method:</b> chosen for extrapolation, and the team found it “also led to smoother training”.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the hope that didn't pan out</span>
+    <p>Vaswani et al. picked sine waves over a learned table partly because they “may allow the model to extrapolate” to longer sequences. Four years later the ALiBi paper put that hope to the test, found sinusoidal transformers extrapolate very weakly, and opened with the same quote. A good example of a reasonable hypothesis in a famous paper turning out to be wrong.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Fixes the order-blindness of self-attention (6.1); the “position match” sliders in 6.2 were a toy RoPE. Positions are added (or rotated in) at the bottom of the transformer block (6.4). Going past the trained length, rescaling RoPE and the “lost in the middle” problem are Lesson 6.11. Rotations and dot products: <a href="../../math-course/phase1/3-dot-product.html">math 1.3</a>; the attention formula: <a href="../../math-course/phase8/4-attention.html">math 8.4</a>. What a context window means for your bill: <a href="../../ai-engineer/phase0/3-tokens-cost.html">AI Engineer 0.3</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2104.09864" target="_blank" rel="noopener">RoFormer: Enhanced Transformer with Rotary Position Embedding (2021)</a>. The RoPE paper; section 3 has the 2D derivation you just played with.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2108.12409" target="_blank" rel="noopener">Train Short, Test Long: ALiBi (2021)</a>. Figure 1 compares how sinusoidal, rotary, T5 bias and ALiBi extrapolate.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1803.02155" target="_blank" rel="noopener">Self-Attention with Relative Position Representations (2018)</a>. Short; the first “put distance into the score” paper.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. RoPE with one pair and θ = 30° per position. The query is at position 4 and the key at position 7. By what angle does RoPE rotate the key relative to the query, and would positions 104 and 107 give the same score?</div>
+    <div class="opts"><button class="opt">210° (7 × 30°); no, the positions are larger</button><button class="opt" data-ok>90° ((7 − 4) × 30°); yes, the distance is 3 in both cases</button><button class="opt">0°, because the same word gets the same rotation</button></div>
+    <div class="explain">The query turns 4 × 30° = 120° and the key 7 × 30° = 210°, so the angle between them changes by 90°, which is (n − m) × θ. At 104 and 107 both turn much more, but the difference is again 3 × 30° = 90°, so the dot product is identical. That's RoPE's whole point: scores depend on distance only.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You fine-tune a BERT-style model (learned absolute positions, 512 rows) and want to classify 2,000-token documents. What happens if you just feed them in?</div>
+    <div class="opts"><button class="opt">It works; attention handles any length</button><button class="opt" data-ok>It fails (or you must invent rows 513–2,000 the model never trained): the position table has only 512 entries. Chunk the documents or use a model with a longer context</button><button class="opt">It works, but each token gets the average position</button></div>
+    <div class="explain">A learned absolute position table literally has one row per trained position. Libraries raise an error or silently truncate past 512. Options: split into 512-token chunks and combine predictions, or pick a long-context encoder (e.g. ModernBERT, 8,192 tokens, Lesson 6.5) or a RoPE-based model.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A teammate removes the positional encoding from a small translation transformer “to simplify it”. Training loss still goes down a bit. What will you most likely see in its translations?</div>
+    <div class="opts"><button class="opt">Nothing changes: attention learns order from the data</button><button class="opt">It refuses to translate long sentences</button><button class="opt" data-ok>Word-order mistakes: it gets which words appear roughly right but can't reliably tell “dog bites man” from “man bites dog”</button></div>
+    <div class="explain">Without positions the encoder sees a bag of words: permuting the input just permutes the outputs, so any meaning carried by order is invisible. The model can still learn which words to output (so loss improves), but order-dependent meaning is lost. (Causal decoders are a partial exception: the mask itself leaks some order information, but encoders get none.)</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Self-attention is permutation-blind: shuffle the words and each word gets exactly the same vector. Positions must be injected.</li>
+      <li>Learned absolute tables (BERT 512, GPT-2 1,024) cap the length. Sinusoids: clock hands at geometric speeds, no parameters, extrapolate weakly.</li>
+      <li>Relative positions (Shaw 2018) put distance into the score: +1.3 BLEU over absolute.</li>
+      <li>RoPE rotates q and k by position × frequency, so q·k depends only on the distance n − m. No parameters. Used by Llama 3, Qwen3, Gemma 3 (2024–25 reports).</li>
+      <li>ALiBi subtracts a distance penalty and extrapolates by design (BLOOM). Going past the trained length is still hard: Lesson 6.11.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/plane.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const pe = (pos, d, base = 10000) => Array.from({ length: d }, (_, j) => { const i = Math.floor(j / 2), a = pos / Math.pow(base, (2 * i) / d); return j % 2 ? Math.cos(a) : Math.sin(a); });
+
+  /* ---------- 1. shuffle the sentence ---------- */
+  const D = 8, r = NN.rng(5), WORDS = ["dog", "bites", "man"];
+  const EMB = {}; WORDS.forEach(w => (EMB[w] = Array.from({ length: D }, r.n)));
+  const mat = () => Array.from({ length: D }, () => Array.from({ length: D }, () => r.n() / Math.sqrt(D)));
+  const WQ = mat(), WK = mat(), WV = mat();
+  const mul = (x, M) => M[0].map((_, c) => x.reduce((s, v, k) => s + v * M[k][c], 0));
+  let order = [...WORDS], usePos = false, pick = -1;
+  function dogVec(ord) {
+    const X = ord.map((w, p) => usePos ? EMB[w].map((v, j) => v + 1.5 * pe(p, D)[j]) : EMB[w]);
+    const A = NN.attention(X.map(x => mul(x, WQ)), X.map(x => mul(x, WK)), X.map(x => mul(x, WV)));
+    return A.out[ord.indexOf("dog")];
+  }
+  function pDraw() {
+    $("chips").innerHTML = order.map((w, i) => `<button data-i="${i}" class="${i === pick ? "pick" : ""}">${w}</button>`).join("");
+    [...$("chips").querySelectorAll("button")].forEach(b => (b.onclick = () => {
+      const i = +b.dataset.i;
+      if (pick < 0) pick = i; else { [order[pick], order[i]] = [order[i], order[pick]]; pick = -1; }
+      pDraw();
+    }));
+    const a = dogVec(WORDS), b = dogVec(order);
+    NN.heat($("v0"), [a], { lo: -2, hi: 2, cmap: "div", text: true, digits: 2 });
+    NN.heat($("v1"), [b], { lo: -2, hi: 2, cmap: "div", text: true, digits: 2 });
+    const diff = Math.sqrt(a.reduce((s, v, j) => s + (v - b[j]) ** 2, 0));
+    $("curS").textContent = order.join(" ");
+    $("pDiff").textContent = diff.toFixed(3);
+    const moved = order.join() !== WORDS.join();
+    $("pTell").innerHTML = !moved ? "–" : diff < 1e-9 ? `<span class="dead">no: same vector</span>` : `<span class="ev">yes: vectors differ</span>`;
+    win("gSame", moved && !usePos && diff < 1e-9);
+    win("gDiff", moved && usePos && diff > 0.01);
+  }
+  seg("posSeg", v => { usePos = v === "on"; pDraw(); });
+  $("shuf").onclick = () => { order = ["man", "bites", "dog"]; pick = -1; pDraw(); };
+  $("unshuf").onclick = () => { order = [...WORDS]; pick = -1; pDraw(); };
+  pDraw();
+
+  /* ---------- 2. sinusoid barcode ---------- */
+  const BD = 64, NP = 100;
+  function bDraw() {
+    const p = +$("bP").value, base = +$("bB").value;
+    const M = Array.from({ length: NP }, (_, i) => pe(i, BD, base));
+    NN.heat($("barcode"), M, { lo: -1, hi: 1, cmap: "div", gap: 0, highlight: undefined });
+    const g = $("barcode")._heat, ctx = $("barcode").getContext("2d");
+    ctx.strokeStyle = MX.css("--c-at"); ctx.lineWidth = 2; ctx.strokeRect(1, g.padT + p * (g.h - g.padT) / NP, g.w - 2, (g.h - g.padT) / NP + 1);
+    const me = M[p], sim = M.map(v => v.reduce((s, x, j) => s + x * me[j], 0) / (BD / 2));
+    Plot.line($("simC"), { series: [{ label: "similarity to position " + p, color: MX.css("--c-at"), data: sim.map((v, i) => [i, v]), width: 2 }], yMin: -0.4, yMax: 1, xLabel: "position" });
+    $("bPV").textContent = p;
+    const five = [p - 5, p + 5].filter(i => i >= 0 && i < NP).map(i => sim[i]);
+    const nbrs = [p - 1, p + 1].filter(i => i >= 0 && i < NP), top2 = sim.map((v, i) => [v, i]).filter(([, i]) => i !== p).sort((a, b) => b[0] - a[0]).slice(0, 2).map(([, i]) => i);
+    win("gFar", base === 10000 && p === 50 && top2.every(i => nbrs.includes(i)));
+    const unrelated = five.some(v => v <= 0.05);
+    win("gAlias", unrelated);
+    $("bMsg").textContent = unrelated ? `Base ${base}: only 5 positions away, the encodings already look unrelated (${five.map(v => v.toFixed(2)).join(", ")}). Every clock is fast, so “near” and “far” blur.` :
+      `Most similar other positions: ${top2.join(" and ")}. Similarity 5 positions away: ${five.map(v => v.toFixed(2)).join(", ")}.`;
+  }
+  $("bP").oninput = bDraw; $("bB").onchange = bDraw;
+  bDraw();
+
+  /* ---------- 3. RoPE rotation ---------- */
+  let q0 = [2.2, 0.6], k0 = [1.6, 1.6], log = [];
+  const rot = (v, a) => [v[0] * Math.cos(a) - v[1] * Math.sin(a), v[0] * Math.sin(a) + v[1] * Math.cos(a)];
+  const dot = (a, b) => a[0] * b[0] + a[1] * b[1];
+  const plane = new Plane($("ropePlane"), { range: 3, onDrag: (key, p) => { if (key === "q") q0 = p; else k0 = p; log = []; rDraw(); } });
+  function rDraw() {
+    const m = +$("rM").value, n = +$("rN").value, th = +$("rT").value;
+    const qm = rot(q0, m * th), kn = rot(k0, n * th), s = dot(qm, kn), s0 = dot(q0, k0);
+    plane.draw([
+      { type: "vec", to: q0, color: "--c-at", dash: [5, 4], width: 2, drag: "q" },
+      { type: "vec", to: k0, color: "--c-x", dash: [5, 4], width: 2, drag: "k" },
+      { type: "vec", to: qm, color: "--c-at", width: 3.5, label: "q@" + m },
+      { type: "vec", to: kn, color: "--c-x", width: 3.5, label: "k@" + n },
+    ]);
+    $("rMV").textContent = m; $("rNV").textContent = n; $("rTV").textContent = th.toFixed(2) + " rad";
+    $("rDist").textContent = n - m; $("rScore").textContent = s.toFixed(3); $("rZero").textContent = s0.toFixed(3);
+    const key = `${m},${n},${th}`;
+    if (!log.some(e => e.key === key)) { log.unshift({ key, m, n, th, s }); log = log.slice(0, 8); }
+    $("rLog").innerHTML = log.map(e => `<tr><td>${e.m}</td><td>${e.n}</td><td>${e.n - e.m}</td><td>${e.th.toFixed(2)}</td><td>${e.s.toFixed(3)}</td></tr>`).join("");
+    const eq = log.some((a, i) => log.some((b, j) => j > i && a.th === b.th && a.n - a.m === b.n - b.m && a.m !== b.m && Math.abs(a.s - b.s) < 1e-9));
+    const L = Math.hypot(...q0) * Math.hypot(...k0);
+    win("gEq", eq);
+    win("gNeg", s < 0 && s0 > 0);
+    win("gWrap", n !== m && Math.abs(s - s0) < 0.01 * L && Math.abs((n - m) * th) > 3);
+    $("rMsg").textContent = Math.abs(s - s0) < 0.01 * L && n !== m && Math.abs((n - m) * th) > 3 ? `Distance ${n - m} × θ ≈ a whole number of turns, so it scores like distance 0. One clock alone can't tell them apart.` :
+      eq ? "Same distance, same score, wherever the pair sits. That's relative position." :
+      s < 0 ? "The rotated key now points more than 90° away from the query: negative score." : "Move both positions by the same amount: the score stays put.";
+  }
+  ["rM", "rN", "rT"].forEach(id => ($(id).oninput = rDraw));
+  $("rClear").onclick = () => { log = []; rDraw(); };
+  rDraw();
+})();
+</script>
+</body>
+</html>

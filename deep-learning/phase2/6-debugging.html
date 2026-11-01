@@ -1,0 +1,469 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.6 Debugging training: read the loss curve, overfit one batch · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .game-opts { display: grid; gap: 8px; margin: 10px 0; }
+  .game-opts button { text-align: left; font: inherit; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); cursor: pointer; }
+  .game-opts button.right { border-color: var(--good); background: color-mix(in srgb, var(--good) 15%, var(--bg2)); }
+  .game-opts button.wrong { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, var(--bg2)); }
+  .case { font-weight: 700; margin: 6px 0; }
+  .checks { display: grid; gap: 4px; margin: 8px 0; font-size: .92rem; }
+  .checks div { padding: 4px 10px; border-radius: 8px; background: var(--bg2); border: 1px solid var(--line); }
+  .checks div.ok { border-color: var(--good); }
+  .checks div.bad { border-color: var(--bad); }
+  canvas.bd { width: 100%; max-width: 260px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 10px; border: 1px solid var(--line); }
+  .toggles { display: flex; flex-wrap: wrap; gap: 6px; }
+  .toggles button { font: inherit; font-size: .82rem; padding: 4px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); cursor: pointer; }
+  .toggles button.on { background: var(--c-dead); color: #fff; border-color: var(--c-dead); }
+</style>
+</head>
+<body data-lesson="d2-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 6</div>
+  <h1>Debugging training: read the loss curve, overfit one batch</h1>
+  <p class="subtitle">Most broken training runs don't crash. They just learn a little worse, quietly, forever. This lesson is a field guide: the five-minute checks that catch most bugs, a gallery of loss curves and what they mean, and a game to train your eye.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Cross-entropy loss is −ln(probability of the right class) (Lesson 1.1, <a href="../../math-course/phase6/3-cross-entropy.html">math 6.3</a>).</li>
+      <li>The PyTorch loop: <code>zero_grad → forward → loss → backward → step</code> (Lesson 1.3); the learning rate and how to choose it (1.6).</li>
+      <li>This phase's failure modes: vanishing/exploding gradients (2.1), train/eval modes (2.3, 2.4), overfitting (2.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2019 Andrej Karpathy wrote a blog post that thousands of engineers have bookmarked: “A Recipe for Training Neural Networks”. Its central warning: <b>“Neural net training fails silently.”</b> Normal code throws an exception when you plug an integer where a string belongs. A network with flipped labels, a forgotten <code>zero_grad()</code> or a broadcasting mistake still trains. It just gets a bit worse, and nothing tells you.</p>
+    <p>His antidote is a set of paranoid habits: look at your data, check the loss before training, overfit a single batch, visualize what goes in just before the network. Practitioners at every lab use some version of them.</p>
+    <p><b>How do you tell a bug from a bad hyperparameter from a model that's simply too small, by looking at a few curves?</b> You'll diagnose ten loss curves against the clock, hunt hidden bugs with the overfit-one-batch test, and run a learning-rate finder.</p>
+  </div>
+
+  <h2>Numbers first: the loss you should see at step 0</h2>
+  <p>Before any training, a sensibly initialized classifier is clueless: it gives each of the K classes about the same probability, 1/K. Cross-entropy is −ln(probability of the right class), so the very first loss should be about <b>ln(K)</b>:</p>
+  <table>
+    <tr><th>Classes K</th><th>Uniform probability</th><th>Expected initial loss ln(K)</th></tr>
+    <tr><td>2 (cat / dog)</td><td>0.5</td><td><b>0.693</b></td></tr>
+    <tr><td>10 (CIFAR-10, digits)</td><td>0.1</td><td><b>2.303</b></td></tr>
+    <tr><td>1,000 (ImageNet)</td><td>0.001</td><td><b>6.908</b></td></tr>
+    <tr><td>50,257 (GPT-2's vocabulary)</td><td>0.00002</td><td><b>10.825</b></td></tr>
+  </table>
+  <p>Karpathy's recipe: “Verify that your loss starts at the correct loss value”, e.g. −log(1/n_classes) on a softmax. A first loss of 40 instead of 2.3 means the network starts out confidently wrong: the final layer's weights or the inputs are badly scaled. A first loss <i>far below</i> ln(K) before training is even more suspicious: the answer may be leaking into the input. It costs one forward pass to check.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Debug a network like a scientist, <b>from the cheapest check to the most expensive</b>: look at the data, check the initial loss, overfit one tiny batch, then train for real while watching training loss, validation loss and gradient norms. Each check rules out a whole family of bugs before you burn hours of compute. And read loss curves like an X-ray: their <b>shape</b> tells you what's wrong.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a mechanic's checklist</span>
+    <p>A car that won't start: a good mechanic doesn't rebuild the engine first. Is there fuel? Does the battery turn the starter? Does it run on the stand with the wheels off the ground? Overfitting one batch is “running on the stand”: if the network can't even memorize 12 examples, the problem is the engine (code), not the road (data, hyperparameters).</p>
+  </div>
+
+  <h2>The recipe, as checks</h2>
+  <table>
+    <tr><th>#</th><th>Check</th><th>Catches</th><th>Cost</th></tr>
+    <tr><td>1</td><td><b>Look at the data</b>: samples, labels, class balance, duplicates; visualize the batch <i>right before</i> <code>model(x)</code></td><td>Wrong labels, broken preprocessing, augmentation bugs, leakage</td><td>Minutes</td></tr>
+    <tr><td>2</td><td><b>Initial loss ≈ ln(K)</b> (or the right value for your loss)</td><td>Bad init, unnormalized inputs, wrong loss function</td><td>1 forward pass</td></tr>
+    <tr><td>3</td><td><b>Overfit one batch</b>: a few examples, train until loss ≈ 0</td><td>Wiring bugs: frozen layers, a loss that doesn't match the outputs, dead networks, an LR that's far off</td><td>Seconds</td></tr>
+    <tr><td>4</td><td><b>Input-independent baseline</b>: zero the inputs; the model should do worse</td><td>The model ignoring its input (only learning class frequencies)</td><td>One short run</td></tr>
+    <tr><td>5</td><td><b>Shapes and dtypes</b> at every step; watch for silent broadcasting</td><td>(N, 1) − (N,) → (N, N), labels as floats, wrong axis in softmax</td><td>Minutes</td></tr>
+    <tr><td>6</td><td><b>Monitor</b> train and val loss, per-layer gradient norms, dead units, learning rate</td><td>Over/underfitting, vanishing/exploding (2.1), dead ReLUs (0.4), a missing <code>zero_grad()</code> (a gradient norm that keeps growing)</td><td>Always on</td></tr>
+  </table>
+
+  <h2>Playground: overfit one batch (and hunt the bug)</h2>
+  <p>A small network (2 inputs → 16 → 16 → 3 classes) trains on <b>one batch of 12 points</b>. A healthy pipeline memorizes 12 points easily: the loss should fall to almost 0. Switch on bugs (or press 🎲 for a mystery bug), press Run, and read the automatic checklist.</p>
+  <p class="predict">🔮 <b>Predict:</b> if two examples' labels are accidentally swapped (a classic off-by-one in a data loader), will the overfit-one-batch test catch it?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Overfit one batch, with hidden bugs</span>
+    <div class="goals">
+      <span class="goal" id="gClean">🎯 Clean run: loss &lt; 0.05</span>
+      <span class="goal" id="gMyst">🎯 Diagnose 3 mystery bugs</span>
+      <span class="goal" id="gSneaky">🎯 Find the bug the test can't catch</span>
+    </div>
+    <div class="toggles" id="bBugs">
+      <button data-v="nozero">forgot zero_grad()</button>
+      <button data-v="hilr">learning rate ×100</button>
+      <button data-v="lolr">learning rate ÷1000</button>
+      <button data-v="scale">inputs not normalized (×100)</button>
+      <button data-v="dead">biases start at −3</button>
+      <button data-v="shuffle">two labels swapped</button>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="bRun">▶ Run 300 steps</button>
+      <button class="btn" id="bMyst">🎲 Mystery bug</button>
+      <button class="btn" id="bClear">↺ No bugs</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="bd" id="bView"></canvas><p class="hint">The batch as the network sees it: dot color = the label it's given; background = its prediction.</p></div>
+      <div>
+        <div class="checks" id="bChecks"></div>
+        <div class="stat-row"><div class="stat">step <b id="bStep">0</b></div><div class="stat"><span class="ls">loss</span> <b id="bLoss">–</b></div><div class="stat"><span class="gr">‖g‖</span> <b id="bG">–</b></div></div>
+      </div>
+    </div>
+    <canvas class="chart" id="bCurve" style="height:150px"></canvas>
+    <div id="bGuess" style="display:none">
+      <p class="case">Which bug is it?</p>
+      <div class="game-opts" id="bOpts"></div>
+    </div>
+    <p class="hint" id="bMsg"></p>
+  </div>
+  <p><b>What you should see:</b> with no bugs, the first loss is <b>1.099</b> (= ln 3, check 2 passes) and it is down to about 0.01 by step 50. Each bug leaves a fingerprint. <b>Inputs ×100</b>: first loss 17.1, far above ln 3, then everything dies. <b>Biases at −3</b>: every ReLU is off, the gradient is about 10⁻¹⁷ and the loss sits at exactly 1.099. <b>LR ÷1000</b>: 1.099 → 1.045 in 300 steps. <b>LR ×100</b>: loss jumps to 9+ and units die. <b>Forgot zero_grad</b>: the gradients pile up, so the loss hits 0 in 10 steps and then <i>explodes</i> to about 10 as the accumulated push keeps going. (In real PyTorch on one batch the loss can even stay at 0; the giveaway is a gradient norm that keeps growing, which you'll measure in Lab 2.) And the sneaky one: <b>two swapped labels</b> pass the test. The network happily memorizes the wrong labels too (loss 0.03 by step 300, under the 0.05 bar). Only looking at the data catches it: two dots have the wrong color for their cluster. That's why check 1 comes first. (Scramble <i>many</i> labels and memorizing takes much longer, but networks can eventually memorize even random labels.)</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Overfit a single batch first</span></span>
+    <ol>
+      <li><b>The problem before</b> A full training run takes hours, and a bad result has a hundred possible causes: data, model size, learning rate, a bug. You can't tell which by staring at a 70% accuracy.</li>
+      <li><b>What people tried</b> Launching full runs and tweaking hyperparameters until something works, which wastes compute and can hide a bug for weeks.</li>
+      <li><b>Why this works</b> A network with thousands of parameters can memorize a handful of examples, so on one tiny batch the loss <b>must</b> reach about 0 (Karpathy: “as little as two” examples). If it doesn't, the pipeline is broken, and it's broken in seconds instead of hours. It isolates the code (forward, loss, backward, optimizer wiring) from the hard questions (generalization, hyperparameters).</li>
+      <li><b>What it costs, when it fails</b> It only proves the model <i>can</i> fit; it says nothing about generalization. It can't catch bugs that are self-consistent: misaligned labels, leakage and wrong preprocessing all memorize fine, and so can a loop that never zeroes its gradients (watch the gradient norm for that one). Turn off augmentation and dropout for the test, or the loss won't reach 0 for innocent reasons.</li>
+      <li><b>What refined it</b> The rest of the recipe: visualize data just before the model, input-independent baselines, monitoring gradient norms and dead units, LR range tests (below), fixed seeds and small ablations (Lesson 10.6 on experiment tracking).</li>
+    </ol>
+  </div>
+
+  <h2>The loss-curve gallery</h2>
+  <table>
+    <tr><th>What you see</th><th>Most likely</th><th>First thing to try</th></tr>
+    <tr><td>Loss flat at exactly ln(K) from step 0</td><td>Not learning at all: dead network, LR = 0, optimizer not given the parameters, no <code>backward()</code></td><td>Overfit one batch; check grad norms</td></tr>
+    <tr><td>Starts far above ln(K), drops sharply, then normal (“hockey stick”)</td><td>Badly scaled final layer or inputs; the first steps just fix the bias</td><td>Init the last layer small; normalize inputs</td></tr>
+    <tr><td>Straight, slow decline</td><td>Learning rate too low</td><td>LR range test; raise 3–10×</td></tr>
+    <tr><td>Wild jumps, trend upward, then NaN</td><td>Learning rate too high</td><td>Lower 3–10×; warmup; clip gradients (2.1)</td></tr>
+    <tr><td>Healthy, then one huge spike and NaN</td><td>An exploding step: overflow, a bad batch</td><td>Clip norm, lower LR, check data for inf/NaN, bf16 (10.2)</td></tr>
+    <tr><td>Train ↓, val ↓ then ↑</td><td>Overfitting</td><td>Early stopping, regularization, augmentation (2.4, 2.5)</td></tr>
+    <tr><td>Val far worse than train from epoch 1, and noisy</td><td>Eval in train mode (BN/dropout), or different preprocessing for val</td><td><code>model.eval()</code>; same transforms</td></tr>
+    <tr><td>Repeating sawtooth inside every epoch</td><td>Data not shuffled (sorted by class or source)</td><td><code>DataLoader(shuffle=True)</code></td></tr>
+    <tr><td>Both ≈ 0 within a few epochs on a hard task</td><td>Label leakage or duplicates across splits</td><td>Audit features and splits</td></tr>
+    <tr><td>Train and val close together, both still falling</td><td>Healthy (and probably underfitting)</td><td>Train longer, bigger model</td></tr>
+  </table>
+  <p class="muted">CS231n's notes add one more: how much the loss “wiggles” step to step depends on the batch size. A batch of 1 is very noisy; the full dataset is smooth.</p>
+
+  <h2>Game: the loss-curve doctor</h2>
+  <p class="predict">🔮 <b>Predict:</b> before you start, which curve do you think is hardest to tell apart from healthy training? (Hint: the most dangerous bugs look like success.)</p>
+  <div class="playground">
+    <span class="label">🎮 Game · Loss-curve doctor</span>
+    <p class="hint">Ten real-looking runs. Teal = training loss, gold = validation loss. Read the curve (and the note), pick the diagnosis. Instant feedback, with the lesson to revisit.</p>
+    <div class="goals"><span class="goal" id="gDoc">🎯 Score 8 / 10 or better</span></div>
+    <div class="stat-row"><div class="stat">case <b id="gq">1 / 10</b></div><div class="stat">score <b id="gs">0</b></div></div>
+    <canvas class="chart" id="gChart" style="height:200px"></canvas>
+    <p class="case" id="gNote"></p>
+    <div class="game-opts"><button id="g0"></button><button id="g1"></button><button id="g2"></button><button id="g3"></button></div>
+    <p class="hint" id="gfb"></p>
+    <div class="controls"><button class="btn primary" id="gnext">Next case →</button><button class="btn" id="greset">↺ Start over</button></div>
+  </div>
+
+  <h2>Playground: the learning-rate range test</h2>
+  <p>Leslie Smith (2015) proposed a one-run way to find a sensible learning rate: train briefly while the learning rate grows exponentially from tiny to huge, and plot loss against learning rate. The loss doesn't move at first (too small), drops fastest in the useful range, then blows up. A common rule of thumb: pick a value about <b>10× below</b> where the loss is lowest, inside the steepest-descent region.</p>
+  <p class="predict">🔮 <b>Predict:</b> sweeping from 0.0001 to 10 on the moons data, where will the loss start to explode?</p>
+  <div class="playground">
+    <span class="label">🎮 Playground · LR finder</span>
+    <div class="controls"><button class="btn primary" id="lRun">▶ Sweep 120 steps (LR 10⁻⁴ → 10)</button></div>
+    <canvas class="chart" id="lChart" style="height:190px"></canvas>
+    <div class="stat-row"><div class="stat">lowest loss at LR <b id="lMin" class="lr">–</b></div><div class="stat">explodes at LR <b id="lBoom" class="dead">–</b></div><div class="stat">suggested LR (÷10) <b id="lSug" class="lr">–</b></div></div>
+    <p class="hint" id="lMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the smoothed loss barely moves until about 0.01, falls steeply between about 0.1 and 3, bottoms out near <b>3.8</b>, and explodes on the very next steps (by 4.6 the raw loss is over 4× the minimum; at 5.6 it's 3.65). Dividing the best value by 10 suggests about <b>0.4</b>, close to the 0.3 that several earlier playgrounds use. The test costs one short run; guessing costs many long ones (Lesson 1.6 covers schedules built on top of it).</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: five bugs you can find by printing shapes</span>
+    <ul>
+      <li><code>pred</code> is (32, 1), <code>target</code> is (32,): <code>(pred - target)</code> is <b>(32, 32)</b>. The MSE averages 1,024 meaningless differences and trains anyway. Fix: <code>pred.squeeze(-1)</code>.</li>
+      <li><code>nn.CrossEntropyLoss</code> expects raw <b>logits</b>. Adding <code>softmax</code> before it applies softmax twice: for K = 10 the loss can never go below about <b>1.46</b> (even a perfectly confident model gets e/(e + 9) ≈ 0.23 for the right class), and the gradients are squashed.</li>
+      <li>Labels as floats (<code>tensor([3.0, 1.0])</code>) instead of class indices: CrossEntropyLoss raises “expected scalar type Long but found Float”. The tempting “fix” of casting the model output instead hides the real mistake; convert labels with <code>.long()</code>. (Float targets are only valid as full probability rows, the soft labels of Lesson 2.5.)</li>
+      <li><code>x.view(B, C, H, W)</code> on data stored as (B, H, W, C) scrambles pixels without error. Use <code>permute</code> to reorder axes.</li>
+      <li><code>total_loss += loss</code> instead of <code>loss.item()</code> keeps every step's graph alive: memory grows until the run dies.</li>
+    </ul>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Three checks in plain PyTorch: initial loss, overfit one batch, per-layer gradient norms, plus the classic broadcasting trap. For monitoring real runs, log the same numbers to TensorBoard, Weights &amp; Biases or MLflow (Lesson 10.6); <code>torch.autograd.set_detect_anomaly(True)</code> points to the operation that produced a NaN (slow: debugging only).</p>
+<pre><code><span class="k">import</span> math, torch, torch.nn <span class="k">as</span> nn
+
+torch.manual_seed(<span class="n">0</span>)
+K = <span class="n">10</span>
+model = nn.Sequential(nn.Linear(<span class="n">20</span>, <span class="n">64</span>), nn.ReLU(), nn.Linear(<span class="n">64</span>, K))
+x, y = torch.randn(<span class="n">32</span>, <span class="n">20</span>), torch.randint(<span class="n">0</span>, K, (<span class="n">32</span>,))     <span class="c"># ONE fixed batch</span>
+loss_fn = nn.CrossEntropyLoss()                             <span class="c"># expects raw logits</span>
+
+<span class="c"># Check 1: loss at init ≈ ln(K)</span>
+print(<span class="s">f"initial loss {loss_fn(model(x), y).item():.3f}  vs ln(K) = {math.log(K):.3f}"</span>)
+
+<span class="c"># Check 2: overfit one batch (it must reach ~0, or the pipeline is broken)</span>
+opt = torch.optim.Adam(model.parameters(), lr=<span class="n">1e-2</span>)
+<span class="k">for</span> step <span class="k">in</span> range(<span class="n">300</span>):
+    opt.zero_grad()                     <span class="c"># forget this and gradients pile up</span>
+    loss = loss_fn(model(x), y)
+    loss.backward()
+    opt.step()
+print(<span class="s">f"after 300 steps on one batch: {loss.item():.4f}"</span>)
+
+<span class="c"># Check 3: per-layer gradient norms (vanishing? exploding?)</span>
+<span class="k">for</span> name, p <span class="k">in</span> model.named_parameters():
+    <span class="k">if</span> p.dim() == <span class="n">2</span>:
+        print(<span class="s">f"{name:9s} grad norm {p.grad.norm():.1e}"</span>)
+
+<span class="c"># A classic silent bug: broadcasting (N, 1) against (N,)</span>
+pred, target = torch.randn(<span class="n">32</span>, <span class="n">1</span>), torch.randn(<span class="n">32</span>)
+print(<span class="s">"silent broadcast:"</span>, (pred - target).shape)          <span class="c"># (32, 32), not (32,)</span>
+
+<span class="c"># What we got on a laptop CPU (torch 2.8):</span>
+<span class="c"># initial loss 2.425  vs ln(K) = 2.303</span>
+<span class="c"># after 300 steps on one batch: 0.0003</span>
+<span class="c"># 0.weight  grad norm 3.6e-04</span>
+<span class="c"># 2.weight  grad norm 5.2e-04</span>
+<span class="c"># silent broadcast: torch.Size([32, 32])</span></code></pre>
+    <p class="hint">2.425 vs 2.303 is close enough (random init isn't exactly uniform); 25 would not be. The gradient norms are tiny at the end because the batch is memorized. Gotchas: run the overfit test with augmentation and dropout off; keep the exact same batch every step; when validating, wrap in <code>model.eval()</code> and <code>torch.no_grad()</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Habit</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Overfit one batch before every new model</td><td>Catches wiring bugs in seconds</td><td>Misses data bugs that are self-consistent</td></tr>
+      <tr><td>Logging gradient norms and dead units</td><td>Explains plateaus and explosions</td><td>A little overhead and dashboard clutter</td></tr>
+      <tr><td>LR range test</td><td>A good LR in one short run</td><td>Assumes the short-run optimum transfers; schedules still needed</td></tr>
+      <tr><td>Full validation pass every epoch</td><td>Trustworthy curves (Karpathy: “add significant digits to your eval”)</td><td>Compute and time</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your model isn't learning. Walk me through how you debug it.” A strong answer:</p>
+    <ul>
+      <li>Starts cheap: look at samples and labels right before the model, check shapes and dtypes, check the initial loss against ln(K).</li>
+      <li>Overfits a tiny batch to separate code bugs from generalization; knows what it can't catch (misaligned labels, leakage).</li>
+      <li>Reads curves: flat at ln(K) (not learning), slow linear (LR low), jagged then NaN (LR high or explosion), U-shaped val (overfitting), val bad from the start (eval-mode or preprocessing mismatch), sawtooth (no shuffling), too good (leakage).</li>
+      <li>Monitors per-layer gradient norms and dead units, uses an LR range test, changes one thing at a time with a fixed seed.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The recipe</b> <span class="tag oss">🧰 Blog · 2019</span> <a href="http://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">Karpathy: A Recipe for Training Neural Networks</a></div>
+      <p><b>How:</b> become one with the data; set up end-to-end training with dumb baselines; verify the loss at init; overfit one batch; visualize just before the net; then regularize and tune.</p>
+      <p><b>Why this method:</b> “neural net training fails silently”, so each step is designed to make a whole class of silent bugs visible before it costs a full run.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Sanity checks and babysitting</b> <span class="tag res">🧪 Course</span> <a href="https://cs231n.github.io/neural-networks-3/" target="_blank" rel="noopener">Stanford CS231n: Neural Networks Part 3</a></div>
+      <p><b>How:</b> expect −ln(0.1) = 2.302 at init for CIFAR-10, overfit a tiny subset, and read loss, accuracy and update-to-weight ratios during training.</p>
+      <p><b>Why this method:</b> the same checks, taught to a generation of practitioners alongside example curves of good and bad learning rates.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The LR range test</b> <span class="tag res">🧪 Research · 2015</span> <a href="https://arxiv.org/abs/1506.01186" target="_blank" rel="noopener">Smith: Cyclical Learning Rates for Training Neural Networks</a></div>
+      <p><b>How:</b> run a few epochs while the learning rate increases between a low and a high value, and read off where accuracy starts rising and where it falls apart.</p>
+      <p><b>Why this method:</b> “enormously valuable whenever you are facing a new architecture or dataset”: one run replaces a grid search over learning rates.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Monitoring giant runs</b> <span class="tag co">🏢 Google · 2022</span> <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">Chowdhery et al.: PaLM</a></div>
+      <p><b>How:</b> watch the loss for spikes; when one appears, restart from a checkpoint about 100 steps earlier and skip the 200 to 500 batches around it.</p>
+      <p><b>Why this method:</b> at that scale you can't rerun from scratch, so reading the loss curve live is part of the training system (Lesson 2.1).</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the most dangerous curve looks perfect</span>
+    <p>A run that gets 99.9% validation accuracy in two epochs on a hard problem is more likely broken than brilliant. The usual culprits: the same images appear in both training and validation sets (near-duplicates count), or some input feature secretly encodes the label (a file name, a timestamp, the hospital a scan came from). The network takes the shortcut, the curves look wonderful, and the model fails in the real world. Karpathy's first step, “become one with the data”, is the defence.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Every check here uses an earlier lesson: ln(K) is cross-entropy at uniform probabilities (1.1, <a href="../../math-course/phase6/3-cross-entropy.html">math 6.3</a>); gradient norms and NaNs are 2.1 (and floating point, <a href="../../math-course/phase8/5-numerics.html">math 8.5</a>); dead units are 0.4; eval-mode bugs are 2.3 and 2.4; the LR finder feeds the schedules of 1.6. Next: the Phase 2 recap puts all of it together in a symptom ↔ fix game and a deep network you fix step by step. Later, experiment tracking and reproducibility (10.6) make these checks routine; the RL course has its own debugging checklist for value and policy learning (<a href="../../rl-course/phase9/3-experiment-hygiene.html">RL 9.3</a>).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="http://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">Karpathy: A Recipe for Training Neural Networks</a>. Short, opinionated, and still the best checklist.</li>
+      <li><span class="kind">Course</span> <a href="https://cs231n.github.io/neural-networks-3/" target="_blank" rel="noopener">CS231n: Learning and evaluation</a>. Gradient checks, sanity checks and example loss curves.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/tutorials/recipes/recipes/tuning_guide.html" target="_blank" rel="noopener">PyTorch Performance Tuning Guide</a>. When the bug is “it's slow”: data loading, <code>zero_grad(set_to_none=True)</code>, mixed precision.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A 100-class classifier's first logged loss is 4.6. Is that a problem?</div>
+    <div class="opts"><button class="opt">Yes: it should start near 0</button><button class="opt" data-ok>No: ln(100) ≈ 4.605, exactly what a model guessing uniformly should score</button><button class="opt">Yes: it should start near 0.693</button></div>
+    <div class="explain">Uniform guessing gives each class probability 0.01, and −ln(0.01) = 4.605. That's the healthy starting point. 0.693 is the value for 2 classes; a start near 0 before training would suggest leakage.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. On a single batch of 8 examples, your loss drops to 0.3 and then stays there for 2,000 steps. What does that tell you?</div>
+    <div class="opts"><button class="opt" data-ok>Something in the pipeline is wrong (or regularization is on): a working network memorizes 8 examples to ~0. Check dropout/augmentation are off, labels match outputs, the loss expects logits, all parameters are in the optimizer</button><button class="opt">The model generalizes well</button><button class="opt">You need more data</button></div>
+    <div class="explain">Overfitting one batch should be trivial. A plateau above 0 points to a bug: softmax before CrossEntropyLoss, duplicate inputs with conflicting labels, frozen layers, dropout still on, or a learning rate far too small. Fix it before training on the full set.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your training loss falls smoothly. Validation loss is 3× higher from the very first epoch, jumps around a lot, and never improves. The model has BatchNorm and dropout. Most likely?</div>
+    <div class="opts"><button class="opt">Classic overfitting: add more dropout</button><button class="opt" data-ok>Validation runs in training mode (no <code>model.eval()</code>), or uses different preprocessing than training</button><button class="opt">The learning rate is too high</button></div>
+    <div class="explain">Overfitting starts with validation <i>improving</i>, then rising. A gap from epoch 1 that never closes points to a mismatch between how training and validation are computed: BN batch statistics and active dropout in eval, or different normalization/resizing in the val transforms (Lessons 2.3, 2.4).</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Training fails silently. Debug cheapest-first: look at the data, check the initial loss (≈ ln K: 0.693, 2.303, 6.908), overfit one batch, then train while monitoring.</li>
+      <li>Overfit one batch to ~0 loss: if it can't, the code is broken. It can't catch self-consistent data bugs (misaligned labels, leakage): visualize the batch right before the model.</li>
+      <li>Curve shapes: flat at ln K = not learning; slow line = LR too low; jagged → NaN = LR too high or explosion; val U-shape = overfitting; val bad from epoch 1 = eval-mode/preprocessing mismatch; sawtooth = no shuffling; too good = leakage.</li>
+      <li>The LR range test sweeps the learning rate in one short run; pick about 10× below the loss minimum.</li>
+      <li>Usual PyTorch suspects: missing <code>zero_grad()</code>, softmax before CrossEntropyLoss, broadcasting (N, 1) vs (N,), <code>view</code> vs <code>permute</code>, forgetting <code>model.eval()</code>, accumulating loss tensors instead of <code>.item()</code>.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const sci = v => (!isFinite(v) ? "NaN" : v === 0 ? "0" : Math.abs(v) < 0.01 || Math.abs(v) >= 1e4 ? v.toExponential(1) : v.toFixed(3));
+  const LN3 = Math.log(3);
+
+  /* ---------- 1. overfit one batch with hidden bugs ---------- */
+  const r0 = NN.rng(31), BATCH = [];
+  for (let i = 0; i < 12; i++) { const c = i % 3, a = c * 2 * Math.PI / 3 + 0.4 * r0.n(), rad = 0.5 + 0.3 * r0.u(); BATCH.push({ x: [rad * Math.cos(a), rad * Math.sin(a)], y: c }); }
+  const BUGS = { nozero: "forgot zero_grad()", hilr: "learning rate ×100", lolr: "learning rate ÷1000", scale: "inputs not normalized (×100)", dead: "biases start at −3", shuffle: "two labels swapped" };
+  let bugs = new Set(), mystery = null, mysteryCount = 0, guessed = false, net, data, step = 0, first = null, last = null, hist = [];
+  const active = () => (mystery ? new Set([mystery]) : bugs);
+  function bReset() {
+    const B = active();
+    net = new NN.MLP({ sizes: [2, 16, 16, 3], act: "relu", out: "softmax", init: "he", seed: 2 });
+    if (B.has("dead")) net.layers.slice(0, 2).forEach(L => L.b.fill(-3));
+    data = BATCH.map((s, i) => ({ x: B.has("scale") ? [s.x[0] * 100, s.x[1] * 100] : s.x, y: B.has("shuffle") ? BATCH[[1, 0, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11][i]].y : s.y }));
+    step = 0; first = last = null; hist = []; bDraw();
+  }
+  function bStep() {
+    const B = active(), lr = B.has("hilr") ? 30 : B.has("lolr") ? 0.0003 : 0.3;
+    last = net.train(data, B.has("nozero") ? { lr, opt: "momentum", beta: 1 } : { lr, opt: "sgd" });   // momentum with β = 1 = gradients that are never zeroed
+    step++; if (step === 1) first = last;
+    hist.push([step, isFinite(last.loss) ? Math.min(last.loss, 15) : NaN]);
+  }
+  const COLS = ["--c-x", "--c-w", "--c-y"];
+  function bView() {
+    const c = $("bView"), dpr = window.devicePixelRatio || 1, w = c.clientWidth || 260, h = c.clientHeight || 260;
+    c.width = w * dpr; c.height = h * dpr; const ctx = c.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const R = 1.25, res = 26, sc = active().has("scale") ? 100 : 1;
+    for (let i = 0; i < res; i++) for (let j = 0; j < res; j++) {
+      const x = -R + 2 * R * (i + 0.5) / res, y = R - 2 * R * (j + 0.5) / res, p = net.predict([x * sc, y * sc]);
+      const k = isFinite(p[0]) ? p.indexOf(Math.max(...p)) : -1;
+      ctx.fillStyle = k < 0 ? MX.css("--bg2") : NN.cmap.seq(0.3, COLS[k]); ctx.fillRect(i * w / res, j * h / res, w / res + 1, h / res + 1);
+    }
+    data.forEach((s, i) => { const o = BATCH[i].x; ctx.beginPath(); ctx.arc((o[0] + R) / (2 * R) * w, (R - o[1]) / (2 * R) * h, 6, 0, 7); ctx.fillStyle = MX.css(COLS[s.y]); ctx.fill(); ctx.lineWidth = 1.5; ctx.strokeStyle = MX.css("--bg2"); ctx.stroke(); });
+  }
+  function bDraw() {
+    bView();
+    $("bStep").textContent = step;
+    $("bLoss").textContent = last ? sci(last.loss) : "–";
+    $("bG").textContent = last ? sci(last.gradNorm) : "–";
+    Plot.line($("bCurve"), { series: [{ label: "loss on the batch", color: MX.css("--c-ls"), data: hist.length ? hist : [[0, LN3]] }], yMin: 0, yMax: 4, xMin: 0, xMax: 300, xLabel: "step", hlines: [{ y: LN3, label: "ln 3 = 1.099", color: MX.css("--muted") }] });
+    const st = last && isFinite(last.loss) ? net.stats(BATCH.map((s, i) => data[i])) : null, dead = st ? Math.max(...st.map(s => s.dead)) : last ? 1 : 0;
+    const items = !first ? [["Initial loss ≈ ln 3 = 1.10", null], ["Loss reaches < 0.05", null], ["Gradient norm in a sane range", null], ["Fewer than half the units dead", null]] : [
+      [`Initial loss ${sci(first.loss)} ≈ ln 3 = 1.10`, Math.abs(first.loss - LN3) < 0.5],
+      [`Loss reaches < 0.05 (now ${sci(last.loss)})`, step >= 300 ? last.loss < 0.05 : last.loss < 0.05 ? true : null],
+      [`Gradient norm ${sci(last.gradNorm)} in a sane range`, isFinite(last.gradNorm) && (last.gradNorm > 1e-8 || last.loss < 0.05) && last.gradNorm < 1e3],
+      [`Dead units: ${Math.round(100 * dead)}% in the worst layer`, dead < 0.5],
+    ];
+    $("bChecks").innerHTML = items.map(([t, ok]) => `<div class="${ok === true ? "ok" : ok === false ? "bad" : ""}">${ok === true ? "✅" : ok === false ? "❌" : "⏳"} ${t}</div>`).join("");
+    if (step >= 300) {
+      const clean = !mystery && bugs.size === 0;
+      win("gClean", clean && last.loss < 0.05);
+      if (active().has("shuffle") && active().size === 1 && last.loss < 0.05) win("gSneaky", true);
+    }
+    $("bMsg").textContent = !last ? (mystery ? "A mystery bug is hidden. Run it and read the checklist." : "Press ▶ Run.") :
+      step < 300 ? "" : mystery ? "Read the checklist and the picture, then guess." :
+      active().has("shuffle") && last.loss < 0.05 ? "All checks pass, yet two dots have the wrong color for their cluster: those labels are wrong. Only looking at the data catches this." :
+      last.loss < 0.05 ? "The batch is memorized: the pipeline can learn. Now train on everything." : "It can't even memorize 12 points: something in the code is broken.";
+  }
+  function showGuess() {
+    $("bGuess").style.display = mystery ? "" : "none"; if (!mystery) { $("bOpts").innerHTML = ""; return; }
+    const keys = Object.keys(BUGS); guessed = false;
+    $("bOpts").innerHTML = keys.map(k => `<button data-k="${k}">${BUGS[k]}</button>`).join("");
+    [...$("bOpts").children].forEach(b => (b.onclick = () => {
+      if (guessed || !mystery) return; guessed = true; const ok = b.dataset.k === mystery;
+      b.className = ok ? "right" : "wrong"; $("bOpts").querySelector(`[data-k="${mystery}"]`).className = "right";
+      if (ok) { mysteryCount++; win("gMyst", mysteryCount >= 3); }
+      $("bMsg").textContent = (ok ? `✅ Right (${mysteryCount} found). ` : "❌ Not quite. ") + `It was “${BUGS[mystery]}”. Press 🎲 for another.`;
+    }));
+  }
+  const loop = NN.loop(() => { for (let i = 0; i < 6 && step < 300; i++) bStep(); bDraw(); if (step >= 300) return false; }, { onStop: () => ($("bRun").textContent = "▶ Run 300 steps") });
+  $("bRun").onclick = () => { if (loop.running) { loop.stop(); return; } if (step >= 300) bReset(); loop.start(); $("bRun").textContent = "⏸ Pause"; };
+  [...$("bBugs").children].forEach(b => (b.onclick = () => { mystery = null; showGuess(); const v = b.dataset.v; bugs.has(v) ? bugs.delete(v) : bugs.add(v); b.classList.toggle("on", bugs.has(v)); loop.stop(); bReset(); }));
+  const mr = NN.rng(77);
+  $("bMyst").onclick = () => { const keys = Object.keys(BUGS); let k; do { k = keys[mr.int(keys.length)]; } while (k === mystery); mystery = k; bugs.clear(); [...$("bBugs").children].forEach(b => b.classList.remove("on")); loop.stop(); bReset(); showGuess(); };
+  $("bClear").onclick = () => { mystery = null; showGuess(); bugs.clear(); [...$("bBugs").children].forEach(b => b.classList.remove("on")); loop.stop(); bReset(); };
+  bReset();
+
+  /* ---------- 2. loss-curve doctor ---------- */
+  const nz = NN.rng(12);
+  const curve = (n, f, noise) => Array.from({ length: n }, (_, i) => [i + 1, Math.max(0.001, f(i) + noise * nz.n())]);
+  const CASES = [
+    { note: "10 classes. Loss stays at 2.30 from the very first step.", tr: curve(60, () => 2.303, 0.004), va: curve(60, () => 2.303, 0.004),
+      opts: ["Not learning at all (dead units, LR 0, optimizer missing parameters): overfit one batch and check grad norms", "Learning rate slightly too low: raise it a little", "Overfitting: add dropout", "Healthy: wait longer"], ok: 0, more: "2.303 = ln 10 = uniform guessing. The network outputs the same thing for every input (Lessons 2.6, 2.1)." },
+    { note: "Learning rate 3e-6 with Adam. 60 epochs.", tr: curve(60, i => 2.3 - 0.006 * i, 0.01), va: curve(60, i => 2.32 - 0.0058 * i, 0.012),
+      opts: ["Overfitting", "Learning rate too low: run an LR range test and raise it", "Label leakage", "Learning rate too high"], ok: 1, more: "A slow, nearly straight decline is the signature of tiny steps (Lesson 1.6)." },
+    { note: "Batches of 64, sometimes the line stops early.", tr: curve(40, i => 2.3 + 0.04 * i + 0.8 * Math.abs(Math.sin(i * 1.7)), 0.3), va: curve(40, i => 2.4 + 0.05 * i + 0.6 * Math.abs(Math.sin(i * 1.3)), 0.3),
+      opts: ["Model too small", "Data not shuffled", "Learning rate too high: lower it 3–10×, add warmup, clip gradients", "Healthy noise from small batches"], ok: 2, more: "Jagged jumps with an upward trend: steps overshoot the valley (Lessons 1.6, 2.1)." },
+    { note: "ResNet on 5,000 images, no augmentation.", tr: curve(60, i => 2.0 * Math.exp(-i / 9) + 0.03, 0.01), va: curve(60, i => 1.6 * Math.exp(-i / 7) + 0.75 + 0.0006 * (i - 18) ** 2 * (i > 18 ? 1 : 0.15), 0.02),
+      opts: ["Overfitting: early stopping, weight decay, dropout, augmentation", "Learning rate too low", "Forgot model.eval()", "Data not shuffled"], ok: 0, more: "Validation falls, bottoms out (around epoch 18) and climbs while training keeps falling (Lessons 2.4, 2.5)." },
+    { note: "Steps, not epochs. The dataset was built by concatenating class 0, then class 1, then class 2.", tr: curve(90, i => 0.4 + 1.6 * Math.pow((i % 30) < 2 ? 1 : 0.15 + 0.85 * Math.exp(-(i % 30) / 3), 1) * (0.95 - 0.002 * i), 0.03), va: curve(90, i => 1.9 - 0.002 * i, 0.03),
+      opts: ["Exploding gradients", "Data not shuffled: every block of steps sees one class; set shuffle=True", "Overfitting", "Label leakage"], ok: 1, more: "A repeating sawtooth: the loss spikes each time the stream switches class, then the model over-adapts to the new class." },
+    { note: "Fraud detection. Validation accuracy 99.9% after 2 epochs. Features include ‘case_status’.", tr: curve(30, i => 0.7 * Math.exp(-i * 1.4) + 0.004, 0.001), va: curve(30, i => 0.7 * Math.exp(-i * 1.5) + 0.003, 0.001),
+      opts: ["A great model: ship it", "Learning rate too high", "Label leakage: a feature (or duplicates across splits) gives away the answer; audit features and splits", "Underfitting"], ok: 2, more: "‘case_status’ is filled in after fraud is confirmed. Too-good curves on a hard task mean a shortcut (fun fact above)." },
+    { note: "Model with BatchNorm and dropout. Validation computed one image at a time.", tr: curve(50, i => 2.0 * Math.exp(-i / 12) + 0.3, 0.02), va: curve(50, () => 1.9, 0.25),
+      opts: ["Overfitting", "Validation runs in training mode: call model.eval() (and torch.no_grad())", "Learning rate too low", "Model too small"], ok: 1, more: "Validation never improves and is noisy from epoch 1: BN uses one image's statistics and dropout is still on (Lessons 2.3, 2.4)." },
+    { note: "fp16 training, step 300 of 400 shown. The log then prints loss = nan.", tr: curve(30, i => (i < 27 ? 2.1 * Math.exp(-i / 10) + 0.4 : [6, 40, 900][i - 27]), 0.015), va: curve(27, i => 2.1 * Math.exp(-i / 10) + 0.5, 0.015),
+      opts: ["Overfitting", "An exploding step: clip the gradient norm, lower the LR, check data for inf/NaN, consider bf16", "Data not shuffled", "Learning rate too low"], ok: 1, more: "Healthy, then a sudden blow-up: one huge gradient or an overflow (Lessons 2.1, 10.2)." },
+    { note: "10 classes. The first logged loss is 38.", tr: curve(60, i => (i < 4 ? 38 * Math.exp(-i * 1.1) : 0) + 1.9 * Math.exp(-i / 25) + 0.35, 0.02), va: curve(60, i => (i < 4 ? 38 * Math.exp(-i * 1.1) : 0) + 1.9 * Math.exp(-i / 25) + 0.45, 0.02),
+      opts: ["Bad final-layer init or unnormalized inputs: the first steps just undo it (a ‘hockey stick’)", "Label leakage", "Learning rate too low", "Healthy"], ok: 0, more: "The first loss should be ≈ ln 10 = 2.3. Karpathy: initializing well eliminates hockey-stick curves (Lessons 1.4, 2.6)." },
+    { note: "ViT fine-tune, 60 epochs, cosine schedule.", tr: curve(60, i => 1.6 * Math.exp(-i / 14) + 0.45, 0.015), va: curve(60, i => 1.6 * Math.exp(-i / 14) + 0.55, 0.02),
+      opts: ["Overfitting", "Learning rate too high", "Healthy: small gap, both still falling; train longer or scale up", "Forgot model.eval()"], ok: 2, more: "Train and val fall together with a small, steady gap. Nothing to fix; the only question is whether to spend more compute." },
+  ];
+  let gi = 0, score = 0, answered = false;
+  function gShow() {
+    const g = CASES[gi]; answered = false;
+    $("gq").textContent = `${gi + 1} / ${CASES.length}`; $("gs").textContent = score;
+    $("gNote").textContent = g.note; $("gfb").textContent = "";
+    const ymax = Math.min(12, Math.max(...g.tr.concat(g.va).map(p => p[1])) * 1.1);
+    Plot.line($("gChart"), { series: [{ label: "training loss", color: MX.css("--c-ls"), data: g.tr.map(p => [p[0], Math.min(p[1], ymax)]) }, { label: "validation loss", color: MX.css("--c-at"), data: g.va }], yMin: 0, yMax: Math.max(1, ymax), xLabel: gi === 4 ? "step" : "epoch" });
+    g.opts.forEach((o, n) => { const b = $("g" + n); b.textContent = o; b.className = ""; });
+  }
+  [0, 1, 2, 3].forEach(n => ($("g" + n).onclick = () => {
+    if (answered) return; answered = true;
+    const g = CASES[gi], ok = n === g.ok; if (ok) score++;
+    $("g" + n).className = ok ? "right" : "wrong"; $("g" + g.ok).className = "right";
+    $("gs").textContent = score;
+    $("gfb").textContent = (ok ? "✅ Right. " : "❌ Not quite. ") + g.more;
+    if (gi === CASES.length - 1) win("gDoc", score >= 8);
+  }));
+  $("gnext").onclick = () => {
+    if (gi < CASES.length - 1) { gi++; gShow(); }
+    else { $("gNote").textContent = `Done: ${score} / ${CASES.length}. ${score >= 8 ? "You read loss curves like a senior engineer." : "Revisit the lessons named in the feedback, then try again."}`; $("gfb").textContent = ""; [0, 1, 2, 3].forEach(n => { $("g" + n).textContent = ""; $("g" + n).className = ""; }); answered = true; }
+  };
+  $("greset").onclick = () => { gi = 0; score = 0; gShow(); };
+  gShow();
+
+  /* ---------- 3. LR range test ---------- */
+  function lRun() {
+    const data = NN.data.moons(200), net = new NN.MLP({ sizes: [2, 16, 16, 1], act: "relu", out: "sigmoid", init: "he", seed: 3 });
+    const pts = [], raw = []; let sm = null;
+    for (let i = 0; i <= 120; i++) { const lr = 1e-4 * Math.pow(10, 5 * i / 120), res = net.train(data, { lr, opt: "sgd" }); sm = sm == null ? res.loss : 0.9 * sm + 0.1 * res.loss; pts.push([Math.log10(lr), Math.min(sm, 2)]); raw.push({ lr, loss: res.loss, sm }); }
+    let iMin = 0; raw.forEach((p, i) => { if (p.sm < raw[iMin].sm) iMin = i; });
+    const boom = raw.find((p, i) => i > iMin && p.loss > 4 * raw[iMin].loss);
+    Plot.line($("lChart"), { series: [{ label: "smoothed loss", color: MX.css("--c-ls"), data: pts }], yMin: 0, yMax: 1.6, xLabel: "log₁₀(learning rate)" });
+    $("lMin").textContent = raw[iMin].lr.toPrecision(2);
+    $("lBoom").textContent = boom ? boom.lr.toPrecision(2) : "–";
+    $("lSug").textContent = (raw[iMin].lr / 10).toPrecision(2);
+    $("lMsg").textContent = "Flat on the left (steps too small to matter), steepest in the middle, then it falls apart: everything right of the minimum is unusable.";
+  }
+  $("lRun").onclick = lRun;
+  Plot.line($("lChart"), { series: [{ label: "smoothed loss", color: MX.css("--c-ls"), data: [[-4, NaN]] }], xMin: -4, xMax: 1, yMin: 0, yMax: 1.6, xLabel: "log₁₀(learning rate)" });
+})();
+</script>
+</body>
+</html>

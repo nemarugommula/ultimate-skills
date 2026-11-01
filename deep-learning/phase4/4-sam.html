@@ -1,0 +1,427 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.4 Segment Anything: promptable segmentation (SAM) · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.px { width: 100%; max-width: 440px; aspect-ratio: 4 / 3; height: auto; display: block; margin: 0 auto; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; touch-action: none; image-rendering: pixelated; cursor: crosshair; }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .bars { display: grid; gap: 8px; font-size: .85rem; margin: 8px 0; }
+  .bars .b { display: grid; grid-template-columns: 150px 1fr 90px; gap: 8px; align-items: center; }
+  .bars .meterbar { height: 14px; }
+  .bars .naive > i { background: var(--c-dead); } .bars .split > i { background: var(--c-y); }
+  svg.arch { width: 100%; max-width: 680px; display: block; margin: 0 auto; }
+</style>
+</head>
+<body data-lesson="d4-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 4</div>
+  <h1>Segment Anything: promptable segmentation (SAM)</h1>
+  <p class="subtitle">Click on anything, get its mask in a twentieth of a second, even for objects no one ever labelled for training. How Meta's SAM works, why it is split into a heavy part and a light part, how SAM 2 remembers objects through a video, and what SAM 3 added.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Instance masks, mask IoU, Dice and focal loss (Lessons 4.1 to 4.3).</li>
+      <li>A Vision Transformer (ViT) turns an image into a grid of patch tokens and runs a transformer over them (Lesson 4.5 explains it fully; here it's just “the heavy encoder”).</li>
+      <li>Attention lets a set of tokens look at another set and pull in what's relevant (Lesson 6.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook: a billion masks, and a click that answers in 50 ms</span>
+    <p>In April 2023 Meta released <b>SAM</b> together with <b>SA-1B</b>: <b>1.1 billion</b> masks on <b>11 million</b> images, 400× more masks than any segmentation dataset before it. Of those masks, 99.1% were made by the model itself.</p>
+    <p>Give SAM a click, a box or a rough mask on any photo and it returns a mask, even for things nobody labelled: a cell under a microscope, a crater, a sticker on a laptop. Once the photo is encoded, each new click takes about <b>50 ms</b> in a web browser, on a CPU. Meta's November 2025 SAM 3 announcement says SAM 3 (with SAM 3D) powers Facebook Marketplace's “View in Room” feature and will power effects in Instagram's Edits app; labelling tools and robots use the SAM family every day.</p>
+    <p><b>How can one model segment “anything”, and why is each click so cheap when the network is huge?</b></p>
+  </div>
+
+  <h2>The task: segment what I point at</h2>
+  <p>Classic segmentation models have a fixed list of classes (Lesson 4.3). SAM's task is different: <b>promptable segmentation</b>. Input: an image plus a <b>prompt</b> (one or more points marked “object” or “not object”, a box, or a rough mask). Output: a valid mask for whatever the prompt points at. No class names: just “this thing”.</p>
+  <p>A single click is <b>ambiguous</b>. Click on a shirt's pocket: did you mean the pocket, the shirt, or the whole person? SAM doesn't guess one answer: it outputs <b>three masks</b> by default, because, in the paper's words, three layers (whole, part, and subpart) “are often enough to describe nested masks”, each with a predicted IoU score so the best can be picked. Add more clicks and the ambiguity disappears.</p>
+  <p class="predict">🔮 <b>Predict:</b> below, the mug is almost the same brown as the table. With a generous tolerance, what will one click on the mug select? What kind of click fixes it?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Click to segment (a stand-in, not SAM)</span>
+    <p class="hint"><b>This is a classic algorithm, not a neural network:</b> each pixel joins the click it can reach most cheaply, where crossing a color edge costs more (seeded region growing). It shows how SAM is <i>used</i>: positive clicks add, negative clicks subtract. Target: the <b>mug</b> (dashed outline), including its handle and its label.</p>
+    <div class="goals"><span class="goal" id="gLeak">🎯 Leak into the table</span><span class="goal" id="gNeg">🎯 Fix a leak with a negative click</span><span class="goal" id="g3">🎯 Mug IoU ≥ 0.9 in ≤ 3 clicks</span></div>
+    <div class="controls">
+      <span class="seg" id="sMode"><button data-v="1" class="on">＋ positive click</button><button data-v="0">− negative click</button></span>
+      <label>tolerance <input type="range" id="sTau" min="0.01" max="0.5" step="0.01" value="0.1"> <b class="mono" id="sTauV"></b></label>
+      <button class="btn" id="sUndo">↶ Undo click</button><button class="btn" id="sReset">↺ Reset</button>
+    </div>
+    <canvas class="px" id="sC"></canvas>
+    <div class="stat-row">
+      <div class="stat">clicks <b id="sClicks">0</b></div>
+      <div class="stat">mask size <b id="sSize">–</b></div>
+      <div class="stat">IoU with the mug <b id="sIou" class="y">–</b></div>
+    </div>
+    <p class="hint" id="sMsg">Click on the mug.</p>
+  </div>
+  <p><b>What you should see:</b> at tolerance 0.10, one click on the mug body floods the whole table too (IoU about 0.25): mug and table differ by less than the tolerance. A negative click on the table hands the table to the “not object” seed: IoU 0.85, but the lighter label in the middle is still missing (crossing into it costs more than 0.10). Then either click the label (IoU 1.0 in 3 clicks), or raise the tolerance to 0.3 (2 clicks). Real SAM learned which edges matter from a billion masks, so it usually needs one or two clicks where this toy needs three.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Promptable segmentation</span></span>
+    <ol>
+      <li><b>The problem before</b> Every segmentation model was trained for a fixed list of classes on its own labelled data (Lesson 4.3). A new domain (cells, satellite roofs, a factory part) meant a new dataset and a new model. Interactive tools existed but needed many clicks per object.</li>
+      <li><b>What people tried</b> Class-specific models per domain; interactive segmentation trained on small datasets; edge-based tools like “magic wand” (the playground's cousin).</li>
+      <li><b>Why this works</b> Make the <b>prompt</b> the task, as language models did with text prompts. “Segment what I point at” is defined for any object, needs no class list, and lets one model be trained on masks of anything. It also composes: a detector's boxes or a text model's outputs can be the prompts (Lesson 4.6). The paper reports zero-shot performance “often competitive with or even superior to” fully supervised results.</li>
+      <li><b>What it costs, when it fails</b> SAM 1 and 2 return masks without names: “what is this?” needs another model. Ambiguous prompts need several masks or more clicks. Domains far from SA-1B's photos (medical scans, microscopy) can need fine-tuning. Fine detail (hair, thin wires) is soft at the 256 × 256 mask resolution before upsampling.</li>
+      <li><b>What refined it</b> SAM 2 (video), SAM 3 (prompts that are words or example images and return <i>all</i> matching objects with names), lighter variants (MobileSAM, FastSAM), and medical versions like MedSAM.</li>
+    </ol>
+  </div>
+
+  <h2>Heavy once, light many times</h2>
+  <p>SAM has three parts:</p>
+  <svg class="arch" viewBox="0 0 680 170" role="img" aria-label="SAM architecture: image encoder runs once; prompt encoder and mask decoder run per click">
+    <g id="archG"></g>
+  </svg>
+  <ul>
+    <li><b>Image encoder</b>: a big ViT (pretrained as a masked autoencoder, MAE, Lesson 9.1) reads the 1024 × 1024 image and outputs an <span class="ac">image embedding</span> of 256 channels on a 64 × 64 grid. It runs <b>once per image</b>.</li>
+    <li><b>Prompt encoder</b>: turns each click or box corner into a small vector (its position plus “positive / negative / corner” type).</li>
+    <li><b>Mask decoder</b>: a tiny transformer where prompt tokens and image embedding <span class="at">attend</span> to each other, then three output tokens become three masks and three IoU scores.</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: we timed it on a laptop CPU</span>
+    <p>We built a SAM with Hugging Face's default configuration (a ViT-B-sized encoder) and random weights, so nothing was downloaded, and timed it on this course's laptop CPU (code in the Tools box):</p>
+    <table>
+      <tr><th>Part</th><th>Parameters</th><th>Time</th><th>Runs</th></tr>
+      <tr><td>Image encoder</td><td>89.7 M</td><td class="dead">2.05 s</td><td>once per image</td></tr>
+      <tr><td>Prompt encoder + mask decoder</td><td>4.1 M</td><td class="ev">29 ms</td><td>once per click</td></tr>
+    </table>
+    <p>The decoder is 22× smaller and 70× faster. Ten clicks on one photo cost 2.05 + 10 × 0.029 = <b>2.34 s</b> with the split, versus 10 × (2.05 + 0.029) = <b>20.8 s</b> if you reran the whole model per click: <b>8.9× faster</b>, and every click after the first feels instant. (Your numbers will differ; the ratio is the point. The released SAM uses a bigger ViT-H encoder, which makes the split matter even more.)</p>
+  </div>
+  <p class="predict">🔮 <b>Predict:</b> with these timings, how many prompts per image do you need before “encode once” is 10× faster than rerunning everything? And what's the best speed-up you could ever get?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Encode once, prompt many</span>
+    <p class="hint">Defaults are our measured laptop numbers. Change them for your hardware (a GPU encoder takes a fraction of a second). Prompts could be clicks by a human, or a detector's boxes in an auto-labelling job.</p>
+    <div class="goals"><span class="goal" id="gX10">🎯 Encode-once 10× faster</span><span class="goal" id="gLive">🎯 Every click after the first under 50 ms</span><span class="goal" id="gMax">🎯 Find the speed-up ceiling (within 5%)</span></div>
+    <div class="controls">
+      <label>image encoder (ms) <input type="range" id="lE" min="50" max="5000" step="50" value="2050"> <b class="mono" id="lEV"></b></label>
+      <label>prompt + decoder (ms) <input type="range" id="lD" min="5" max="200" step="1" value="29"> <b class="mono" id="lDV"></b></label>
+      <label>prompts per image <input type="range" id="lP" min="1" max="500" step="1" value="10"> <b class="mono" id="lPV"></b></label>
+    </div>
+    <div class="bars">
+      <div class="b"><span>rerun everything per prompt</span><div class="meterbar naive"><i id="lNb"></i></div><b class="mono" id="lN">–</b></div>
+      <div class="b"><span>encode once, decode per prompt</span><div class="meterbar split"><i id="lSb"></i></div><b class="mono" id="lS">–</b></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">speed-up <b id="lX" class="y">–</b></div>
+      <div class="stat">ceiling (E + D) ÷ D <b id="lCeil">–</b></div>
+      <div class="stat">latency per extra click <b id="lClick">–</b></div>
+    </div>
+    <p class="hint" id="lMsg"></p>
+  </div>
+  <p><b>What you should see:</b> with 2,050 ms and 29 ms, 10× needs <b>12 prompts</b>; the speed-up can never pass (E + D) ÷ D ≈ <b>72×</b>, however many prompts you add, because each still pays the decoder. Make the decoder 50 ms (the paper's browser figure) and the ceiling drops while every click still feels interactive. A labelling tool with 30 objects per photo gets most of the benefit.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">SAM's heavy encoder / light decoder split</span></span>
+    <ol>
+      <li><b>The problem before</b> Interactive segmentation reran a whole network after every click, so the network had to be small (weaker masks) or the tool felt slow. Annotating SA-1B meant millions of clicks; every second per mask mattered.</li>
+      <li><b>What people tried</b> Small networks for speed; caching some features in ad hoc ways.</li>
+      <li><b>Why this works</b> Put almost all the computation where it can be <b>shared</b>: the image doesn't change between clicks, only the prompt does. The paper: the image embedding “can be reused (and its cost amortized) with different prompts”, so they “can afford a high number of image encoder FLOPs because they are computed only once per image, not per prompt”. The decoder (about 4 M parameters) runs on a CPU in a browser in ~50 ms. Even the 3 masks come out of one decoder call.</li>
+      <li><b>What it costs, when it fails</b> The first click on a new image waits for the encoder (seconds on a CPU, a fraction of a second on a GPU). For video at 30 fps the encoder must run on every frame, so the split helps less. Storing embeddings (256 × 64 × 64 floats ≈ 4 MB each) adds up for big image sets.</li>
+      <li><b>What refined it</b> SAM 2 uses a faster hierarchical encoder (Hiera) and is 6× faster than SAM on images; MobileSAM and EfficientSAM shrink the encoder; SAM 3 shares one backbone between a detector and a video tracker.</li>
+    </ol>
+  </div>
+
+  <h2>The data engine: the model labels its own dataset</h2>
+  <p>Segmentation masks aren't lying around on the internet like captions are, so Meta built them with SAM in the loop, in three stages:</p>
+  <table>
+    <tr><th>Stage</th><th>Who does what</th><th>Output</th></tr>
+    <tr><td>1. Assisted manual</td><td>Annotators click; SAM proposes masks; humans fix them. SAM is retrained 6 times as data grows, and the encoder grows from ViT-B to ViT-H.</td><td>4.3 M masks on 120k images; time per mask falls from 34 s to 14 s</td></tr>
+    <tr><td>2. Semi-automatic</td><td>SAM fills in the confident masks; humans label what it missed</td><td>more varied, less obvious objects</td></tr>
+    <tr><td>3. Fully automatic</td><td>SAM is prompted with a grid of points on every image and keeps only confident, stable masks</td><td>1.1 B masks on 11 M images</td></tr>
+  </table>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">A model-in-the-loop data engine</span></span>
+    <ol>
+      <li><b>The problem before</b> The largest segmentation datasets had a few million masks; at 30+ seconds of human time per mask, a billion was out of reach.</li>
+      <li><b>What people tried</b> Crowd-sourced polygons (COCO), coarse labels (Cityscapes' 20,000 coarse images), synthetic data.</li>
+      <li><b>Why this works</b> A flywheel: better model → faster labelling → more data → better model. Each stage moves humans from drawing to correcting to just checking quality, and the last stage costs only compute. The paper checks quality by comparing automatic masks with professional annotations.</li>
+      <li><b>What it costs, when it fails</b> The model's blind spots can be baked into its own data (it can't easily label what it can't see); quality depends on the filtering rules. Data collection still needed licensed, privacy-protected images (faces and plates blurred).</li>
+      <li><b>What refined it</b> SAM 2's video engine (SA-V: 50.9K videos, 642.6K masklets) and SAM 3's engine of 4 M unique concept labels with hard negatives; the same idea powers Depth Anything's pseudo-labels (Lesson 4.8).</li>
+    </ol>
+  </div>
+
+  <h2>SAM 2: segmenting through a video with memory</h2>
+  <p>Video adds time. The object moves, turns, gets hidden behind someone, comes back. Running SAM per frame would need a click on every frame. <b>SAM 2</b> (July 2024) treats an image as a one-frame video and adds a <b>memory</b>: after each frame, a memory encoder stores a compact summary of the frame and its predicted mask in a <b>memory bank</b>; on the next frame, <b>memory attention</b> lets the new frame's features look at those memories before the mask decoder runs. One click on frame 1 can follow the object for the whole clip, and a correction click on frame 40 is remembered from then on.</p>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a detective's photo wall</span>
+    <p>You're following one person through a crowd. You don't re-read their full description each second: you keep a few snapshots pinned up (“red jacket, from the side”, “same person, hood up”) and compare each new glimpse with the wall. When they vanish behind a bus you keep the wall; when they reappear, you recognize them. SAM 2's memory bank is the wall: a few recent frames plus every frame you clicked on.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">SAM 2's streaming memory</span></span>
+    <ol>
+      <li><b>The problem before</b> Image SAM has no notion of time: per-frame use needs per-frame prompts, and masks flicker or jump to other objects. Video object segmentation models existed but weren't promptable at this scale.</li>
+      <li><b>What people tried</b> SAM on each frame plus a separate tracker to carry the prompt forward; propagating masks with optical flow.</li>
+      <li><b>Why this works</b> Memory attention gives each frame direct access to how the object looked before, so appearance changes and occlusions are handled by comparison, not by a hand-made tracker. It's <b>streaming</b>: frames are processed one at a time with a fixed-size memory, so it works on live video. Prompts can come at any frame. The paper reports better accuracy with <b>3× fewer interactions</b> than prior approaches on video, and on images it is more accurate and <b>6× faster</b> than SAM.</li>
+      <li><b>What it costs, when it fails</b> Memory has a fixed size, so long occlusions or look-alike objects (identical twins, a flock of birds) can swap identities; cost grows with the number of objects tracked; the first frames depend on the first prompt being right.</li>
+      <li><b>What refined it</b> SAM 2.1 checkpoints (September 2024); SAM 3 (November 2025) adds concept prompts and a detector; SAM 3.1 (March 2026) “Object Multiplex” shares memory across objects to track many objects faster.</li>
+    </ol>
+  </div>
+
+  <h2>SAM 3: from “this thing” to “every yellow school bus”</h2>
+  <p><b>SAM 3</b> (Meta, November 2025) changes what a prompt can be: a short <b>noun phrase</b> (the paper's example: “yellow school bus”), <b>image exemplars</b> (boxes around examples), or both. The task, “promptable concept segmentation”, returns masks and IDs for <b>all</b> matching objects in an image or video. It pairs an image-level detector with a SAM 2-style memory tracker on one shared backbone, and adds a “presence head” that first decides whether the concept is in the image at all. Meta reports it doubles the accuracy of existing systems on concept segmentation and runs in 30 ms for an image with more than 100 detected objects on an H200 GPU.</p>
+  <table>
+    <tr><th></th><th>SAM (Apr 2023)</th><th>SAM 2 (Jul 2024)</th><th>SAM 3 (Nov 2025) · 3.1 (Mar 2026)</th></tr>
+    <tr><td>Prompt</td><td>points, boxes, masks</td><td>same, on any video frame</td><td>+ text noun phrases, image exemplars</td></tr>
+    <tr><td>Returns</td><td>1 object (3 candidate masks)</td><td>1 object tracked over time (masklet)</td><td>all matching objects, tracked, with identities</td></tr>
+    <tr><td>Data</td><td>SA-1B: 11 M images, 1.1 B masks</td><td>SA-V: 50.9 K videos, 642.6 K masklets</td><td>4 M unique concept labels; SA-Co benchmark</td></tr>
+    <tr><td>Key idea</td><td>heavy encoder, light decoder</td><td>memory bank + memory attention</td><td>detector + tracker, presence head; 3.1 shares memory across objects</td></tr>
+  </table>
+  <p class="muted">Also from November 2025: <b>SAM 3D</b>, separate models that reconstruct a 3D object (geometry, texture, layout) or a human body from a single image (Lesson 4.8 covers 3D). Checked November 2026; this family moves fast, so check Meta's <a href="https://github.com/facebookresearch/sam3" target="_blank" rel="noopener">SAM 3 repository</a> for the latest release.</p>
+
+  <h3>Where SAM helps, and where to be careful</h3>
+  <ul>
+    <li><b>Labelling:</b> click-to-mask in annotation tools; auto-labelling by feeding a detector's boxes to SAM as prompts (Ultralytics ships an <code>auto_annotate</code> helper that does exactly this).</li>
+    <li><b>Robotics and AR:</b> “segment the object under the gripper”, cut-outs for placing furniture in a room.</li>
+    <li><b>Video editing:</b> one click to track and mask a person through a clip.</li>
+    <li><b>Medical images, with caveats:</b> SA-1B is natural photos; scans look different. MedSAM fine-tuned SAM on 1,570,263 medical image-mask pairs across 10 modalities. Any clinical use needs validation on your own scanners and patients, and a human in the loop.</li>
+  </ul>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>The timing experiment from the worked example: SAM from Hugging Face Transformers with its <b>default config and random weights</b> (no download), so the masks are garbage but the shapes and timings are real.</p>
+<pre><code><span class="k">import</span> time, torch
+<span class="k">from</span> transformers <span class="k">import</span> SamConfig, SamModel
+
+torch.manual_seed(<span class="n">0</span>)
+model = SamModel(SamConfig()).eval()            <span class="c"># default config = ViT-B sized encoder, random weights (no download)</span>
+pixels = torch.rand(<span class="n">1</span>, <span class="n">3</span>, <span class="n">1024</span>, <span class="n">1024</span>)
+<span class="k">with</span> torch.no_grad():
+    t = time.perf_counter()
+    emb = model.get_image_embeddings(pixels)                    <span class="c"># run the heavy ViT once</span>
+    print(<span class="s">"image embedding"</span>, tuple(emb.shape), <span class="s">f"{time.perf_counter() - t:.2f} s"</span>)
+    pts = torch.tensor([[[[<span class="n">500.</span>, <span class="n">400.</span>]]]])                      <span class="c"># one click (x, y) in 1024-pixel coordinates</span>
+    lab = torch.tensor([[[<span class="n">1</span>]]])                                 <span class="c"># 1 = positive click, 0 = negative</span>
+    t = time.perf_counter()
+    <span class="k">for</span> _ <span class="k">in</span> range(<span class="n">10</span>):
+        out = model(image_embeddings=emb, input_points=pts, input_labels=lab, multimask_output=<span class="k">True</span>)
+    print(<span class="s">"masks"</span>, tuple(out.pred_masks.shape), <span class="s">"scores"</span>, tuple(out.iou_scores.shape),
+          <span class="s">f"{1000 * (time.perf_counter() - t) / 10:.0f} ms per prompt"</span>)
+
+<span class="c"># What we got (torch 2.8, transformers 4.57, laptop CPU):</span>
+<span class="c"># image embedding (1, 256, 64, 64) 2.05 s</span>
+<span class="c"># masks (1, 1, 3, 256, 256) scores (1, 1, 3) 29 ms per prompt</span></code></pre>
+    <p>With real, pretrained weights (these download checkpoints on first use; we did not run them):</p>
+<pre><code><span class="c"># Hugging Face: SamProcessor resizes the image and rescales click coordinates for you</span>
+<span class="c"># from transformers import SamModel, SamProcessor</span>
+<span class="c"># model = SamModel.from_pretrained("facebook/sam-vit-base"); processor = SamProcessor.from_pretrained("facebook/sam-vit-base")</span>
+
+<span class="c"># Ultralytics: SAM 2.1 with point or box prompts</span>
+<span class="k">from</span> ultralytics <span class="k">import</span> SAM
+model = SAM(<span class="s">"sam2.1_b.pt"</span>)                                       <span class="c"># downloads weights</span>
+results = model(<span class="s">"photo.jpg"</span>, points=[<span class="n">900</span>, <span class="n">370</span>], labels=[<span class="n">1</span>])         <span class="c"># one positive click</span>
+results = model(<span class="s">"photo.jpg"</span>, bboxes=[<span class="n">100</span>, <span class="n">100</span>, <span class="n">200</span>, <span class="n">200</span>])          <span class="c"># a box prompt</span>
+
+<span class="c"># SAM 3 concept prompts (text): Ultralytics' SAM3SemanticPredictor, or Hugging Face's</span>
+<span class="c"># Sam3Model / Sam3Processor ("facebook/sam3", a gated checkpoint: request access; needs a recent transformers)</span></code></pre>
+    <p class="hint">Gotcha: SAM expects click coordinates in the resized 1024-pixel frame (the processors handle this). Encode once per image (<code>get_image_embeddings</code> / <code>set_image</code>), then loop over prompts; re-encoding per click throws away the whole design.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>SAM / SAM 2 (visual prompts)</td><td>Any object, no training, great masks from 1–2 clicks</td><td>No class names; needs prompts from a human or another model</td></tr>
+      <tr><td>SAM 3 (concept prompts)</td><td>Text in, all instances out, with tracking</td><td>Bigger, gated weights; still weak on rare or very specific concepts</td></tr>
+      <tr><td>A trained detector/segmenter (YOLO-seg, Mask R-CNN)</td><td>Fast, exact classes, tuned to your data</td><td>Needs labelled data for every class</td></tr>
+      <tr><td>Heavy encoder once per image</td><td>Interactive clicks, cheap extra prompts</td><td>Slow first click on CPU; per-frame cost in video</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“We need masks for 50,000 product photos of 300 product types. How would you use SAM?” A strong answer:</p>
+    <ul>
+      <li>Auto-label: a detector (or an open-vocabulary detector, Lesson 4.6, or SAM 3 with text prompts) proposes boxes; SAM turns boxes into masks; humans review a sample and fix with clicks.</li>
+      <li>Explains the encoder/decoder split (encode each photo once, many prompts) and the 3-mask ambiguity output with predicted IoU scores.</li>
+      <li>Measures quality on a hand-labelled subset (mask IoU, Dice) before trusting the rest; then trains a small, fast model on the SAM-made labels for production.</li>
+      <li>Knows SAM gives masks without names, and that out-of-domain images (X-rays, microscopy) may need fine-tuning.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Shopping and creative apps</b> <span class="tag co">🏢 Meta · 2025</span> <a href="https://ai.meta.com/blog/segment-anything-model-3/" target="_blank" rel="noopener">Meta AI blog: Introducing SAM 3</a></div>
+      <p><b>How:</b> SAM 3 and SAM 3D power Facebook Marketplace's “View in Room” (visualize a lamp or table in your space); SAM 3 effects are announced for Instagram's Edits app.</p>
+      <p><b>Why this method:</b> users name or tap an object and get its exact cut-out, with no per-category model to train.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The original model and dataset</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2304.02643" target="_blank" rel="noopener">Kirillov et al.: Segment Anything</a></div>
+      <p><b>How:</b> a MAE-pretrained ViT encoder, a prompt encoder and a light mask decoder, trained with focal + Dice loss on SA-1B, built by the three-stage data engine.</p>
+      <p><b>Why this method:</b> a promptable task plus a huge, diverse dataset gives zero-shot transfer to new image distributions.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Auto-annotation pipelines</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.ultralytics.com/models/sam-2/" target="_blank" rel="noopener">Ultralytics: SAM 2 docs</a></div>
+      <p><b>How:</b> a detector's boxes are passed to SAM as prompts to create segmentation labels for a whole dataset (<code>auto_annotate</code>).</p>
+      <p><b>Why this method:</b> boxes are cheap to get, masks are expensive; SAM converts one into the other.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Medical segmentation</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2304.12306" target="_blank" rel="noopener">Ma et al.: Segment Anything in Medical Images (MedSAM)</a></div>
+      <p><b>How:</b> SAM fine-tuned on 1,570,263 image-mask pairs from 10 imaging modalities and over 30 cancer types, prompted with boxes.</p>
+      <p><b>Why this method:</b> one promptable model instead of a specialist per modality; the authors report better accuracy and robustness than modality-wise specialists on 86 internal and 60 external validation tasks.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 34 seconds → 14 seconds</span>
+    <p>In the first, human-driven stage of SAM's data engine, the model was retrained 6 times as the data grew, and the average time for a person to annotate one mask fell from <b>34 seconds to 14</b>. By the last stage, people weren't drawing at all: 99.1% of the final billion masks were generated fully automatically.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Masks, Dice and focal loss come from 4.3 and 4.2. The image encoder is a ViT (4.5), pretrained with MAE (9.1, self-supervised learning). Text prompts like SAM 3's grow out of CLIP and open-vocabulary detection (4.6); SAM 2's memory and tracking connect to 4.7 (tracking-by-detection). The <a href="../../ai-engineer/phase4/5-multimodal-rag.html">AI Engineer course's multimodal RAG lesson</a> shows vision models inside applications; robots that grasp segmented objects appear in the <a href="../../autonomous-systems/index.html">Autonomous Systems course</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2304.02643" target="_blank" rel="noopener">Segment Anything (2023)</a>. Sections 3 and 4 (model and data engine) are very readable.</li>
+      <li><span class="kind">Project</span> <a href="https://ai.meta.com/sam2/" target="_blank" rel="noopener">Meta: SAM 2</a>. Interactive video demo and the SA-V dataset.</li>
+      <li><span class="kind">Docs</span> <a href="https://huggingface.co/docs/transformers/model_doc/sam" target="_blank" rel="noopener">Hugging Face Transformers: SAM</a>. Prompting with points, boxes and masks in code.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. On a GPU, the encoder takes 400 ms and the decoder 20 ms. A labelling job sends 20 box prompts per image. Roughly how much faster is “encode once” than rerunning the full model per prompt?</div>
+    <div class="opts"><button class="opt">20×, one per prompt</button><button class="opt" data-ok>About 10.5×</button><button class="opt">About 2×</button></div>
+    <div class="explain">Rerun: 20 × (400 + 20) = 8,400 ms. Encode once: 400 + 20 × 20 = 800 ms. 8,400 ÷ 800 = <b>10.5×</b>. It can never reach (400 + 20) ÷ 20 = 21× because every prompt still pays the decoder.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A user clicks once on a car's side mirror in SAM's demo and gets just the mirror, but wanted the whole car. What's the intended way to handle this?</div>
+    <div class="opts"><button class="opt" data-ok>Look at SAM's other candidate masks (it returns several for an ambiguous click), or add another positive click on the car body</button><button class="opt">Retrain SAM on cars</button><button class="opt">Lower the image resolution so the mirror disappears</button></div>
+    <div class="explain">One click is ambiguous (subpart, part, whole), so SAM outputs three masks with predicted IoU scores. Pick another one, or add a click: more prompts remove the ambiguity. No retraining needed.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You need to count and outline every “forklift” in hours of warehouse video, with no labelled data. Which tool fits best?</div>
+    <div class="opts"><button class="opt">SAM 1 on each frame with one click per frame</button><button class="opt" data-ok>SAM 3 with the text prompt “forklift” (all instances, tracked), checking a sample by hand; or an open-vocabulary detector + SAM 2</button><button class="opt">Semantic segmentation with pixel accuracy</button></div>
+    <div class="explain">SAM 1 needs a prompt per object per frame and doesn't know names. SAM 3 takes a concept (a noun phrase) and returns every matching instance with identities through the video. A detector-plus-SAM 2 pipeline does the same in two steps. Semantic segmentation can't count instances.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Promptable segmentation: image + clicks/box/mask → a mask for “this thing”, any object, no class list. One click is ambiguous, so SAM returns 3 masks with IoU scores.</li>
+      <li>Heavy ViT image encoder once per image (1024² → 256 × 64 × 64), tiny prompt encoder + mask decoder per prompt (~50 ms in a browser): cost amortized over many prompts.</li>
+      <li>SA-1B: 1.1 B masks on 11 M images from a model-in-the-loop data engine; 99.1% automatic.</li>
+      <li>SAM 2 (2024): streaming memory bank + memory attention for video; 6× faster than SAM on images, 3× fewer interactions on video.</li>
+      <li>SAM 3 (Nov 2025): text or exemplar prompts → all matching objects, tracked; SAM 3.1 (Mar 2026) speeds multi-object tracking. Validate before medical or safety use.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const fit = c => { const d = window.devicePixelRatio || 1, w = c.clientWidth || 400, h = c.clientHeight || 300;
+    if (c.width !== Math.round(w * d)) { c.width = Math.round(w * d); c.height = Math.round(h * d); }
+    const x = c.getContext("2d"); x.setTransform(d, 0, 0, d, 0, 0); x.clearRect(0, 0, w, h); return { x, w, h }; };
+
+  /* ---------- architecture diagram ---------- */
+  (() => {
+    const g = $("archG"), NS = "http://www.w3.org/2000/svg";
+    const el = (t, a, txt) => { const e = document.createElementNS(NS, t); Object.entries(a).forEach(([k, v]) => e.setAttribute(k, v)); if (txt) e.textContent = txt; g.appendChild(e); return e; };
+    const box = (x, y, w, h, fill, t1, t2) => { el("rect", { x, y, width: w, height: h, rx: 10, fill, opacity: 0.22, stroke: fill, "stroke-width": 2 });
+      el("text", { x: x + w / 2, y: y + h / 2 - 4, "text-anchor": "middle", style: "font:700 13px var(--font);fill:var(--text)" }, t1);
+      el("text", { x: x + w / 2, y: y + h / 2 + 13, "text-anchor": "middle", style: "font:500 11px var(--font);fill:var(--muted)" }, t2); };
+    const arrow = (x1, y1, x2, y2) => el("line", { x1, y1, x2, y2, stroke: "var(--muted)", "stroke-width": 2, "marker-end": "url(#arr)" });
+    const defs = el("defs", {}); const m = document.createElementNS(NS, "marker"); [["id", "arr"], ["markerWidth", 8], ["markerHeight", 8], ["refX", 7], ["refY", 4], ["orient", "auto"]].forEach(([k, v]) => m.setAttribute(k, v));
+    const p = document.createElementNS(NS, "path"); p.setAttribute("d", "M0,0 L8,4 L0,8 z"); p.setAttribute("fill", "var(--muted)"); m.appendChild(p); defs.appendChild(m);
+    box(10, 20, 100, 50, "var(--c-x)", "image", "1024 × 1024");
+    box(150, 15, 150, 60, "var(--c-w)", "image encoder (ViT)", "heavy · once per image");
+    box(340, 20, 120, 50, "var(--c-ac)", "embedding", "256 × 64 × 64");
+    box(10, 105, 100, 50, "var(--c-x)", "prompt", "clicks · box · mask");
+    box(150, 105, 150, 50, "var(--c-w)", "prompt encoder", "light · per prompt");
+    box(500, 60, 170, 60, "var(--c-at)", "mask decoder", "light · per prompt → 3 masks + IoU");
+    arrow(110, 45, 148, 45); arrow(300, 45, 338, 45); arrow(460, 50, 498, 80); arrow(110, 130, 148, 130); arrow(300, 130, 498, 100);
+  })();
+
+  /* ---------- 1. click to segment (geodesic seeded region growing) ---------- */
+  const W = 40, H = 30, rr = NN.rng(5), IMG = [], TGT = [];
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    let c = [0.74, 0.78, 0.86], t = 0;
+    if (y >= 18) c = [0.55, 0.38, 0.25];
+    if (x >= 2 && x <= 9 && y >= 20 && y <= 24) c = [0.20, 0.35, 0.70];
+    if (Math.hypot(x - 31, y - 9) <= 5) c = [0.25, 0.60, 0.30];
+    if (x >= 28 && x <= 34 && y >= 13 && y <= 19) c = [0.70, 0.35, 0.25];
+    const body = x >= 12 && x <= 21 && y >= 8 && y <= 21, rad = Math.hypot(x - 22, y - 13.5), ring = rad <= 3.6 && rad >= 1.8 && x > 21;
+    if (body || ring) { c = [0.60, 0.42, 0.28]; t = 1; }
+    if (x >= 14 && x <= 19 && y >= 11 && y <= 14) { c = [0.80, 0.60, 0.42]; t = 1; }
+    IMG.push(c.map(v => Math.max(0, Math.min(1, v + 0.008 * rr.n())))); TGT.push(t);
+  }
+  const cost = (a, b) => Math.max(0, Math.hypot(IMG[a][0] - IMG[b][0], IMG[a][1] - IMG[b][1], IMG[a][2] - IMG[b][2]) - 0.03) + 0.0005;
+  function geo(seeds) {
+    const Dd = new Float64Array(W * H).fill(Infinity), done = new Uint8Array(W * H), pq = [];
+    seeds.forEach(s => { Dd[s] = 0; pq.push([0, s]); });
+    while (pq.length) { let bi = 0; for (let i = 1; i < pq.length; i++) if (pq[i][0] < pq[bi][0]) bi = i; const [d, u] = pq.splice(bi, 1)[0]; if (done[u]) continue; done[u] = 1;
+      const x = u % W, y = (u / W) | 0; for (const [dx, dy] of [[1, 0], [-1, 0], [0, 1], [0, -1]]) { const nx = x + dx, ny = y + dy; if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue; const v = ny * W + nx, nd = d + cost(u, v); if (nd < Dd[v]) { Dd[v] = nd; pq.push([nd, v]); } } }
+    return Dd;
+  }
+  let clicks = [], mode = 1, usedNeg = false, leaked = false;
+  function drawS() {
+    const tau = +$("sTau").value; $("sTauV").textContent = tau.toFixed(2);
+    const pos = clicks.filter(c => c.l === 1).map(c => c.i), neg = clicks.filter(c => c.l === 0).map(c => c.i);
+    const P = pos.length ? geo(pos) : null, N = neg.length ? geo(neg) : null;
+    const M = TGT.map((_, i) => (P && P[i] <= tau && (!N || P[i] < N[i]) ? 1 : 0));
+    const { x, w } = fit($("sC")), k = w / W;
+    let it = 0, un = 0, size = 0;
+    M.forEach((m, i) => { const px = i % W, py = (i / W) | 0, c = IMG[i];
+      x.fillStyle = `rgb(${Math.round(255 * c[0])},${Math.round(255 * c[1])},${Math.round(255 * c[2])})`; x.fillRect(px * k, py * k, k + 0.5, k + 0.5);
+      if (m) { x.globalAlpha = 0.5; x.fillStyle = css("--c-ac"); x.fillRect(px * k, py * k, k + 0.5, k + 0.5); x.globalAlpha = 1; size++; }
+      if (m && TGT[i]) it++; if (m || TGT[i]) un++; });
+    x.setLineDash([4, 3]); x.strokeStyle = "#fff"; x.lineWidth = 1.5;
+    TGT.forEach((t, i) => { if (!t) return; const px = i % W, py = (i / W) | 0; [[1, 0], [-1, 0], [0, 1], [0, -1]].forEach(([dx, dy]) => { const nx = px + dx, ny = py + dy; if (nx < 0 || ny < 0 || nx >= W || ny >= H || !TGT[ny * W + nx]) {
+      x.beginPath(); if (dx) { const xx = (dx > 0 ? px + 1 : px) * k; x.moveTo(xx, py * k); x.lineTo(xx, (py + 1) * k); } else { const yy = (dy > 0 ? py + 1 : py) * k; x.moveTo(px * k, yy); x.lineTo((px + 1) * k, yy); } x.stroke(); } }); });
+    x.setLineDash([]);
+    clicks.forEach(c => { const px = (c.i % W + 0.5) * k, py = (((c.i / W) | 0) + 0.5) * k; x.beginPath(); x.arc(px, py, 8, 0, 7); x.fillStyle = c.l ? css("--c-y") : css("--c-dead"); x.fill(); x.strokeStyle = "#fff"; x.lineWidth = 2; x.stroke();
+      x.fillStyle = "#fff"; x.font = "700 13px " + css("--font"); x.textAlign = "center"; x.textBaseline = "middle"; x.fillText(c.l ? "+" : "−", px, py + 1); });
+    x.textAlign = "left"; x.textBaseline = "alphabetic";
+    const iou = un ? it / un : 0, tableLeak = M.some((m, i) => m && !TGT[i] && ((i / W) | 0) >= 18);
+    if (tableLeak) leaked = true;
+    $("sClicks").textContent = clicks.length; $("sSize").textContent = size + " px"; $("sIou").textContent = clicks.length ? iou.toFixed(2) : "–";
+    win("gLeak", tableLeak); win("gNeg", usedNeg && leaked && !tableLeak && iou > 0.5); win("g3", iou >= 0.9 && clicks.length <= 3 && clicks.length > 0);
+    $("sMsg").textContent = !clicks.length ? "Click on the mug." : tableLeak ? "Leaked into the table: mug and table are almost the same color. Try a negative click on the table." :
+      iou >= 0.9 ? `IoU ${iou.toFixed(2)} in ${clicks.length} click${clicks.length > 1 ? "s" : ""}.` : iou > 0.6 ? "Close. Is part of the mug (the label?) still missing?" : "";
+  }
+  const C = $("sC");
+  C.addEventListener("pointerdown", e => { const r = C.getBoundingClientRect(), px = Math.floor((e.clientX - r.left) / r.width * W), py = Math.floor((e.clientY - r.top) / r.height * H);
+    if (px < 0 || py < 0 || px >= W || py >= H) return; clicks.push({ i: py * W + px, l: mode }); if (!mode) usedNeg = true; drawS(); });
+  seg("sMode", v => (mode = +v));
+  $("sTau").oninput = drawS;
+  $("sUndo").onclick = () => { clicks.pop(); drawS(); };
+  $("sReset").onclick = () => { clicks = []; usedNeg = false; leaked = false; drawS(); };
+  drawS();
+
+  /* ---------- 2. latency calculator ---------- */
+  function drawL() {
+    const E = +$("lE").value, D = +$("lD").value, P = +$("lP").value;
+    $("lEV").textContent = E; $("lDV").textContent = D; $("lPV").textContent = P;
+    const naive = P * (E + D), split = E + P * D, x = naive / split, ceil = (E + D) / D, fmt = ms => (ms >= 1000 ? (ms / 1000).toFixed(2) + " s" : ms.toFixed(0) + " ms");
+    $("lN").textContent = fmt(naive); $("lS").textContent = fmt(split);
+    $("lNb").style.width = "100%"; $("lSb").style.width = (100 * split / naive).toFixed(1) + "%";
+    $("lX").textContent = x.toFixed(1) + "×"; $("lCeil").textContent = ceil.toFixed(0) + "×"; $("lClick").textContent = D + " ms";
+    win("gX10", x >= 10); win("gLive", D <= 50); win("gMax", x >= 0.95 * ceil);
+    const need = E > 9 * D ? Math.ceil(10 * E / (E - 9 * D)) : null;
+    $("lMsg").textContent = need ? `10× needs at least ${need} prompts per image at these timings.` : "With a decoder this slow relative to the encoder, 10× is impossible: the ceiling is below 10.";
+  }
+  ["lE", "lD", "lP"].forEach(id => ($(id).oninput = drawL));
+  drawL();
+})();
+</script>
+</body>
+</html>

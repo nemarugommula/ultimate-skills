@@ -1,0 +1,500 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.3 Occupancy networks · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .seg { display: inline-flex; gap: 0; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { border: 0; background: var(--bg2); color: var(--text); padding: 5px 12px; font: inherit; font-size: .88rem; cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+</style>
+</head>
+<body data-lesson="s6-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 3</div>
+  <h1>Occupancy networks: “something is there” beats “a car is there”</h1>
+  <p class="subtitle">A box detector only sees what it was taught to name. The road is full of things nobody named: a fallen ladder, a mattress, a trailer with a strange shape. Occupancy networks stop naming and start asking one question about every little cube of space: is it filled?</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Bird's-eye view (BEV)</b> grids: the scene from above in 0.5 m cells, built from cameras by lifting pixels with a depth guess or by letting map cells query the images (Lesson 6.2).</li>
+      <li><b>A voxel</b> is a 3D pixel: a small cube of space, say 0.4 m on a side. A voxel grid is a 3D array of them.</li>
+      <li><b>Box detectors</b> output a class and a 3D box per object, and need a <b>confidence threshold</b> to decide which outputs count (Lesson 6.1).</li>
+      <li><b>Occupancy grid</b> (classic robotics): a 2D map where each cell holds the probability it's blocked, built from lidar or sonar. Lesson 5.1 builds these for mapping; here a network predicts one in 3D from cameras.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>Your detector knows three classes: <i>car, pedestrian, cyclist</i>. A ladder falls off a van and lies across your lane, 25 m ahead. <b>What does the detector output?</b> And if you lower the confidence threshold until it finally shows something, what else shows up?</p>
+    <p>Tesla described this exact trap at CVPR 2022. Its object network was confused by a <b>pickup truck that looked like a fence</b>, by statues and mannequins that look like people, and by a crouched pedestrian that looks like a pile of trash; Ashok Elluswamy called defining the right list of classes “an impossible fight”. Tesla's answer was an <b>occupancy network</b> that takes all 8 cameras and predicts, for every voxel around the car, whether it's occupied, and how it's moving, in about <b>10 milliseconds</b> (<a href="https://www.youtube.com/watch?v=jPCV4GKX9Dw" target="_blank" rel="noopener">CVPR'22 WAD keynote</a>).</p>
+  </div>
+
+  <div class="predict" id="pr0">
+    <b class="q">🧩 Predict:</b> the ladder gets a confidence of 0.16 as a “cyclist?”. A shadow, a puddle and a painted arrow score 0.19 to 0.24 as “obstacles?”. If you lower the threshold to 0.15 so the ladder counts, how many phantom obstacles do you also brake for?
+    <div><button class="btn small" data-open="pr0">Show the answer</button></div>
+    <div class="ans">All three. Every flat, harmless thing that scored above the ladder now counts too, so the car slams on the brakes for a shadow 14 m ahead (a “phantom braking” event) before it ever reaches the ladder. A threshold can't separate “odd but real” from “odd but harmless” when the network has no class for the odd thing. Occupancy asks a different question (is space physically filled?), which shadows and paint fail and ladders pass. Try it below.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · The fallen ladder</span>
+    <p class="hint">Top-down view of your lane. A <span class="ag">lead car</span> at 45 m, a pedestrian on the sidewalk, a <b>ladder</b> lying diagonally across the lane at 25 m, and three flat harmless things (shadow, puddle, painted arrow). Choose what the planner sees, then press <b>▶ Drive</b>. Box outputs show their confidence; dashed = below threshold. Gold cells = voxels the occupancy stand-in marks as filled.</p>
+    <canvas class="sim" id="ladCanvas"></canvas>
+    <div class="controls">
+      <span class="seg" id="ladMode"><button id="ladBox" data-m="box" class="on">box detector</button><button id="ladOcc" data-m="occ">occupancy</button><button id="ladBoth" data-m="both">both</button></span>
+      <label>box confidence threshold <input type="range" id="ladT" min="0.05" max="0.9" step="0.01" value="0.5"> <b class="mono" id="ladTV"></b></label>
+      <button class="btn primary" id="ladGo">▶ Drive</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">obstacles the planner sees in the lane <b id="ladSee">–</b></div>
+      <div class="stat">outcome <b id="ladOut">–</b></div>
+      <div class="stat">challenge <b id="ladChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> stop before the ladder <b>without</b> braking for any phantom. First try with the box detector alone at any threshold. Then switch the perception. (All confidences come from a scripted stand-in, not a real network.)</p>
+  </div>
+
+  <h2>Why boxes and pixels weren't enough</h2>
+  <p>Before occupancy networks, Tesla's talk listed two common ways to represent “general obstacles” from cameras, and why each broke:</p>
+  <table>
+    <tr><th>Representation</th><th>What it outputs</th><th>Why it broke (per Tesla, CVPR 2022)</th></tr>
+    <tr><td><b>Image-space drivable space</b></td><td>Each pixel: drivable or not</td><td>It's in pixels, not meters; the few pixels near the horizon swing wildly when projected to 3D; no overhangs, walls or occlusion</td></tr>
+    <tr><td><b>Dense depth</b></td><td>Each pixel: a distance</td><td>Looks great close up, but far away walls wave and curve; each camera's depth disagrees at the seams; can't see behind things; blurs edges between a car and the background</td></tr>
+    <tr><td><b>3D boxes with classes</b></td><td>Car / pedestrian / cyclist + box</td><td>Only for named classes; an odd shape gets the wrong class or none; protrusions (a ladder on a roof rack) don't fit a cuboid</td></tr>
+  </table>
+  <p>An occupancy network keeps the best part of each: it's in <b>3D meters</b> (like boxes), it's <b>dense</b> (like depth, every location gets an answer), and it's <b>class-free</b> (like drivable space, it just says filled or not). Tesla's version predicts a probability per voxel from all eight cameras at once, “no stitching of independent predictions”, both static things (walls, trees) and moving ones, even through occlusions.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how many voxels?</span>
+    <p>Use the public <b>Occ3D-nuScenes</b> benchmark's grid: ±40 m around the car, from 1 m below to 5.4 m above it, in 0.4 m voxels.</p>
+    <ol>
+      <li>Across: 80 m ÷ 0.4 = 200 voxels. Along: 200. Up: 6.4 m ÷ 0.4 = 16. Total = 200 × 200 × 16 = <b>640,000 voxels</b>.</li>
+      <li>Halve the voxel size to 0.2 m: 400 × 400 × 32 = <b>5.12 million</b>. <b>8× more</b>, because all three dimensions double.</li>
+      <li>Store 1 byte of occupancy plus a 2-number flow (4 bytes as 16-bit floats) per voxel: 640,000 × 5 B ≈ <b>3.2 MB</b> at 0.4 m, ≈ 26 MB at 0.2 m, and real networks keep many more feature channels inside.</li>
+      <li>Occ3D-Waymo uses 0.05 m voxels over ±80 m: 3,200 × 3,200 × 128 ≈ <b>1.3 billion</b> voxels per frame, which is why it's a label format, not something a car predicts densely at 100 Hz.</li>
+    </ol>
+    <p>Resolution costs cubically. That's the central engineering trade of this lesson, and Playground 2.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Stop asking “<i>what</i> is there?” first. Ask “<b>is anything there, and where is it going?</b>” for every small cube of space, then add class labels on top only where they help the plan (a pedestrian may step out; a cardboard box won't). The planner needs to avoid hitting things; it doesn't need to know that the thing is a ladder.
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Box detectors cover a fixed list of classes. The road's long tail (debris, odd trailers, overturned cars, a pickup that looks like a fence) is exactly what they miss or mislabel, and image-space drivable space or per-pixel depth get noisy and inconsistent beyond a few tens of meters.</li>
+      <li><b>What people tried.</b> <i>More classes</i> (“debris”, “other”): the list never ends and labels are inconsistent. <i>Lower thresholds</i>: catches the odd thing, plus every shadow (phantom braking). <i>Per-camera depth or drivable space, projected to 3D</i>: noisy at range, seams between cameras. Lidar-based occupancy grids work well but need a lidar.</li>
+      <li><b>Why this works.</b> Geometry is class-free: a ladder fills voxels; a shadow doesn't. Learned from many cameras at once, the network makes one consistent 3D volume. Tiny numbers: 200 × 200 × 16 = 640,000 voxels at 0.4 m is small enough that Tesla says its version runs in about 10 ms, i.e. it could run at 100 Hz, faster than its cameras' 36 frames per second.</li>
+      <li><b>What it costs, when it fails.</b> Memory and compute grow cubically with resolution, so thin things (a ladder 12 cm tall, a cable, a curb) need fine voxels exactly where it's expensive. Training labels need dense 3D ground truth (from lidar, multi-trip reconstruction or auto-labeling, Lesson 6.7). Camera-only occupancy still guesses depth, so far occupancy is soft. Flat hazards (a pothole, black ice) aren't “occupied” at all.</li>
+      <li><b>What came next.</b> <b>Occupancy flow</b> (predicting where filled voxels will move: Tesla, and Waymo's “Occupancy Flow Fields” for motion forecasting), semantic occupancy (a class per voxel, as in the Occ3D benchmarks with a “general object” class for the unnamed), continuous queries at arbitrary points instead of a fixed grid (Tesla, AI Day 2022), and supervision by rendering the predicted volume back into camera images, the NeRF idea.</li>
+    </ol>
+  </div>
+
+  <h2>How an occupancy network is built (plain words)</h2>
+  <p>Tesla has described its design twice, at CVPR 2022 and AI Day 2022. In plain words:</p>
+  <ol>
+    <li><b>Normalize and encode each camera.</b> Rectify away each camera's lens quirks; feed raw 12-bit photon counts (16× the dynamic range of a normal 8-bit image, and no image processor in the loop, per AI Day 2022) into image backbones that output feature maps.</li>
+    <li><b>3D queries ask the images.</b> A fixed set of 3D positions, each with a positional code, attends to the image features of all cameras (the same pull idea as BEVFormer in Lesson 6.2, but in 3D). Details of attention: <span class="dlref" data-href="phase6/1-self-attention.html">the Deep Learning course, Phase 6 (self-attention)</span>.</li>
+    <li><b>Low resolution, then upsample.</b> Doing this at every fine voxel is too expensive, so features are made at a coarse resolution and upsampled (deconvolutions) to the output grid. AI Day 2022 added an MLP (a small network) you can query at <i>any</i> 3D point for finer detail.</li>
+    <li><b>Add time.</b> Features from a short buffer of past frames are aligned using the car's own motion, which lets the network output <b>occupancy flow</b>: how each filled voxel moves.</li>
+    <li><b>Supervise with geometry.</b> Train on auto-labeled 3D occupancy (“without any human in the loop”, AI Day 2022), and additionally by rendering the predicted volume into held-out camera images and comparing, like a neural radiance field (NeRF). 3D vision background: <span class="dlref" data-href="phase4/8-3d-vision.html">the Deep Learning course, Phase 4 (3D vision)</span>.</li>
+  </ol>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Pick a resolution under a compute budget</span>
+    <p class="hint">You must catch two things: the <b>ladder</b> (12 cm tall, about half solid, 25 m ahead) and a <b>stalled car at 62 m</b>. A voxel reads “occupied” when the object fills at least 20% of it, so a coarse voxel washes a thin ladder out. You may use a <b>fine inner zone</b> around the car and a <b>coarse outer zone</b>, both 3.2 m tall. Budget: <b>1.0 million voxels</b> (about 10 ms on our stand-in chip).</p>
+    <canvas class="sim" id="resCanvas"></canvas>
+    <div class="controls">
+      <label>fine voxel size <input type="range" id="rsF" min="0.1" max="1" step="0.05" value="0.4"> <b class="mono" id="rsFV"></b></label>
+      <label>fine zone radius <input type="range" id="rsR" min="10" max="64" step="1" value="40"> <b class="mono" id="rsRV"></b></label>
+      <label>coarse voxel size <input type="range" id="rsC" min="0.2" max="2" step="0.05" value="0.4"> <b class="mono" id="rsCV"></b></label>
+      <label>total range <input type="range" id="rsO" min="20" max="80" step="1" value="40"> <b class="mono" id="rsOV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">voxels <b id="rsN">–</b></div>
+      <div class="stat">latency (stand-in) <b id="rsL">–</b></div>
+      <div class="stat">ladder fill per voxel <b id="rsFill">–</b></div>
+      <div class="stat">ladder captured? <b id="rsLad">–</b></div>
+      <div class="stat">car at 62 m captured? <b id="rsCar">–</b></div>
+      <div class="stat">challenge <b id="rsChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> capture both under 1.0 M voxels. The default (one uniform 0.4 m grid out to 40 m, like Occ3D-nuScenes) misses both. Is a single uniform grid enough, or do you need two zones?</p>
+  </div>
+  <p>What you should find: a uniform grid fine enough for the ladder (0.3 m or less) blows the budget long before it reaches 62 m (0.3 m out to ±64 m is about 2 million voxels). Spending resolution where thin hazards matter (near, in your path) and going coarse far away fits easily. Real systems make similar choices in their own ways: Tesla described a fixed voxel grid plus a point-query MLP for detail; others use sparse or multi-scale grids.</p>
+
+  <h2>Occupancy flow: where will the filled space be?</h2>
+  <p>Occupancy alone is a snapshot. Following a car on the highway, its voxels are filled right in front of you. If the planner assumed those voxels were standing still, it would brake for a car that's driving away at your own speed. Tesla's CVPR 2022 talk made exactly this point and added <b>occupancy flow</b>: a velocity for each filled voxel (or higher derivatives), estimated from several time steps. Waymo's research reached the same idea from the forecasting side: <a href="https://arxiv.org/abs/2203.03875" target="_blank" rel="noopener">Occupancy Flow Fields</a> (2022) predict future occupancy and flow of all agents together.</p>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> a cyclist crosses your lane 30 m ahead from the left at 3 m/s while you drive at 14 m/s. A planner that sees only the <i>current</i> occupancy: does it brake too early, on time, or too late?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans"><b>Too late.</b> While the cyclist is still left of your lane, current occupancy says “your lane is clear”. By the time the voxels in your lane fill, you're about 2 seconds away and need hard braking, too late here. With flow over a 1.5–2 s horizon, the planner sees the cyclist's future voxels crossing your path and eases off early and smoothly.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Snapshot vs flow</span>
+    <p class="hint">Two scenarios: a <b>cyclist crossing</b> your lane, and a <b>lead car</b> 12 m ahead driving at your speed. The planner stand-in brakes (6 m/s²) when it predicts that you and filled space will overlap. With flow off it treats every filled voxel as standing still. Press <b>▶ Run both</b>.</p>
+    <canvas class="sim" id="flowCanvas"></canvas>
+    <div class="controls">
+      <label><input type="checkbox" id="flOn"> use occupancy flow</label>
+      <label>flow horizon <input type="range" id="flT" min="0" max="3" step="0.25" value="0.5"> <b class="mono" id="flTV"></b></label>
+      <button class="btn primary" id="flGo">▶ Run both</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">cyclist: outcome / slowest speed <b id="flA">–</b></div>
+      <div class="stat">lead car: slowest speed <b id="flB">–</b></div>
+      <div class="stat">challenge <b id="flChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> no collision with the cyclist while never dropping below <b>8 m/s</b> (no panic stop), and never braking for the lead car (stay at 14 m/s). Find the shortest flow horizon that works.</p>
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a blind person's cane vs a field guide</span>
+    <p>A field guide lets you name birds you've seen pictures of; show it a bird it doesn't list and it's useless. A cane doesn't know what anything is, but it never fails to tell you something is in the way. Occupancy is the cane, swept over the whole space around the car 100 times a second, plus a sense of which way the obstacles are moving. You still want the field guide for things whose <i>identity</i> changes what you do: a child behaves differently from a bin.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Open benchmarks: <b>Occ3D</b> (nuScenes and Waymo versions), with dense, visibility-aware voxel labels. For geometry experiments, <b>Open3D</b> voxelizes point clouds; for a quick occupancy grid, NumPy is enough.</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+<span class="k">import</span> open3d <span class="k">as</span> o3d
+
+<span class="c"># A 3D occupancy grid from a lidar (or reconstructed) point cloud, NumPy only</span>
+<span class="k">def</span> occupancy(points, voxel=<span class="n">0.4</span>, lo=(-<span class="n">40</span>, -<span class="n">40</span>, -<span class="n">1</span>), hi=(<span class="n">40</span>, <span class="n">40</span>, <span class="n">5.4</span>)):
+    lo, hi = np.array(lo), np.array(hi)
+    shape = np.ceil((hi - lo) / voxel).astype(int)              <span class="c"># (200, 200, 16) for the defaults</span>
+    idx = np.floor((points[:, :<span class="n">3</span>] - lo) / voxel).astype(int)
+    ok = np.all((idx &gt;= <span class="n">0</span>) &amp; (idx &lt; shape), axis=<span class="n">1</span>)
+    grid = np.zeros(shape, dtype=bool)
+    grid[tuple(idx[ok].T)] = <span class="k">True</span>
+    <span class="k">return</span> grid                                                 <span class="c"># True = at least one point fell in it</span>
+
+<span class="c"># The same with Open3D (sparse: only filled voxels are stored)</span>
+pcd = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(points[:, :<span class="n">3</span>]))
+vg = o3d.geometry.VoxelGrid.create_from_point_cloud(pcd, voxel_size=<span class="n">0.4</span>)
+filled = [v.grid_index <span class="k">for</span> v <span class="k">in</span> vg.get_voxels()]</code></pre>
+    <p class="hint">Careful with “no points = empty”: a voxel with no lidar returns may be <i>unobserved</i> (hidden behind a truck), not free. Occ3D's labels mark visibility for exactly this reason; Phase 5's occupancy grids keep three states: free, occupied, unknown.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚘 Tesla</h4><p>The occupancy network is the base of Tesla's publicly described stack: “the base geometry layer” under lanes and objects (AI Day 2022). As presented: 8 cameras in, one volumetric occupancy and occupancy flow out; runs about every 10 ms on the FSD computer; raw 12-bit photon counts as input; RegNet/BiFPN image backbones; 3D position queries with attention; trained on auto-labeled data with no human in the loop, plus NeRF-style rendering losses. Tesla also said the same occupancy network was ported to its Optimus robot with new training data.</p>
+        <p class="src">Sources: <a href="https://www.youtube.com/watch?v=jPCV4GKX9Dw" target="_blank" rel="noopener">CVPR'22 WAD keynote</a>, <a href="https://www.youtube.com/watch?v=ODSJsviD_SU" target="_blank" rel="noopener">Tesla AI Day 2022</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo's lidar measures occupancy directly, so the hard part shifts to <i>prediction</i>: its research on <b>Occupancy Flow Fields</b> forecasts future occupancy and flow of all agents, and <b>StopNet</b> (ICRA 2022) predicts trajectories and occupancy at scale. The Occ3D-Waymo occupancy benchmark is built from the Waymo Open Dataset. What its production stack uses internally isn't published.</p>
+        <p class="src">Sources: <a href="https://arxiv.org/abs/2203.03875" target="_blank" rel="noopener">Occupancy Flow Fields</a>, <a href="https://waymo.com/research/" target="_blank" rel="noopener">Waymo research</a>, <a href="https://arxiv.org/abs/2304.14365" target="_blank" rel="noopener">Occ3D</a></p></div>
+      <div><h4>🛸 Drones</h4><p>For a drone, a 3D occupancy map is the natural world model: it flies among branches, wires and walls, none of which need a class. Skydio says its drones “constantly map the environment” as they fly and can build 3D models onboard. Its manual notes limits: obstacle avoidance doesn't avoid moving objects and can be degraded near transparent or reflective surfaces. Internal map formats aren't published.</p>
+        <p class="src">Sources: <a href="https://www.skydio.com/autonomy" target="_blank" rel="noopener">Skydio autonomy</a>, <a href="https://www.skydio.com/x10" target="_blank" rel="noopener">Skydio X10</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> Tesla has no lidar, so a learned occupancy network is how it gets class-free geometry at all. Waymo gets geometry from lidar and spends learning on how that geometry will move. A drone lives in 3D clutter where classes barely matter, so occupancy-style maps are its default, with tight limits on weight and compute.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Boxes with classes</td><td>Compact; object identity, size and heading; tracks and intent</td><td>Blind to unnamed things; odd shapes and protrusions</td></tr>
+      <tr><td>Occupancy voxels</td><td>Class-free; any shape; through occlusion; dense</td><td>Memory ∝ 1/size³; thin things need fine voxels; no identity</td></tr>
+      <tr><td>Occupancy + flow</td><td>Moving obstacles without classes; avoids phantom braking behind moving cars</td><td>Needs several frames; flow is noisy for small or far objects</td></tr>
+      <tr><td>Fine near, coarse far</td><td>Detail where it matters within a budget</td><td>Far thin hazards are invisible; zone boundaries need care</td></tr>
+      <tr><td>Rendering (NeRF-style) supervision</td><td>Free supervision from the cameras themselves; no ontology</td><td>Glare, dirt and rain on lenses create artifacts; costly to train</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your detector missed a mattress on the highway. What would you change?” A strong answer:</p>
+    <ul>
+      <li>Says lowering thresholds or adding a “debris” class won't scale (phantom braking, endless ontology), and proposes a <b>class-free geometric layer</b>: occupancy (lidar or learned from cameras) with flow.</li>
+      <li>Does the <b>memory math</b>: 200 × 200 × 16 = 640k voxels at 0.4 m; halve the voxel and pay 8×; spend resolution near and in-path.</li>
+      <li>Distinguishes <b>free, occupied and unknown</b>, and explains why unobserved space must not be treated as free.</li>
+      <li>Talks about <b>data</b>: dense 3D labels from lidar or auto-labeling, rare-hazard mining, and evaluation on long-tail sets rather than average IoU.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Tesla's occupancy network</b> <span class="tag co">🏢 Tesla · 2022</span> <a href="https://www.youtube.com/watch?v=jPCV4GKX9Dw" target="_blank" rel="noopener">CVPR'22 keynote</a></div>
+      <p><b>How:</b> multi-camera video → 3D queries attend to image features → voxel occupancy and occupancy flow, about every 10 ms.</p>
+      <p><b>Why this method:</b> the object network kept fighting classification dilemmas (fence-like pickup, mannequins); occupancy avoids hitting things regardless of what they are.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Occ3D benchmarks</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://tsinghua-mars-lab.github.io/Occ3D/" target="_blank" rel="noopener">Occ3D</a></div>
+      <p><b>How:</b> a label pipeline (voxel densification, occlusion reasoning, image-guided refinement) turns nuScenes and Waymo data into dense voxel labels: 0.4 m (200×200×16) and 0.05 m grids, with a “general object” class.</p>
+      <p><b>Why this method:</b> boxes “struggle to handle general, out-of-vocabulary objects”; the field needed a shared yardstick for occupancy.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Occupancy Flow Fields at Waymo</b> <span class="tag av">🚗 AV</span> <a href="https://arxiv.org/abs/2203.03875" target="_blank" rel="noopener">Mahjourian et al., 2022</a></div>
+      <p><b>How:</b> predict future occupancy grids and per-cell flow for all agents together, instead of one trajectory per agent.</p>
+      <p><b>Why this method:</b> a grid handles any number of agents, and their uncertainty, at a fixed cost.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Classic occupancy grids on robots</b> <span class="tag hist">📜 History</span> <a href="https://en.wikipedia.org/wiki/Occupancy_grid_mapping" target="_blank" rel="noopener">Occupancy grid mapping</a></div>
+      <p><b>How:</b> each cell keeps a probability of being blocked, updated from range sensors (Lesson 5.1).</p>
+      <p><b>Why this method:</b> robots have avoided unnamed obstacles this way for decades; the new part is predicting it in 3D from cameras.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · “there is no such thing as stationary obstacles”</span>
+    <p>Tesla's team started the project to handle only static things like walls and trees, leaving moving objects to the object network. Then they changed their minds; in Elluswamy's words, “any object when enough force is applied will move”, so moving and static obstacles went into the same framework (<a href="https://www.youtube.com/watch?v=jPCV4GKX9Dw" target="_blank" rel="noopener">CVPR'22 WAD keynote</a>).</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Occupancy is the 3D, learned cousin of the occupancy grids of Lesson 5.1. It's built with the camera-to-BEV machinery of 6.2 (queries attending to images) and complements the boxes of 6.1. Its flow feeds prediction and planning (Phase 7) as cost maps; its dense labels come from the auto-labeling of 6.7. Probability per voxel is plain <a href="../../math-course/phase4/1-probability.html">probability</a> (Math course); the Bayesian update of grids is <a href="../../math-course/phase4/2-bayes.html">Bayes' rule</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Talk</span> <a href="https://www.youtube.com/watch?v=jPCV4GKX9Dw" target="_blank" rel="noopener">Ashok Elluswamy, CVPR 2022 WAD keynote</a>. 30 minutes, the clearest public account of occupancy networks.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2304.14365" target="_blank" rel="noopener">Occ3D (2023)</a>. How dense voxel labels are made, and why visibility matters.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2203.03875" target="_blank" rel="noopener">Occupancy Flow Fields (Waymo, 2022)</a>. Flow for forecasting every agent at once.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. An occupancy grid covers ±40 m with 6.4 m of height at 0.4 m voxels (640,000 voxels). You switch to 0.2 m voxels over the same volume. How many voxels now?</div>
+    <div class="opts"><button class="opt">1.28 million (2×)</button><button class="opt">2.56 million (4×)</button><button class="opt" data-ok>5.12 million (8×)</button></div>
+    <div class="explain">All three dimensions double: 400 × 400 × 32 = <b>5.12 million</b>, 2³ = 8× more. That's why fine resolution is spent only where it matters.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. On a test drive the car brakes hard behind a lead vehicle that is accelerating away. Perception shows the lead car's voxels correctly. Most likely missing piece?</div>
+    <div class="opts"><button class="opt">A higher voxel resolution</button><button class="opt" data-ok>Occupancy flow (or object velocity): the planner is treating occupied voxels as stationary</button><button class="opt">A lower box-detector threshold</button></div>
+    <div class="explain">Instantaneous occupancy says “filled”, not “moving away at 14 m/s”. Without flow, a planner must assume the worst and brakes. Tesla's CVPR 2022 talk used this exact highway-following example to motivate occupancy flow.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your camera occupancy network marks a region behind a parked truck as empty, though nothing there was ever seen. What's the right way to treat it?</div>
+    <div class="opts"><button class="opt">Free space: the network said empty</button><button class="opt" data-ok>Unknown (unobserved): plan as if something could be there, e.g. creep forward to look</button><button class="opt">Occupied: assume the worst forever</button></div>
+    <div class="explain">“Not seen” isn't “free”. Occ3D's labels track visibility, and Tesla's talk described reasoning about occlusions and creeping forward at blind turns. Treating unknown as free is how you hit the car hidden behind the truck.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Box detectors only see named classes; lowering thresholds brings phantom obstacles. Occupancy asks “is this voxel filled?” for everything, class-free.</li>
+      <li>Tesla (CVPR 2022, AI Day 2022): 8 cameras → one volumetric occupancy + occupancy flow, about every 10 ms; 3D queries attend to image features; auto-labeled and NeRF-style supervision.</li>
+      <li>Resolution costs cubically: 200 × 200 × 16 = 640k voxels at 0.4 m (Occ3D-nuScenes), 8× more at 0.2 m. Spend fine voxels near and in-path; thin hazards need them.</li>
+      <li>Flow turns a snapshot into a prediction: no braking behind moving cars, early easing for crossing cyclists.</li>
+      <li>Unobserved ≠ free. Waymo measures occupancy with lidar and researches occupancy flow for forecasting; drones live in 3D maps by default.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+
+  // ---------- Playground 1: box detector vs occupancy, the fallen ladder ----------
+  const THINGS = [
+    { name: "lead car", kind: "car", x: 45, y: 0, l: 4.5, w: 1.9, th: 0, conf: 0.95, solid: true },
+    { name: "pedestrian", kind: "pedestrian", x: 20, y: 6.2, l: 0.6, w: 0.6, th: 0, conf: 0.91, solid: true },
+    { name: "ladder", kind: "cyclist?", x: 25, y: 0.2, l: 3.6, w: 0.45, th: 0.55, conf: 0.16, solid: true, ladder: true },
+    { name: "shadow", kind: "obstacle?", x: 14, y: -0.6, l: 2.2, w: 1.4, th: 0.2, conf: 0.24, solid: false },
+    { name: "puddle", kind: "obstacle?", x: 33, y: 0.8, l: 1.8, w: 1.2, th: 0, conf: 0.21, solid: false },
+    { name: "painted arrow", kind: "obstacle?", x: 38, y: -0.4, l: 2.5, w: 0.7, th: 0, conf: 0.19, solid: false },
+  ];
+  const LANE = 1.75;
+  let mode = "box", egoX = 0, egoV = 14, driving = false, outcome = null;
+  const corners = b => { const c = Math.cos(b.th), s = Math.sin(b.th); return [[b.l / 2, b.w / 2], [-b.l / 2, b.w / 2], [-b.l / 2, -b.w / 2], [b.l / 2, -b.w / 2]].map(([u, v]) => [b.x + u * c - v * s, b.y + u * s + v * c]); };
+  const inLane = b => corners(b).some(p => Math.abs(p[1]) < LANE);
+  const nearX = b => Math.min(...corners(b).filter(p => Math.abs(p[1]) < LANE + 0.3).map(p => p[0]).concat([b.x]));
+  function perceived() {
+    const t = +$("ladT").value, out = [];
+    THINGS.forEach(b => {
+      const byBox = (mode === "box" || mode === "both") && b.conf >= t;
+      const byOcc = (mode === "occ" || mode === "both") && b.solid;
+      if ((byBox || byOcc) && inLane(b)) out.push(b);
+    });
+    return out.sort((a, b) => nearX(a) - nearX(b));
+  }
+  // planner stand-in: brake at 6 m/s² for the first perceived in-lane obstacle once inside stopping distance + 4 m
+  function simulateDrive() {
+    const obs = perceived(), dt = 0.05; let x = 0, v = 14, first = null, trace = [];
+    for (let k = 0; k < 160; k++) {
+      const ahead = obs.filter(b => nearX(b) > x + 2.5);
+      const tgt = ahead[0];
+      if (tgt && nearX(tgt) - (x + 2.5) < v * v / 12 + 4) { if (!first) first = tgt; v = Math.max(0, v - 6 * dt); }
+      x += v * dt; trace.push(x);
+      const ladder = THINGS[2];
+      if (x + 2.5 >= nearX(ladder) && x < ladder.x + 2) return { hit: true, first, trace };
+      if (v === 0) break;
+    }
+    return { hit: false, first, trace, stopX: x };
+  }
+  function evalLadder() {
+    const r = simulateDrive(); const ph = r.first && !r.first.solid;
+    outcome = r.hit ? { txt: "💥 hit the ladder", win: false } : ph ? { txt: `🛑 phantom brake for the ${r.first.name}`, win: false } : r.first && r.first.ladder ? { txt: "✅ stopped before the ladder", win: true } : { txt: "stopped", win: false };
+    return r;
+  }
+  const LW = new Sim($("ladCanvas"), { xRange: [-4, 52], yRange: [-7.75, 7.75] });
+  LW.render(w => {
+    w.clear();
+    w.rect(-4, -LANE * 3, 56, LANE * 6, { fill: "--muted", alpha: 0.18 });
+    [LANE, -LANE].forEach(y => w.line([[-4, y], [52, y]], { color: "--text", width: 1.5, dash: [8, 8], alpha: 0.7 }));
+    [3 * LANE, -3 * LANE].forEach(y => w.line([[-4, y], [52, y]], { color: "--text", width: 2, alpha: 0.8 }));
+    const t = +$("ladT").value;
+    if (mode !== "box") { // occupancy stand-in: 0.4 m cells filled by solid things
+      const res = 0.4;
+      THINGS.filter(b => b.solid).forEach(b => {
+        const cs = corners(b), xs = cs.map(p => p[0]), ys = cs.map(p => p[1]);
+        for (let x = Math.floor(Math.min(...xs) / res) * res; x < Math.max(...xs); x += res) for (let y = Math.floor(Math.min(...ys) / res) * res; y < Math.max(...ys); y += res) {
+          const cx = x + res / 2, cy = y + res / 2, c = Math.cos(-b.th), s = Math.sin(-b.th), u = (cx - b.x) * c - (cy - b.y) * s, v = (cx - b.x) * s + (cy - b.y) * c;
+          if (Math.abs(u) <= b.l / 2 + res / 2 && Math.abs(v) <= b.w / 2 + res / 2) w.rect(x, y, res, res, { fill: "--c-un", alpha: 0.85 });
+        }
+      });
+    }
+    THINGS.forEach(b => {
+      if (b.ladder) { const cs = corners({ ...b, w: 0.08 }); w.line(corners(b), { color: "--text", width: 1, close: true, alpha: 0.6 }); for (let k = -3; k <= 3; k++) { const c = Math.cos(b.th), s = Math.sin(b.th), u = k * 0.5; w.line([[b.x + u * c - 0.22 * -s, b.y + u * s + 0.22 * c], [b.x + u * c + 0.22 * -s, b.y + u * s - 0.22 * c]], { color: "--text", width: 2 }); } }
+      else if (!b.solid) w.line(corners(b), { fill: "--muted", alpha: 0.45, close: true });
+      else if (b.kind === "car") w.car({ x: b.x - 2.25, y: b.y, th: 0 }, { color: "--c-ag", L: 3.4 });
+      else w.circle(b.x, b.y, 0.35, { fill: "--c-ag" });
+      if (mode !== "occ") {
+        const on = b.conf >= t;
+        w.line(corners({ ...b, l: b.l + 0.5, w: b.w + 0.5 }), { color: on ? "--c-be" : "--muted", width: on ? 2 : 1, dash: on ? [] : [4, 4], close: true, alpha: on ? 1 : 0.6 });
+        w.text([b.x, b.y + b.w / 2 + 1.0], `${b.kind} ${b.conf.toFixed(2)}`, { color: on ? "--c-be" : "--muted", size: 10 });
+      } else w.text([b.x, b.y + b.w / 2 + 1.0], b.name, { color: "--muted", size: 10 });
+    });
+    w.car({ x: egoX, y: 0, th: 0 }, { color: "--c-pl", L: 2.7 });
+  });
+  function refreshLad() {
+    $("ladTV").textContent = (+$("ladT").value).toFixed(2);
+    const p = perceived(); $("ladSee").textContent = p.length ? p.map(b => b.name).join(", ") : "nothing";
+    evalLadder();
+    $("ladOut").textContent = outcome.txt;
+    $("ladChal").innerHTML = outcome.win ? `<span class="badge-win">✅ safe stop, no phantoms</span>` : `<span class="badge-lose">${outcome.txt.replace(/^\S+ /, "")}</span>`;
+    if (!driving) { egoX = 0; LW.render(); }
+  }
+  $("ladMode").querySelectorAll("button").forEach(b => (b.onclick = () => { mode = b.dataset.m; $("ladMode").querySelectorAll("button").forEach(x => x.classList.toggle("on", x === b)); refreshLad(); }));
+  $("ladT").oninput = refreshLad;
+  $("ladGo").onclick = () => {
+    const r = evalLadder(); let k = 0; driving = true;
+    LW.run(() => { egoX = r.trace[Math.min(k, r.trace.length - 1)]; k += 1; if (k >= r.trace.length + 10) { driving = false; return false; } });
+  };
+  refreshLad();
+
+  // ---------- Playground 2: resolution under a budget ----------
+  const H = 3.2, LAD = { x: 25, len: 3.6, h: 0.12, fill: 0.5 }, CARF = 62, BUDGET = 1.0e6;
+  let rs = null;
+  function evalRes() {
+    const f = +$("rsF").value, R = +$("rsR").value, c = +$("rsC").value, O = +$("rsO").value;
+    const Rin = Math.min(R, O);
+    const nIn = Math.pow(2 * Rin / f, 2) * Math.ceil(H / f - 1e-9);
+    const nOut = O > Rin ? (Math.pow(2 * O / c, 2) - Math.pow(2 * Rin / c, 2)) * Math.ceil(H / c - 1e-9) : 0;
+    const ladderZone = LAD.x + LAD.len / 2 <= Rin ? f : c;
+    const ladFill = LAD.fill * Math.min(1, LAD.h / ladderZone);
+    const ladOK = ladFill >= 0.2 && LAD.x + LAD.len / 2 <= O;
+    const carOK = O >= CARF + 1;
+    return { f, R: Rin, c, O, n: nIn + nOut, ladFill, ladOK, carOK, ladderZone };
+  }
+  const RW = new Sim($("resCanvas"), { xRange: [-84, 84], yRange: [-47.25, 47.25] });
+  RW.render(w => {
+    if (!rs) return;
+    w.clear();
+    w.rect(-rs.O, -rs.O, 2 * rs.O, 2 * rs.O, { fill: "--c-mp", alpha: 0.08 });
+    w.rect(-rs.O, -rs.O, 2 * rs.O, 2 * rs.O, { stroke: "--c-mp", width: 1.5 });
+    w.rect(-rs.R, -rs.R, 2 * rs.R, 2 * rs.R, { fill: "--c-un", alpha: 0.12 });
+    w.rect(-rs.R, -rs.R, 2 * rs.R, 2 * rs.R, { stroke: "--c-un", width: 1.5 });
+    // a sample of grid lines (drawing every line at 0.1 m would be a solid block)
+    const gl = (lo, hi, s, col) => { const step = s * Math.max(1, Math.ceil(2.5 / s)); for (let v = -hi; v <= hi + 1e-9; v += step) { if (Math.abs(v) < lo - 1e-9) { w.line([[v, -hi], [v, -lo]], { color: col, width: 1, alpha: 0.35 }); w.line([[v, lo], [v, hi]], { color: col, width: 1, alpha: 0.35 }); w.line([[-hi, v], [-lo, v]], { color: col, width: 1, alpha: 0.35 }); w.line([[lo, v], [hi, v]], { color: col, width: 1, alpha: 0.35 }); } else { w.line([[v, -hi], [v, hi]], { color: col, width: 1, alpha: 0.35 }); w.line([[-hi, v], [hi, v]], { color: col, width: 1, alpha: 0.35 }); } } };
+    if (rs.O > rs.R) gl(rs.R, rs.O, rs.c, "--c-mp");
+    gl(0, rs.R, rs.f, "--c-un");
+    w.car({ x: -2, y: 0, th: 0 }, { color: "--c-be", L: 4 });
+    w.rect(LAD.x, 0, LAD.len, 1.2, { fill: rs.ladOK ? "--c-un" : "--muted", center: true, angle: 0.55 });
+    w.text([LAD.x, 5], "ladder", { color: rs.ladOK ? "--c-un" : "--muted", size: 11, bold: true });
+    w.rect(CARF, 0, 4.5, 1.9, { fill: rs.carOK ? "--c-ag" : "--muted", center: true });
+    w.text([CARF, 5], "stalled car", { color: rs.carOK ? "--c-ag" : "--muted", size: 11, bold: true });
+    w.text([0, -rs.R + 3], "fine zone", { color: "--c-un", size: 11 });
+    if (rs.O > rs.R) w.text([0, -rs.O + 3], "coarse zone", { color: "--c-mp", size: 11 });
+  });
+  function refreshRes() {
+    ["rsF", "rsC"].forEach(id => ($(id + "V").textContent = (+$(id).value).toFixed(2) + " m"));
+    ["rsR", "rsO"].forEach(id => ($(id + "V").textContent = "±" + $(id).value + " m"));
+    rs = evalRes();
+    $("rsN").textContent = (rs.n / 1e6).toFixed(2) + " M";
+    $("rsL").textContent = fmt(rs.n / 1e5, 1) + " ms";
+    $("rsFill").textContent = fmt(100 * rs.ladFill, 0) + "% (" + rs.ladderZone.toFixed(2) + " m voxels)";
+    $("rsLad").innerHTML = rs.ladOK ? "✅ yes" : "❌ washed out";
+    $("rsCar").innerHTML = rs.carOK ? "✅ yes" : "❌ out of range";
+    const win = rs.ladOK && rs.carOK && rs.n <= BUDGET;
+    $("rsChal").innerHTML = win ? `<span class="badge-win">✅ both, ${(rs.n / 1e6).toFixed(2)} M voxels</span>` : `<span class="badge-lose">${rs.n > BUDGET ? "over budget" : !rs.ladOK ? "ladder missed" : "car missed"}</span>`;
+    RW.render();
+  }
+  ["rsF", "rsR", "rsC", "rsO"].forEach(id => ($(id).oninput = refreshRes));
+  refreshRes();
+
+  // ---------- Playground 3: occupancy flow ----------
+  // ==MODEL63==
+  function runFlow(sc,useFlow,T){
+    const dt=0.05,EGO_L=4.5,HW=0.95;let x=0,v=14,minV=14,collide=false,braked=false,t=0,trace=[];
+    const ob=sc==="cyclist"?{x:30,y:6,vx:0,vy:-3,hx:0.9,hy:0.4}:{x:12,y:0,vx:14,vy:0,hx:2.3,hy:0.95};
+    const overlap=(ex,o)=>ex+0>o.x-o.hx&&ex-EGO_L<o.x+o.hx&&Math.abs(o.y)<HW+o.hy;
+    for(let k=0;k<200;k++){t=k*dt;
+      const o={...ob,x:ob.x+ob.vx*t,y:ob.y+ob.vy*t};
+      let conflict=false;
+      if(!useFlow){
+        if(Math.abs(o.y)<HW+o.hy+0.3){const gap=o.x-o.hx-x;const need=v*v/(2*6)+3;if(gap<need)conflict=true;}
+      }else{
+        for(let tau=0;tau<=T+1e-9;tau+=0.1){const ex=x+v*tau,ox=o.x+o.vx*tau,oy=o.y+o.vy*tau;if(overlap(ex+2,{x:ox,y:oy,hx:o.hx,hy:o.hy+0.3})){conflict=true;break;}}
+      }
+      if(conflict){v=Math.max(0,v-6*dt);braked=true;}else v=Math.min(14,v+1*dt);
+      x+=v*dt;minV=Math.min(minV,v);
+      if(overlap(x,o))collide=true;
+      trace.push({t,x,v,o:{x:o.x,y:o.y},conflict});
+    }
+    return {collide,minV,braked,trace,ob};
+  }
+  // ==END63==
+  let fr = null, frame = 34;
+  const FW = new Sim($("flowCanvas"), { xRange: [-6, 66], yRange: [-10.25, 10.25] });
+  FW.render(w => {
+    if (!fr) return;
+    w.clear();
+    const lanes = (yc) => { w.rect(-6, yc - 2.2, 72, 4.4, { fill: "--muted", alpha: 0.16 }); [yc + 1.6, yc - 1.6].forEach(y => w.line([[-6, y], [66, y]], { color: "--text", width: 1, dash: [8, 8], alpha: 0.6 })); };
+    const rows = [{ r: fr.a, yc: 4.6, label: "cyclist crossing" }, { r: fr.b, yc: -5.4, label: "lead car, same speed" }];
+    rows.forEach(({ r, yc, label }) => {
+      lanes(yc); w.text([-5, yc + 3.6], label, { color: "--muted", size: 11, align: "left" });
+      const s = r.trace[Math.min(frame, r.trace.length - 1)];
+      const off = Math.max(0, s.x - 14);   // camera follows the ego car once it passes 14 m
+      const oy = yc + Math.max(-4, Math.min(4, s.o.y * 0.6)), ox = s.o.x - off;
+      if (r.ob.hx < 1) w.circle(ox, oy, 0.6, { fill: "--c-ag" }); else w.car({ x: ox - 2.3, y: oy, th: 0 }, { color: "--c-ag", L: 3.4 });
+      if ($("flOn").checked) { const T = +$("flT").value; const fx = ox + r.ob.vx * T, fy = yc + Math.max(-4, Math.min(4, (s.o.y + r.ob.vy * T) * 0.6)); w.arrow([ox, oy], [fx, fy], { color: "--c-un", width: 2 }); }
+      w.car({ x: s.x - off - 4.5, y: yc, th: 0 }, { color: s.conflict ? "--c-ct" : "--c-pl", L: 3.6 });
+      w.text([s.x - off - 2.5, yc - 2.9], fmt(s.v, 1) + " m/s" + (s.conflict ? " braking" : ""), { color: s.conflict ? "--c-ct" : "--c-pl", size: 10 });
+      w.text([64, yc + 3.6], "t = " + fmt(s.t, 1) + " s", { color: "--muted", size: 10, align: "right" });
+    });
+  });
+  function refreshFlow() {
+    const on = $("flOn").checked, T = +$("flT").value;
+    $("flTV").textContent = T.toFixed(2) + " s"; $("flT").disabled = !on;
+    fr = { a: runFlow("cyclist", on, T), b: runFlow("lead", on, T) };
+    $("flA").textContent = (fr.a.collide ? "💥 collision" : "✅ no collision") + " / " + fmt(fr.a.minV, 1) + " m/s";
+    $("flB").textContent = fmt(fr.b.minV, 1) + " m/s" + (fr.b.minV < 13.9 ? " (phantom braking)" : "");
+    const win = !fr.a.collide && fr.a.minV >= 8 && fr.b.minV >= 13.9;
+    $("flChal").innerHTML = win ? `<span class="badge-win">✅ safe and smooth</span>` : `<span class="badge-lose">${fr.a.collide ? "hit the cyclist" : fr.a.minV < 8 ? "panic stop" : "braked for the lead car"}</span>`;
+    frame = 34; FW.render();   // static view: t ≈ 1.7 s, while the cyclist is in the lane
+  }
+  $("flOn").onchange = refreshFlow; $("flT").oninput = refreshFlow;
+  $("flGo").onclick = () => { refreshFlow(); frame = 0; FW.run(() => { frame += 1; return frame < 110; }); };
+  refreshFlow();
+})();
+</script>
+</body>
+</html>

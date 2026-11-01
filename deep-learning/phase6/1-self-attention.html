@@ -1,0 +1,468 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.1 Self-attention, step by step: Q, K, V and √d · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.hm { width: 100%; height: 330px; display: block; border-radius: 10px; border: 1px solid var(--line); background: var(--bg2); cursor: pointer; touch-action: none; }
+  canvas.bars2 { height: 170px; }
+  canvas.nn2 { width: 100%; max-width: 260px; aspect-ratio: 1 / 1; height: auto; display: block; margin: 0 auto; border-radius: 10px; border: 1px solid var(--line); }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .wrow { display: grid; grid-template-columns: 70px 1fr 44px; gap: 6px; align-items: center; font-size: .82rem; margin: 2px 0; }
+  .wrow .meterbar i { background: var(--c-at); }
+  .wrow.masked { opacity: .35; }
+  .sent { font-size: 1.05rem; line-height: 2; }
+  .sent span { padding: 2px 5px; border-radius: 6px; }
+</style>
+</head>
+<body data-lesson="d6-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 1</div>
+  <h1>Self-attention, step by step: Q, K, V and √d</h1>
+  <p class="subtitle">Every word looks at every other word, scores them with a dot product, and pulls in a blend of what they offer. That one move, repeated, is the engine of every large language model.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Bahdanau attention</b> (Lesson 5.4): a decoder RNN scores every encoder state, softmaxes the scores and takes a weighted average. Today we drop the RNN and keep only that idea.</li>
+      <li><b>Softmax</b> turns a list of scores into positive weights that add up to 1 (Lesson 0.6, <a href="../../math-course/phase8/2-softmax.html">math 8.2</a>).</li>
+      <li>A <b>dot product</b> q·k is big when two vectors point the same way (<a href="../../math-course/phase1/3-dot-product.html">math 1.3</a>). The math course already did one attention row by hand: <a href="../../math-course/phase8/4-attention.html">math 8.4</a>.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p class="sent">“The <b>animal</b> didn't cross the <b>street</b> because <b class="at">it</b> was too <b>tired</b>.” Swap <i>tired</i> for <i>wide</i> and “it” flips from the animal to the street. You did that without thinking. A translator can't skip it: in French, <i>animal</i> and <i>street</i> have different genders, so “it” becomes a different word.</p>
+    <p>Google's 2017 post introducing the <b>Transformer</b> used a sentence pair like this one, and showed the model's attention for “it” landing on the right noun in each case. The same year's paper, “Attention Is All You Need”, threw away recurrence entirely and still set a translation record (28.4 BLEU on English→German) after <b>3.5 days on 8 GPUs</b>, “a small fraction of the training costs” of the previous best models.</p>
+    <p>Today GPT-style chatbots, open models like Llama, Qwen and Gemma, vision transformers and speech models like Whisper all run on this mechanism. <b>How does a word “look at” other words, and why is there a mysterious √d in the formula?</b> You'll steer “it” yourself in a few minutes.</p>
+  </div>
+
+  <h2>Numbers first: from one decoder looking back, to everyone looking at everyone</h2>
+  <p>In Lesson 5.4, only the <b>decoder</b> looked around: at each output step it scored the encoder's hidden states. The encoder itself was still an RNN that read one word at a time. For a 50-word sentence, information from word 1 had to survive 49 hand-offs to reach word 50.</p>
+  <p><b>Self-attention</b> makes every token do the looking, at the same time. Each of the n tokens scores all n tokens (itself included), so one layer computes an <b>n × n table</b> of scores:</p>
+  <table>
+    <tr><th></th><th>RNN layer</th><th>Self-attention layer</th></tr>
+    <tr><td>Steps that must run one after another</td><td class="dead">n (each word waits for the previous)</td><td class="ev">1 (all rows at once: one big matrix multiply)</td></tr>
+    <tr><td>Hops between word 1 and word 50</td><td class="dead">49</td><td class="ev">1</td></tr>
+    <tr><td>Work per layer (n tokens, width d)</td><td>about n·d²</td><td>about n²·d</td></tr>
+  </table>
+  <p class="muted">These three rows are Table 1 of Vaswani et al. (2017). The last row is the catch: double the length and attention's work quadruples. Hold that thought until the end of the lesson.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Self-attention is a <b>soft lookup</b> that every token runs over every token. Each token asks a question (its <span class="at">query</span>), every token advertises what it has (its <span class="at">key</span>), dot products decide the match, softmax turns matches into weights, and each token walks away with a weighted blend of everyone's <span class="at">values</span>.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a room where everyone asks and answers at once</span>
+    <p>Eleven people stand in a room, one per word. Each holds up a sign saying what they're looking for (<b>query</b>: “it” holds up “a noun I could refer to”) and wears a badge saying what they are (<b>key</b>: “animal” wears “living noun”). Everyone glances at every badge at once, listens most to the best matches, and writes down a blend of what those people say (<b>value</b>). No queue, no passing notes down a line: that's the difference from an RNN.</p>
+  </div>
+
+  <h2>Q, K, V: three lenses on the same word</h2>
+  <p>Each token starts as an embedding vector <span class="x">x</span> (Lesson 5.1). Three learned weight matrices turn it into three different vectors:</p>
+  <ul>
+    <li><span class="at">query</span> q = <span class="x">x</span><span class="w">W<sub>Q</sub></span>: <b>what I'm looking for</b>.</li>
+    <li><span class="at">key</span> k = <span class="x">x</span><span class="w">W<sub>K</sub></span>: <b>what I offer</b> (how I want to be found).</li>
+    <li><span class="at">value</span> v = <span class="x">x</span><span class="w">W<sub>V</sub></span>: <b>what I hand over</b> if you pick me.</li>
+  </ul>
+  <p>Why three, not one? Because “what I'm looking for” and “what I am” are different things. The word “it” <i>is</i> a pronoun but is <i>looking for</i> a noun. If query and key were the same vector, every word would mostly match itself.</p>
+  <p>Then three steps: <b>score</b> (q·k for every pair), <b>softmax</b> each row into weights, <b>mix</b> the values with those weights. In the playground below the vectors have just 2 numbers so you can drag them; real heads use 64 or 128.</p>
+
+  <p class="predict">🔮 <b>Predict:</b> “it” starts with a short query pointing between the two nouns. Will it already prefer “animal”? And if you just make the query <b>longer</b> without turning it, what happens to the weights?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Steer “it”: an attention map you can edit</span>
+    <p class="hint">Gold arrow = the <span class="at">query</span> of the selected word (drag its tip). Dots = every word's <span class="at">key</span> (drag them too). Axis 1 ≈ “living thing”, axis 2 ≈ “place”. The heatmap is the whole n × n table: row = who is looking, column = who is looked at. Click any row to steer that word instead. Values are kept simple: each word hands over its own meaning, so the output of a row is just its weights.</p>
+    <div class="goals"><span class="goal" id="gAnimal">🎯 “it” → animal ≥ 50% (tired)</span><span class="goal" id="gStreet">🎯 “it” → street ≥ 50% (wide)</span><span class="goal" id="gSharp">🎯 “it” → animal ≥ 90%</span></div>
+    <div class="controls">
+      <span class="seg" id="lastSeg"><button data-v="tired" class="on">…too tired</button><button data-v="wide">…too wide</button></span>
+      <span class="seg" id="maskSeg"><button data-v="full" class="on">Full (encoder)</button><button data-v="causal">Causal mask (GPT)</button></span>
+      <button class="btn" id="ctxBtn">🪄 Let an earlier layer mix the last word into “it”</button>
+      <button class="btn" id="aReset">↺ Reset</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="plane" id="qkPlane"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">steering <b id="selV" class="at">it</b></div>
+          <div class="stat">query <b id="qV" class="mono">–</b></div>
+          <div class="stat">top match <b id="topV" class="at">–</b></div>
+        </div>
+        <div id="wRows"></div>
+        <p class="hint" id="mixV"></p>
+      </div>
+    </div>
+    <canvas class="hm" id="attHeat"></canvas>
+    <p class="hint" id="aMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at the start “it” is undecided: <b>19%</b> on “animal” and <b>19%</b> on “street”. Turn the arrow toward “animal” and stretch it: at about [2.5, 0] the animal gets <b>64%</b>. Switch the sentence to “wide” and point it up at [0, 3]: “street” gets about <b>72%</b>. For 90% you'll need more than the query: try dragging the animal's key further out too. Making the query longer (same direction) makes the weights <b>peakier</b>, which is the whole √d story coming up. The 🪄 button shows how real models get there: an earlier layer mixes “tired” or “wide” into “it” first, and the query turns by itself (62% animal for tired, 62% street for wide; the goals only count when you steer by hand).</p>
+  <p class="muted">In a trained model nobody drags arrows: W<sub>Q</sub> and W<sub>K</sub> are learned so that the right words match. You just played gradient descent.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Self-attention instead of recurrence</span></span>
+    <ol>
+      <li><b>The problem before</b> RNNs and LSTMs (Lessons 5.2–5.3) read one token at a time. A 1,000-token document needs 1,000 sequential steps, so a GPU (which wants thousands of things at once) sits mostly idle, and information between distant words passes through hundreds of hand-offs.</li>
+      <li><b>What people tried</b> LSTMs with attention bolted onto the decoder (Lesson 5.4), and convolutions over sequences (Lesson 5.5), which run in parallel but need a stack of O(log n) or more layers to connect distant words.</li>
+      <li><b>Why this works</b> Every token reads every token in <b>one</b> step, so the whole layer is a couple of matrix multiplies (GPUs love those), and any two words are <b>one hop</b> apart. The Transformer's base model trained in <b>12 hours</b> on 8 GPUs and still beat previously published models on English→German.</li>
+      <li><b>What it costs, when it fails</b> The n × n score table: double the context, 4× the work and memory (playground at the end). And attention alone has <b>no idea of word order</b>: shuffle the words and each token gets the same blend (Lesson 6.3 fixes that).</li>
+      <li><b>What refined it</b> Several heads in parallel (6.2), positions (6.3), the full block with MLP, residuals and norms (6.4), and memory-saving tricks like the KV cache and FlashAttention (6.9).</li>
+    </ol>
+  </div>
+
+  <h2>The formula, now that you've felt it</h2>
+  <p>In words: <b>score every query against every key, divide by √d, softmax each row, use the weights to average the values.</b> Stack the n queries as rows of a matrix Q (and keys as K, values as V), and the whole layer is one line:</p>
+  <div class="calc">Attention(Q, K, V) = softmax( Q K<sup>T</sup> / √d<sub>k</sub> ) · V</div>
+  <p>Q K<sup>T</sup> is the n × n heatmap you just edited; d<sub>k</sub> is the length of each key (64 in the original paper). The math course derives this line slowly: <a href="../../math-course/phase8/4-attention.html">math 8.4</a>. What it skips is the next question: why that √d?</p>
+
+  <h2>Why divide by √d? Because dot products grow with dimension</h2>
+  <p>A dot product adds up d little products. If every entry of q and k is a random number with average 0 and spread 1, the paper notes that q·k has average 0 and <b>variance d</b>, so its typical size is <b>√d</b>. With d = 64 that's about ±8; with d = 1,024, about ±32.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: three scores at d = 64</span>
+    <p>Typical scores at d = 64 look like <b>[16, 8, 0]</b> (two spreads apart). Softmax them as they are, then divided by √64 = 8:</p>
+    <table>
+      <tr><th></th><th>Scores</th><th>Softmax weights</th><th>Slope p(1 − p) of the top weight</th></tr>
+      <tr><td>Unscaled</td><td>[16, 8, 0]</td><td class="dead">[0.9997, 0.0003, 0.0000]</td><td class="dead">0.0003</td></tr>
+      <tr><td>÷ √d</td><td>[2, 1, 0]</td><td class="ev">[0.67, 0.24, 0.09]</td><td class="ev">0.22</td></tr>
+    </table>
+    <p>Unscaled, softmax has already decided: one key gets everything, and the slope that backprop needs is <b>660× smaller</b> (0.22 ÷ 0.00034). The paper's own words: large dot products push softmax “into regions where it has extremely small gradients”. Dividing by √d brings the scores back to a spread of about 1, whatever d is.</p>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> with no scaling, at what dimension d will about <b>one in three</b> attention rows be essentially one-hot (top weight above 99%)? 16? 64? 1,024?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Why the √d is there</span>
+    <p class="hint">One random query against 10 random keys, every entry drawn from a bell curve with spread 1. Bars: the softmax weights for one draw, unscaled (left) and ÷√d (right). The numbers below average <b>1,000 draws</b> at this d. “Gradient size” is how much the softmax output can move when its scores move (the size of its slope matrix; bigger is healthier).</p>
+    <div class="goals"><span class="goal" id="gThird">🎯 Find the d where ⅓ of unscaled rows go one-hot</span><span class="goal" id="gEight">🎯 Make unscaled gradients 8× weaker than scaled</span></div>
+    <div class="controls">
+      <label>dimension d <input type="range" id="dS" min="1" max="10" step="1" value="3"> <b class="mono" id="dV"></b></label>
+      <button class="btn" id="dDraw">🎲 New draw</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="chart bars2" id="barU"></canvas><p class="hint">softmax(q·k), unscaled</p></div>
+      <div><canvas class="chart bars2" id="barS"></canvas><p class="hint">softmax(q·k / √d)</p></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">typical score size <b id="sdV">–</b></div>
+      <div class="stat">√d <b id="rdV">–</b></div>
+      <div class="stat">one-hot rows, unscaled <b id="ohU" class="dead">–</b></div>
+      <div class="stat">one-hot rows, ÷√d <b id="ohS" class="ev">–</b></div>
+      <div class="stat"><span class="gr">gradient size</span> unscaled → ÷√d <b id="gV" class="gr">–</b></div>
+    </div>
+    <p class="hint" id="dMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the typical score size tracks √d almost exactly (7.8 at d = 64, 31 at d = 1,024). Unscaled, the share of one-hot rows climbs from 8% at d = 16 to <b>35% at d = 64</b> (the per-head size of the original Transformer) and 80% at d = 1,024, while the gradient size sinks from 0.34 to 0.04. Scaled, nothing moves: 0% one-hot and a gradient size of 0.35 at every d. One division makes the layer behave the same at any width.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Scaling scores by 1/√d<sub>k</sub></span></span>
+    <ol>
+      <li><b>The problem before</b> Dot products grow with dimension (variance d). At d = 64 typical scores are ±8, softmax goes nearly one-hot, and its slope collapses (0.0003 instead of 0.22 in the worked example). Gradients stop reaching W<sub>Q</sub> and W<sub>K</sub>.</li>
+      <li><b>What people tried</b> Additive attention (Bahdanau's small MLP scorer, Lesson 5.4), which the paper notes beat <i>unscaled</i> dot products at large d, but is slower than one matrix multiply.</li>
+      <li><b>Why this works</b> Dividing by √d turns a spread of √d back into a spread of 1, at every width. It's free (one multiply) and keeps the fast matrix-multiply form. Think of it as a fixed softmax temperature chosen so the layer starts “undecided” instead of “already sure”.</li>
+      <li><b>What it costs, when it fails</b> It assumes entries of roughly unit size. During training, query and key vectors can still grow and softmax saturates anyway: training a 22-billion-parameter vision transformer, Dehghani et al. (2023) hit “extremely large values in attention logits” that made attention almost one-hot and destabilized training.</li>
+      <li><b>What refined it</b> Normalizing queries and keys before the dot product (“QK-norm”), introduced for that 22B model and used in Google's Gemma 3 (2025), keeps scores bounded; the normalization layers themselves are Lesson 2.3. Flash-style kernels (6.9) fold the scale into the same fused computation.</li>
+    </ol>
+  </div>
+
+  <h2>The causal mask: no peeking at the future</h2>
+  <p>A GPT-style model is trained to predict the <b>next</b> token. If token 7 could read token 8, it would just copy the answer. So before the softmax, every score where the key comes <b>after</b> the query is set to −∞. Since e<sup>−∞</sup> = 0, those words get exactly zero weight, and the heatmap becomes a lower triangle.</p>
+  <p>Go back to the first playground and press <b>Causal mask</b>. Then flip tired ↔ wide while steering “it”. Its row doesn't change at all: at position 8 it simply can't see the word that decides the answer. A GPT resolves this one token later: when it reaches “tired”, that row can look back at both nouns (click the “tired” row).</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Causal (look-back-only) mask</span></span>
+    <ol>
+      <li><b>The problem before</b> To train next-token prediction on a 1,000-token text you'd want 1,000 training examples from one pass. With full attention, the prediction at position 7 can read position 8: the loss drops to near zero and the model learns nothing useful.</li>
+      <li><b>What people tried</b> Running the model once per prefix (1,000 separate passes for 1,000 positions), which is exactly how slow RNN decoding felt.</li>
+      <li><b>Why this works</b> One mask (−∞ above the diagonal) lets <b>every position train at once</b> while each one only sees its past: a 1,000-token text gives 1,000 honest next-token predictions in one forward pass. At generation time it also means old tokens never need recomputing when a new one arrives.</li>
+      <li><b>What it costs, when it fails</b> Each token only sees the left side, so early tokens have less context. For tasks where you have the whole text up front (classifying a review, embedding a document) that's a handicap; encoders like BERT drop the mask (Lesson 6.5).</li>
+      <li><b>What refined it</b> The “never recompute the past” property becomes the <b>KV cache</b> (Lesson 6.9). Encoder vs decoder vs both: Lesson 6.5.</li>
+    </ol>
+  </div>
+
+  <h2>The price: n² scores</h2>
+  <p>Every token scores every token, so the table has n² entries <b>per head, per layer</b>. Stored in 16-bit numbers (2 bytes each), one 8,192 × 8,192 table is 134 MB. A model with 32 heads and 32 layers that kept all of them (training needs them for the backward pass) would need about <b>137 GB</b> just for attention weights.</p>
+  <p class="predict">🔮 <b>Predict:</b> how long can a context get before a <b>single head's</b> score table no longer fits on an 80 GB GPU? 10 thousand tokens? 100 thousand? A million?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The n² bill</span>
+    <p class="hint">Slide the sequence length. The square shows the score table (each cell stands for many scores once n is large; the causal mask blanks the upper half, but standard kernels often still compute or allocate it). Assumes 16-bit numbers, 32 heads and 32 layers, like a mid-sized open model.</p>
+    <div class="goals"><span class="goal" id="gAll">🎯 Overflow 80 GB with all heads × layers</span><span class="goal" id="gOne">🎯 Overflow 80 GB with ONE head's table</span></div>
+    <div class="controls">
+      <label>sequence length n <input type="range" id="nS" min="7" max="20" step="1" value="10"> <b class="mono" id="nV"></b></label>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="nn2" id="nCanvas"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">scores per head <b id="nScores" class="at">–</b></div>
+          <div class="stat">one head's table <b id="nOne">–</b></div>
+          <div class="stat">32 heads × 32 layers <b id="nAll">–</b></div>
+        </div>
+        <div class="stat-row">
+          <div class="stat">RNN: steps in a row <b id="nRnn" class="dead">–</b></div>
+          <div class="stat">attention: steps in a row <b class="ev">1</b></div>
+        </div>
+        <p class="hint" id="nMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> the full stack passes 80 GB at only <b>8,192 tokens</b> (137 GB). A single head's table crosses 80 GB a bit above 200,000 tokens: 131,072 tokens is 34 GB, 262,144 is 137 GB. Yet models in 2026 advertise contexts of hundreds of thousands to millions of tokens. They can because <b>FlashAttention</b> computes the same result in tiles and never stores the full table (Lesson 6.9), and long-context tricks reduce the work itself (Lesson 6.11).</p>
+
+  <h2>Side by side: three ways to let a token use its context</h2>
+  <table>
+    <tr><th></th><th>RNN / LSTM (5.2–5.3)</th><th>Bahdanau attention (5.4)</th><th>Self-attention (this lesson)</th></tr>
+    <tr><td>Who looks around</td><td>No one: context is squeezed into one hidden state</td><td>Only the decoder, over encoder states</td><td>Every token, over every token</td></tr>
+    <tr><td>Scoring</td><td>–</td><td>Small MLP (additive)</td><td>Dot product ÷ √d</td></tr>
+    <tr><td>Parallel over positions</td><td class="dead">No</td><td>Decoder side no</td><td class="ev">Yes</td></tr>
+    <tr><td>Cost in length n</td><td>n steps</td><td>n · m scores</td><td>n² scores</td></tr>
+    <tr><td>Knows word order</td><td class="ev">Yes, by construction</td><td>Yes (from the RNN)</td><td class="dead">No, needs positions (6.3)</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>You rarely write attention by hand: <code>F.scaled_dot_product_attention</code> does score → scale → mask → softmax → mix in one fused call and picks a FlashAttention or memory-efficient kernel when it can. Writing it by hand once is still the best way to trust it:</p>
+<pre><code><span class="k">import</span> torch, torch.nn.functional <span class="k">as</span> F
+torch.manual_seed(<span class="n">0</span>)
+n, d = <span class="n">5</span>, <span class="n">64</span>                          <span class="c"># 5 tokens, 64 numbers per query/key</span>
+x = torch.randn(<span class="n">1</span>, n, d)              <span class="c"># (batch, tokens, features)</span>
+Wq, Wk, Wv = (torch.randn(d, d) / d**<span class="n">0.5</span> <span class="k">for</span> _ <span class="k">in</span> range(<span class="n">3</span>))
+q, k, v = x @ Wq, x @ Wk, x @ Wv
+
+<span class="c"># by hand: scores -> causal mask -> softmax -> mix values</span>
+scores = q @ k.transpose(-<span class="n">2</span>, -<span class="n">1</span>) / d**<span class="n">0.5</span>            <span class="c"># (1, 5, 5)</span>
+mask = torch.triu(torch.ones(n, n, dtype=torch.bool), <span class="n">1</span>)
+weights = scores.masked_fill(mask, float(<span class="s">"-inf"</span>)).softmax(-<span class="n">1</span>)
+out_hand = weights @ v
+
+<span class="c"># the fused PyTorch kernel</span>
+out = F.scaled_dot_product_attention(q, k, v, is_causal=<span class="k">True</span>)
+print(torch.allclose(out, out_hand, atol=<span class="n">1e-6</span>))
+print(weights[<span class="n">0</span>, <span class="n">2</span>].round(decimals=<span class="n">2</span>))   <span class="c"># token 3 sees only tokens 1-3</span>
+
+<span class="c"># What we got on a laptop CPU (torch 2.8):</span>
+<span class="c"># True</span>
+<span class="c"># tensor([0.4500, 0.3100, 0.2400, 0.0000, 0.0000])</span></code></pre>
+    <p class="hint">Gotcha: in the real thing q, k, v have shape (batch, heads, tokens, head_dim); the scale uses the <b>head</b> dimension, not the model width (Lesson 6.2). And pass <code>is_causal=True</code> rather than building your own mask when you can: it lets PyTorch pick the fastest kernel.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Self-attention vs recurrence</td><td>Fully parallel training; any two tokens one hop apart</td><td>n² time and memory in context length; no built-in word order</td></tr>
+      <tr><td>Dot-product vs additive scoring</td><td>One matrix multiply, hardware-friendly</td><td>Needs the 1/√d scale (and sometimes QK-norm) to avoid saturation</td></tr>
+      <tr><td>Causal mask vs full attention</td><td>Trains every next-token prediction in one pass; makes generation cacheable</td><td>Each token sees only its past; worse for “read the whole thing” tasks</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Walk me through self-attention. Why the √d?” A strong answer:</p>
+    <ul>
+      <li>Q = XW<sub>Q</sub>, K = XW<sub>K</sub>, V = XW<sub>V</sub>; scores QKᵀ (n × n), scale by 1/√d<sub>k</sub>, optional causal mask (−∞ above the diagonal), row-wise softmax, multiply by V.</li>
+      <li>√d: for unit-variance entries, q·k has variance d<sub>k</sub>; big scores saturate softmax and its gradients vanish. Scaling restores unit spread.</li>
+      <li>Costs: O(n²·d) compute and O(n²) memory per head; mentions FlashAttention / KV cache as the practical answers.</li>
+      <li>Knows attention is permutation-blind without positional information.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The paper that dropped recurrence</b> <span class="tag hist">📜 History · 2017</span> <a href="https://arxiv.org/abs/1706.03762" target="_blank" rel="noopener">Vaswani et al.: Attention Is All You Need</a></div>
+      <p><b>How:</b> encoder and decoder built only from self-attention (8 heads of size 64), feed-forward layers, residuals and normalization; the decoder uses the causal mask.</p>
+      <p><b>Why this method:</b> parallel training. The big model hit 28.4 BLEU on English→German after 3.5 days on 8 P100 GPUs; the base model beat earlier published models after 12 hours.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Causal self-attention for text generation</b> <span class="tag co">🏢 OpenAI · 2019</span> <a href="https://cdn.openai.com/better-language-models/language_models_are_unsupervised_multitask_learners.pdf" target="_blank" rel="noopener">Radford et al.: Language Models are Unsupervised Multitask Learners (GPT-2)</a></div>
+      <p><b>How:</b> a stack of decoder-only blocks with masked self-attention over a 1,024-token context, trained to predict the next token.</p>
+      <p><b>Why this method:</b> the causal mask turns every position of every document into a training example in one pass, which is what made scaling to billions of parameters practical.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Self-attention over image patches</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/2010.11929" target="_blank" rel="noopener">Dosovitskiy et al.: An Image is Worth 16x16 Words (ViT)</a></div>
+      <p><b>How:</b> cut an image into 16 × 16 pixel patches, treat each patch as a token, and run a standard transformer encoder (full, unmasked attention).</p>
+      <p><b>Why this method:</b> every patch can relate to every other patch from layer 1, instead of growing a receptive field slowly like a CNN (Phase 3).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Making n² fit in memory</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">Dao et al.: FlashAttention</a></div>
+      <p><b>How:</b> computes exact attention in tiles that fit in the GPU's fast on-chip memory, never writing the full n × n table out.</p>
+      <p><b>Why this method:</b> the quadratic memory you just measured is the bottleneck; the paper reports a 3× speedup on GPT-2 at length 1K and longer usable contexts (Lesson 6.9).</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the author list is random</span>
+    <p>The Attention paper has eight authors, and a footnote says “Equal contribution. Listing order is random.” The same footnote credits Jakob Uszkoreit with proposing to replace RNNs with self-attention. That one idea is now in nearly every model you use.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Builds on Bahdanau attention (5.4) and the RNN bottleneck (5.2–5.3); the formula is derived in <a href="../../math-course/phase8/4-attention.html">math 8.4</a> and softmax in <a href="../../math-course/phase8/2-softmax.html">math 8.2</a>. Next: run several attentions in parallel (6.2), give tokens positions (6.3), wrap it in the full block (6.4), and choose encoder, decoder or both (6.5). The n² bill comes back in 6.9 (KV cache, FlashAttention) and 6.11 (long context). For the applied view of how an LLM uses this to pick the next token, see <a href="../../ai-engineer/phase0/2-how-llms-work.html">AI Engineer 0.2</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://jalammar.github.io/illustrated-transformer/" target="_blank" rel="noopener">Jay Alammar: The Illustrated Transformer</a>. The classic picture-by-picture walk through Q, K and V.</li>
+      <li><span class="kind">Video</span> <a href="https://www.youtube.com/watch?v=kCc8FmEb1nY" target="_blank" rel="noopener">Andrej Karpathy: Let's build GPT, from scratch, in code</a>. Builds causal self-attention line by line, including why the scale matters.</li>
+      <li><span class="kind">Code</span> <a href="https://nlp.seas.harvard.edu/annotated-transformer/" target="_blank" rel="noopener">The Annotated Transformer</a>. The original paper, interleaved with runnable PyTorch.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Query and key entries are random with mean 0 and variance 1, and each head has d<sub>k</sub> = 256. Roughly how big is a typical unscaled score q·k, and what is it after scaling?</div>
+    <div class="opts"><button class="opt">About 256, and 16 after scaling</button><button class="opt" data-ok>About 16 (√256), and about 1 after dividing by √256</button><button class="opt">About 1 either way, because the entries have variance 1</button></div>
+    <div class="explain">A dot product sums 256 products, each with variance 1, so the sum has variance 256 and a typical size of √256 = 16. Dividing by √d<sub>k</sub> = 16 brings it back to about 1, which keeps softmax out of its flat, one-hot region.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You train a small GPT-style model and the training loss falls to almost 0 within minutes, but generated text is garbage. What's the most likely bug?</div>
+    <div class="opts"><button class="opt">The √d scale is missing</button><button class="opt">The learning rate is too low</button><button class="opt" data-ok>The causal mask is missing or wrong, so each position can attend to the token it's supposed to predict</button></div>
+    <div class="explain">A near-zero loss that doesn't translate into good generation is the signature of a leak: with no causal mask, position i reads token i+1 and copies it. At generation time the future isn't there, so the model has learned nothing useful. Check that scores above the diagonal are set to −∞ (or pass <code>is_causal=True</code>).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. An attention layer takes 4 ms on a 2,000-token input. Ignoring everything except the n² score computation, about how long on an 8,000-token input?</div>
+    <div class="opts"><button class="opt">16 ms (4× the tokens)</button><button class="opt" data-ok>64 ms (4× the tokens → 16× the scores)</button><button class="opt">8 ms (it runs in parallel, so length barely matters)</button></div>
+    <div class="explain">The score table has n² entries. Going from 2,000 to 8,000 tokens multiplies n by 4 and n² by 16, so 4 ms × 16 = 64 ms. Parallelism removes the <i>sequential</i> steps, not the total work. This is why long context is expensive (Lessons 6.9 and 6.11).</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Self-attention: every token makes a query (what I want), a key (what I offer) and a value (what I hand over); scores q·k → softmax → weighted sum of values.</li>
+      <li>One step connects any two tokens and runs fully in parallel, unlike an RNN's n sequential steps.</li>
+      <li>Divide scores by √d<sub>k</sub>: dot products have variance d, and big scores make softmax one-hot with vanishing gradients (35% of rows one-hot at d = 64 without it).</li>
+      <li>The causal mask (−∞ above the diagonal) lets decoders train all next-token predictions at once without peeking.</li>
+      <li>The price is n² time and memory per head and layer; attention also ignores word order until we add positions (6.3).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/plane.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const pct = v => Math.round(100 * v) + "%";
+
+  /* ---------- 1. steer “it” ---------- */
+  const BASE = ["The", "animal", "didn't", "cross", "the", "street", "because", "it", "was", "too", "tired"];
+  const K0 = { The: [-0.7, 0.4], animal: [2.0, 0.3], "didn't": [0.1, -0.8], cross: [0.6, 0.8], the: [-0.7, 0.4], street: [0.3, 2.0], because: [-1.0, -0.2], it: [0.7, -0.2], was: [-0.4, -1.0], too: [-1.1, -0.7], tired: [1.2, -0.6], wide: [-0.5, 1.2] };
+  const IT = 7, LAST = 10;
+  let last = "tired", causal = false, sel = IT, Ks, Qs, magic = false;
+  const toks = () => { const t = [...BASE]; t[LAST] = last; return t; };
+  function aReset() {
+    Ks = toks().map(t => [...K0[t]]);
+    Qs = Ks.map(k => [k[0], k[1]]);       // other words simply look for words like themselves
+    Qs[IT] = [0.6, 0.6];                  // “it” starts undecided
+    sel = IT; magic = false; aDraw("");
+  }
+  const plane = new Plane($("qkPlane"), { range: 3.5, snap: 0.1, xLabel: "living thing", yLabel: "place", onDrag: (key, p) => {
+    if (key === "q") Qs[sel] = p; else Ks[+key.slice(1)] = p;
+    magic = false;
+    aDraw("");
+  } });
+  function aDraw(msg) {
+    const T = toks(), A = NN.attention(Qs, Ks, Ks, { causal });
+    const items = [];
+    Ks.forEach((k, j) => items.push({ type: "pt", at: k, r: j === 1 || j === 5 || j === LAST ? 6 : 4, color: j === sel ? "--c-ac" : "--c-x", label: T[j], drag: "k" + j }));
+    items.push({ type: "vec", from: [0, 0], to: Qs[sel], color: "--c-at", width: 3.5, label: "q(" + T[sel] + ")", drag: "q" });
+    plane.draw(items);
+    const w = A.weights[sel];
+    $("selV").textContent = T[sel];
+    $("qV").textContent = `[${Qs[sel][0].toFixed(1)}, ${Qs[sel][1].toFixed(1)}]`;
+    const top = w.indexOf(Math.max(...w));
+    $("topV").textContent = `${T[top]} ${pct(w[top])}`;
+    $("wRows").innerHTML = T.map((t, j) => `<div class="wrow${causal && j > sel ? " masked" : ""}"><span>${t}</span><div class="meterbar"><i style="width:${100 * w[j]}%"></i></div><span class="mono">${(100 * w[j]).toFixed(0)}%</span></div>`).join("");
+    const order = w.map((v, j) => [v, j]).sort((a, b) => b[0] - a[0]).slice(0, 3);
+    $("mixV").innerHTML = `Output for “${T[sel]}” = ` + order.map(([v, j]) => `${v.toFixed(2)}·v(${T[j]})`).join(" + ") + " + …";
+    NN.heat($("attHeat"), A.weights, { lo: 0, hi: 1, color: "--c-at", text: true, fmt: v => (v < 0.005 ? "" : (100 * v).toFixed(0)), rowLabels: T, colLabels: T, padLeft: 62, highlight: [sel, top] });
+    const wa = A.weights[IT];
+    if (!magic) {   // goals count only when you steer by hand
+      win("gAnimal", last === "tired" && wa[1] >= 0.5);
+      win("gStreet", last === "wide" && wa[5] >= 0.5);
+      win("gSharp", wa[1] >= 0.9);
+    }
+    $("aMsg").textContent = msg || (causal && sel === IT ? "Causal mask on: “it” cannot see “was too " + last + "”, so flipping tired ↔ wide changes nothing in its row. Click the last row to see who can." :
+      causal && sel === LAST ? "The last word sees the whole sentence, both nouns included: this is where a GPT can resolve “it”." :
+      sel === IT && w[1] >= 0.5 ? "“it” now mostly reads “animal”." : sel === IT && w[5] >= 0.5 ? "“it” now mostly reads “street”." : "");
+  }
+  NN.onCells($("attHeat"), BASE.length, BASE.length, (r) => { if (r !== sel) { sel = r; aDraw(""); } });
+  seg("lastSeg", v => { last = v; Ks[LAST] = [...K0[v]]; if (sel === LAST) Qs[LAST] = [...K0[v]]; aDraw(""); });
+  seg("maskSeg", v => { causal = v === "causal"; aDraw(""); });
+  $("ctxBtn").onclick = () => {
+    const k = K0[last]; Qs[IT] = [0.6 + 1.6 * k[0], 0.6 + 1.6 * k[1]]; sel = IT; magic = true;
+    aDraw(`An earlier layer blended “${last}” into “it”, so its query turned toward ${last === "tired" ? "living things" : "places"}. That's how stacked layers resolve “it”: one layer gathers context, the next one uses it.`);
+  };
+  $("aReset").onclick = aReset;
+  aReset();
+
+  /* ---------- 2. why √d ---------- */
+  const sm = z => { const m = Math.max(...z), e = z.map(v => Math.exp(v - m)), s = e.reduce((a, b) => a + b, 0); return e.map(v => v / s); };
+  const jac = p => { let s = 0; p.forEach((pi, i) => p.forEach((pj, j) => { const v = (i === j ? pi : 0) - pi * pj; s += v * v; })); return Math.sqrt(s); };
+  const cache = {};
+  function stats(d, T = 1000) {
+    if (cache[d]) return cache[d];
+    const r = NN.rng(7); let spread = 0, ohU = 0, ohS = 0, gU = 0, gS = 0;
+    for (let t = 0; t < T; t++) {
+      const q = Array.from({ length: d }, r.n);
+      const s = Array.from({ length: 10 }, () => { let a = 0; for (let i = 0; i < d; i++) a += q[i] * r.n(); return a; });
+      spread += Math.sqrt(s.reduce((a, v) => a + v * v, 0) / 10);
+      const pu = sm(s), ps = sm(s.map(v => v / Math.sqrt(d)));
+      if (Math.max(...pu) > 0.99) ohU++; if (Math.max(...ps) > 0.99) ohS++;
+      gU += jac(pu); gS += jac(ps);
+    }
+    return (cache[d] = { spread: spread / T, ohU: ohU / T, ohS: ohS / T, gU: gU / T, gS: gS / T });
+  }
+  let draw = 1;
+  function dDraw() {
+    const d = Math.pow(2, +$("dS").value), r = NN.rng(100 + draw);
+    const q = Array.from({ length: d }, r.n), s = Array.from({ length: 10 }, () => { let a = 0; for (let i = 0; i < d; i++) a += q[i] * r.n(); return a; });
+    const pu = sm(s), ps = sm(s.map(v => v / Math.sqrt(d))), at = MX.css("--c-at");
+    Plot.bars($("barU"), { bars: pu.map((v, i) => ({ label: "k" + (i + 1), value: v, color: v > 0.99 ? MX.css("--c-dead") : at })), yMin: 0, yMax: 1 });
+    Plot.bars($("barS"), { bars: ps.map((v, i) => ({ label: "k" + (i + 1), value: v, color: at })), yMin: 0, yMax: 1 });
+    const st = stats(d);
+    $("dV").textContent = d;
+    $("sdV").textContent = "±" + st.spread.toFixed(1);
+    $("rdV").textContent = Math.sqrt(d).toFixed(1);
+    $("ohU").textContent = (100 * st.ohU).toFixed(1) + "%";
+    $("ohS").textContent = (100 * st.ohS).toFixed(1) + "%";
+    $("gV").textContent = `${st.gU.toFixed(3)} → ${st.gS.toFixed(3)}`;
+    win("gThird", st.ohU >= 0.33 && st.ohU < 0.4);
+    win("gEight", st.gS / st.gU >= 7.8);
+    $("dMsg").textContent = st.ohU >= 0.33 && st.ohU < 0.4 ? "d = 64: exactly the per-head size of the original Transformer. Without the scale, a third of its attention rows would be frozen one-hot." :
+      d >= 512 ? "Unscaled softmax is nearly always one-hot here; its gradient is a small fraction of the scaled one." : d <= 4 ? "Tiny d: scores are small anyway, so scaling hardly matters." : "";
+  }
+  $("dS").oninput = dDraw;
+  $("dDraw").onclick = () => { draw++; dDraw(); };
+  dDraw();
+
+  /* ---------- 3. the n² bill ---------- */
+  const human = b => (b >= 1e12 ? (b / 1e12).toFixed(1) + " TB" : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : (b / 1e3).toFixed(0) + " KB");
+  const big = v => (v >= 1e12 ? (v / 1e12).toFixed(1) + " trillion" : v >= 1e9 ? (v / 1e9).toFixed(1) + " billion" : v >= 1e6 ? (v / 1e6).toFixed(1) + " million" : v.toLocaleString("en-US"));
+  function nDraw() {
+    const n = Math.pow(2, +$("nS").value), sc = n * n, one = 2 * sc, all = one * 32 * 32;
+    $("nV").textContent = n.toLocaleString("en-US");
+    $("nScores").textContent = big(sc);
+    $("nOne").innerHTML = one > 80e9 ? `<span class="dead">${human(one)}</span>` : human(one);
+    $("nAll").innerHTML = all > 80e9 ? `<span class="dead">${human(all)}</span>` : human(all);
+    $("nRnn").textContent = n.toLocaleString("en-US");
+    const g = Math.min(32, n), M = Array.from({ length: g }, (_, i) => Array.from({ length: g }, (_, j) => (j > i ? 0.15 : 0.55 + 0.45 * ((i * 7 + j * 3) % 5) / 5)));
+    NN.heat($("nCanvas"), M, { lo: 0, hi: 1, color: "--c-at", gap: g > 16 ? 0 : 1 });
+    win("gAll", all > 80e9);
+    win("gOne", one > 80e9);
+    $("nMsg").textContent = one > 80e9 ? "One head's table alone no longer fits on an 80 GB GPU. Real long-context models never build it: FlashAttention works in tiles (6.9)." :
+      all > 80e9 ? "Storing every table for 32 heads × 32 layers already overflows a top GPU. Doubling n again costs 4× more." : "Doubling n quadruples every number on the right.";
+  }
+  $("nS").oninput = nDraw;
+  nDraw();
+})();
+</script>
+</body>
+</html>

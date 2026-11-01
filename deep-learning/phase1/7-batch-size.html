@@ -1,0 +1,356 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.7 Batch size: noise, speed and the scaling rules · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+</style>
+</head>
+<body data-lesson="d1-7" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 1 · Lesson 7</div>
+  <h1>Batch size: noise, speed and the scaling rules</h1>
+  <p class="subtitle">How many examples should each step look at? One is noisy, all of them is slow, and the sweet spot moves during training. Get the batch size and learning rate to agree and you can train on 256 GPUs as accurately as on 8.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>The <code>DataLoader</code> hands out mini-batches; one epoch = one pass over the data (Lesson 1.3).</li>
+      <li>The gradient of a mini-batch is an average of per-example gradients, a noisy estimate of the full-data gradient (<a href="../../math-course/phase7/2-sgd.html">math 7.2</a>). Averages of B samples have noise ∝ 1/√B (<a href="../../math-course/phase4/7-lln-clt.html">math 4.7</a>).</li>
+      <li>Warmup ramps the learning rate up at the start (Lesson 1.6).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2017 a team at Facebook took the standard ImageNet recipe, ResNet-50 with batches of 256 images, which took <b>29 hours on 8 GPUs</b>, and trained it in <b>1 hour on 256 GPUs</b> with batches of <b>8,192</b>, with essentially the same accuracy (23.74% vs 23.60% top-1 error). Two rules did it: multiply the learning rate by the same factor as the batch, and warm up gradually.</p>
+    <p>And yet a 2018 study from Graphcore found that their <i>best</i> test results came from batches of just <b>2 to 32</b>. Llama 3 405B started with a smaller batch for stability and doubled it twice during training. <b>So is a bigger batch better or worse?</b> Both, and by the end you'll know exactly when.</p>
+  </div>
+
+  <h2>Numbers first: steps, epochs and what one step costs</h2>
+  <p>Say you have N = 1,024 training examples.</p>
+  <table>
+    <tr><th>Batch size B</th><th>Steps per epoch (N ÷ B)</th><th>Gradient noise (relative)</th><th>Work per step</th></tr>
+    <tr><td>1 (pure SGD)</td><td>1,024</td><td>1</td><td>1 example</td></tr>
+    <tr><td>16</td><td>64</td><td>1/√16 = 0.25</td><td>16 examples, done in parallel</td></tr>
+    <tr><td>256</td><td>4</td><td>1/√256 = 0.0625</td><td>256 examples, done in parallel</td></tr>
+    <tr><td>1,024 (full batch)</td><td>1</td><td>0 (the exact gradient)</td><td>everything</td></tr>
+  </table>
+  <p>The catch is the square root: going from 16 to 256 makes each step <b>16× more expensive</b> but its gradient only <b>4× less noisy</b>. Whether that trade is worth it depends on whether noise is what's slowing you down, and on whether those 256 examples run in parallel (on a GPU they mostly do, until the memory is full).</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A mini-batch gradient = the true direction + noise that shrinks like 1/√B. When the noise is large compared with the true gradient, a bigger batch buys real progress per step, and with the learning rate scaled up to match, you get the same result in proportionally fewer steps. When the noise is already small, extra examples are wasted compute. That turning point is the <b>critical batch size</b>, and it grows as training goes on.
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Mini-batches</span></span>
+    <ol>
+      <li><b>The problem before</b> Full-batch gradient descent reads the entire dataset for <b>one</b> step: with 1.28 million ImageNet images, a single update is a full epoch. Pure SGD (B = 1) updates after every example, but its direction is very noisy and it can't use a GPU's thousands of parallel cores.</li>
+      <li><b>What people tried</b> Full-batch methods (slow per step), single-example online SGD (noisy, no parallelism).</li>
+      <li><b>Why this works</b> Average B examples: the direction gets √B less noisy, and the B forward/backward passes run in parallel on a GPU, so a batch of 64 often costs barely more wall-clock time than a batch of 1. Typical batches (32–512 for vision, millions of tokens for LLMs) sit in between. The leftover noise even helps a little: it keeps the optimizer from settling into the first narrow dip it finds.</li>
+      <li><b>What it costs, when it fails</b> Activation memory grows linearly with B (Lesson 1.3), so the GPU caps the batch. The best learning rate depends on B. Batch-dependent layers (BatchNorm, Lesson 2.3) behave badly with tiny batches.</li>
+      <li><b>What refined it</b> The linear scaling rule with warmup, gradient accumulation (both below), and batch-size schedules that grow B during training.</li>
+    </ol>
+  </div>
+
+  <h2>See the noise</h2>
+  <p>A model with just two weights (logistic regression on 1,024 points), so every gradient is a 2D arrow. The thick green arrow is the <b>true</b> gradient over all 1,024 points; each thin pink arrow is the gradient of one random mini-batch.</p>
+  <p class="predict">🔮 <b>Predict:</b> to make the cloud of pink arrows half as wide, how much bigger must the batch be: 2× or 4×?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Mini-batch gradients vs the true one</span>
+    <div class="controls">
+      <label>batch size B <input type="range" id="nB" min="0" max="9" step="1" value="2"> <b class="mono" id="nBv"></b></label>
+      <span class="seg" id="nStage"><button data-v="0" class="on">start of training</button><button data-v="30">after 30 steps</button><button data-v="100">after 100</button><button data-v="300">after 300</button></span>
+      <button class="btn" id="nResample">🎲 New batches</button>
+    </div>
+    <canvas class="plane wide" id="nPlane" style="height:300px"></canvas>
+    <div class="stat-row">
+      <div class="stat">steps per epoch <b id="nSteps">–</b></div>
+      <div class="stat">noise (rms distance from truth) <b id="nNoise" class="gr">–</b></div>
+      <div class="stat">noise ÷ signal (rms noise ÷ |true gradient|) <b id="nCos">–</b></div>
+      <div class="stat">noise scale B<sub>noise</sub> here <b id="nBn" class="at">–</b></div>
+    </div>
+    <div class="goals"><span class="goal" id="gHalf">🎯 Halve the noise compared with B = 4</span><span class="goal" id="gLate">🎯 After 300 steps: find the smallest batch whose noise is smaller than the signal</span></div>
+    <p class="hint" id="nMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the noise halves each time the batch grows 4× (B = 1, 4, 16, 64: about 0.28, 0.14, 0.070, 0.036 at the start). Early in training the true gradient is big, so even a single example has less noise than signal (ratio 0.82). Switch to “after 300 steps”: the model is close to the minimum and the true gradient has shrunk about 50×, but the per-example disagreement hasn't, so a single example is now 12× more noise than signal, and you need about B = 128 to get the ratio below 1. The noise scale B<sub>noise</sub> = (per-example variance) ÷ |true gradient|² climbs from under 1 to over 100. Batches much smaller than it are mostly noise; batches much larger waste compute.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the gradient noise scale</span>
+    <p>McCandlish et al. (2018) measure B<sub>noise</sub> = tr(Σ) / |G|²: the total variance of one example's gradient divided by the squared length of the true gradient. At our “start”, tr(Σ) ≈ 0.078 and |G| ≈ 0.342, so B<sub>noise</sub> ≈ 0.078 / 0.117 ≈ <b>0.7</b>: one example is already about as informative as the whole dataset. After 300 steps, tr(Σ) ≈ 0.0045 but |G| ≈ 0.0063, so B<sub>noise</sub> ≈ 0.0045 / 0.00004 ≈ <b>113</b>.</p>
+    <p>Their finding across MNIST, ImageNet, language models and Dota 2 agents: this simple number roughly predicts the largest <b>useful</b> batch size, it differs by orders of magnitude between tasks (tens of thousands of images for ImageNet, millions for Dota), and it <b>increases as the loss decreases</b>. That's why Llama 3 started with 4M-token batches and doubled to 8M and then 16M.</p>
+  </div>
+
+  <h2>Same number of examples, different batch sizes</h2>
+  <p>Fair comparison: every run sees exactly <b>12,800 examples</b> (25 epochs of a 512-point spiral; SGD; same network and sampling seed). A batch of 2 takes 6,400 steps; a batch of 256 takes 50. First keep the learning rate fixed at 0.1; then apply the <b>linear scaling rule</b>: lr = 0.1 × B/16.</p>
+  <p class="predict">🔮 <b>Predict:</b> with the learning rate fixed, which batch size ends with the lowest loss? And with the linear scaling rule?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Batch-size race at a fixed budget</span>
+    <div class="controls">
+      <span class="seg" id="bRule"><button data-v="same" class="on">same lr (0.1) for every batch</button><button data-v="linear">linear scaling: lr = 0.1 × B / 16</button></span>
+      <button class="btn primary" id="bRun">▶ Run all 8 batch sizes</button>
+    </div>
+    <canvas class="chart" id="bBars" style="height:220px"></canvas>
+    <p class="hint">Steps needed for 12,800 examples: B 2 → 6,400 · 4 → 3,200 · 8 → 1,600 · 16 → 800 · 32 → 400 · 64 → 200 · 128 → 100 · 256 → 50.</p>
+    <div class="stat-row">
+      <div class="stat">best batch <b id="bBest">–</b></div>
+      <div class="stat">steps it needed <b id="bSteps">–</b></div>
+      <div class="stat">largest batch within 20% of B = 16's loss <b id="bOk">–</b></div>
+    </div>
+    <div class="goals"><span class="goal" id="gSame">🎯 See small batches win at a fixed lr</span><span class="goal" id="gLin">🎯 Linear scaling: same loss with 8× fewer steps</span><span class="goal" id="gBreakLin">🎯 Find where the rule breaks</span></div>
+    <p class="hint" id="bMsg"></p>
+  </div>
+  <p><b>What you should see</b> (seeded): with a fixed lr, smaller is better: B = 2 ends at <b>0.008</b>, B = 16 at 0.062, B = 256 at 0.628, simply because it took 128× fewer steps of the same size. With linear scaling, every batch from 2 to 128 ends between <b>0.060 and 0.070</b>: B = 128 matches B = 16 with <b>8× fewer steps</b>. That's Goyal et al.'s result in miniature. At B = 256 (lr 1.6) it breaks (0.416): the steps got too big for the loss surface, the same edge you found in Lesson 1.6. Past the critical batch size, more parallelism stops buying speed.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">The linear scaling rule (+ warmup)</span></span>
+    <ol>
+      <li><b>The problem before</b> To use more GPUs you need bigger batches, but keeping the old learning rate means fewer, equally sized steps per epoch: in our race, B = 256 at lr 0.1 ends at 0.628 vs 0.062 for B = 16. Large-batch training had a reputation for losing accuracy.</li>
+      <li><b>What people tried</b> Training longer at large batch (wastes the speed-up), square-root scaling of the lr, and early observations by Krizhevsky and others that Goyal et al. build on.</li>
+      <li><b>Why this works</b> Goyal et al.'s rule: “When the minibatch size is multiplied by k, multiply the learning rate by k.” Intuition: k small steps with nearly the same gradient ≈ one step k times as big with their average. So B × 8 with lr × 8 covers the same distance per epoch. With a 5-epoch gradual warmup, ResNet-50 at batch 8,192 (lr 0.1 × 32 = 3.2) reached 23.74% error vs 23.60% at batch 256, and trained in 1 hour on 256 GPUs with ~90% scaling efficiency.</li>
+      <li><b>What it costs, when it fails</b> The “nearly the same gradient” assumption fails early in training (hence warmup) and at very large batches: Goyal et al. saw accuracy degrade rapidly beyond about 8k on ImageNet; our toy broke at 256. Adam-style optimizers follow different rules (often closer to √k).</li>
+      <li><b>What refined it</b> The critical batch size / noise scale (McCandlish et al.), large-batch optimizers like LARS and LAMB, and batch-size warmup (Llama 3's 4M → 8M → 16M tokens).</li>
+    </ol>
+  </div>
+
+  <h2>Sharp vs flat minima (careful here)</h2>
+  <p>Keskar et al. (2016) observed that large-batch training often generalized worse and presented evidence that large-batch methods tend to converge to <b>sharp</b> minima (the loss rises steeply around them) while small batches find <b>flatter</b> ones, which they linked to the noise in small-batch gradients. It's a popular intuition: noise shakes you out of narrow holes.</p>
+  <p>But be careful. Dinh et al. (2017) showed that for ReLU networks you can reparametrize a model to make its minimum arbitrarily sharp <b>without changing what it computes</b>, so “sharpness” alone can't explain generalization. Shallue et al. (2018), across 35 workloads, found <b>no evidence that larger batches degrade out-of-sample performance</b> once hyperparameters are re-tuned for each batch size; many earlier gaps came from tuning differences. The safe takeaway: large batches need their learning rate (and schedule) re-tuned; they aren't inherently worse.</p>
+
+  <h2>When the batch doesn't fit: gradient accumulation</h2>
+  <p>Your recipe says “batch of 512”, but only 64 examples fit in GPU memory. Run 8 micro-batches of 64, call <code>backward()</code> on each <b>without</b> calling <code>zero_grad()</code> in between (gradients add up, Lesson 1.2), divide each loss by 8, then take one optimizer step. The result is the same gradient as one batch of 512.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Gradient accumulation</span></span>
+    <ol>
+      <li><b>The problem before</b> Activation memory grows linearly with batch size, so the batch a recipe needs (hundreds of thousands of tokens for an LLM) doesn't fit on one GPU, and changing the batch changes the learning rate you need.</li>
+      <li><b>What people tried</b> Smaller batches with re-tuned hyperparameters; more GPUs (expensive).</li>
+      <li><b>Why this works</b> PyTorch's <code>.grad</code> accumulates by design. k micro-batches of size b, each loss divided by k, sum to exactly the mean gradient over k·b examples (our check: identical to 2 × 10⁻⁸). Memory is set by b, the effective batch by k·b. nanoGPT's GPT-2 config does 40 micro-steps of 12 sequences × 1,024 tokens ≈ 0.5M tokens per optimizer step.</li>
+      <li><b>What it costs, when it fails</b> k times slower per optimizer step than a real k·b batch on k× the hardware (it's sequential). Forgetting to divide the loss by k multiplies the effective lr by k. BatchNorm still only sees micro-batches of b.</li>
+      <li><b>What refined it</b> Data parallelism across GPUs (each GPU a micro-batch, gradients averaged: DDP and FSDP, Lesson 10.3), and mixed precision plus activation checkpointing to fit bigger micro-batches.</li>
+    </ol>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Gradient accumulation, checked against a real big batch, and the 1/√B noise law measured on a small network:</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn
+
+torch.manual_seed(<span class="n">0</span>)
+model = nn.Sequential(nn.Linear(<span class="n">20</span>, <span class="n">64</span>), nn.ReLU(), nn.Linear(<span class="n">64</span>, <span class="n">3</span>))
+x, y = torch.randn(<span class="n">64</span>, <span class="n">20</span>), torch.randint(<span class="n">0</span>, <span class="n">3</span>, (<span class="n">64</span>,))
+loss_fn = nn.CrossEntropyLoss()
+
+<span class="c"># A: one batch of 64</span>
+model.zero_grad()
+loss_fn(model(x), y).backward()
+big = [p.grad.clone() <span class="k">for</span> p <span class="k">in</span> model.parameters()]
+
+<span class="c"># B: 4 micro-batches of 16, gradients accumulated</span>
+model.zero_grad()
+accum = <span class="n">4</span>
+<span class="k">for</span> xb, yb <span class="k">in</span> zip(x.chunk(accum), y.chunk(accum)):
+    (loss_fn(model(xb), yb) / accum).backward()     <span class="c"># divide, so the sum equals the mean over 64</span>
+small = [p.grad <span class="k">for</span> p <span class="k">in</span> model.parameters()]
+
+diff = max((a - b).abs().max().item() <span class="k">for</span> a, b <span class="k">in</span> zip(big, small))
+print(<span class="s">f"max difference between the two gradients: {diff:.1e}"</span>)
+
+<span class="c"># Gradient noise: how far is a mini-batch gradient from the full-batch one?</span>
+X, Y = torch.randn(<span class="n">4096</span>, <span class="n">20</span>), torch.randint(<span class="n">0</span>, <span class="n">3</span>, (<span class="n">4096</span>,))
+<span class="k">def</span> grad(idx):
+    model.zero_grad(); loss_fn(model(X[idx]), Y[idx]).backward()
+    <span class="k">return</span> torch.cat([p.grad.flatten() <span class="k">for</span> p <span class="k">in</span> model.parameters()])
+full = grad(torch.arange(<span class="n">4096</span>))
+<span class="k">for</span> B <span class="k">in</span> [<span class="n">8</span>, <span class="n">32</span>, <span class="n">128</span>, <span class="n">512</span>]:
+    devs = [(grad(torch.randint(<span class="n">0</span>, <span class="n">4096</span>, (B,))) - full).norm().item() <span class="k">for</span> _ <span class="k">in</span> range(<span class="n">50</span>)]
+    print(<span class="s">f"batch {B:4d}: average distance from the full gradient {sum(devs) / 50:.3f}"</span>)
+
+<span class="c"># What we got (torch 2.8, CPU):</span>
+<span class="c"># max difference between the two gradients: 2.2e-08</span>
+<span class="c"># batch    8: average distance from the full gradient 1.153</span>
+<span class="c"># batch   32: average distance from the full gradient 0.590</span>
+<span class="c"># batch  128: average distance from the full gradient 0.299</span>
+<span class="c"># batch  512: average distance from the full gradient 0.152</span></code></pre>
+    <p class="hint">In a real loop: <code>if (step + 1) % accum == 0: opt.step(); opt.zero_grad()</code>. With DDP, wrap the non-final micro-steps in <code>model.no_sync()</code> so GPUs only average gradients once per optimizer step (nanoGPT sets <code>require_backward_grad_sync</code> for the same reason).</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Small batch (2–64)</td><td>Most progress per example; small memory; noise can help generalization</td><td>Poor hardware use; many sequential steps</td></tr>
+      <tr><td>Large batch + linear lr scaling + warmup</td><td>Same result in far fewer steps; scales across many GPUs</td><td>Breaks past the critical batch size; needs re-tuning</td></tr>
+      <tr><td>Gradient accumulation</td><td>Any effective batch on a small GPU</td><td>Sequential: no speed-up; must divide the loss</td></tr>
+      <tr><td>Growing the batch during training</td><td>Matches the rising noise scale; stable early, efficient late</td><td>More schedule to manage (lr must follow)</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“You're moving training from 8 to 64 GPUs. What changes?” A strong answer:</p>
+    <ul>
+      <li>Effective batch grows 8× (data parallelism), so steps per epoch drop 8×; apply the <b>linear scaling rule</b> (lr × 8 for SGD; re-tune for Adam) with a <b>gradual warmup</b>; keep everything else fixed and compare curves against examples seen.</li>
+      <li>Knows the limit: past the critical batch size (≈ the gradient noise scale), more batch buys nothing; it grows as loss falls.</li>
+      <li>Gives the memory answer: gradient accumulation for a large effective batch on few GPUs, dividing the loss by the number of micro-steps.</li>
+      <li>Is careful about generalization: sharp-vs-flat is a debated intuition; well-tuned large batches needn't generalize worse (Shallue et al.).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>ImageNet in one hour</b> <span class="tag co">🏢 Facebook AI Research · 2017</span> <a href="https://arxiv.org/abs/1706.02677" target="_blank" rel="noopener">Goyal et al.: Accurate, Large Minibatch SGD</a></div>
+      <p><b>How:</b> ResNet-50, batch 8,192 across 256 GPUs, lr = 0.1 × batch/256, 5-epoch gradual warmup, zero-γ init (Lesson 1.4).</p>
+      <p><b>Why this method:</b> the rule kept the training curves matched to small-batch training, so a 29-hour job became a 1-hour job at the same accuracy.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The largest useful batch, predicted</b> <span class="tag co">🏢 OpenAI · 2018</span> <a href="https://arxiv.org/abs/1812.06162" target="_blank" rel="noopener">McCandlish et al.: An Empirical Model of Large-Batch Training</a></div>
+      <p><b>How:</b> measure the gradient noise scale during training.</p>
+      <p><b>Why this method:</b> it roughly predicts the critical batch across supervised, RL and generative tasks, from tens of thousands (ImageNet) to millions (Dota 2), and shows it grows as the loss falls.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Growing the batch during pre-training</b> <span class="tag co">🏢 Meta · 2024</span> <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></div>
+      <p><b>How:</b> 405B model starts at 4M tokens per batch (sequences of 4,096), doubles to 8M after 252M tokens, then to 16M after 2.87T tokens.</p>
+      <p><b>Why this method:</b> the paper says the lower batch size early improves training stability and the increase later improves efficiency, which is the rising-noise-scale story.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The case for small batches</b> <span class="tag res">🧪 Research · 2018</span> <a href="https://arxiv.org/abs/1804.07612" target="_blank" rel="noopener">Masters &amp; Luschi (Graphcore): Revisiting Small Batch Training</a></div>
+      <p><b>How:</b> compared batch sizes on CIFAR-10, CIFAR-100 and ImageNet with learning rates scaled consistently.</p>
+      <p><b>Why this method:</b> larger batches narrowed the range of stable learning rates; their best results came from batches of 2 to 32. Small batches are best per example; large batches are best per hour on lots of hardware.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 71 million loss measurements</span>
+    <p>To settle the batch-size debate, Shallue et al. (2018) trained <b>168,160</b> models across 35 workloads and published all <b>71,638,836</b> loss measurements as a public database. Their verdict: the steps-vs-batch-size curve has a perfect-scaling region, then diminishing returns, then a plateau, and where those bends happen varies enormously between workloads.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The 1/√B noise law is the central limit theorem (<a href="../../math-course/phase4/7-lln-clt.html">math 4.7</a>); SGD's noise is <a href="../../math-course/phase7/2-sgd.html">math 7.2</a>. Built on: the learning rate and warmup (1.6), <code>.grad</code> accumulation (1.2), DataLoader batches (1.3). Next in Phase 2: BatchNorm's dependence on batch size (2.3) and debugging loss curves (2.6). Phase 10 scales this to many GPUs: data parallelism, FSDP/ZeRO (10.3) and mixed precision to fit bigger batches (10.2).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1706.02677" target="_blank" rel="noopener">Accurate, Large Minibatch SGD: Training ImageNet in 1 Hour</a>. Unusually practical: section 3 lists implementation pitfalls of distributed SGD.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1812.06162" target="_blank" rel="noopener">An Empirical Model of Large-Batch Training</a>. The noise scale, with a clear derivation and many tasks.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1811.03600" target="_blank" rel="noopener">Shallue et al.: Measuring the Effects of Data Parallelism</a>. The careful, large-scale answer to “does batch size hurt?”.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A recipe trains with batch 256 at lr 0.1 using SGD. You move to batch 2,048. By the linear scaling rule, what lr should you start from (after warmup)?</div>
+    <div class="opts"><button class="opt">0.1</button><button class="opt">0.28 (× √8)</button><button class="opt" data-ok>0.8</button></div>
+    <div class="explain">The batch grew by k = 2,048 / 256 = 8, so the lr grows by 8: 0.1 × 8 = 0.8, reached through a gradual warmup. (√8 scaling is sometimes used with Adam-type optimizers; the linear rule is Goyal et al.'s rule for SGD.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A batch of 512 doesn't fit; 128 does. You accumulate 4 micro-batches but forget to divide each loss by 4. What happens?</div>
+    <div class="opts"><button class="opt">Nothing: the optimizer normalizes the gradient</button><button class="opt" data-ok>The gradient is the sum, 4× the mean, so SGD effectively uses 4× the learning rate</button><button class="opt">The gradient is 4× smaller</button></div>
+    <div class="explain">Each backward adds its micro-batch's mean gradient, so four of them sum to 4× the mean over 512. With SGD that's a 4× larger step (possibly over the edge). Adam is mostly scale-invariant, so it hides the bug, until you switch optimizers. Divide the loss by the number of micro-steps.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You double the batch size four times (16× in total), scaling the lr each time. Steps-to-target fall 2×, 2×, 1.3×, then not at all. What's happening?</div>
+    <div class="opts"><button class="opt">The linear scaling rule is wrong; use the old lr</button><button class="opt" data-ok>You've passed the critical batch size: the gradient noise is already small, so extra examples per step barely improve the direction</button><button class="opt">The batch is too small</button></div>
+    <div class="explain">Bigger batches help only while noise dominates the gradient. Past the critical batch size (≈ the gradient noise scale), each step is already nearly the true gradient, and the lr can't grow further without hitting the stability edge. Shallue et al. found this perfect-scaling → diminishing-returns → plateau shape across workloads.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Mini-batch gradient = truth + noise ∝ 1/√B. 16× the batch costs 16× the work for 4× less noise; GPUs make moderate batches nearly free.</li>
+      <li>Linear scaling rule (SGD): batch × k → lr × k, with a gradual warmup. ResNet-50 at batch 8,192: 1 hour on 256 GPUs, 23.74% vs 23.60% error.</li>
+      <li>The critical batch size ≈ the gradient noise scale tr(Σ)/|G|²: past it, more batch buys nothing. It grows as the loss falls, so big runs grow the batch (Llama 3: 4M → 8M → 16M tokens).</li>
+      <li>Sharp-vs-flat minima is an intuition, not a law; re-tuned large batches needn't generalize worse.</li>
+      <li>Gradient accumulation: k micro-batches, each loss ÷ k, one step = the same gradient as a batch k times bigger.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/plane.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+
+  /* ---------- 1. gradient noise, 2-weight logistic regression ---------- */
+  const D = NN.data.gauss(1024, { noise: 0.35 });
+  const g1 = (w, s) => { const z = w[0] * s.x[0] + w[1] * s.x[1], p = 1 / (1 + Math.exp(-z)); return [(p - s.y) * s.x[0], (p - s.y) * s.x[1]]; };
+  const fullG = w => { const G = [0, 0]; D.forEach(s => { const g = g1(w, s); G[0] += g[0] / D.length; G[1] += g[1] / D.length; }); return G; };
+  const W = {}; { let w = [0.3, -0.6]; for (let t = 0; t <= 300; t++) { if ([0, 30, 100, 300].includes(t)) W[t] = w.slice(); const G = fullG(w); w = [w[0] - G[0], w[1] - G[1]]; } }   // full-batch GD, lr 1
+  let stage = 0, seed = 3;
+  const plane = new Plane($("nPlane"), { range: 1 });
+  function nDraw() {
+    const B = Math.pow(2, +$("nB").value), w = W[stage], G = fullG(w), gs = D.map(s => g1(w, s));
+    const tr = gs.reduce((a, g) => a + (g[0] - G[0]) ** 2 + (g[1] - G[1]) ** 2, 0) / gs.length, Gn = Math.hypot(...G);
+    const r = NN.rng(seed), arrows = [], K = 30; let cs = 0, dev = 0;
+    for (let k = 0; k < 200; k++) {
+      const g = [0, 0]; for (let i = 0; i < B; i++) { const q = gs[r.int(gs.length)]; g[0] += q[0] / B; g[1] += q[1] / B; }
+      cs += (g[0] * G[0] + g[1] * G[1]) / (Math.hypot(...g) * Gn || 1) / 200; dev += ((g[0] - G[0]) ** 2 + (g[1] - G[1]) ** 2) / 200;
+      if (k < K) arrows.push(g);
+    }
+    // view fixed per stage, sized to fit a batch of 1 (so the cloud visibly shrinks as B grows)
+    const r1 = NN.rng(seed), ext = [[0, 0], G]; for (let k = 0; k < K; k++) ext.push(gs[r1.int(gs.length)]);
+    let x0 = Math.min(...ext.map(p => p[0])), x1 = Math.max(...ext.map(p => p[0])), y0 = Math.min(...ext.map(p => p[1])), y1 = Math.max(...ext.map(p => p[1]));
+    const cw = $("nPlane").clientWidth || 700, ch = $("nPlane").clientHeight || 300, cx = (x0 + x1) / 2, cy = (y0 + y1) / 2;
+    let hx = 0.6 * (x1 - x0) + 1e-6, hy = 0.6 * (y1 - y0) + 1e-6; if (hx / hy < cw / ch) hx = hy * cw / ch; else hy = hx * ch / cw;
+    plane.o.xRange = [cx - hx, cx + hx]; plane.o.yRange = [cy - hy, cy + hy];
+    plane.draw([...arrows.map(g => ({ type: "vec", to: g, color: "--c-gr", width: 1.4 })), { type: "vec", to: G, color: "--c-y", width: 4, label: "true gradient" }]);
+    $("nBv").textContent = B; $("nSteps").textContent = Math.ceil(1024 / B);
+    const ratio = Math.sqrt(dev) / Gn;
+    $("nNoise").textContent = Math.sqrt(dev).toFixed(3); $("nCos").innerHTML = `<span class="${ratio > 1 ? "dead" : "ev"}">${ratio.toFixed(2)}</span>`;
+    $("nBn").textContent = (tr / (Gn * Gn)).toFixed(1);
+    if (B === 4) base4 = Math.sqrt(dev);
+    win("gHalf", base4 && stage === 0 && Math.sqrt(dev) <= 0.55 * base4 && B > 4);
+    if (stage === 300 && ratio < 1 && B > 1 && ratioFor(G, gs, B / 2) >= 1) win("gLate", true);
+    $("nMsg").textContent = ratio > 1.5 ? "Noise dominates: the arrows scatter around the truth. A bigger batch would help a lot here." : ratio < 0.2 ? "The noise is tiny compared with the signal: a bigger batch would mostly waste compute." : "";
+  }
+  let base4 = null;
+  function ratioFor(G, gs, B) { const r = NN.rng(seed); let dev = 0; for (let k = 0; k < 200; k++) { const g = [0, 0]; for (let i = 0; i < B; i++) { const q = gs[r.int(gs.length)]; g[0] += q[0] / B; g[1] += q[1] / B; } dev += ((g[0] - G[0]) ** 2 + (g[1] - G[1]) ** 2) / 200; } return Math.sqrt(dev) / Math.hypot(...G); }
+  { const w = W[0], r = NN.rng(3); let dev = 0; const gs = D.map(s => g1(w, s)), G = fullG(w); for (let k = 0; k < 200; k++) { const g = [0, 0]; for (let i = 0; i < 4; i++) { const q = gs[r.int(gs.length)]; g[0] += q[0] / 4; g[1] += q[1] / 4; } dev += ((g[0] - G[0]) ** 2 + (g[1] - G[1]) ** 2) / 200; } base4 = Math.sqrt(dev); }
+  $("nB").oninput = nDraw;
+  $("nResample").onclick = () => { seed++; nDraw(); };
+  seg("nStage", v => { stage = +v; nDraw(); });
+  nDraw();
+
+  /* ---------- 2. batch-size race at a fixed budget ---------- */
+  const data = NN.data.spiral(512);
+  const fullLoss = n => data.reduce((s, d) => { const p = Math.min(1 - 1e-12, Math.max(1e-12, n.predict(d.x)[0])); return s - (d.y ? Math.log(p) : Math.log(1 - p)); }, 0) / data.length;
+  const BS = [2, 4, 8, 16, 32, 64, 128, 256];
+  let rule = "same";
+  function runB(B, lr) {
+    const net = new NN.MLP({ sizes: [2, 16, 16, 1], act: "relu", out: "sigmoid", init: "he", seed: 1 }), r = NN.rng(42), steps = Math.round(12800 / B);
+    for (let t = 0; t < steps; t++) { const b = []; for (let i = 0; i < B; i++) b.push(data[r.int(data.length)]); const L = net.train(b, { lr }); if (!isFinite(L.loss)) return { loss: NaN, steps }; }
+    return { loss: fullLoss(net), steps };
+  }
+  function bars(res) {
+    Plot.bars($("bBars"), { bars: BS.map((B, i) => ({ label: `B ${B}`, value: res ? Math.min(0.8, isFinite(res[i].loss) ? res[i].loss : 0.8) : 0, color: MX.css(res && res[i].loss > 0.3 ? "--c-dead" : "--c-ls") })), yMin: 0, yMax: 0.8, yLabel: "final loss" });
+  }
+  $("bRun").onclick = () => {
+    const res = BS.map(B => runB(B, rule === "same" ? 0.1 : 0.1 * B / 16));
+    bars(res);
+    let bi = 0; res.forEach((r, i) => { if (r.loss < res[bi].loss) bi = i; });
+    $("bBest").textContent = `B = ${BS[bi]} (loss ${res[bi].loss.toFixed(3)})`; $("bSteps").textContent = res[bi].steps;
+    const ref = res[3].loss; let ok = 16; res.forEach((r, i) => { if (BS[i] > 16 && r.loss <= 1.2 * ref) ok = Math.max(ok, BS[i]); });
+    $("bOk").textContent = `B = ${ok} (${Math.round(12800 / ok)} steps vs 800)`;
+    if (rule === "same") { win("gSame", bi === 0); $("bMsg").textContent = "Same lr: big batches take far fewer steps of the same size, so they fall behind."; }
+    else { win("gLin", ok >= 128); win("gBreakLin", res[7].loss > 2 * ref); $("bMsg").textContent = `Linear scaling: losses stay close up to B = ${ok}; B = 256 (lr 1.6) ${res[7].loss > 2 * ref ? "breaks: past the edge" : "still holds"}.`; }
+  };
+  seg("bRule", v => { rule = v; bars(null); $("bMsg").textContent = ""; });
+  bars(null);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9.2 Graph neural networks · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.gr { width: 100%; aspect-ratio: 16 / 9; height: auto; display: block; border-radius: 10px; border: 1px solid var(--line); touch-action: none; cursor: pointer; }
+  canvas.adj { width: 100%; max-width: 230px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 8px; border: 1px solid var(--line); }
+  canvas.mini { width: 100%; max-width: 230px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 8px; border: 1px solid var(--line); }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .seen { font-family: var(--mono); font-size: .85rem; word-break: break-all; }
+</style>
+</head>
+<body data-lesson="d9-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 9 · Lesson 2</div>
+  <h1>Graph neural networks</h1>
+  <p class="subtitle">Molecules, road networks, social networks and 3D meshes aren't grids or sequences. Graph neural networks learn on them by letting every node listen to its neighbours, round after round.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>A layer is a matrix multiply plus a bend: <span class="ac">h</span>′ = ReLU(<span class="w">W</span> <span class="ac">h</span>) (Lessons 0.3 and 0.4).</li>
+      <li>A CNN slides the <b>same</b> small filter over every pixel and looks only at its neighbours (Lesson 3.2). Keep that idea: GNNs do the same on graphs.</li>
+      <li>Attention computes a weighted average of other tokens with weights from a softmax (Lesson 6.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Every time Google Maps tells you “arrive 9:42”, a graph neural network may be behind it. Google and DeepMind modelled roads as a <b>graph</b> (road segments connected where they meet) and deployed a GNN to predict travel times. They report it cut bad ETA predictions by <b>over 40%</b> in cities like Sydney compared with the previous production system.</p>
+    <p>In 2023, DeepMind's <b>GraphCast</b>, a GNN on a mesh wrapped around the globe, made <b>10-day</b> weather forecasts in <b>under a minute</b> on one TPU and beat the European Centre's flagship forecast (HRES) on <b>90%</b> of 1,380 test targets. Pinterest recommends pins with a GNN running on a graph of <b>3 billion</b> nodes.</p>
+    <p><b>But a road map has no pixels and no word order. How do you feed it to a neural network at all?</b> You'll find out by spreading colours through a graph by hand, solving a challenge in two rounds, and then watching too many rounds ruin everything.</p>
+  </div>
+
+  <h2>Numbers first: why an MLP or a CNN can't take a graph</h2>
+  <p>A <b>graph</b> is a set of <b>nodes</b> (atoms, people, road segments) and <b>edges</b> between them (bonds, friendships, junctions). Each node has a feature vector <span class="x">x</span> (atom type, age, speed limit). Try the obvious approaches:</p>
+  <table>
+    <tr><th>Idea</th><th>What goes wrong</th></tr>
+    <tr><td>Flatten the adjacency matrix into an MLP</td><td>A molecule with 20 atoms gives 400 inputs, one with 21 gives 441: <b>the input size changes</b>. And numbering the atoms differently gives a different input for the <b>same molecule</b>: 20 atoms can be numbered 20! ≈ 2.4 × 10<sup>18</sup> ways.</td></tr>
+    <tr><td>A CNN</td><td>A filter needs a fixed grid: “the pixel to the left”. A node has <b>no left</b>, and might have 1 neighbour or 1,000.</td></tr>
+    <tr><td>An RNN over the nodes</td><td>It needs an order. A graph doesn't have one.</td></tr>
+  </table>
+  <p>So we need a network that (1) works for <b>any number of nodes and neighbours</b>, and (2) gives the same answer however you <b>number</b> the nodes. That second property is called <b>permutation invariance</b> (for a whole-graph answer) or <b>equivariance</b> (for per-node answers: relabel the nodes and the answers get relabelled the same way).</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Message passing</b>: in each round, every node collects its neighbours' vectors, combines them with an order-free operation (sum, mean or max), and updates its own vector with a small shared network. After k rounds, each node knows about everything within k hops. The same weights are used at every node, exactly like a CNN filter is reused at every pixel.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: gossip in a village</span>
+    <p>On day 1 each villager knows only their own news. Every evening, everyone chats with their direct neighbours and updates their opinion: a bit of their own view, a bit of the neighbours'. After two evenings you've heard news from friends of friends. After a month everyone in the village holds the same blended opinion, and nobody remembers who started what. Both halves of that story matter in this lesson.</p>
+  </div>
+
+  <h2>Message passing, one round at a time</h2>
+  <p>For node <span class="ac">v</span> with vector <span class="ac">h<sub>v</sub></span>, one round (one GNN layer) is:</p>
+  <div class="calc">message = AGGREGATE { <span class="ac">h<sub>u</sub></span> for every neighbour u } &nbsp;→&nbsp; <span class="ac">h<sub>v</sub></span>′ = ReLU( <span class="w">W<sub>self</sub></span> <span class="ac">h<sub>v</sub></span> + <span class="w">W<sub>nbr</sub></span> · message )</div>
+  <p>AGGREGATE must not care about order (sum, mean, max), so relabelling nodes can't change anything. The weights <span class="w">W</span> are shared by every node, so the number of parameters <b>doesn't depend on the size of the graph</b>.</p>
+  <p class="predict">🔮 <b>Predict:</b> below, two nodes start with a colour (coral = community A, blue = community B) and the rest are blank. Each round, every node becomes the average of itself and its neighbours. After 2 rounds, will every node be coloured? After 40 rounds, will the two communities still look different?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Message passing, round by round</span>
+    <p class="hint">16 nodes in two communities (left = A, right = B, joined by 3 bridge edges). <b>Click a node</b> to cycle its starting colour: blank → A (+1) → B (−1). Turn on <b>✏️ Edit edges</b> and click two nodes to add or remove an edge. A node counts as <b>correct</b> if its value has the right sign and is at least 0.01 in size; fainter than that, it can't be told apart (it's drawn with a dashed ring).</p>
+    <div class="goals">
+      <span class="goal" id="gTwo">🎯 All 16 correct in ≤ 2 rounds (one seed per community)</span>
+      <span class="goal" id="gSmooth">🎯 Over-smooth it: accuracy falls 6+ nodes below its best</span>
+      <span class="goal" id="gBoom">🎯 Make the sum aggregator explode (a value over 1,000)</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="aggSeg"><button data-v="mean" class="on">Mean</button><button data-v="sum">Sum</button><button data-v="max">Max</button></span>
+      <button class="btn primary" id="mpStep">▶ 1 round</button>
+      <button class="btn" id="mpTen">⏩ 10 rounds</button>
+      <button class="btn" id="mpEdit">✏️ Edit edges: off</button>
+      <button class="btn" id="mpBack">↺ Back to round 0</button>
+      <button class="btn" id="mpReset">Reset graph</button>
+    </div>
+    <canvas class="gr" id="mpCan"></canvas>
+    <div class="stat-row">
+      <div class="stat">round <b id="mpR">0</b></div>
+      <div class="stat">correct <b class="y" id="mpAcc">–</b></div>
+      <div class="stat">best so far <b id="mpBest">–</b></div>
+      <div class="stat">spread (max − min) <b class="ac" id="mpSp">–</b></div>
+      <div class="stat">largest |value| <b id="mpMax">–</b></div>
+    </div>
+    <canvas class="chart" id="mpChart" style="height:150px"></canvas>
+    <p class="hint" id="mpMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the default seeds sit at the far edges (nodes on the outside of each community). With <b>mean</b>, round 2 gets <b>10 of 16</b> right; colour needs 3 to 6 rounds to reach everyone (best: 15 at round 6), because information travels <b>one hop per round</b>. Now seed the two <b>hubs</b> (the big central node of each community): <b>16 of 16 at round 2</b>. Keep going. By round 20 the colours fade and blend across the bridges, and by round 40 every value is within 0.01 of zero: <b>0 of 16</b> can be told apart. That's <b>over-smoothing</b>. Switch to <b>sum</b> (with the hub seeds): no fading, but the largest value reaches 618 by round 6 and 98,930 by round 10, which is why real layers normalize. <b>Max</b> keeps the strongest signal forever, but it can't count: one coral neighbour or five look the same.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Message passing</span></span>
+    <ol>
+      <li><b>The problem before</b> Graphs have no fixed size, no grid and no node order. Flattening a 20-node adjacency matrix gives 400 inputs that change with every relabelling (20! ≈ 2.4 × 10<sup>18</sup> numberings of the same molecule).</li>
+      <li><b>What people tried</b> Hand-made graph features (counts of rings, degrees, fingerprints of molecules) fed to classical models; “spectral” graph convolutions defined through the graph's eigenvectors, which were expensive and tied to one fixed graph.</li>
+      <li><b>Why this works</b> Each node does the same local computation with the same weights: gather neighbours with an order-free operation, then update. That is a CNN filter generalized from “the 8 pixels around me” to “whoever I'm connected to”. Any graph size works, relabelling can't change the result, and k layers see k hops. Gilmer et al. (2017) showed that many earlier models were all instances of this one recipe and named it the message passing neural network.</li>
+      <li><b>What it costs, when it fails</b> Information moves <b>one hop per layer</b>, so far-apart nodes need many layers, and many layers <b>over-smooth</b> (you just saw it). Plain message passing also can't tell apart some different graphs (for example, two triangles versus one hexagon look the same to every node: each has 2 neighbours). Many messages funnel through a few bridge nodes (“over-squashing”).</li>
+      <li><b>What refined it</b> GCN (normalized averaging), GraphSAGE (sampled neighbours), GAT (learned attention weights), residual connections and normalization for depth (Lessons 2.2, 2.3), and graph transformers that let every node attend to every other.</li>
+    </ol>
+  </div>
+
+  <h2>Sum, mean or max? The aggregator matters</h2>
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Neighbour aggregation: sum, mean, max</span></span>
+    <ol>
+      <li><b>The problem before</b> A node may have 2 neighbours or 2 million, and they come in no particular order. You need one fixed-size vector out of a <b>set</b> of any size.</li>
+      <li><b>What people tried</b> Sorting neighbours by some score and running an RNN over them (GraphSAGE tested an LSTM aggregator on random orderings): it works but depends on an arbitrary order.</li>
+      <li><b>Why this works</b> Sum, mean and max all ignore order. <b>Sum</b> can count (a carbon with 4 bonds differs from one with 2): useful for molecules. <b>Mean</b> keeps values on the same scale whatever the degree: a celebrity with a million followers doesn't explode. <b>Max</b> picks out “is any neighbour like X?”, robust to how many there are. Tiny example: neighbours with values 1, 1, 1, 1 give sum 4, mean 1, max 1; a node with a single neighbour of value 1 gives sum 1, mean 1, max 1. Only sum tells them apart.</li>
+      <li><b>What it costs, when it fails</b> Sum blows up with degree and depth (98,930 after 10 rounds in the playground) unless normalized. Mean and max can't count neighbours. Every choice throws some information away.</li>
+      <li><b>What refined it</b> GCN's symmetric normalization (divide by √deg<sub>u</sub> · √deg<sub>v</sub>), combining several aggregators at once (“principal neighbourhood aggregation”), and attention-weighted averages (GAT, below).</li>
+    </ol>
+  </div>
+
+  <h2>GCN: the averaging layer that started the boom</h2>
+  <p>Kipf and Welling's <b>Graph Convolutional Network</b> (2016) is message passing with one specific, cheap normalization. Add a self-loop to every node (so you keep your own features), then average neighbours weighted by 1 ÷ √(deg<sub>u</sub> · deg<sub>v</sub>), then apply a shared weight matrix and ReLU. As a matrix formula, with Â = A + I:</p>
+  <div class="calc"><span class="ac">H</span>′ = ReLU( D̂<sup>−½</sup> Â D̂<sup>−½</sup> <span class="ac">H</span> <span class="w">W</span> )</div>
+  <p class="muted">That's one matrix multiply by a normalized adjacency matrix, then a normal linear layer (matrix multiplication: <a href="../../math-course/phase2/2-matmul.html">math 2.2</a>). Real graphs are stored as sparse edge lists, so the cost is proportional to the number of edges.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: one GCN layer on a 3-node path</span>
+    <p>Graph A — B — C, one feature each: <span class="x">x</span> = [3, 0, 1]. With self-loops, degrees are A: 2, B: 3, C: 2. Weight <span class="w">W</span> = 1.</p>
+    <table>
+      <tr><th>Node</th><th>Receives (weight × value)</th><th>New value</th></tr>
+      <tr><td>A</td><td>itself ½ × 3 + B 1/√6 × 0</td><td class="ac"><b>1.5</b></td></tr>
+      <tr><td>B</td><td>A 1/√6 × 3 + itself ⅓ × 0 + C 1/√6 × 1 = 4 × 0.408</td><td class="ac"><b>1.63</b></td></tr>
+      <tr><td>C</td><td>B 1/√6 × 0 + itself ½ × 1</td><td class="ac"><b>0.5</b></td></tr>
+    </table>
+    <p>B had nothing (0) and now holds a blend of its neighbours. <b>Parameters:</b> on the Cora citation graph (2,708 papers, 1,433 word features each, 7 topics), the paper's first layer maps 1,433 → 16 hidden units: 1,433 × 16 + 16 = <b>22,944</b> weights, the same whether the graph has 2,708 nodes or 2 million. Two such layers scored 81.5% on Cora's topic labels using only 20 labelled papers per topic (140 in all).</p>
+  </div>
+
+  <h2>Shuffle the nodes: who notices?</h2>
+  <p>Here is the permutation problem made concrete. A 4-node graph, one number per node. Two models with fixed random weights: an <b>MLP</b> that reads the flattened adjacency matrix plus the features (20 numbers), and a <b>GNN</b> that does one round of mean message passing and then sums over nodes.</p>
+  <p class="predict">🔮 <b>Predict:</b> there are 4! = 24 ways to number 4 nodes, all describing the same graph. How many different outputs will each model produce?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Same graph, different numbering</span>
+    <p class="hint">Left: the adjacency matrix in the current numbering (row i, column j lit = an edge) with node features down the right. Right: the same graph drawn with the current labels. Shuffle and watch the two outputs.</p>
+    <div class="goals"><span class="goal" id="gAll24">🎯 Try all 24 numberings</span></div>
+    <div class="controls">
+      <button class="btn primary" id="pShuf">🔀 Shuffle the numbering</button>
+      <button class="btn" id="pAll">Try all 24</button>
+      <button class="btn" id="pReset">↺ Original order</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="adj" id="pAdj"></canvas><p class="hint">adjacency matrix + <span class="x">features</span></p></div>
+      <div><canvas class="mini" id="pDraw"></canvas><p class="hint">the graph, labelled by the current numbering</p></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">MLP output <b class="dead" id="pM">–</b></div>
+      <div class="stat">GNN output <b class="y" id="pG">–</b></div>
+      <div class="stat">distinct MLP outputs seen <b id="pMn">–</b></div>
+      <div class="stat">distinct GNN outputs seen <b id="pGn">–</b></div>
+    </div>
+    <p class="hint" id="pMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the MLP gives a different answer for almost every numbering: after all 24 it has produced <b>24 different outputs</b> for one molecule. It would have to learn, from data, that all of them mean the same thing. The GNN gives <b>exactly one</b> output, because mean and sum don't care about order. That's not something it learned; it's built in, so no data is wasted on it.</p>
+
+  <h2>GraphSAGE: when the graph is too big</h2>
+  <p>GCN, as first written, multiplies by the whole adjacency matrix at once and assumes you know the whole graph at training time. Pinterest and Reddit have billions of nodes, and new ones arrive every second. <b>GraphSAGE</b> (Hamilton, Ying and Leskovec, 2017) fixes both:</p>
+  <ul>
+    <li><b>Sample</b> a fixed number of neighbours per node instead of all of them: the paper used 25 at the first hop and 10 at the second, so each node's computation touches at most 25 × 10 = 250 nodes, whatever its real degree.</li>
+    <li>Learn an aggregation <b>function</b> instead of one embedding per node, so it can produce embeddings for <b>new nodes</b> never seen in training (“inductive” learning).</li>
+  </ul>
+  <p>PinSage, Pinterest's version, runs on a graph of 3 billion nodes and 18 billion edges, trained on 7.5 billion examples.</p>
+
+  <h2>GAT: not all neighbours are equal</h2>
+  <p>Mean aggregation treats your best friend and a random acquaintance alike. A <b>Graph Attention Network</b> (Veličković et al., 2017) learns a score for each edge and turns the scores into weights with a softmax over the neighbours, exactly the attention of Lesson 6.1, but only over a node's neighbours.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Graph attention (GAT)</span></span>
+    <ol>
+      <li><b>The problem before</b> GCN's weights 1 ÷ √(deg<sub>u</sub> · deg<sub>v</sub>) are fixed by the graph's shape. A spammy or mislabelled neighbour counts as much as a reliable one.</li>
+      <li><b>What people tried</b> Hand-made edge weights (interaction counts, distances), and separate learned weights per edge type.</li>
+      <li><b>Why this works</b> For each edge, a tiny network scores “how useful is u's message to v?” from both nodes' features; a softmax over v's neighbours turns scores into weights that sum to 1. Example: three neighbours scored 2, 0, 0 get weights 0.79, 0.11, 0.11 (mean would give 0.33 each), so one relevant neighbour can dominate. Several heads look for different things, as in a transformer (Lesson 6.2). GAT reported 83.0% on Cora versus GCN's 81.5%.</li>
+      <li><b>What it costs, when it fails</b> A score per edge per head: more compute and memory than GCN on dense graphs. Gains over a well-tuned GCN are often small on simple benchmarks. It still over-smooths with depth.</li>
+      <li><b>What refined it</b> GATv2 (a more expressive scoring function), and graph transformers that attend over all nodes with positional encodings that describe graph structure.</li>
+    </ol>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: a transformer is a GNN on a complete graph</span>
+    <p>Take a sentence of 6 tokens. Connect <b>every</b> token to every other one (and itself): 6 × 6 = 36 edges. Run GAT on that graph: each token scores every other token, softmaxes the scores and averages their vectors. That is self-attention (Lesson 6.1). The order of words, which a complete graph forgets, comes back through positional encodings (Lesson 6.3). So a transformer is message passing on a fully connected graph, and a GNN is attention restricted to the edges you already know. The cost difference: a 1,000-node graph with 5,000 edges needs 5,000 messages per layer; a complete graph on 1,000 nodes needs 1,000,000.</p>
+  </div>
+
+  <h2>Over-smoothing: why GNNs stay shallow</h2>
+  <p>You watched it happen: averaging again and again makes every node the same. Li, Han and Wu (2018) showed GCN's layer is a form of “Laplacian smoothing”: that's exactly why it works (nodes in a cluster become similar) and why deep GCNs fail (nodes from different clusters become indistinguishable). In practice most GNNs use <b>2 to 4 layers</b>; deep ones need residual connections, normalization or other tricks. The torch snippet below measures it: after 50 rounds of averaging, every node vector points the same way (mean cosine 1.000).</p>
+
+  <h2>Side by side</h2>
+  <table>
+    <tr><th>Model</th><th>Aggregation</th><th>Weights per neighbour</th><th>Scales to huge graphs?</th><th>New nodes at test time?</th></tr>
+    <tr><td>GCN (2016)</td><td>normalized sum</td><td>fixed: 1/√(deg·deg)</td><td>full-graph multiply; sampled variants exist</td><td>original: no</td></tr>
+    <tr><td>GraphSAGE (2017)</td><td>mean, max-pool or LSTM over a <b>sample</b></td><td>equal</td><td>yes (fixed sample sizes)</td><td>yes (inductive)</td></tr>
+    <tr><td>GAT (2017)</td><td>attention-weighted sum</td><td><span class="at">learned</span> per edge, per head</td><td>OK on sparse graphs</td><td>yes</td></tr>
+    <tr><td>Transformer</td><td>attention over <b>all</b> nodes</td><td><span class="at">learned</span></td><td>n² cost (Lesson 6.9)</td><td>yes</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>For real work, use <b>PyTorch Geometric</b> (<code>torch_geometric.nn.GCNConv</code>, <code>SAGEConv</code>, <code>GATConv</code>, neighbour-sampling loaders) or <b>DGL</b>. Under the hood a GCN layer is a few lines of plain PyTorch, which this snippet runs (dense adjacency, fine for small graphs):</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn
+
+<span class="k">class</span> GCNLayer(nn.Module):
+    <span class="s">"""H' = Â H W with Â = D^-1/2 (A + I) D^-1/2 (Kipf &amp; Welling)."""</span>
+    <span class="k">def</span> __init__(self, d_in, d_out):
+        super().__init__()
+        self.lin = nn.Linear(d_in, d_out, bias=<span class="k">False</span>)
+    <span class="k">def</span> forward(self, H, A):
+        A_hat = A + torch.eye(A.shape[<span class="n">0</span>])                   <span class="c"># self-loops: keep your own features</span>
+        d = A_hat.sum(<span class="n">1</span>).rsqrt()                            <span class="c"># 1 / sqrt(degree)</span>
+        A_norm = d[:, <span class="k">None</span>] * A_hat * d[<span class="k">None</span>, :]            <span class="c"># symmetric normalization</span>
+        <span class="k">return</span> A_norm @ self.lin(H)                         <span class="c"># aggregate neighbours, then mix features</span>
+
+<span class="c"># a 6-node graph: two triangles joined by one edge</span>
+edges = [(<span class="n">0</span>, <span class="n">1</span>), (<span class="n">1</span>, <span class="n">2</span>), (<span class="n">2</span>, <span class="n">0</span>), (<span class="n">3</span>, <span class="n">4</span>), (<span class="n">4</span>, <span class="n">5</span>), (<span class="n">5</span>, <span class="n">3</span>), (<span class="n">2</span>, <span class="n">3</span>)]
+A = torch.zeros(<span class="n">6</span>, <span class="n">6</span>)
+<span class="k">for</span> i, j <span class="k">in</span> edges:
+    A[i, j] = A[j, i] = <span class="n">1.0</span>
+
+torch.manual_seed(<span class="n">0</span>)
+H = torch.randn(<span class="n">6</span>, <span class="n">4</span>)                                       <span class="c"># 4 features per node</span>
+layer = GCNLayer(<span class="n">4</span>, <span class="n">2</span>)
+out = layer(H, A)
+print(<span class="s">"output shape:"</span>, tuple(out.shape), <span class="s">"| parameters:"</span>, sum(p.numel() <span class="k">for</span> p <span class="k">in</span> layer.parameters()))
+
+perm = torch.randperm(<span class="n">6</span>)                                    <span class="c"># relabel the nodes</span>
+out_p = layer(H[perm], A[perm][:, perm])
+print(<span class="s">"same answers after relabelling:"</span>, torch.allclose(out_p, out[perm], atol=<span class="n">1e-6</span>))
+
+<span class="c"># over-smoothing: apply the averaging 50 times and watch the nodes become identical</span>
+A_hat = A + torch.eye(<span class="n">6</span>); d = A_hat.sum(<span class="n">1</span>).rsqrt(); A_norm = d[:, <span class="k">None</span>] * A_hat * d[<span class="k">None</span>, :]
+X = H.clone()
+<span class="k">for</span> k <span class="k">in</span> range(<span class="n">1</span>, <span class="n">51</span>):
+    X = A_norm @ X
+    <span class="k">if</span> k <span class="k">in</span> (<span class="n">1</span>, <span class="n">5</span>, <span class="n">50</span>):
+        Xn = X / X.norm(dim=<span class="n">1</span>, keepdim=<span class="k">True</span>)
+        print(<span class="s">f"after {k:2d} rounds, mean cosine between nodes = {(Xn @ Xn.T).mean().item():.3f}"</span>)
+
+<span class="c"># What we got on a laptop CPU (torch 2.8):</span>
+<span class="c"># output shape: (6, 2) | parameters: 8</span>
+<span class="c"># same answers after relabelling: True</span>
+<span class="c"># after  1 rounds, mean cosine between nodes = 0.822</span>
+<span class="c"># after  5 rounds, mean cosine between nodes = 0.945</span>
+<span class="c"># after 50 rounds, mean cosine between nodes = 1.000</span></code></pre>
+    <p class="hint">With PyTorch Geometric the layer is <code>GCNConv(4, 2)(x, edge_index)</code>, where <code>edge_index</code> is a 2 × E tensor of edges (not run here: PyG isn't installed in this course's setup). Gotcha: undirected graphs need each edge listed in <b>both</b> directions.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>More GNN layers</td><td>Each node sees farther (k layers = k hops)</td><td>Over-smoothing and over-squashing; more compute per node</td></tr>
+      <tr><td>Sum vs mean vs max</td><td>Sum counts; mean is scale-stable; max finds “any neighbour like X”</td><td>Sum explodes with degree; mean and max can't count</td></tr>
+      <tr><td>Neighbour sampling (GraphSAGE)</td><td>Fixed cost per node; billion-node graphs; new nodes</td><td>Noisy estimates; may miss important neighbours</td></tr>
+      <tr><td>Attention (GAT, graph transformers)</td><td>Learned neighbour importance; long-range links (transformers)</td><td>More memory; complete-graph attention is n²</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Why can't you use an MLP on a graph, and what does a GNN layer do?” A strong answer:</p>
+    <ul>
+      <li>Graphs vary in size and have no node order; an MLP on a flattened adjacency matrix isn't permutation invariant (24 outputs for 24 numberings of 4 nodes).</li>
+      <li>Message passing: aggregate neighbours with an order-free function (sum/mean/max), update with shared weights; k layers = k-hop receptive field; parameters independent of graph size.</li>
+      <li>GCN (normalized averaging), GraphSAGE (sampling, inductive), GAT (attention over neighbours); a transformer is attention on a complete graph.</li>
+      <li>Limits: over-smoothing with depth, over-squashing through bottlenecks, and limited power to distinguish some graphs; typical depth 2–4.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Travel times on the road graph</b> <span class="tag co">🏢 Google / DeepMind · 2021</span> <a href="https://arxiv.org/abs/2108.11482" target="_blank" rel="noopener">Derrow-Pinion et al.: ETA Prediction with Graph Neural Networks in Google Maps</a></div>
+      <p><b>How:</b> the road network is split into “supersegments” (sequences of connected road segments on typical routes); a GNN passes messages between the segments and predicts each supersegment's travel time.</p>
+      <p><b>Why this method:</b> traffic spreads along roads, which is exactly what message passing models; deployed, it reduced negative ETA outcomes by over 40% in cities like Sydney.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Weather forecasting on a mesh around the Earth</b> <span class="tag res">🧪 DeepMind · 2023</span> <a href="https://arxiv.org/abs/2212.12794" target="_blank" rel="noopener">Lam et al.: GraphCast</a></div>
+      <p><b>How:</b> an encoder maps the 0.25° weather grid onto a multi-scale icosahedral mesh, a processor runs learned message passing on the mesh, and a decoder maps back to the grid.</p>
+      <p><b>Why this method:</b> a sphere has no clean grid, and the multi-scale mesh carries information far in few rounds; it beat ECMWF's HRES on 90% of 1,380 targets and runs a 10-day forecast in under a minute on one TPU v4.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Recommendations on a 3-billion-node graph</b> <span class="tag co">🏢 Pinterest · 2018</span> <a href="https://arxiv.org/abs/1806.01973" target="_blank" rel="noopener">Ying et al.: Graph Convolutional Neural Networks for Web-Scale Recommender Systems (PinSage)</a></div>
+      <p><b>How:</b> GraphSAGE-style sampled convolutions over a pin–board graph (3 billion nodes, 18 billion edges), with neighbours chosen by random walks.</p>
+      <p><b>Why this method:</b> a pin's meaning comes from the boards people save it to; sampling keeps the cost per pin fixed at that scale.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Protein structure as graph reasoning</b> <span class="tag res">🧪 DeepMind · 2021</span> <a href="https://www.nature.com/articles/s41586-021-03819-2" target="_blank" rel="noopener">Jumper et al.: Highly accurate protein structure prediction with AlphaFold</a></div>
+      <p><b>How:</b> AlphaFold 2's Evoformer keeps a representation for every pair of amino-acid residues and updates it with attention and “triangle” updates.</p>
+      <p><b>Why this method:</b> the authors describe the Evoformer as viewing structure prediction “as a graph inference problem in 3D space” whose edges are residues in proximity; the pair representation is read as edges of that graph.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · two-hop power</span>
+    <p>GraphCast's mesh is built by refining an icosahedron 6 times, giving 40,962 nodes spread evenly over the globe. Its trick against slow, one-hop-per-round spreading: it keeps the long edges from the coarse early meshes too, so its 16 message-passing layers carry information both locally and over long distances (the paper's words: “long-range information propagation with few message-passing steps”). Same idea you used when you seeded the hubs: put information where it travels far fast.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Message passing reuses a CNN's two ideas, locality and shared weights (3.2), on any graph. GAT is attention (6.1, 6.2) restricted to edges; a transformer is a GNN on a complete graph, with positional encodings (6.3) restoring order and an n² cost (6.9). Residual connections (2.2) and normalization (2.3) help deeper GNNs. In the AI Engineer course, knowledge graphs for retrieval are <a href="../../ai-engineer/phase4/3-graphrag.html">GraphRAG (AI Eng 4.3)</a>; that's graphs as data for an LLM, not a GNN. Next: state-space models (9.3), another way to beat attention's n² cost.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Interactive</span> <a href="https://distill.pub/2021/gnn-intro/" target="_blank" rel="noopener">Distill: A Gentle Introduction to Graph Neural Networks</a>. Beautiful interactive figures of message passing and pooling.</li>
+      <li><span class="kind">Docs</span> <a href="https://pytorch-geometric.readthedocs.io/en/latest/" target="_blank" rel="noopener">PyTorch Geometric documentation</a>. Tutorials, every layer in this lesson, and neighbour-sampling loaders.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1609.02907" target="_blank" rel="noopener">Kipf &amp; Welling: Semi-Supervised Classification with Graph Convolutional Networks</a>. Short and the source of the GCN formula.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A GCN layer maps 1,433 input features to 16 hidden units. How many parameters does it have on a graph with 2 million nodes (weights plus one bias per output)?</div>
+    <div class="opts"><button class="opt">2,000,000 × 16 = 32 million</button><button class="opt" data-ok>1,433 × 16 + 16 = 22,944</button><button class="opt">1,433 × 2,000,000</button></div>
+    <div class="explain">The same weight matrix is shared by every node, like a CNN filter shared by every pixel. The graph's size changes the compute (one message per edge), not the parameter count.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your 12-layer GCN classifies nodes worse than your 2-layer one, and you find all node embeddings in the last layer have cosine similarity above 0.99 with each other. Diagnosis?</div>
+    <div class="opts"><button class="opt">Not enough layers: go to 24 so information can travel farther</button><button class="opt" data-ok>Over-smoothing: repeated neighbour averaging made nodes indistinguishable. Use 2–4 layers, or add residual connections, normalization or other anti-smoothing tricks</button><button class="opt">The learning rate is too high</button></div>
+    <div class="explain">Each GCN layer is a smoothing step. A few steps make each cluster consistent (helpful); many steps blend clusters together until every node holds the same vector. More layers make it worse. Shallow GNNs, skip connections, or methods that keep each node's original features in the mix are the usual fixes.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You need to predict a property of molecules, where it matters whether a carbon atom has 2 or 4 bonded neighbours. Which aggregator is the safest choice?</div>
+    <div class="opts"><button class="opt" data-ok>Sum: it can count neighbours, so 4 identical neighbours give a different message than 2</button><button class="opt">Mean: it keeps values stable whatever the degree</button><button class="opt">Max: it ignores how many neighbours there are</button></div>
+    <div class="explain">Mean of four identical neighbours equals the mean of two, and so does max: both lose the count. Sum keeps it. Molecules have small, bounded degrees, so sum's tendency to explode on high-degree nodes isn't a problem here (it would be for a social network).</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Graphs have any size and no order, so MLPs and CNNs don't fit. A GNN must be permutation invariant/equivariant.</li>
+      <li>Message passing: aggregate neighbours (sum/mean/max), update with shared weights. k layers = k hops; parameters don't depend on graph size.</li>
+      <li>GCN = normalized averaging; GraphSAGE = sampled neighbours, works on new nodes and billion-node graphs; GAT = learned attention over neighbours.</li>
+      <li>Too many layers <span class="dead">over-smooth</span>: nodes become identical. Typical GNNs use 2–4 layers.</li>
+      <li>A transformer is attention on a complete graph. GNNs power Google Maps ETAs, GraphCast weather and Pinterest recommendations.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const fmtN = v => (Math.abs(v) >= 1e6 ? v.toExponential(1) : Math.abs(v) >= 100 ? Math.round(v).toLocaleString() : v.toFixed(3));
+
+  /* ---------- 1. message passing stepper ---------- */
+  const POS = [[0.25, 0.5], [0.15, 0.28], [0.33, 0.24], [0.12, 0.72], [0.38, 0.66], [0.06, 0.1], [0.41, 0.08], [0.09, 0.93]];
+  const XY = [...POS, ...POS.map(([x, y]) => [1 - x, y])];
+  const BASE = [[0, 1], [0, 2], [0, 3], [0, 4], [1, 5], [2, 6], [3, 7], [1, 2], [5, 6]];
+  const E0 = [...BASE, ...BASE.map(([a, b]) => [a + 8, b + 8]), [4, 12], [7, 15], [6, 13]];
+  const SEED0 = { 5: 1, 13: -1 };
+  let E, seeds, h, round, agg = "mean", best, hist, editMode = false, pick = null, peaked16 = false;
+  const nbrs = () => { const N = Array.from({ length: 16 }, () => []); E.forEach(([a, b]) => { N[a].push(b); N[b].push(a); }); return N; };
+  const truth = i => (i < 8 ? 1 : -1);
+  const correct = v => v.filter((x, i) => Math.abs(x) >= 0.01 && Math.sign(x) === truth(i)).length;
+  function mpStart() { h = Array.from({ length: 16 }, (_, i) => seeds[i] || 0); round = 0; best = correct(h); hist = [[0, best]]; peaked16 = false; mpDraw(""); }
+  function mpReset() { E = E0.map(e => e.slice()); seeds = Object.assign({}, SEED0); mpStart(); }
+  function mpRound() {
+    const N = nbrs();
+    h = h.map((v, i) => { const xs = [v, ...N[i].map(j => h[j])]; if (agg === "mean") return xs.reduce((a, b) => a + b, 0) / xs.length; if (agg === "sum") return xs.reduce((a, b) => a + b, 0); return xs.reduce((a, b) => (Math.abs(b) > Math.abs(a) ? b : a), 0); });
+    round++; const c = correct(h); best = Math.max(best, c); hist.push([round, c]);
+    const nA = Object.entries(seeds).filter(([, v]) => v > 0).length, nB = Object.entries(seeds).filter(([, v]) => v < 0).length;
+    if (c === 16 && round <= 2 && nA === 1 && nB === 1) win("gTwo", true);
+    if (best - c >= 6) win("gSmooth", true);
+    if (agg === "sum" && Math.max(...h.map(Math.abs)) > 1000) win("gBoom", true);
+  }
+  function mpDraw(msg) {
+    const cv = $("mpCan"), { ctx, w, h: H } = NN.fit(cv), P = i => [24 + XY[i][0] * (w - 48), 18 + XY[i][1] * (H - 36)];
+    ctx.clearRect(0, 0, w, H); ctx.fillStyle = css("--bg2"); ctx.fillRect(0, 0, w, H);
+    ctx.lineWidth = 2;
+    E.forEach(([a, b]) => { const [x1, y1] = P(a), [x2, y2] = P(b); const bridge = (a < 8) !== (b < 8); ctx.strokeStyle = bridge ? css("--c-at") : css("--line"); ctx.setLineDash(bridge ? [5, 4] : []); ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke(); });
+    ctx.setLineDash([]);
+    const mx = Math.max(1e-9, ...h.map(Math.abs)), scale = agg === "sum" ? mx : 1;
+    const deg = nbrs().map(n => n.length);
+    h.forEach((v, i) => {
+      const [x, y] = P(i), r = 11 + deg[i] * 1.5, t = v / scale;
+      ctx.beginPath(); ctx.arc(x, y, r, 0, 7);
+      ctx.fillStyle = Math.abs(v) < 1e-12 ? css("--panel") : NN.cmap.div(Math.sign(t) * Math.min(1, 0.15 + Math.sqrt(Math.abs(t))));
+      ctx.fill();
+      ctx.lineWidth = seeds[i] ? 3.5 : 1.5;
+      ctx.strokeStyle = pick === i ? css("--accent") : seeds[i] ? css("--text") : css("--muted");
+      if (Math.abs(v) < 0.01 && !seeds[i]) ctx.setLineDash([3, 3]);
+      ctx.stroke(); ctx.setLineDash([]);
+      ctx.fillStyle = css("--text"); ctx.font = "11px " + css("--mono"); ctx.textAlign = "center"; ctx.textBaseline = "middle";
+      ctx.fillText(Math.abs(v) >= 1000 ? v.toExponential(0) : Math.abs(v) < 0.005 ? "0" : v.toFixed(2), x, y + r + 9);
+    });
+    ctx.fillStyle = css("--muted"); ctx.font = "12px " + css("--font"); ctx.textAlign = "left"; ctx.fillText("community A", 10, 14); ctx.textAlign = "right"; ctx.fillText("community B", w - 10, 14);
+    const c = correct(h);
+    $("mpR").textContent = round; $("mpAcc").textContent = `${c} / 16`; $("mpBest").textContent = `${best} / 16`;
+    $("mpSp").textContent = fmtN(Math.max(...h) - Math.min(...h)); $("mpMax").textContent = fmtN(Math.max(...h.map(Math.abs)));
+    Plot.line($("mpChart"), { series: [{ label: "nodes correct", color: css("--c-y"), data: hist, width: 2.5 }], yMin: 0, yMax: 16, xLabel: "round" });
+    $("mpMsg").textContent = msg || (round === 0 ? "Coral = A (+), blue = B (−), thick ring = a seed you set. Press ▶ 1 round." :
+      c === 16 && round <= 2 ? "All 16 in two rounds: the seeds reach everyone within 2 hops." :
+      best - c >= 6 ? "Over-smoothed: repeated averaging blended both communities into the same faint value." :
+      agg === "sum" && Math.max(...h.map(Math.abs)) > 1000 ? "Sum with no normalization: values multiply by about the degree every round." : "");
+  }
+  $("mpCan").addEventListener("pointerdown", e => {
+    const r = $("mpCan").getBoundingClientRect(), px = e.clientX - r.left, py = e.clientY - r.top;
+    let bi = -1, bd = 26; XY.forEach(([x, y], i) => { const d = Math.hypot(24 + x * (r.width - 48) - px, 18 + y * (r.height - 36) - py); if (d < bd) { bd = d; bi = i; } });
+    if (bi < 0) return;
+    if (editMode) {
+      if (pick == null) { pick = bi; mpDraw("Now click a second node to add or remove the edge."); return; }
+      if (pick !== bi) { const k = E.findIndex(([a, b]) => (a === pick && b === bi) || (a === bi && b === pick)); if (k >= 0) E.splice(k, 1); else E.push([pick, bi]); }
+      pick = null; mpStart(); return;
+    }
+    const cur = seeds[bi] || 0; if (cur === 0) seeds[bi] = 1; else if (cur > 0) seeds[bi] = -1; else delete seeds[bi];
+    mpStart();
+  });
+  seg("aggSeg", v => { agg = v; mpStart(); });
+  $("mpStep").onclick = () => { mpRound(); mpDraw(); };
+  $("mpTen").onclick = () => { for (let i = 0; i < 10; i++) mpRound(); mpDraw(); };
+  $("mpBack").onclick = mpStart;
+  $("mpReset").onclick = () => { pick = null; mpReset(); };
+  $("mpEdit").onclick = () => { editMode = !editMode; pick = null; $("mpEdit").textContent = "✏️ Edit edges: " + (editMode ? "on" : "off"); mpDraw(editMode ? "Edit mode: click two nodes to toggle an edge between them." : ""); };
+  mpReset();
+
+  /* ---------- 2. permutation demo ---------- */
+  const G = { edges: [[0, 1], [1, 2], [1, 3], [2, 3]], f: [1, 2, 0, 3] }, NPOS = [[0.2, 0.5], [0.5, 0.25], [0.8, 0.5], [0.5, 0.8]];
+  const rr = NN.rng(42), WM = Array.from({ length: 20 }, () => rr.n()), WG = [rr.n(), rr.n(), rr.n()];
+  let perm = [0, 1, 2, 3]; const seenM = new Set(), seenG = new Set();
+  const view = p => { // p[k] = original node shown at position k
+    const inv = []; p.forEach((o, k) => (inv[o] = k));
+    const A = Array.from({ length: 4 }, () => [0, 0, 0, 0]); G.edges.forEach(([a, b]) => { A[inv[a]][inv[b]] = 1; A[inv[b]][inv[a]] = 1; });
+    return { A, f: p.map(o => G.f[o]) };
+  };
+  const mlp = ({ A, f }) => { const x = [...A.flat(), ...f]; return Math.tanh(x.reduce((s, v, i) => s + v * WM[i], 0) / 4); };
+  const gnn = ({ A, f }) => { let s = 0; for (let i = 0; i < 4; i++) { const nb = A[i].map((v, j) => (v ? f[j] : null)).filter(v => v != null), m = nb.reduce((a, b) => a + b, 0) / (nb.length || 1); s += Math.max(0, WG[0] * f[i] + WG[1] * m); } return Math.tanh(WG[2] * s / 4); };
+  function pDraw(msg) {
+    const V = view(perm);
+    NN.heat($("pAdj"), V.A.map((row, i) => [...row, 10 + V.f[i]]), { cmap: "seq", color: "--c-x", lo: 0, hi: 1, text: true, fmt: v => (v >= 10 ? v - 10 : v).toFixed(0), rowLabels: ["0", "1", "2", "3"], colLabels: ["0", "1", "2", "3", "x"], padLeft: 22 });
+    const { ctx, w, h } = NN.fit($("pDraw"));
+    ctx.clearRect(0, 0, w, h); ctx.fillStyle = css("--bg2"); ctx.fillRect(0, 0, w, h);
+    const inv = []; perm.forEach((o, k) => (inv[o] = k));
+    ctx.strokeStyle = css("--line"); ctx.lineWidth = 2;
+    G.edges.forEach(([a, b]) => { ctx.beginPath(); ctx.moveTo(NPOS[a][0] * w, NPOS[a][1] * h); ctx.lineTo(NPOS[b][0] * w, NPOS[b][1] * h); ctx.stroke(); });
+    NPOS.forEach(([x, y], o) => { ctx.beginPath(); ctx.arc(x * w, y * h, 18, 0, 7); ctx.fillStyle = css("--panel"); ctx.fill(); ctx.strokeStyle = css("--c-x"); ctx.stroke();
+      ctx.fillStyle = css("--text"); ctx.font = "bold 13px " + css("--mono"); ctx.textAlign = "center"; ctx.textBaseline = "middle"; ctx.fillText("#" + inv[o], x * w, y * h - 2);
+      ctx.font = "11px " + css("--mono"); ctx.fillStyle = css("--c-x"); ctx.fillText("x=" + G.f[o], x * w, y * h + 28); });
+    const m = mlp(V), g = gnn(V);
+    seenM.add(m.toFixed(9)); seenG.add(g.toFixed(9));
+    $("pM").textContent = m.toFixed(4); $("pG").textContent = g.toFixed(4);
+    $("pMn").textContent = seenM.size; $("pGn").textContent = seenG.size;
+    $("pMsg").textContent = msg || "";
+  }
+  const allPerms = (a => { const out = []; const go = (p, rest) => { if (!rest.length) out.push(p); rest.forEach((x, i) => go([...p, x], rest.filter((_, j) => j !== i))); }; go([], a); return out; })([0, 1, 2, 3]);
+  $("pShuf").onclick = () => { perm = allPerms[Math.floor(Math.random() * 24)]; pDraw("Same graph, new numbering."); };
+  $("pAll").onclick = () => { allPerms.forEach(p => { perm = p; pDraw(); }); win("gAll24", true); pDraw(`All 24 numberings tried: the MLP gave ${seenM.size} different answers, the GNN gave ${seenG.size}.`); };
+  $("pReset").onclick = () => { perm = [0, 1, 2, 3]; pDraw(); };
+  pDraw();
+})();
+</script>
+</body>
+</html>

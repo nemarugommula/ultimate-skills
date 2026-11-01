@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.3 PyTorch: tensors, modules and the training loop · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .shapes td, .shapes th { font-family: var(--mono); font-size: .88em; }
+  .shapes tr.warnrow td { color: var(--bad); }
+  .loopcode { font-family: var(--mono); font-size: .88em; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; white-space: pre; overflow-x: auto; line-height: 1.55; }
+  .loopcode .bugline { background: color-mix(in srgb, var(--bad) 22%, transparent); border-radius: 4px; }
+  .loopcode .strike { text-decoration: line-through; opacity: .55; }
+  .order { display: flex; flex-direction: column; gap: 6px; margin: 8px 0; }
+  .order button { font-family: var(--mono); text-align: left; padding: 7px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+  .order button:disabled { opacity: .35; cursor: default; }
+  .built { font-family: var(--mono); font-size: .9em; background: var(--bg2); border: 1px dashed var(--line); border-radius: 10px; padding: 8px 12px; min-height: 2.2em; white-space: pre; }
+  .checks label { margin-right: 14px; }
+</style>
+</head>
+<body data-lesson="d1-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 1 · Lesson 3</div>
+  <h1>PyTorch: tensors, modules and the training loop</h1>
+  <p class="subtitle">Five lines train almost every network on Earth. Get one of them wrong and nothing crashes: the loss just quietly refuses to go down. Here's how the pieces fit, and how to see the bugs that don't raise errors.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><code>nn.CrossEntropyLoss</code> takes raw logits; its push on each logit is p − y (Lesson 1.1).</li>
+      <li><code>loss.backward()</code> fills each weight's <code>.grad</code>, and <code>.grad</code> <b>accumulates</b> (Lesson 1.2).</li>
+      <li>A layer computes <span class="ac">h</span> = <span class="w">W</span><span class="x">x</span> + <span class="w">b</span>; a weight matrix has one row per output unit (<a href="../../math-course/phase2/2-matmul.html">math 2.2</a>, tensors in <a href="../../math-course/phase2/3-tensors.html">math 2.3</a>).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Andrej Karpathy (founding member of OpenAI, former head of AI at Tesla) opens his famous guide <i>A Recipe for Training Neural Networks</i> with a warning: neural net training <b>“fails silently”</b>. Wrong code usually raises an exception. A wrong training loop usually runs perfectly and produces a model that's a bit worse, or useless, with no error at all.</p>
+    <p>Below you'll run three real PyTorch bugs we recorded. One makes the loss explode. One gets stuck at exactly the accuracy of guessing one class. And one <b>still reaches 99.6%</b>, just with a loss four times higher than the correct run's at the same epoch, so you'd never know it was a bug. <b>Can you tell which bug produces which curve before you look?</b></p>
+    <p>Who uses this: Hugging Face's <code>Trainer</code>, PyTorch Lightning and Karpathy's nanoGPT all wrap exactly the loop you'll learn here, and so does every PyTorch model in this course.</p>
+  </div>
+
+  <h2>Numbers first: everything is a tensor with a shape</h2>
+  <p>A <b>tensor</b> is an n-dimensional array (like a NumPy array) that can live on a GPU and remember how it was computed. Three things describe it: its <b>shape</b>, its <b>dtype</b> and its <b>device</b>.</p>
+  <table>
+    <tr><th>Thing</th><th>Typical shape</th><th>dtype</th><th>Why</th></tr>
+    <tr><td><span class="x">A batch of 64 points with 2 features</span></td><td><code>(64, 2)</code></td><td>float32</td><td>batch first, features last: the convention everywhere</td></tr>
+    <tr><td><span class="x">64 RGB images, 224×224</span></td><td><code>(64, 3, 224, 224)</code></td><td>float32</td><td>batch, channels, height, width (Phase 3)</td></tr>
+    <tr><td><span class="y">64 class labels</span></td><td><code>(64,)</code></td><td><b>int64</b> (long)</td><td><code>CrossEntropyLoss</code> wants class <i>indices</i>, not one-hot</td></tr>
+    <tr><td><span class="w">Weight of <code>nn.Linear(2, 32)</code></span></td><td><code>(32, 2)</code></td><td>float32</td><td>(out, in): one row per output unit</td></tr>
+    <tr><td><span class="ac">Its output for the batch</span></td><td><code>(64, 32)</code></td><td>float32</td><td>x @ Wᵀ + b, the batch dimension rides along</td></tr>
+  </table>
+  <p>Device is where the numbers live: <code>"cpu"</code>, <code>"cuda"</code> (NVIDIA GPU) or <code>"mps"</code> (Apple GPU). Every tensor in one operation must be on the same device; <code>model.to(device)</code> and <code>x.to(device)</code> move them. Most PyTorch errors you'll actually see are shape or device mismatches, and those are the <i>good</i> errors: they're loud.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A PyTorch program has three parts: <b>tensors</b> (the data, with shapes), <b>modules</b> (layers that own their weights as parameters) and <b>the loop</b> (forward, loss, zero_grad, backward, step). Shapes are checked loudly; the loop's logic is not. So you trace shapes on paper and you watch the loss curve, because the curve is the only place most loop bugs show up.
+  </div>
+
+  <h2>Modules: layers that own their weights</h2>
+  <p>An <code>nn.Module</code> is a Python object with a <code>forward()</code> method. Any <code>nn.Parameter</code> (or sub-module) you assign to it is <b>registered</b>: <code>model.parameters()</code> finds every weight, <code>model.to("cuda")</code> moves them all, <code>model.state_dict()</code> saves them. <code>nn.Sequential</code> is a module that just runs its children in order.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">nn.Module and registered parameters</span></span>
+    <ol>
+      <li><b>The problem before</b> A network has dozens of weight tensors. Passing each one by hand to the optimizer, moving each to the GPU, saving each to disk, is a bug factory: forget one and it silently never trains.</li>
+      <li><b>What people tried</b> Global lists of weights; layer libraries with their own save formats (Torch7, Caffe prototxt).</li>
+      <li><b>Why this works</b> Assigning <code>self.fc = nn.Linear(2, 32)</code> registers its weight (32 × 2 = 64 numbers) and bias (32) automatically. Then one call, <code>model.parameters()</code>, hands all of them to the optimizer, and modules nest: a transformer is modules of modules.</li>
+      <li><b>What it costs, when it fails</b> Weights kept in a plain Python list (instead of <code>nn.ModuleList</code>) or as plain tensors (instead of <code>nn.Parameter</code>) are <b>not</b> registered: no error, they just never train and never get saved.</li>
+      <li><b>What refined it</b> <code>nn.ModuleList</code>/<code>nn.ModuleDict</code> for dynamic structures, <code>torch.compile(model)</code> for speed (Lesson 10.5), and the Hugging Face <code>PreTrainedModel</code> wrapper for saving and sharing.</li>
+    </ol>
+  </div>
+
+  <h3>Trace the shapes yourself</h3>
+  <p>Parameter count of one linear layer = in × out (weights) + out (biases). Shapes flow left to right; the batch size never changes the parameter count.</p>
+  <p class="predict">🔮 <b>Predict:</b> a classifier for 28×28 digit images (784 inputs, 10 classes) with two hidden layers of 128. Fewer or more than 100,000 parameters? And what happens to the count if you double the batch size?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Shape tracer</span>
+    <p class="hint">Change the network and the batch. Every tensor's shape and every layer's parameter count update live. Memory assumes float32 (4 bytes per number); “with AdamW” adds gradients plus AdamW's two running averages (Lesson 1.5), so 16 bytes per weight.</p>
+    <div class="controls">
+      <label>batch B <input type="range" id="sB" min="1" max="512" step="1" value="64"> <b class="mono" id="sBv"></b></label>
+      <label>inputs <select id="sIn" class="btn small"><option>2</option><option selected>784</option><option>3072</option></select></label>
+      <label>hidden width <input type="range" id="sH" min="4" max="1024" step="4" value="128"> <b class="mono" id="sHv"></b></label>
+      <label>hidden layers <input type="range" id="sL" min="1" max="6" step="1" value="2"> <b class="mono" id="sLv"></b></label>
+      <label>classes <select id="sK" class="btn small"><option>2</option><option selected>10</option><option>1000</option></select></label>
+    </div>
+    <div class="controls checks"><label><input type="checkbox" id="sReg"> regression head with targets shaped <code>(B,)</code> instead of <code>(B, 1)</code></label></div>
+    <table class="shapes" id="sTable"></table>
+    <div class="stat-row">
+      <div class="stat">parameters <b id="sP" class="w">–</b></div>
+      <div class="stat">weights in float32 <b id="sM">–</b></div>
+      <div class="stat">with AdamW (16 B/weight) <b id="sMA">–</b></div>
+      <div class="stat">activations kept for backward <b id="sAct" class="ac">–</b></div>
+    </div>
+    <div class="goals"><span class="goal" id="gMnist">🎯 784 in, 10 out, 2 hidden layers, under 100k parameters</span><span class="goal" id="gExact">🎯 Rebuild the Tools model: exactly 1,218 parameters</span><span class="goal" id="gBcast">🎯 Trigger the (B, B) broadcasting bug</span></div>
+  </div>
+  <p><b>What you should see:</b> the default 784 → 128 → 128 → 10 has 100,480 + 16,512 + 1,290 = <b>118,282</b> parameters, slightly over 100k; width 112 still gives 101,706; width 108 drops to 97,642. Batch size changes every activation shape and the activation memory, never the parameter count. Tick the regression box: the prediction is <code>(B, 1)</code>, the target <code>(B,)</code>, and subtracting them <b>broadcasts</b> to <code>(B, B)</code>: every prediction compared with every target. No error, just a warning, and a model that learns to predict the average.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what a model costs in memory</span>
+    <p>The Tools model below: <code>Linear(2, 32)</code> has 2 × 32 + 32 = <b>96</b> parameters, <code>Linear(32, 32)</code> has 1,024 + 32 = <b>1,056</b>, <code>Linear(32, 2)</code> has 64 + 2 = <b>66</b>. Total <b>1,218</b>, about 4.9 KB in float32. PyTorch prints the same count.</p>
+    <p>Scale up: a 7-billion-parameter model is 7 × 10⁹ × 4 bytes = <b>28 GB</b> in float32 just to hold the weights. Training it with AdamW needs weights + gradients + two moment buffers = 16 bytes per weight = <b>112 GB</b>, before a single activation. That's why Phase 10 is about mixed precision and splitting models across GPUs.</p>
+  </div>
+
+  <h2>The loop: five lines</h2>
+  <p>Every epoch (one pass over the data), the <code>DataLoader</code> hands you shuffled <b>mini-batches</b> (Lesson 1.7 explains why batches). For each batch:</p>
+  <ol>
+    <li><code>logits = model(xb)</code>: <b>forward</b> (autograd records the graph)</li>
+    <li><code>loss = loss_fn(logits, yb)</code>: one number for “how wrong”</li>
+    <li><code>opt.zero_grad()</code>: clear last step's gradients</li>
+    <li><code>loss.backward()</code>: <b>backward</b>, fills every <code>.grad</code></li>
+    <li><code>opt.step()</code>: the optimizer moves every weight using its <code>.grad</code></li>
+  </ol>
+  <p>Around it: <code>model.train()</code> before training and <code>model.eval()</code> plus <code>torch.no_grad()</code> when evaluating.</p>
+  <p class="predict">🔮 <b>Predict:</b> does <code>zero_grad()</code> have to be the third line, or could it go first?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Build the loop</span>
+    <p class="hint">Click the lines in the order they should run inside the batch loop. More than one order is correct.</p>
+    <div class="order" id="order"></div>
+    <div class="built" id="built"></div>
+    <div class="controls"><button class="btn" id="oReset">↺ Shuffle again</button></div>
+    <p class="hint" id="oMsg"></p>
+    <div class="goals"><span class="goal" id="gOrder">🎯 Build a correct loop</span><span class="goal" id="gOrder2">🎯 Build a second, different correct loop</span></div>
+  </div>
+  <p><b>What you should see:</b> forward must come before the loss, the loss before backward, backward before step. <code>zero_grad()</code> can go anywhere <i>before</i> <code>backward()</code>: first, second or third. Putting it between backward and step erases the gradient you just computed, and the step does nothing.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">DataLoader with shuffle=True</span></span>
+    <ol>
+      <li><b>The problem before</b> Datasets are often stored sorted (all cats, then all dogs; or by date). Batches taken in order give the model 300 cats in a row: it learns “always say cat”, then gets yanked to “always dog”.</li>
+      <li><b>What people tried</b> Shuffling once on disk; hand-written batching loops with off-by-one bugs at the last batch.</li>
+      <li><b>Why this works</b> <code>DataLoader(ds, batch_size=64, shuffle=True)</code> draws a new random order every epoch, so each batch is a fair sample of the whole dataset and its gradient points roughly where the full-data gradient points. It also batches, and with <code>num_workers</code> loads data in parallel with training.</li>
+      <li><b>What it costs, when it fails</b> Random order makes runs less reproducible (seed the generator). For time series you usually must <i>not</i> shuffle across the train/validation split, or the model sees the future.</li>
+      <li><b>What refined it</b> Samplers for class balance (<code>WeightedRandomSampler</code>), distributed samplers that give each GPU a different shard (Lesson 10.3), and streaming datasets for data that doesn't fit on disk.</li>
+    </ol>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">model.train() / model.eval() and torch.no_grad()</span></span>
+    <ol>
+      <li><b>The problem before</b> Some layers must behave differently during training and testing: dropout randomly zeroes units while training but must not at test time; batch norm uses batch statistics while training but stored averages at test time (Phase 2). And evaluating with autograd on wastes memory recording a graph nobody will use.</li>
+      <li><b>What people tried</b> Separate “train” and “test” network definitions sharing weights.</li>
+      <li><b>Why this works</b> <code>model.train()</code>/<code>model.eval()</code> flip a flag on every sub-module at once; layers that care read it. <code>torch.no_grad()</code> turns off graph recording, so evaluation uses less memory and runs faster.</li>
+      <li><b>What it costs, when it fails</b> They're independent: <code>eval()</code> does <b>not</b> stop gradients, and <code>no_grad()</code> does <b>not</b> switch dropout off. Forgetting <code>model.train()</code> after a validation pass trains the rest of the run with dropout disabled, silently.</li>
+      <li><b>What refined it</b> <code>torch.inference_mode()</code>, a stricter and slightly faster <code>no_grad</code> for pure inference.</li>
+    </ol>
+  </div>
+
+  <h2>Spot the bug: three real runs that never raised an error</h2>
+  <p>We trained the same network in real PyTorch with every combination of three bugs and recorded the loss after each epoch. The task: 900 points in a 3-class spiral, sorted by class on disk. Model 2 → 64 → 64 → 3 with ReLU, SGD with momentum (lr 0.1), batches of 64, 30 epochs, seed 0.</p>
+  <p class="predict">🔮 <b>Predict:</b> which bug makes the loss explode, which gets stuck at 33% accuracy (one class out of three), and which still ends near 100%?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Toggle the bugs</span>
+    <p class="hint">Tick a bug: the buggy line lights up in the code and the chart switches to that run's recorded loss curve (teal), next to the correct run (grey). Curves are capped at 5 so the chart stays readable. Recorded with torch 2.8 on CPU; the loss is always measured on the model's own probabilities so curves compare fairly.</p>
+    <div class="controls checks">
+      <label><input type="checkbox" id="bZg"> 🐞 forgot <code>zero_grad()</code></label>
+      <label><input type="checkbox" id="bSm"> 🐞 <code>nn.Softmax</code> at the end of the model</label>
+      <label><input type="checkbox" id="bSh"> 🐞 <code>shuffle=False</code> on sorted data</label>
+    </div>
+    <div class="loopcode" id="code"></div>
+    <canvas class="chart" id="bChart" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">loss after epoch 10 <b id="bL10" class="ls">–</b></div>
+      <div class="stat">final loss <b id="bLf" class="ls">–</b></div>
+      <div class="stat">final accuracy <b id="bAcc">–</b></div>
+      <div class="stat">verdict <b id="bVerdict">–</b></div>
+    </div>
+    <div class="goals"><span class="goal" id="gLoud">🎯 Find the bug that explodes</span><span class="goal" id="gStuck33">🎯 Find the bug stuck at 33%</span><span class="goal" id="gSilent">🎯 Find the bug that still reaches 99%</span></div>
+  </div>
+  <p><b>What you should see:</b> every run starts at 1.083, close to ln 3 = 1.099 (the know-nothing loss for 3 classes). The correct run reaches 0.108 by epoch 10 and 100% accuracy. <b>Forgetting zero_grad</b> makes each update the sum of all past gradients, a runaway: the loss is 6.3 after one epoch and in the hundreds by the end. <b>shuffle=False</b> on sorted data: the last batches of every epoch contain only class 2, so the model is left saying “class 2” for everything, 33.3%. <b>Softmax before CrossEntropyLoss</b> is the sneaky one: softmax gets applied twice, the gradient on the logits shrinks, and the loss after 10 epochs is 0.452 instead of 0.108. It still ends at 99.6%. Nothing tells you it's wrong except comparing curves.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>A complete, correct loop on synthetic XOR-style data (runs in about a second on a laptop CPU):</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn
+<span class="k">from</span> torch.utils.data <span class="k">import</span> TensorDataset, DataLoader
+
+torch.manual_seed(<span class="n">0</span>)
+<span class="c"># 1. Tensors: shape, dtype, device</span>
+x = torch.randn(<span class="n">1000</span>, <span class="n">2</span>)                                  <span class="c"># 1,000 points, 2 features</span>
+y = (x[:, <span class="n">0</span>] * x[:, <span class="n">1</span>] &gt; <span class="n">0</span>).long()                        <span class="c"># XOR-style labels: class 0 or 1</span>
+print(x.shape, x.dtype, y.dtype, x.device)
+
+<span class="c"># 2. A model is an nn.Module; Sequential chains layers</span>
+model = nn.Sequential(nn.Linear(<span class="n">2</span>, <span class="n">32</span>), nn.ReLU(), nn.Linear(<span class="n">32</span>, <span class="n">32</span>), nn.ReLU(), nn.Linear(<span class="n">32</span>, <span class="n">2</span>))
+print(<span class="s">"parameters:"</span>, sum(p.numel() <span class="k">for</span> p <span class="k">in</span> model.parameters()))
+
+<span class="c"># 3. Data in mini-batches, reshuffled every epoch</span>
+train = DataLoader(TensorDataset(x[:<span class="n">800</span>], y[:<span class="n">800</span>]), batch_size=<span class="n">64</span>, shuffle=<span class="k">True</span>)
+loss_fn = nn.CrossEntropyLoss()                           <span class="c"># takes raw logits: no softmax in the model!</span>
+opt = torch.optim.AdamW(model.parameters(), lr=<span class="n">1e-2</span>)
+
+<span class="k">for</span> epoch <span class="k">in</span> range(<span class="n">20</span>):
+    model.train()                                         <span class="c"># dropout/batchnorm in training mode</span>
+    <span class="k">for</span> xb, yb <span class="k">in</span> train:
+        logits = model(xb)                                <span class="c"># 1. forward</span>
+        loss = loss_fn(logits, yb)                        <span class="c"># 2. loss</span>
+        opt.zero_grad()                                   <span class="c"># 3. clear old gradients</span>
+        loss.backward()                                   <span class="c"># 4. backprop</span>
+        opt.step()                                        <span class="c"># 5. update the weights</span>
+    model.eval()                                          <span class="c"># evaluation mode</span>
+    <span class="k">with</span> torch.no_grad():                                 <span class="c"># no graph, less memory</span>
+        acc = (model(x[<span class="n">800</span>:]).argmax(<span class="n">1</span>) == y[<span class="n">800</span>:]).float().mean().item()
+    <span class="k">if</span> epoch % <span class="n">5</span> == <span class="n">4</span>:
+        print(<span class="s">f"epoch {epoch + 1:2d}  last batch loss {loss.item():.3f}  val acc {acc:.1%}"</span>)
+
+<span class="c"># The classic shape bug: (N, 1) minus (N,) broadcasts to (N, N)</span>
+pred, target = torch.zeros(<span class="n">4</span>, <span class="n">1</span>), torch.zeros(<span class="n">4</span>)
+print(<span class="s">"broadcast:"</span>, (pred - target).shape)
+
+<span class="c"># What we got (torch 2.8, CPU):</span>
+<span class="c"># torch.Size([1000, 2]) torch.float32 torch.int64 cpu</span>
+<span class="c"># parameters: 1218</span>
+<span class="c"># epoch  5  last batch loss 0.039  val acc 95.0%</span>
+<span class="c"># epoch 10  last batch loss 0.024  val acc 96.5%</span>
+<span class="c"># epoch 15  last batch loss 0.013  val acc 97.5%</span>
+<span class="c"># epoch 20  last batch loss 0.066  val acc 99.0%</span>
+<span class="c"># broadcast: torch.Size([4, 4])</span></code></pre>
+    <p class="hint">On a GPU add <code>device = "cuda"</code>, <code>model.to(device)</code> and <code>xb, yb = xb.to(device), yb.to(device)</code> inside the loop. <code>nn.MSELoss</code> does print a <code>UserWarning: Using a target size … different to the input size</code> for the broadcast bug: read your warnings. Note the last-batch loss bounces around (0.013 → 0.066): one batch is noisy; plot a running average.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Hand-written loop</td><td>See and control every step; easy to debug</td><td>You own the boilerplate: logging, checkpoints, mixed precision, multi-GPU</td></tr>
+      <tr><td>Hugging Face <code>Trainer</code> / Lightning</td><td>Best-practice loop, logging and distributed training for free</td><td>Bugs hide in config; harder to do something unusual</td></tr>
+      <tr><td><code>torch.compile(model)</code></td><td>Often noticeably faster on GPU with one line</td><td>Compile time up front; some Python tricks force slow paths</td></tr>
+      <tr><td><code>shuffle=True</code></td><td>Each batch is a fair sample</td><td>Less reproducible unless seeded; wrong for time-ordered splits</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Write a PyTorch training loop” or “this model doesn't train, what would you check?” A strong answer:</p>
+    <ul>
+      <li>Writes the five lines from memory, with <code>train()</code>/<code>eval()</code> and <code>no_grad()</code> in the right places, and explains why <code>zero_grad</code> exists (gradients accumulate).</li>
+      <li>Checks <b>shapes and dtypes</b> first (labels int64 of shape (B,), logits (B, K); no (B, 1) vs (B,) broadcasting) and the <b>loss at step 0</b> (≈ ln K for K classes).</li>
+      <li>Lists the silent bugs: softmax before <code>CrossEntropyLoss</code>, missing <code>zero_grad</code>, unshuffled sorted data, forgetting <code>model.train()</code> after evaluation, unregistered parameters.</li>
+      <li>Knows the next debugging move: overfit one small batch to near-zero loss (Lesson 2.6).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The framework itself</b> <span class="tag res">🧪 Research · 2019</span> <a href="https://arxiv.org/abs/1912.01703" target="_blank" rel="noopener">Paszke et al.: PyTorch: An Imperative Style, High-Performance Deep Learning Library</a></div>
+      <p><b>How:</b> models are ordinary Python classes, executed eagerly, with autograd recording operations as they run.</p>
+      <p><b>Why this method:</b> the paper's argument is usability: code you can debug with print statements and a normal debugger, while still running fast on GPUs.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A GPT-2 training loop you can read</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/karpathy/nanoGPT" target="_blank" rel="noopener">Karpathy: nanoGPT train.py</a></div>
+      <p><b>How:</b> the same five lines, plus gradient accumulation over 40 micro-batches, gradient clipping and a warmup-then-cosine learning rate (Lessons 1.6 and 1.7). Its README notes it's now deprecated in favour of the newer <a href="https://github.com/karpathy/nanochat" target="_blank" rel="noopener">nanochat</a> (Nov 2025).</p>
+      <p><b>Why this method:</b> a roughly 300-line loop that reproduces GPT-2 (124M), small enough to read every line.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The loop, packaged</b> <span class="tag oss">🧰 Open source</span> <a href="https://huggingface.co/docs/transformers/main_classes/trainer" target="_blank" rel="noopener">Hugging Face Transformers: Trainer</a></div>
+      <p><b>How:</b> you pass a model, datasets and <code>TrainingArguments</code>; it runs the loop, evaluation, logging, checkpointing and multi-GPU training.</p>
+      <p><b>Why this method:</b> fine-tuning thousands of models should not mean writing thousands of loops; knowing the five lines underneath is how you debug it when it misbehaves.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the loss at step 0 is a free unit test</span>
+    <p>Every run in the bug playground started at 1.083, almost exactly ln 3 = 1.099. Karpathy's recipe calls this “verify loss @ init”: with K classes and a sensible initialization, the first loss should be about −log(1/K). If yours starts at 8 or 0.001, something is wired wrong, before you've trained a single step.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Autograd (1.2) is what <code>backward()</code> runs; the loss (1.1) is what it differentiates. Next: what the weights should be <i>before</i> step 1 (1.4), what <code>opt.step()</code> actually does (1.5), the learning rate inside it (1.6) and the batch size in the DataLoader (1.7). Phase 2 adds clipping, normalization, regularization and a full debugging checklist (2.6). The RL course builds its Q-networks on the same loop (<a href="../../rl-course/phase4/3-dqn.html">RL 4.3</a>).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/tutorials/beginner/basics/optimization_tutorial.html" target="_blank" rel="noopener">PyTorch Learn the Basics: Optimizing Model Parameters</a>. The official walk-through of this exact loop.</li>
+      <li><span class="kind">Guide</span> <a href="https://karpathy.github.io/2019/04/25/recipe/" target="_blank" rel="noopener">Karpathy: A Recipe for Training Neural Networks</a>. How to build a training pipeline that doesn't fail silently.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/docs/stable/notes/broadcasting.html" target="_blank" rel="noopener">PyTorch broadcasting semantics</a>. The exact rules behind the (B, 1) vs (B,) bug.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. How many parameters does <code>nn.Linear(512, 256)</code> have?</div>
+    <div class="opts"><button class="opt">131,072</button><button class="opt" data-ok>131,328</button><button class="opt">768</button></div>
+    <div class="explain">Weights: 512 × 256 = 131,072, plus one bias per output: 256. Total 131,328. (768 = 512 + 256 would be the number of input plus output units, not parameters.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A teammate's classifier trains to 97% but noticeably slower than a reference implementation. Their model ends with <code>nn.Softmax(dim=1)</code> and they use <code>nn.CrossEntropyLoss</code>. What's going on?</div>
+    <div class="opts"><button class="opt">Nothing: softmax at the end is required for probabilities</button><button class="opt" data-ok>Softmax is applied twice (CrossEntropyLoss already includes it), which squashes the logits and shrinks the gradient; remove the Softmax layer and apply softmax only when you need probabilities</button><button class="opt">The learning rate is too high</button></div>
+    <div class="explain"><code>CrossEntropyLoss</code> = log-softmax + negative log-likelihood on raw logits. Feeding it probabilities (all between 0 and 1) means the “logits” barely differ, so the loss can't get small and the gradients are weak. It still trains, slowly, which is why it's a silent bug (our recorded run: loss 0.452 vs 0.108 after 10 epochs).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A regression model outputs shape <code>(64, 1)</code>; the targets have shape <code>(64,)</code>. You compute <code>((pred - target) ** 2).mean()</code>. What happens?</div>
+    <div class="opts"><button class="opt">A shape error is raised</button><button class="opt">It works correctly</button><button class="opt" data-ok>Broadcasting makes a (64, 64) matrix comparing every prediction with every target; it runs, and the model learns roughly to predict the mean</button></div>
+    <div class="explain">PyTorch broadcasting stretches (64, 1) and (64,) to (64, 64). The loss is then the average error of each prediction against <i>all</i> targets, which is minimized by predicting the mean of the targets for everyone. Fix with <code>target.unsqueeze(1)</code> or <code>pred.squeeze(1)</code>, and assert shapes.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Tensors have a shape, dtype and device; batch dimension first; class labels are int64 of shape (B,); weights of <code>Linear(in, out)</code> are (out, in).</li>
+      <li><code>nn.Module</code> registers parameters automatically; parameters per linear layer = in × out + out.</li>
+      <li>The loop: forward, loss, <code>zero_grad</code>, <code>backward</code>, <code>step</code> (zero_grad anywhere before backward). <code>train()</code>/<code>eval()</code> switch layer behaviour; <code>no_grad()</code> stops graph recording. They're independent.</li>
+      <li>Silent bugs: missing zero_grad (explodes), unshuffled sorted data (stuck), softmax before CrossEntropyLoss (slow), (B, 1) vs (B,) broadcasting (predicts the mean).</li>
+      <li>Check the loss at step 0 (≈ ln K), trace shapes on paper, and compare curves.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const num = n => n.toLocaleString("en-US");
+  const bytes = b => b >= 1e9 ? (b / 1e9).toFixed(2) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(2) + " MB" : (b / 1e3).toFixed(1) + " KB";
+
+  /* ---------- 1. shape tracer ---------- */
+  function trace() {
+    const B = +$("sB").value, I = +$("sIn").value, H = +$("sH").value, L = +$("sL").value, K = +$("sK").value, reg = $("sReg").checked;
+    $("sBv").textContent = B; $("sHv").textContent = H; $("sLv").textContent = L;
+    const outN = reg ? 1 : K;
+    let rows = [`<tr><th>step</th><th>tensor</th><th>shape</th><th>parameters</th></tr>`, `<tr><td>input</td><td class="x">x</td><td>(${B}, ${I})</td><td>–</td></tr>`];
+    let total = 0, prev = I, acts = 0;
+    for (let l = 0; l < L; l++) {
+      const p = prev * H + H; total += p; acts += 2 * B * H;
+      rows.push(`<tr><td>Linear(${prev}, ${H})</td><td class="w">W (${H}, ${prev}), b (${H})</td><td>(${B}, ${H})</td><td>${num(prev * H)} + ${num(H)} = ${num(p)}</td></tr>`);
+      rows.push(`<tr><td>ReLU</td><td class="ac">h${l + 1}</td><td>(${B}, ${H})</td><td>0</td></tr>`);
+      prev = H;
+    }
+    const p = prev * outN + outN; total += p; acts += B * outN;
+    rows.push(`<tr><td>Linear(${prev}, ${outN})</td><td class="w">W (${outN}, ${prev}), b (${outN})</td><td>(${B}, ${outN})</td><td>${num(prev * outN)} + ${num(outN)} = ${num(p)}</td></tr>`);
+    if (reg) {
+      rows.push(`<tr><td>target</td><td class="y">y</td><td>(${B},)</td><td>float32</td></tr>`);
+      rows.push(`<tr class="warnrow"><td>pred − y</td><td>broadcast!</td><td>(${B}, ${B})</td><td>⚠ every prediction vs every target</td></tr>`);
+    } else {
+      rows.push(`<tr><td>target</td><td class="y">labels</td><td>(${B},)</td><td>int64</td></tr>`);
+      rows.push(`<tr><td>CrossEntropyLoss</td><td class="ls">loss</td><td>() a scalar</td><td>–</td></tr>`);
+    }
+    $("sTable").innerHTML = rows.join("");
+    $("sP").textContent = num(total); $("sM").textContent = bytes(4 * total); $("sMA").textContent = bytes(16 * total); $("sAct").textContent = bytes(4 * (acts + B * I));
+    win("gMnist", I === 784 && K === 10 && !reg && L === 2 && total < 100000);
+    win("gExact", total === 1218);
+    win("gBcast", reg && B > 1);
+  }
+  ["sB", "sH", "sL"].forEach(id => ($(id).oninput = trace));
+  ["sIn", "sK"].forEach(id => ($(id).onchange = trace));
+  $("sReg").onchange = trace;
+  trace();
+
+  /* ---------- 2. build the loop ---------- */
+  const LINES = [["fwd", "logits = model(xb)"], ["loss", "loss = loss_fn(logits, yb)"], ["zg", "opt.zero_grad()"], ["bwd", "loss.backward()"], ["step", "opt.step()"]];
+  let picked = [], seen = new Set(), rr = NN_seed(7);
+  function NN_seed(s) { let a = s; return () => { a = (a * 16807) % 2147483647; return a / 2147483647; }; }
+  function oShuffle() { picked = []; const L = [...LINES].sort(() => rr() - 0.5); $("order").innerHTML = L.map(([k, t]) => `<button data-k="${k}">${t}</button>`).join(""); [...$("order").children].forEach(b => (b.onclick = () => { b.disabled = true; picked.push(b.dataset.k); oShow(); })); oShow(); }
+  function oShow() {
+    $("built").textContent = picked.length ? picked.map(k => "    " + LINES.find(l => l[0] === k)[1]).join("\n") : "    (click the lines above in order)";
+    if (picked.length < 5) { $("oMsg").textContent = ""; return; }
+    const at = k => picked.indexOf(k);
+    const problems = [];
+    if (at("fwd") > at("loss")) problems.push("the loss needs the logits, so forward must come first");
+    if (at("loss") > at("bwd")) problems.push("backward differentiates the loss, so the loss must exist first");
+    if (at("bwd") > at("step")) problems.push("step uses the gradients that backward computes");
+    if (at("zg") > at("bwd")) problems.push(at("zg") < at("step") ? "zero_grad between backward and step erases the fresh gradient: the step does nothing" : "zero_grad after step is fine for the next iteration but here the first step uses garbage from before; put it before backward");
+    if (!problems.length) {
+      const key = picked.join(","); seen.add(key);
+      $("oMsg").textContent = `✅ Correct loop. ${seen.size >= 2 ? "And a second correct variant: zero_grad just has to happen before backward." : "Shuffle again and try putting zero_grad somewhere else."}`;
+      win("gOrder", true); win("gOrder2", seen.size >= 2);
+    } else $("oMsg").textContent = "❌ " + problems.join("; ") + ".";
+  }
+  $("oReset").onclick = oShuffle;
+  oShuffle();
+
+  /* ---------- 3. recorded bug runs (real PyTorch, see the hint) ---------- */
+  const RUNS = {"000":{"loss":[1.083,0.825,0.757,0.662,0.593,0.376,0.282,0.307,0.153,0.119,0.108,0.073,0.072,0.038,0.024,0.026,0.016,0.017,0.014,0.012,0.011,0.01,0.007,0.007,0.007,0.006,0.006,0.008,0.006,0.017,0.005],"acc":1.0},"001":{"loss":[1.083,1.821,1.148,1.144,1.138,1.139,1.136,1.136,1.137,1.138,1.136,1.138,1.138,1.138,1.138,1.138,1.137,1.13,1.129,1.088,1.125,1.05,1.259,1.127,1.134,1.145,1.135,1.14,1.138,1.138,1.138],"acc":0.333},"010":{"loss":[1.083,0.973,0.818,0.851,1.163,0.865,0.75,0.912,0.649,0.598,0.452,0.387,0.288,0.249,0.198,0.174,0.175,0.159,0.109,0.103,0.094,0.098,0.086,0.073,0.084,0.074,0.057,0.052,0.049,0.057,0.048],"acc":0.996},"011":{"loss":[1.083,1.11,1.069,1.028,0.992,0.937,0.901,0.872,0.814,0.798,0.756,0.739,0.695,0.782,0.673,0.78,0.629,1.861,1.342,1.198,1.118,1.111,0.88,0.84,0.777,0.719,1.163,1.16,0.963,0.755,1.658],"acc":0.641},"100":{"loss":[1.083,5.0,3.263,1.825,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0],"acc":0.333},"101":{"loss":[1.083,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0],"acc":0.333},"110":{"loss":[1.083,1.051,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0],"acc":0.333},"111":{"loss":[1.083,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0,5.0],"acc":0.333}};
+  function bDraw() {
+    const zg = $("bZg").checked, sm = $("bSm").checked, sh = $("bSh").checked, key = `${+zg}${+sm}${+sh}`, R = RUNS[key];
+    const L = (t, bug) => (bug ? `<span class="bugline">${t}</span>` : t);
+    $("code").innerHTML = [
+      L(`model = nn.Sequential(nn.Linear(2, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU(), nn.Linear(64, 3)${sm ? ", nn.Softmax(dim=1)" : ""})`, sm),
+      L(`loader = DataLoader(data, batch_size=64, shuffle=${sh ? "False" : "True"})`, sh),
+      `for epoch in range(30):`,
+      `    for xb, yb in loader:`,
+      `        loss = loss_fn(model(xb), yb)`,
+      zg ? `        <span class="bugline strike">opt.zero_grad()</span>` : `        opt.zero_grad()`,
+      `        loss.backward()`,
+      `        opt.step()`,
+    ].join("\n");
+    const series = [{ label: "correct run", color: MX.css("--muted"), data: RUNS["000"].loss.map((v, i) => [i, v]), width: 2, dash: [5, 4] }];
+    if (key !== "000") series.push({ label: "this run", color: MX.css("--c-ls"), data: R.loss.map((v, i) => [i, v]), width: 2.8 });
+    Plot.line($("bChart"), { series, yMin: 0, yMax: 5.2, xMin: 0, xMax: 30, xLabel: "epoch", hlines: [{ y: 1.099, label: "ln 3 = know nothing", color: MX.css("--muted") }] });
+    $("bL10").textContent = R.loss[10] >= 5 ? "≥ 5 (exploded)" : R.loss[10].toFixed(3);
+    $("bLf").textContent = R.loss[30] >= 5 ? "≥ 5 (exploded)" : R.loss[30].toFixed(3);
+    $("bAcc").textContent = (100 * R.acc).toFixed(1) + "%";
+    $("bVerdict").innerHTML = key === "000" ? `<span class="ev">healthy</span>` : R.loss[30] >= 5 ? `<span class="dead">explodes (loud)</span>` : R.acc < 0.5 ? `<span class="dead">stuck</span>` : R.acc > 0.95 ? `<span class="dead">silently slower</span>` : `<span class="dead">broken</span>`;
+    win("gLoud", zg && !sm && !sh); win("gStuck33", sh && !zg && !sm); win("gSilent", sm && !zg && !sh);
+  }
+  ["bZg", "bSm", "bSh"].forEach(id => ($(id).onchange = bDraw));
+  bDraw();
+})();
+</script>
+</body>
+</html>

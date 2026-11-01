@@ -1,0 +1,545 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.2 SLAM: the chicken-and-egg problem · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .slamrow { display: grid; grid-template-columns: 2.2fr 1fr; gap: 12px; align-items: start; }
+  @media (max-width: 760px) { .slamrow { grid-template-columns: 1fr; } }
+  canvas.mat { width: 100%; aspect-ratio: 1 / 1; height: auto; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  .game-opts { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+</style>
+</head>
+<body data-lesson="s5-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 5 · Lesson 2</div>
+  <h1>SLAM: the chicken-and-egg problem</h1>
+  <p class="subtitle">To know where you are, you need a map. To draw a map, you need to know where you are. Robots exploring somewhere new have neither, so they build both at once: Simultaneous Localization And Mapping. Here's why that's hard, and the surprising trick that makes it work.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Odometry</b>: estimating motion from wheel turns or an IMU. Small errors pile up, so the estimate <b>drifts</b> (Lessons 2.5 and 2.6).</li>
+      <li><b>The Kalman filter</b>: predict (move, grow the uncertainty), then correct (pull toward a measurement, shrink it), with a covariance matrix <span class="un">P</span> holding how unsure each number is and how the errors are linked (Lesson 3.3). The <b>EKF</b> (extended Kalman filter) does the same for curved models by linearizing them (Lesson 3.4).</li>
+      <li><b>Occupancy grids</b>: a map of free, occupied and unknown cells, built assuming the robot's pose is known (Lesson 5.1). <b>Pose</b> = position plus heading.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>A robot explores a building it has never seen. It drives a big loop, spotting landmarks (a pillar, a door, a fire extinguisher) along the way. Its wheels drift, so by the end of the loop it's <b class="un">± 0.8 m</b> unsure of where it is, and the landmarks it saw last are just as fuzzy.</p>
+    <p>Then it spots the <b>very first pillar</b> again, one it mapped precisely at the start. Obviously the robot's own fix improves. But here's the strange part: the landmarks it saw <i>a minute ago</i>, on the far side of the building, and is <b>not looking at</b>, also get sharper. <b>How can seeing one thing improve your knowledge of things you can't see?</b></p>
+    <p>That question sits at the heart of a 40-year research problem. Its first probabilistic answer was the “stochastic map” of Randall Smith, Matthew Self and Peter Cheeseman (<a href="https://doi.org/10.1007/978-1-4613-8997-2_14" target="_blank" rel="noopener">1987–1990</a>), and the name <b>SLAM</b> first appeared at a robotics symposium in 1995, as Hugh Durrant-Whyte and Tim Bailey recount in their tutorial (<a href="https://doi.org/10.1109/MRA.2006.1638022" target="_blank" rel="noopener">IEEE Robotics &amp; Automation Magazine, 2006</a>).</p>
+  </div>
+
+  <h2>Why you can't just do one, then the other</h2>
+  <table>
+    <tr><th>If you know…</th><th>…then this is easy</th><th>Lesson</th></tr>
+    <tr><td>the robot's exact <span class="be">pose</span></td><td><b class="mp">Mapping</b>: drop each lidar point where it belongs; count hits and misses</td><td>5.1</td></tr>
+    <tr><td>an accurate <span class="mp">map</span></td><td><b class="be">Localization</b>: slide your scan until it lines up with the map</td><td>3.5, 5.6</td></tr>
+    <tr><td>neither</td><td><b>SLAM</b>: errors in the pose smear the map, and a smeared map misleads the pose</td><td>5.2 – 5.4</td></tr>
+  </table>
+  <p>Feel it first: below, a robot maps a room using only its odometry for the pose. The map is drawn from the scans, placed at the pose the robot <i>believes</i>.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Mapping with a drifting pose</span>
+    <p class="hint">The robot drives one 47 m lap of the room, scanning every metre. Its gyro drifts: the heading error grows a little every metre. <b class="se">Blue dots</b> are lidar points placed using the robot's <b class="be">believed pose</b> (purple); grey is the real room. First guess how far off the robot will be when it finishes the lap, lock it in, then drive.</p>
+    <canvas class="sim" id="drift"></canvas>
+    <div class="controls">
+      <label>my guess for the end-of-lap error <input type="range" id="dGuess" min="0" max="6" step="0.1" value="1"> <b class="mono" id="dGuessV"></b></label>
+      <button class="btn primary" id="dGo">🔒 Lock in &amp; drive</button>
+      <label>gyro drift <input type="range" id="dDrift" min="0" max="2" step="0.1" value="0.6"> <b class="mono" id="dDriftV"></b></label>
+      <label><input type="checkbox" id="dTrue"> cheat: use the true pose</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">distance driven <b id="dDist">0 m</b></div>
+      <div class="stat">pose error now <b id="dErr">–</b></div>
+      <div class="stat">map blur (avg point error) <b id="dBlur">–</b></div>
+      <div class="stat">your guess <b id="dChal">–</b></div>
+    </div>
+    <div class="verdict" id="dVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> predict the end-of-lap error within <b>30%</b>. Hint: a heading error of θ radians, after driving d metres, puts you about θ × d sideways. The drift grows with distance, so the error isn't linear.</p>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how fast does drift smear a map?</span>
+    <p>A gyro that drifts <b>0.6° per metre</b> sounds tiny. After driving d metres, the heading is off by 0.6 × d degrees. The <b>sideways</b> error is roughly the heading error × distance, summed along the way: about ½ × (0.6° in radians) × d².</p>
+    <table>
+      <tr><th>distance d</th><th>heading error</th><th>sideways error ≈ ½ × 0.0105 × d²</th></tr>
+      <tr><td>10 m</td><td>6°</td><td>0.5 m</td></tr>
+      <tr><td>20 m</td><td>12°</td><td>2.1 m</td></tr>
+      <tr><td>47 m (one lap)</td><td>28°</td><td>11.6 m if it drove straight</td></tr>
+    </table>
+    <p>On a closed lap the turns partly cancel (you head east, then west), so the real end error is much smaller than the straight-line number, which is why the playground's answer surprises people. Still: errors that grow with <b>d²</b> make every wall you map late in the run land in the wrong place. A wall seen twice, early and late, shows up <b>twice</b>: the classic doubled corridor of a broken SLAM map.</p>
+  </div>
+
+  <h2>The trick: estimate the robot and the map together</h2>
+  <p>EKF-SLAM, the first workable answer, does something bold: put the robot <b>and every landmark</b> into one big state vector, and run one Kalman filter over all of it.</p>
+  <div class="eq">
+    <span class="be">state</span> = [ <span class="be">x, y, θ</span> &nbsp;|&nbsp; <span class="mp">ℓ<sub>1x</sub>, ℓ<sub>1y</sub></span> &nbsp;|&nbsp; <span class="mp">ℓ<sub>2x</sub>, ℓ<sub>2y</sub></span> &nbsp;|&nbsp; … ] &nbsp;&nbsp;&nbsp; size 3 + 2n &nbsp;&nbsp;&nbsp; <span class="un">P</span> is (3 + 2n) × (3 + 2n)
+    <span class="say">Three numbers for the robot's pose, two per landmark. The covariance P stores every uncertainty and, crucially, how every pair of errors is linked.</span>
+  </div>
+  <ol>
+    <li><b>Predict</b> (the robot moves): only the robot's part of the state changes; its uncertainty grows. Landmarks don't move.</li>
+    <li><b>Correct</b> (the robot measures a landmark's <span class="se">range and bearing</span>: “3.1 m away, 40° to my left”): the innovation pulls <i>both</i> the robot and that landmark toward agreement.</li>
+    <li><b>New landmark?</b> Add two numbers to the state, placed where the robot believes it sees it. Its uncertainty starts as the robot's uncertainty plus the sensor's.</li>
+  </ol>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea: correlations are the map's memory</span>
+    When a landmark is first added, its error <b>is</b> the robot's error at that moment (plus sensor noise). The filter remembers that link in the off-diagonal entries of <span class="un">P</span>. Later, if a measurement shows the robot was 0.5 m further east than it thought, the filter knows every landmark seen from that drifted pose was probably also 0.5 m east, and moves them all. That's the answer to the hook: <b>you're not measuring the far landmarks again; you're learning how wrong the pose was when you placed them.</b>
+  </div>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict before Playground 2:</b> the robot drives a full loop and re-sees its first landmark. Which ellipses shrink at that moment: (a) only the robot's, (b) the robot's and that landmark's, or (c) all of them?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans"><b>(c) all of them</b>, and the robot's the most: in the run below its 95% ellipse drops from about 0.6 m to about 0.1 m within two seconds, and the worst landmark from about 0.73 m to about 0.45 m. Landmarks seen late in the loop shrink a lot; landmarks seen early barely change (they were already good). Watch the matrix on the right: by the end of the loop almost every cell lights up, because every error is tied to every other one.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · EKF-SLAM with range-bearing landmarks</span>
+    <p class="hint"><b>Click</b> anywhere to drive the robot there (or press <b>🔁 Auto lap</b>). It sees landmarks within the sensor range (the dashed circle). Grey crosses are the <i>true</i> landmarks; <b class="mp">green dots</b> are the filter's estimates with <b class="un">gold 95% ellipses</b>; the <b class="be">purple</b> robot has its own ellipse. The panel on the right is the covariance matrix as a picture: brighter = more strongly correlated.</p>
+    <div class="slamrow">
+      <canvas class="sim" id="slam"></canvas>
+      <div><canvas class="mat" id="covMat"></canvas><p class="hint" style="margin-top:4px">Rows and columns: robot (x, y, θ), then landmarks in the order they were first seen.</p></div>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="sAuto">🔁 Auto lap</button>
+      <button class="btn" id="sStop">⏸ Stop</button>
+      <button class="btn" id="sReset">↺ Reset</button>
+      <button class="btn" id="sBad">😈 Wrong match next time</button>
+      <label>sensor range <input type="range" id="sRange" min="1.5" max="5" step="0.5" value="2.5"> <b class="mono" id="sRangeV"></b></label>
+      <label>odometry noise <input type="range" id="sNoise" min="0.5" max="3" step="0.25" value="1"> <b class="mono" id="sNoiseV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">landmarks mapped <b id="sN">0 / 12</b></div>
+      <div class="stat">robot ellipse (95%) <b id="sRob">–</b></div>
+      <div class="stat">worst landmark ellipse <b id="sWorst">–</b></div>
+      <div class="stat">state size → P entries <b id="sSize">3 → 9</b></div>
+      <div class="stat">time <b id="sT">0 s</b></div>
+    </div>
+    <div class="verdict" id="sVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> map all 12 landmarks with <b>every</b> 95% ellipse under <b>0.45 m</b>, with the sensor range at 2.5 m or less, in under 75 s, driving <b>by clicking</b> (🔁 Auto lap shows you the idea but doesn't count). Plan a route that sees every landmark and comes back to the start. Then press <b>😈 Wrong match</b> and watch one bad association bend the whole map.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Map with odometry alone and the map inherits all the drift: walls double, loops don't close. Localize against a map you don't have and there's nothing to match. Hand-surveying every building before a robot can enter it doesn't scale.</li>
+      <li><b>What people tried.</b> <i>Map, then localize, then re-map</i>, alternating with the latest best guess (errors feed each other and never settle). <i>Estimate each landmark separately with its own little filter</i>, ignoring links (cheap, but overconfident: the filter forgets that all those landmarks share the robot's error, so it can't fix them together and becomes too sure).</li>
+      <li><b>Why this works.</b> One filter over robot + landmarks keeps the <b>correlations</b>, so information flows: a single re-sighting fixes the robot and, through <span class="un">P</span>'s off-diagonals, every landmark placed from a drifted pose. In the playground, closing the loop drops the robot's 95% ellipse from about 0.6 m to about 0.1 m, and the worst landmark's from about 0.73 m to about 0.45 m, from re-seeing one or two landmarks.</li>
+      <li><b>What it costs, when it fails.</b> <span class="un">P</span> has (3 + 2n)² entries and every update touches all of them: <b>O(n²)</b> per measurement. 1,000 landmarks → 4 million entries (32 MB of doubles), updated many times per second. Linearization errors pile up and make it overconfident over long runs. And it trusts <b>data association</b>: match an observation to the wrong landmark once and the error is spread, with full confidence, over the whole map.</li>
+      <li><b>What came next.</b> <b>FastSLAM</b> (2002): a particle filter over robot paths, with a tiny independent filter per landmark inside each particle, which avoids the giant matrix. Then <b>graph SLAM</b>: keep all poses and constraints and solve them as one sparse least-squares problem, which scales to huge maps and can revisit old decisions (Lesson 5.3). Almost every modern system (slam_toolbox, Cartographer, ORB-SLAM, LIO-SAM) is graph-based.</li>
+    </ol>
+  </div>
+
+  <h2>The O(n²) bill, in numbers</h2>
+  <table>
+    <tr><th>Landmarks n</th><th>State size 3 + 2n</th><th>Entries in P</th><th>Memory (8-byte doubles)</th><th>Feels like</th></tr>
+    <tr><td>12 (playground)</td><td>27</td><td>729</td><td>6 KB</td><td>instant</td></tr>
+    <tr><td>100</td><td>203</td><td>41,209</td><td>0.33 MB</td><td>fine</td></tr>
+    <tr><td>1,000</td><td>2,003</td><td>4.0 million</td><td>32 MB</td><td>millions of multiply-adds per observation</td></tr>
+    <tr><td>10,000 (a city block)</td><td>20,003</td><td>400 million</td><td>3.2 GB</td><td>hopeless in real time</td></tr>
+  </table>
+  <p>A lidar sees hundreds of features per second, and a city has millions. That's why EKF-SLAM is now mainly a teaching tool and a component of small systems, and why the field moved to sparse graphs, where each measurement only touches the two things it connects.</p>
+
+  <h2>Data association: “which landmark is this?”</h2>
+  <p>The math above silently assumed that, when the robot sees a pillar, it knows <i>which</i> pillar. In reality pillars look alike. Picking the right match is called <b>data association</b>, and getting it wrong is the most common way SLAM breaks.</p>
+  <p>The naive rule is “pick the closest predicted landmark”. The better rule uses the uncertainty: measure distance in units of standard deviations, the <b>Mahalanobis distance</b>. A landmark with a long, thin ellipse may be a better explanation for a measurement that's 1.5 m away along its long axis than a sharp landmark 0.9 m away across its narrow side. If even the best match is more than about 3 standard deviations away, it's probably a <b>new</b> landmark (this cutoff is the same gate you met in Lesson 3.7).</p>
+  <div class="eq">
+    d<sub>M</sub>² = (<span class="se">z</span> − <span class="mp">ẑ</span>)ᵀ <span class="un">S</span>⁻¹ (<span class="se">z</span> − <span class="mp">ẑ</span>) &nbsp;&nbsp;&nbsp; match = smallest d<sub>M</sub>; &nbsp; new landmark if every d<sub>M</sub> &gt; 3
+    <span class="say">z is what you measured, ẑ is where landmark k should appear, and S is how uncertain that prediction is (landmark + robot + sensor). Divide the gap by the uncertainty, in every direction.</span>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Which landmark did I just see?</span>
+    <p class="hint">Each round shows two or three mapped landmarks with their <b class="un">uncertainty ellipses</b> (shown at 2<span class="nt">σ</span>) and one new <b class="se">measurement</b> (blue star). Pick the landmark that best explains it, or say it's a new one. After each answer you'll see both the plain distance and the Mahalanobis distance.</p>
+    <canvas class="sim" id="assoc"></canvas>
+    <div class="game-opts" id="aOpts"></div>
+    <div class="stat-row">
+      <div class="stat">round <b id="aRound">1 / 6</b></div>
+      <div class="stat">score <b id="aScore">0</b></div>
+    </div>
+    <p class="hint" id="aFb">Click a button to answer.</p>
+    <div class="controls"><button class="btn primary" id="aNext">Next round →</button><button class="btn" id="aReset">↺ Start over</button></div>
+    <div class="verdict" id="aVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> 6 out of 6. “Closest dot wins” scores 2.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>You'll rarely deploy EKF-SLAM, but writing its update once is the best way to understand correlations. The core, in NumPy (state <code>x</code>, covariance <code>P</code>, landmark <code>k</code> at index <code>j = 3 + 2k</code>):</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+
+<span class="k">def</span> observe(x, P, j, z, R):
+    <span class="s">"""EKF-SLAM correction with one range-bearing measurement z = [r, b] of the landmark at x[j:j+2]."""</span>
+    dx, dy = x[j] - x[<span class="n">0</span>], x[j + <span class="n">1</span>] - x[<span class="n">1</span>]
+    q = dx * dx + dy * dy; r = np.sqrt(q)
+    z_hat = np.array([r, np.arctan2(dy, dx) - x[<span class="n">2</span>]])
+    H = np.zeros((<span class="n">2</span>, len(x)))                              <span class="c"># only 5 columns are non-zero…</span>
+    H[:, [<span class="n">0</span>, <span class="n">1</span>, <span class="n">2</span>]] = [[-dx / r, -dy / r, <span class="n">0</span>], [dy / q, -dx / q, <span class="n">-1</span>]]
+    H[:, [j, j + <span class="n">1</span>]] = [[dx / r, dy / r], [-dy / q, dx / q]]
+    S = H @ P @ H.T + R
+    K = P @ H.T @ np.linalg.inv(S)                         <span class="c"># …but K fills every row: that's the correlation</span>
+    y = z - z_hat; y[<span class="n">1</span>] = np.arctan2(np.sin(y[<span class="n">1</span>]), np.cos(y[<span class="n">1</span>]))  <span class="c"># wrap the bearing error</span>
+    d2 = y @ np.linalg.solve(S, y)                         <span class="c"># Mahalanobis distance², for data association</span>
+    <span class="k">return</span> x + K @ y, (np.eye(len(x)) - K @ H) @ P, d2</code></pre>
+    <p>In practice on a ROS 2 robot you'd run <b>slam_toolbox</b> (graph-based 2D lidar SLAM, the one the Nav2 docs recommend) and on a camera or drone <b>ORB-SLAM3</b>; both are Lesson 5.4.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚕 Waymo</h4><p>Waymo largely sidesteps online SLAM on public roads: it <b>maps first</b>, then localizes against that map. Its 2020 handbook post says the mapping starts by “manually driving our sensor equipped vehicles down each street”, building a 3D picture with lidar, then processing it into a detailed map. A Waymo 2016 post says the car uses the map to know where it is “to within 10cm of accuracy” (Lessons 5.5, 5.6).</p>
+        <p class="src">Sources: <a href="https://waymo.com/blog/2020/09/the-waymo-driver-handbook-mapping/" target="_blank" rel="noopener">Waymo, Sep 2020</a>, <a href="https://waymo.com/blog/2016/12/building-maps-for-self-driving-car/" target="_blank" rel="noopener">Waymo, Dec 2016</a></p></div>
+      <div><h4>🚘 Tesla</h4><p>Tesla hasn't published whether or how its cars run SLAM. What it does say publicly: FSD (Supervised) mainly uses its cameras and is more accurate with recent map data, using navigation data for the route; its owner's manual says that. The approach Tesla has described in talks puts the effort into networks that read the road from video, rather than into a prior lidar map (Lesson 5.5).</p>
+        <p class="src">Sources: <a href="https://www.tesla.com/ownersmanual/modely/en_us/GUID-2CB60804-9CEA-4F4B-8B04-09B991368DC5.html" target="_blank" rel="noopener">Model Y owner's manual (FSD)</a>, <a href="https://www.tesla.com/AI" target="_blank" rel="noopener">tesla.com/AI</a></p></div>
+      <div><h4>🛸 Drones</h4><p>A drone exploring a building or flying under a bridge has no prior map and often no GPS, so it must do SLAM (or at least visual-inertial odometry: camera + IMU motion tracking, Lesson 3.6). Skydio says its drones “constantly map the environment as they fly through it”; open-source drones commonly run visual-inertial SLAM such as ORB-SLAM3 or VINS.</p>
+        <p class="src">Sources: <a href="https://www.skydio.com/skydio-autonomy" target="_blank" rel="noopener">Skydio autonomy</a>, <a href="https://arxiv.org/abs/2007.11898" target="_blank" rel="noopener">ORB-SLAM3 (arXiv 2020)</a></p></div>
+      <div><h4>🤖 Robots</h4><p>Warehouse and service robots usually run SLAM <b>once</b> to build the floor map (driven by a person or exploring), save it, then switch to localization-only for daily work. The Nav2 docs walk through exactly this with slam_toolbox.</p>
+        <p class="src">Sources: <a href="https://docs.nav2.org/rolling/tutorials/general_tutorials/navigation2_with_slam/navigation2_with_slam/" target="_blank" rel="noopener">Nav2 SLAM tutorial</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> SLAM is hardest when you must trust it immediately in an unknown place. A robotaxi company can drive its cities first and turn SLAM into an offline, carefully checked mapping job; a drone or a robot exploring a new building can't, so it runs SLAM live. Tesla's stated bet avoids depending on a detailed prior map at all, which moves the burden onto live perception.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Approach</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Odometry-only mapping</td><td>Trivial; fine for a few metres</td><td>Drift grows without bound; loops never close</td></tr>
+      <tr><td>EKF-SLAM</td><td>Keeps all correlations; one re-sighting fixes everything; gives uncertainty</td><td>O(n²) per update; overconfident from linearization; one wrong match corrupts all</td></tr>
+      <tr><td>FastSLAM (particles + per-landmark filters)</td><td>Cheap per landmark; each particle can make its own data-association guess</td><td>Needs many particles for big loops; particle diversity dies out</td></tr>
+      <tr><td>Graph SLAM (Lesson 5.3)</td><td>Sparse, scales to big maps; can re-decide old associations</td><td>Batch optimization; needs good loop-closure detection and robust handling of bad ones</td></tr>
+      <tr><td>Map first, then localize (Waymo, warehouses)</td><td>Map can be checked and annotated offline; online job is simpler</td><td>Must map before operating; the world changes and the map goes stale</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“What makes SLAM hard, and why did EKF-SLAM fall out of favour?” A strong answer:</p>
+    <ul>
+      <li>States the <b>chicken-and-egg</b> plainly: pose errors smear the map; map errors mislead the pose.</li>
+      <li>Explains that the <b>correlations</b> in the joint covariance are what let one loop closure fix the whole map.</li>
+      <li>Gives the <b>O(n²)</b> cost with a number (1,000 landmarks → 4 M entries) and the move to <b>sparse graph optimization</b>.</li>
+      <li>Names <b>data association</b> as the main failure mode, and Mahalanobis gating (plus geometric checks) as the defence.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The stochastic map</b> <span class="tag hist">📜 History · 1987–1990</span> <a href="https://doi.org/10.1007/978-1-4613-8997-2_14" target="_blank" rel="noopener">Smith, Self &amp; Cheeseman</a></div>
+      <p><b>How:</b> represent the robot and all mapped objects in one state with one covariance matrix, and update it as the robot moves and observes.</p>
+      <p><b>Why this method:</b> it was the first consistent way to keep track of how uncertain spatial relationships depend on each other: the foundation of EKF-SLAM.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>FastSLAM</b> <span class="tag res">🧪 Research · 2002</span> <a href="https://mlanthology.org/aaai/2002/montemerlo2002aaai-fastslam" target="_blank" rel="noopener">Montemerlo, Thrun, Koller &amp; Wegbreit, AAAI 2002</a></div>
+      <p><b>How:</b> a particle filter over the robot's path; each particle carries its own small Kalman filter per landmark.</p>
+      <p><b>Why this method:</b> given a known path, landmarks are independent, so the giant covariance matrix disappears and cost grows gently with the number of landmarks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>slam_toolbox in ROS 2</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/SteveMacenski/slam_toolbox" target="_blank" rel="noopener">GitHub</a></div>
+      <p><b>How:</b> 2D lidar scan matching plus a pose graph with loop closures; outputs an occupancy grid; supports mapping, then localization-only on the saved map.</p>
+      <p><b>Why this method:</b> graph-based SLAM scales to large buildings and is the SLAM library Nav2's documentation recommends.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Visual-inertial SLAM on drones</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/UZ-SLAMLab/ORB_SLAM3" target="_blank" rel="noopener">ORB-SLAM3</a></div>
+      <p><b>How:</b> camera features plus IMU, a map of 3D points, loop closing and multiple maps that can be merged.</p>
+      <p><b>Why this method:</b> cameras and IMUs are light and cheap, which is what a small aircraft can carry; the IMU keeps tracking through fast motion.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · SLAM got its name in 1995</span>
+    <p>The problem was studied for a decade before it had a catchy name. According to Durrant-Whyte and Bailey's tutorial, the acronym <b>SLAM</b> was first presented in a survey at the 1995 International Symposium on Robotics Research (<a href="https://doi.org/10.1109/MRA.2006.1638022" target="_blank" rel="noopener">IEEE RAM, 2006</a>). Before that, people wrote “concurrent mapping and localization”, which, you'll agree, makes a much worse T-shirt.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>EKF-SLAM is the EKF of Lesson 3.4 with a bigger state; FastSLAM is the particle filter of 3.5 with landmarks inside; data-association gating is 3.7's outlier gate. Lesson 5.3 replaces the giant matrix with a sparse graph and loop closures, 5.4 shows the real systems, 5.6 is localization against a saved map. The same chicken-and-egg appears in visual odometry and bundle adjustment (4.6, 4.7). Correlation and covariance: <a href="../../math-course/phase5/2-correlation.html">correlation</a> and <a href="../../math-course/phase4/5-joint-chain.html">joint probability</a> in the Math course.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Tutorial</span> <a href="https://doi.org/10.1109/MRA.2006.1638022" target="_blank" rel="noopener">Durrant-Whyte &amp; Bailey (2006): Simultaneous Localization and Mapping, Part I</a>. The clearest overview of the problem and EKF-SLAM.</li>
+      <li><span class="kind">Book</span> <a href="https://robots.stanford.edu/probabilistic-robotics/" target="_blank" rel="noopener">Thrun, Burgard &amp; Fox: Probabilistic Robotics</a>. EKF-SLAM, FastSLAM and GraphSLAM chapters with pseudocode.</li>
+      <li><span class="kind">Paper</span> <a href="https://mlanthology.org/aaai/2002/montemerlo2002aaai-fastslam" target="_blank" rel="noopener">FastSLAM (2002)</a>. The particle-filter answer to the O(n²) bill.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. An EKF-SLAM map has 500 landmarks. About how many numbers does the covariance matrix P hold?</div>
+    <div class="opts"><button class="opt">1,003</button><button class="opt" data-ok>About 1 million</button><button class="opt">About 250,000</button></div>
+    <div class="explain">The state has 3 + 2 × 500 = 1,003 numbers, so P is 1,003 × 1,003 ≈ <b>1.0 million</b> entries (8 MB of doubles), and each measurement update touches all of them. That O(n²) growth is why large maps use sparse graphs instead.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After a long loop, a robot re-observes the first landmark it mapped. Why do landmarks it is <i>not</i> currently observing also become more certain?</div>
+    <div class="opts"><button class="opt">The filter quietly re-measures them using the old lidar scans</button><button class="opt" data-ok>Their errors are correlated with the robot's past pose errors, stored in P's off-diagonals, so correcting the pose corrects them too</button><button class="opt">Uncertainty is shared out equally among all landmarks after each update</button></div>
+    <div class="explain">Each landmark was placed from a drifting pose, so its error is tied to the robot's error at that time. The joint covariance remembers those ties; when the loop closure reveals how far the robot had drifted, the gain K spreads the correction to every correlated landmark.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. In a parking garage full of identical pillars, a SLAM map suddenly folds onto itself after the robot turns a corner. What's the most likely cause?</div>
+    <div class="opts"><button class="opt">The lidar's range is too short</button><button class="opt">The odometry noise was set too low</button><button class="opt" data-ok>A wrong data association: the robot matched a pillar to the wrong mapped pillar, and the filter confidently pulled the map to fit</button></div>
+    <div class="explain">Lookalike landmarks are the classic trap. A filter that accepts the wrong match spreads the error everywhere with full confidence. Defences: Mahalanobis gating, matching several landmarks jointly, geometric verification, and graph back-ends that can undo a bad match (Lesson 5.3).</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>SLAM: build the map and find yourself in it at the same time. Pose errors smear maps; bad maps mislead poses.</li>
+      <li>EKF-SLAM: one state [robot | all landmarks], one covariance. Correlations let one loop closure shrink every ellipse.</li>
+      <li>Cost is O(n²): 1,000 landmarks → 4 million covariance entries. Modern systems use sparse pose graphs (5.3).</li>
+      <li>Data association is the weak spot: use Mahalanobis distance and a gate (≈ 3<span class="nt">σ</span>), not “closest dot”.</li>
+      <li>Waymo maps first, then localizes; drones and exploring robots run SLAM live; Tesla hasn't published its approach beyond relying on cameras and navigation maps.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+  const wrap = Sim.wrap;
+
+  // ---------- Playground 1: mapping with a drifting pose ----------
+  const RX = 20, RY = 11.25, BOUNDS = [0, 0, RX, RY];
+  const ROOM = [{ type: "rect", x: 4.5, y: 4, w: 3, h: 3.2 }, { type: "rect", x: 11.5, y: 6, w: 3.5, h: 1.8 }, { type: "circle", x: 15.5, y: 3.5, r: 0.8 }, { type: "rect", x: 9, y: 0, w: 0.4, h: 1.2 }];
+  const WP = [[2, 2], [18, 2], [18, 9.4], [2, 9.4], [2, 2]];
+  let d1 = null, guessLocked = null;
+  function simulateDrift(driftDeg) {
+    const rng = Sim.rng(9), path = [];
+    let tr = { x: 2, y: 2, th: 0 }, es = { x: 2, y: 2, th: 0 }, dist = 0;
+    for (let w = 1; w < WP.length; w++) {
+      const [gx, gy] = WP[w];
+      while (Math.hypot(gx - tr.x, gy - tr.y) > 0.05) {
+        const want = Math.atan2(gy - tr.y, gx - tr.x), dth = wrap(want - tr.th), step = Math.min(0.1, Math.hypot(gx - tr.x, gy - tr.y));
+        tr = { x: tr.x + step * Math.cos(want), y: tr.y + step * Math.sin(want), th: want };
+        const err = MX.rad(driftDeg) * step + 0.002 * Sim.randn(rng);
+        es.th = wrap(es.th + dth + err); es = { x: es.x + step * Math.cos(es.th), y: es.y + step * Math.sin(es.th), th: es.th };
+        dist += step;
+        path.push({ tr: { ...tr }, es: { ...es }, dist });
+      }
+    }
+    // scans every metre
+    const pts = []; let next = 0;
+    path.forEach((p, i) => {
+      if (p.dist < next) return; next += 1;
+      Sim.lidar(ROOM, p.tr, { beams: 40, range: 9, noise: 0.02, rng, bounds: BOUNDS }).forEach(b => {
+        if (!b.hit) return;
+        const rel = b.a - p.tr.th, a2 = p.es.th + rel;
+        pts.push({ i, t: [p.tr.x + b.r * Math.cos(b.a), p.tr.y + b.r * Math.sin(b.a)], e: [p.es.x + b.r * Math.cos(a2), p.es.y + b.r * Math.sin(a2)] });
+      });
+    });
+    return { path, pts };
+  }
+  let frame1 = 0;
+  const D = new Sim($("drift"), { xRange: [-1, 21], yRange: [-1.2, 11.2] });
+  D.render(w => {
+    w.clear(); if (!d1) return;
+    w.rect(0, 0, RX, RY, { stroke: "--muted", width: 2 }); w.obstacles(ROOM, { color: "--muted", alpha: 0.35 });
+    const cheat = $("dTrue").checked, p = d1.path[Math.min(frame1, d1.path.length - 1)];
+    d1.pts.forEach(q => { if (q.i <= frame1) w.dot(cheat ? q.t : q.e, { color: "--c-se", r: 1.8, alpha: 0.7 }); });
+    w.line(d1.path.slice(0, frame1 + 1).map(q => [q.tr.x, q.tr.y]), { color: "--muted", width: 1.5, dash: [4, 4] });
+    if (!cheat) w.line(d1.path.slice(0, frame1 + 1).map(q => [q.es.x, q.es.y]), { color: "--c-be", width: 2, alpha: 0.7 });
+    w.robot(p.tr, { color: "--muted", r: 0.3 });
+    w.robot(cheat ? p.tr : p.es, { color: "--c-be", r: 0.3 });
+  });
+  function stats1() {
+    const p = d1.path[Math.min(frame1, d1.path.length - 1)], cheat = $("dTrue").checked;
+    $("dDist").textContent = fmt(p.dist, 0) + " m";
+    $("dErr").textContent = cheat ? "0.00 m" : fmt(Math.hypot(p.es.x - p.tr.x, p.es.y - p.tr.y), 2) + " m";
+    const seen = d1.pts.filter(q => q.i <= frame1);
+    $("dBlur").textContent = cheat ? "0.00 m" : seen.length ? fmt(MX.mean(seen.map(q => Math.hypot(q.e[0] - q.t[0], q.e[1] - q.t[1]))), 2) + " m" : "–";
+  }
+  function prep1() { d1 = simulateDrift(+$("dDrift").value); frame1 = d1.path.length - 1; stats1(); D.render(); }
+  $("dGuess").oninput = () => ($("dGuessV").textContent = fmt(+$("dGuess").value, 1) + " m");
+  $("dDrift").oninput = () => { $("dDriftV").textContent = fmt(+$("dDrift").value, 1) + "°/m"; D.stop(); guessLocked = null; $("dVerdict").innerHTML = ""; $("dChal").textContent = "–"; prep1(); };
+  $("dTrue").onchange = () => { stats1(); D.render(); };
+  $("dGo").onclick = () => {
+    guessLocked = +$("dGuess").value; $("dChal").textContent = fmt(guessLocked, 1) + " m"; $("dVerdict").innerHTML = "";
+    frame1 = 0;
+    D.run(() => {
+      frame1 = Math.min(d1.path.length - 1, frame1 + 6); stats1();
+      if (frame1 >= d1.path.length - 1) {
+        const p = d1.path[frame1], e = Math.hypot(p.es.x - p.tr.x, p.es.y - p.tr.y), ok = Math.abs(guessLocked - e) <= 0.3 * e + 0.05;
+        $("dVerdict").innerHTML = (ok ? `<span class="badge-win">🎯 Real error ${fmt(e, 2)} m, you said ${fmt(guessLocked, 1)} m!</span>` : `<span class="badge-lose">Real error ${fmt(e, 2)} m, you said ${fmt(guessLocked, 1)} m</span>`) +
+          ` <span class="muted">Notice the doubled walls where the start and end of the lap overlap.</span>`;
+        return false;
+      }
+    });
+  };
+  $("dGuess").oninput(); $("dDriftV").textContent = "0.6°/m"; prep1();
+
+  // ---------- Playground 2: EKF-SLAM ----------
+  const LM = []; for (let i = 0; i < 12; i++) { const a = i / 12 * 2 * Math.PI + 0.2, rr = 3.8 + ((i % 3) - 1) * 1.3; LM.push([10 + rr * Math.cos(a), 5.6 + rr * Math.sin(a)]); }
+  const SR = 0.1, SB = 0.03, DT = 0.1;
+  let S = null, tr2 = null, goal = null, auto = false, t2 = 0, rng2 = null, bad = 0, won = false, usedAuto = false;
+  function reset2() {
+    S = { x: [13.8, 5.6, Math.PI / 2], P: [[1e-4, 0, 0], [0, 1e-4, 0], [0, 0, 1e-4]], ids: [] };
+    tr2 = { x: 13.8, y: 5.6, th: Math.PI / 2 }; goal = null; auto = false; t2 = 0; rng2 = Sim.rng(3); bad = 0; won = false; usedAuto = false;
+    $("sVerdict").innerHTML = ""; W2.stop(); stats2(); W2.render(); drawMat();
+  }
+  function predict(v, w) {
+    const n = S.x.length, th = S.x[2], P = S.P, k = +$("sNoise").value;
+    S.x[0] += v * Math.cos(th) * DT; S.x[1] += v * Math.sin(th) * DT; S.x[2] = wrap(th + w * DT);
+    const a = -v * Math.sin(th) * DT, b = v * Math.cos(th) * DT;
+    for (let j = 0; j < n; j++) { P[0][j] += a * P[2][j]; P[1][j] += b * P[2][j]; }
+    for (let i = 0; i < n; i++) { P[i][0] += a * P[i][2]; P[i][1] += b * P[i][2]; }
+    const sv = k * (0.15 * Math.abs(v) * 0.3 + 0.01), sw = k * (0.15 * Math.abs(w) + 0.02), c = Math.cos(th) * DT, s = Math.sin(th) * DT;
+    P[0][0] += c * c * sv * sv; P[0][1] += c * s * sv * sv; P[1][0] += c * s * sv * sv; P[1][1] += s * s * sv * sv; P[2][2] += DT * DT * sw * sw;
+  }
+  function addLM(id, r, b) {
+    const th = S.x[2], n = S.x.length, P = S.P, ab = th + b;
+    S.x.push(S.x[0] + r * Math.cos(ab), S.x[1] + r * Math.sin(ab)); S.ids.push(id);
+    const Gr = [[1, 0, -r * Math.sin(ab)], [0, 1, r * Math.cos(ab)]], Gz = [[Math.cos(ab), -r * Math.sin(ab)], [Math.sin(ab), r * Math.cos(ab)]], R = [SR * SR, SB * SB];
+    const rows = [0, 1].map(k => { const row = []; for (let j = 0; j < n; j++) row.push(Gr[k][0] * P[0][j] + Gr[k][1] * P[1][j] + Gr[k][2] * P[2][j]); return row; });
+    const blk = [[0, 0], [0, 0]];
+    for (let a = 0; a < 2; a++) for (let c = 0; c < 2; c++) { let v = 0; for (let k = 0; k < 3; k++) v += rows[a][k] * Gr[c][k]; for (let k = 0; k < 2; k++) v += Gz[a][k] * R[k] * Gz[c][k]; blk[a][c] = v; }
+    for (let i = 0; i < n; i++) P[i].push(rows[0][i], rows[1][i]);
+    P.push(rows[0].concat(blk[0])); P.push(rows[1].concat(blk[1]));
+  }
+  function update(id, r, b) {
+    const k = S.ids.indexOf(id); if (k < 0) { addLM(id, r, b); return; }
+    const n = S.x.length, j = 3 + 2 * k, dx = S.x[j] - S.x[0], dy = S.x[j + 1] - S.x[1], q = dx * dx + dy * dy, sq = Math.sqrt(q), P = S.P;
+    const zh = [sq, wrap(Math.atan2(dy, dx) - S.x[2])], cols = [0, 1, 2, j, j + 1];
+    const H = [[-dx / sq, -dy / sq, 0, dx / sq, dy / sq], [dy / q, -dx / q, -1, -dy / q, dx / q]];
+    const PHt = P.map(row => [0, 1].map(a => cols.reduce((v, c, ci) => v + row[c] * H[a][ci], 0)));
+    const Sm = [[0, 0], [0, 0]];
+    for (let a = 0; a < 2; a++) for (let c = 0; c < 2; c++) Sm[a][c] = cols.reduce((v, cc, ci) => v + H[a][ci] * PHt[cc][c], 0);
+    Sm[0][0] += SR * SR; Sm[1][1] += SB * SB;
+    const det = Sm[0][0] * Sm[1][1] - Sm[0][1] * Sm[1][0], Si = [[Sm[1][1] / det, -Sm[0][1] / det], [-Sm[1][0] / det, Sm[0][0] / det]];
+    const K = PHt.map(r2 => [r2[0] * Si[0][0] + r2[1] * Si[1][0], r2[0] * Si[0][1] + r2[1] * Si[1][1]]);
+    const y = [r - zh[0], wrap(b - zh[1])];
+    for (let i = 0; i < n; i++) S.x[i] += K[i][0] * y[0] + K[i][1] * y[1];
+    S.x[2] = wrap(S.x[2]);
+    for (let i = 0; i < n; i++) for (let c = 0; c < n; c++) P[i][c] -= K[i][0] * PHt[c][0] + K[i][1] * PHt[c][1];
+  }
+  const ell = (i, k) => Sim.covEllipse([[S.P[i][i], S.P[i][i + 1]], [S.P[i + 1][i], S.P[i + 1][i + 1]]], k || 2.45);
+  function step2() {
+    // controller toward the goal (or the auto-lap circle)
+    let v = 0, w = 0;
+    if (auto) { v = 1; w = 1 / 3.8; }
+    else if (goal) {
+      const dx = goal[0] - tr2.x, dy = goal[1] - tr2.y, d = Math.hypot(dx, dy);
+      if (d < 0.2) goal = null; else { const e = wrap(Math.atan2(dy, dx) - tr2.th); w = MX.clamp(2.5 * e, -1.2, 1.2); v = Math.abs(e) > 1.2 ? 0.2 : Math.min(1, d); }
+    }
+    if (!v && !w) return false;
+    tr2 = Sim.unicycle(tr2, { v, w, dt: DT });
+    const k = +$("sNoise").value;
+    predict(v * (1 + k * 0.045 * Sim.randn(rng2)), w + k * (0.15 * Math.abs(w) + 0.02) * Sim.randn(rng2));
+    t2 += DT;
+    if (Math.round(t2 / DT) % 2 === 0) {
+      const range = +$("sRange").value;
+      LM.forEach((l, id) => {
+        const dx = l[0] - tr2.x, dy = l[1] - tr2.y, r = Math.hypot(dx, dy);
+        if (r >= range) return;
+        let use = id;
+        if (bad > 0 && S.ids.includes(id)) { const others = S.ids.filter(o => o !== id); if (others.length) { use = others[(others.indexOf(id) + 1 + others.length) % others.length]; bad--; } }
+        update(use, r + SR * Sim.randn(rng2), wrap(Math.atan2(dy, dx) - tr2.th + SB * Sim.randn(rng2)));
+      });
+    }
+    return true;
+  }
+  function stats2() {
+    const n = S.ids.length, sz = 3 + 2 * n;
+    $("sN").textContent = n + " / 12"; $("sSize").textContent = sz + " → " + (sz * sz).toLocaleString();
+    $("sRob").textContent = fmt(ell(0).a, 2) + " m"; $("sT").textContent = fmt(t2, 0) + " s";
+    let worst = 0; S.ids.forEach((id, k) => (worst = Math.max(worst, ell(3 + 2 * k).a)));
+    $("sWorst").textContent = n ? fmt(worst, 2) + " m" : "–";
+    if (!won && n === 12 && worst < 0.45 && +$("sRange").value <= 2.5 && t2 < 75) { won = true; $("sVerdict").innerHTML = usedAuto ? `<span class="muted">All 12 under ${fmt(worst, 2)} m: that's loop closure at work. Now reset and do it by clicking for the 🏆.</span>` : `<span class="badge-win">✅ All 12 landmarks under ${fmt(worst, 2)} m in ${fmt(t2, 0)} s, driven by you</span>`; }
+  }
+  const W2 = new Sim($("slam"), {
+    xRange: [0, 20], yRange: [0, 11.25],
+    onPointer(type, p) { if (type !== "down" || !S) return; auto = false; goal = p; if (!W2.running) run2(); },
+  });
+  W2.render(w => {
+    w.clear(); if (!S) return;
+    LM.forEach(l => { w.line([[l[0] - 0.2, l[1] - 0.2], [l[0] + 0.2, l[1] + 0.2]], { color: "--muted", width: 1.5 }); w.line([[l[0] - 0.2, l[1] + 0.2], [l[0] + 0.2, l[1] - 0.2]], { color: "--muted", width: 1.5 }); });
+    w.circle(tr2.x, tr2.y, +$("sRange").value, { stroke: "--c-se", width: 1, dash: [4, 4], alpha: 0.6 });
+    S.ids.forEach((id, k) => {
+      const j = 3 + 2 * k, P2 = [[S.P[j][j], S.P[j][j + 1]], [S.P[j + 1][j], S.P[j + 1][j + 1]]];
+      w.ellipse([S.x[j], S.x[j + 1]], P2, { k: 2.45, color: "--c-un", fill: true, width: 1.5 });
+      w.dot([S.x[j], S.x[j + 1]], { color: "--c-mp", r: 4 });
+    });
+    if (goal) w.dot(goal, { color: "--c-pl", r: 5, ring: "--c-pl" });
+    w.ellipse([S.x[0], S.x[1]], [[S.P[0][0], S.P[0][1]], [S.P[1][0], S.P[1][1]]], { k: 2.45, color: "--c-be", fill: true, width: 2 });
+    w.robot(tr2, { color: "--muted", r: 0.28, alpha: 0.6 });
+    w.robot({ x: S.x[0], y: S.x[1], th: S.x[2] }, { color: "--c-be", r: 0.28 });
+  });
+  function drawMat() {
+    const c = $("covMat"), dpr = window.devicePixelRatio || 1, W = c.clientWidth || 200;
+    c.width = W * dpr; c.height = W * dpr; const g = c.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, W);
+    const n = S.x.length, cs = W / 27, acc = MX.css("--c-un"), line = MX.css("--line");
+    for (let i = 0; i < n; i++) for (let j = 0; j < n; j++) {
+      const r = Math.abs(S.P[i][j]) / Math.sqrt(Math.max(1e-12, S.P[i][i] * S.P[j][j]));
+      g.globalAlpha = Math.min(1, r); g.fillStyle = acc; g.fillRect(j * cs, i * cs, cs + 0.3, cs + 0.3);
+    }
+    g.globalAlpha = 1; g.strokeStyle = line; g.lineWidth = 1;
+    for (let k = 0; k <= 12; k++) { const p = (3 + 2 * k) * cs; if (3 + 2 * k > n) break; g.beginPath(); g.moveTo(p, 0); g.lineTo(p, n * cs); g.moveTo(0, p); g.lineTo(n * cs, p); g.stroke(); }
+    g.strokeRect(0, 0, n * cs, n * cs);
+  }
+  window.addEventListener("resize", () => S && drawMat());
+  function run2() { W2.run(() => { let moved = false; for (let k = 0; k < 3; k++) moved = step2() || moved; stats2(); drawMat(); if (!moved) return false; }); }
+  $("sAuto").onclick = () => { auto = true; usedAuto = true; goal = null; if (!W2.running) run2(); };
+  $("sStop").onclick = () => { auto = false; goal = null; W2.stop(); };
+  $("sReset").onclick = reset2;
+  $("sBad").onclick = () => { bad = 3; $("sVerdict").innerHTML = `<span class="muted">😈 The next 3 sightings of a mapped landmark will be matched to the wrong one.</span>`; };
+  const lab = () => { $("sRangeV").textContent = $("sRange").value + " m"; $("sNoiseV").textContent = "×" + $("sNoise").value; if (S) W2.render(); };
+  $("sRange").oninput = lab; $("sNoise").oninput = lab; lab();
+  reset2();
+
+  // ---------- Playground 3: data association game ----------
+  const rot = (a, s1, s2) => { const c = Math.cos(a), s = Math.sin(a); return [[c * c * s1 * s1 + s * s * s2 * s2, c * s * (s1 * s1 - s2 * s2)], [c * s * (s1 * s1 - s2 * s2), s * s * s1 * s1 + c * c * s2 * s2]]; };
+  const ROUNDS = [
+    { lm: [{ p: [6, 5], C: rot(0, 0.4, 0.4) }, { p: [12, 5.5], C: rot(0, 0.4, 0.4) }], z: [6.6, 5.3] },
+    { lm: [{ p: [6, 4], C: rot(0, 1.6, 0.22) }, { p: [9.6, 5.4], C: rot(0, 0.35, 0.35) }], z: [9.2, 4.1] },
+    { lm: [{ p: [5, 6], C: rot(0.8, 1.7, 0.25) }, { p: [8.6, 4.2], C: rot(0, 0.3, 0.3) }, { p: [13, 6], C: rot(0, 0.5, 0.5) }], z: [7.0, 7.5] },
+    { lm: [{ p: [7, 6], C: rot(0, 0.35, 0.35) }, { p: [11, 6], C: rot(0, 0.35, 0.35) }], z: [9, 3.6] },
+    { lm: [{ p: [7, 5], C: rot(Math.PI / 2, 1.5, 0.25) }, { p: [9.2, 6.4], C: rot(0, 0.45, 0.45) }], z: [7.1, 7.6] },
+    { lm: [{ p: [6.5, 4.5], C: rot(0, 0.6, 0.6) }, { p: [10, 5], C: rot(-0.5, 1.4, 0.3) }, { p: [13.5, 6], C: rot(0, 0.3, 0.3) }], z: [12.6, 3.9] },
+  ];
+  const SZ = [[0.15 * 0.15, 0], [0, 0.15 * 0.15]]; // measurement noise
+  const mahal = (z, L) => { const C = MX.madd(L.C, SZ), I = MX.inv(C), d = [z[0] - L.p[0], z[1] - L.p[1]]; return Math.sqrt(d[0] * (I[0][0] * d[0] + I[0][1] * d[1]) + d[1] * (I[1][0] * d[0] + I[1][1] * d[1])); };
+  const answer = R => { const m = R.lm.map(L => mahal(R.z, L)), b = MX.argmax(m.map(v => -v)); return m[b] > 3 ? "new" : b; };
+  let ar = 0, ascore = 0, answered = false;
+  const A = new Sim($("assoc"), { xRange: [2, 17], yRange: [1.5, 9.94] });
+  A.render(w => {
+    w.clear(); const R = ROUNDS[ar];
+    R.lm.forEach((L, i) => { w.ellipse(L.p, L.C, { k: 2, color: "--c-un", fill: true, width: 2 }); w.dot(L.p, { color: "--c-mp", r: 5 }); w.text([L.p[0], L.p[1] + 0.45], "ABC"[i], { color: "--text", size: 13, bold: true }); });
+    const z = R.z; w.text(z, "★", { color: "--c-se", size: 22, bold: true }); w.text([z[0], z[1] - 0.5], "measurement", { color: "--c-se", size: 11 });
+  });
+  function round() {
+    const R = ROUNDS[ar]; answered = false;
+    $("aRound").textContent = ar + 1 + " / " + ROUNDS.length; $("aScore").textContent = ascore; $("aFb").textContent = "Click a button to answer.";
+    $("aOpts").innerHTML = R.lm.map((_, i) => `<button class="btn" data-a="${i}">It's ${"ABC"[i]}</button>`).join("") + `<button class="btn" data-a="new">🆕 A new landmark</button>`;
+    $("aOpts").querySelectorAll("button").forEach(b => (b.onclick = () => pick(b.dataset.a)));
+    A.render();
+  }
+  function pick(a) {
+    if (answered) return; answered = true;
+    const R = ROUNDS[ar], right = String(answer(R)), ok = a === right; if (ok) ascore++;
+    const info = R.lm.map((L, i) => `${"ABC"[i]}: ${fmt(Math.hypot(R.z[0] - L.p[0], R.z[1] - L.p[1]), 2)} m away, <b>${fmt(mahal(R.z, L), 1)} <span class="nt">σ</span></b>`).join(" · ");
+    $("aFb").innerHTML = (ok ? "✅ Right. " : `❌ The best answer is ${right === "new" ? "a new landmark" : "ABC"[+right]}. `) + info + (right === "new" ? " · every match is beyond 3σ, so it's safer to start a new landmark." : "");
+    $("aScore").textContent = ascore;
+    if (ar === ROUNDS.length - 1) $("aVerdict").innerHTML = ascore === ROUNDS.length ? `<span class="badge-win">🏆 ${ascore} / ${ROUNDS.length}: you associate like a SLAM back-end</span>` : `<span class="badge-lose">${ascore} / ${ROUNDS.length}</span> <span class="muted">Remember: divide the gap by the ellipse's width in that direction.</span>`;
+  }
+  $("aNext").onclick = () => { if (ar < ROUNDS.length - 1) { ar++; round(); } };
+  $("aReset").onclick = () => { ar = 0; ascore = 0; $("aVerdict").innerHTML = ""; round(); };
+  round();
+})();
+</script>
+</body>
+</html>

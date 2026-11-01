@@ -1,0 +1,480 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.9 Efficient attention: KV cache, FlashAttention, GQA · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .membar { display: flex; height: 26px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: var(--panel); margin: 8px 0 2px; position: relative; }
+  .membar > i { display: block; height: 100%; transition: width .2s; }
+  .membar .cap { position: absolute; top: -3px; bottom: -3px; width: 3px; background: var(--text); }
+  .memleg { display: flex; flex-wrap: wrap; gap: 14px; font-size: .8rem; color: var(--muted); }
+  .memleg span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; background: var(--sw); vertical-align: -1px; }
+  canvas.tile { width: 100%; max-width: 380px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 10px; border: 1px solid var(--line); }
+  .ctl-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 4px 16px; }
+  .ctl-grid label { display: flex; gap: 8px; align-items: center; font-size: .88rem; }
+  .ctl-grid input[type=range] { flex: 1; }
+</style>
+</head>
+<body data-lesson="d6-9" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 9</div>
+  <h1>Efficient attention: KV cache, FlashAttention, GQA</h1>
+  <p class="subtitle">A GPU that can do 312 trillion operations a second spends most of a chatbot's reply waiting for memory. Three tricks fix the waiting: remember instead of recompute, share instead of copy, and never write the big matrix down.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><span class="at">Attention</span>: each query is compared with every key (QKᵀ / √d), softmaxed, then used to average the values V (Lesson 6.1). Several heads do this in parallel (6.2).</li>
+      <li>A decoder generates one token at a time, and a <b>causal mask</b> means a token only looks left (6.4, 6.7).</li>
+      <li>A model with <span class="w">N</span> parameters costs about 2·N FLOPs per generated token (6.8).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>An NVIDIA A100 does <b>312 trillion</b> bf16 operations per second and reads its memory at about <b>2 TB/s</b>. Generating one token with an 8-billion-parameter model needs about 16 billion operations: <b>0.05 ms</b> of math. But it also has to read all 16 GB of weights from memory: <b>7.8 ms</b>. The math units sit idle about 99% of the time.</p>
+    <p>Meanwhile every chatbot, coding assistant and agent you use generates text exactly this way, token by token, for millions of users. And the memory problem gets worse with every token of conversation, because the model has to remember the whole conversation in a structure called the <b>KV cache</b>.</p>
+    <p><b>Where does the memory go, and how do Llama, DeepSeek and FlashAttention claw it back?</b> You'll size real caches, fit a 70B model's long context onto one GPU, and watch a 4,096 × 4,096 matrix never get written.</p>
+  </div>
+
+  <h2>Numbers first: decoding is memory-bound</h2>
+  <p>Arithmetic intensity is “FLOPs per byte read”. An A100 can do 312 × 10¹² ÷ 2.04 × 10¹² ≈ <b>153 FLOPs</b> for each byte it reads. Generating one token for one user does 2 FLOPs per weight and reads 2 bytes per weight (bf16): <b>1 FLOP per byte</b>. That's 150× too little work to keep the GPU busy.</p>
+  <p>The fix everyone uses: <b>batching</b>. Read the weights once, apply them to many users' tokens at the same time. But each user also brings their own cached memory of the conversation, and that has to be read too.</p>
+
+  <p class="predict">🔮 <b>Predict:</b> going from 1 user to 100 users at once (1,000-token conversations), does throughput go up 100×, 50×, or barely at all? And what happens with 8,000-token conversations?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Why batching helps, and what stops it</span>
+    <p class="hint">An 8B model (Llama 3 8B shape, bf16) on one 80 GiB A100. Each decoding step reads all weights once plus every user's KV cache, and does 2 FLOPs per weight per user. Step time = whichever is slower: memory or math (attention math ignored).</p>
+    <div class="goals">
+      <span class="goal" id="gB50">🎯 50× the batch-1 throughput</span>
+      <span class="goal" id="gBusy">🎯 Math units over half busy</span>
+      <span class="goal" id="gOom">🎯 Run out of memory</span>
+    </div>
+    <div class="controls">
+      <label>users at once (batch) <input type="range" id="dB" min="0" max="9" step="0.05" value="0"> <b class="mono" id="dBV"></b></label>
+      <label>conversation length <input type="range" id="dT" min="10" max="15" step="1" value="10"> <b class="mono" id="dTV"></b></label>
+    </div>
+    <div class="membar" id="dBar"></div>
+    <div class="memleg"><span style="--sw:var(--c-w)">weights</span><span style="--sw:var(--c-at)">KV cache</span><span>black line = 80 GiB</span></div>
+    <div class="stat-row">
+      <div class="stat">memory used <b id="dMem">–</b></div>
+      <div class="stat">step time <b id="dTime">–</b></div>
+      <div class="stat">tokens / s <b id="dTps" class="y">–</b></div>
+      <div class="stat">vs batch 1 <b id="dX">–</b></div>
+      <div class="stat">math units busy <b id="dU">–</b></div>
+    </div>
+    <p class="hint" id="dMsg"></p>
+  </div>
+  <p><b>What you should see:</b> batch 1 gives about <b>126 tokens/s</b> with the math 1% busy. At 100 users with 1k-token chats, a step takes only 14.5 ms instead of 7.9 ms, so throughput rises to about <b>6,900 tokens/s</b>, 55× more, nearly for free. Now set 8k-token chats: by 64 users the KV cache alone is <b>64 GiB</b> and memory is full, at about 1,500 tokens/s. Long conversations eat your batch. The rest of this lesson is about shrinking that gold bar.</p>
+
+  <h2>The KV cache: remember, don't recompute</h2>
+  <p>To generate token 1,001, the new token's query must be compared with the keys of tokens 1 to 1,000 and average their values. Those keys and values don't change (the causal mask means old tokens never look at new ones). So compute each token's K and V <b>once</b>, store them, and reuse them for every later step. That store is the <b>KV cache</b>.</p>
+  <div class="calc">KV bytes = 2 (K and V) × layers × kv_heads × head_dim × tokens × batch × bytes per value</div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: Llama 3 8B</span>
+    <p>From the Llama 3 paper: 32 layers, 32 query heads, <b>8 key/value heads</b>, model width 4,096 → head_dim = 4096 ÷ 32 = 128. In bf16 (2 bytes):</p>
+    <div class="calc">2 × 32 × 8 × 128 × 2 bytes = 131,072 bytes = <b>128 KiB per token</b></div>
+    <p>An 8,192-token conversation: 128 KiB × 8,192 = <b>1 GiB</b>. At 128k tokens (its maximum): <b>16 GiB</b>, as much as the model's own weights. With 32 K/V heads instead of 8 it would be 4× that: 64 GiB.</p>
+    <p>The 70B model (80 layers, 8 K/V heads, head_dim 128): 2 × 80 × 8 × 128 × 2 = <b>320 KiB per token</b>, so 40 GiB at 128k.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">KV cache</span></span>
+    <ol>
+      <li><b>The problem before</b> Without a cache, generating token t means rerunning the whole model over all t tokens. A 1,000-token answer costs about 1 + 2 + … + 1,000 ≈ 500,000 token-passes instead of 1,000: 500× the work.</li>
+      <li><b>What people tried</b> RNNs carry a fixed-size state instead (Lesson 5.2), which is cheap but forgets; recomputing attention from scratch each step, which is exact but quadratic.</li>
+      <li><b>Why this works</b> With a causal mask, a token's K and V depend only on itself and earlier tokens, so they never change. Store them: each new step computes K, V and Q for <b>one</b> token and attends to the stored ones. Work per step stays proportional to the model, not to t times the model.</li>
+      <li><b>What it costs, when it fails</b> Memory that grows linearly with tokens × batch × layers (128 KiB per token for Llama 3 8B) and must be read every step, which makes long-context decoding memory-bound. It fragments GPU memory when requests have different lengths.</li>
+      <li><b>What refined it</b> Shrinking each entry (GQA, MQA, MLA below, FP8/INT4 cache), paging it like virtual memory (vLLM's PagedAttention; <a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a>), sharing cached prefixes across requests, and windowed caches (6.11).</li>
+    </ol>
+  </div>
+
+  <h2>MQA and GQA: share keys and values across heads</h2>
+  <p>Multi-head attention (6.2) gives every head its own Q, K and V. But only K and V get cached. In 2019 Noam Shazeer asked: what if all heads <b>share one</b> K and V? That's <b>multi-query attention</b> (MQA): the cache shrinks by the number of heads (32× for 32 heads). Quality dropped a little, and training could be unstable.</p>
+  <p><b>Grouped-query attention</b> (GQA, Ainslie et al. 2023) is the middle ground: split the query heads into groups, and each group shares one K/V head. Llama 3 uses 32 query heads in <b>8 groups of 4</b>: a 4× smaller cache, with quality close to full multi-head attention.</p>
+  <table>
+    <tr><th></th><th>Query heads</th><th>K/V heads</th><th>Cache vs MHA</th><th>Quality</th></tr>
+    <tr><td>MHA (multi-head)</td><td>32</td><td>32</td><td>1×</td><td>baseline</td></tr>
+    <tr><td>GQA (Llama 3 8B)</td><td>32</td><td>8</td><td class="ev">¼</td><td>close to MHA</td></tr>
+    <tr><td>MQA (multi-query)</td><td>32</td><td>1</td><td class="ev">1/32</td><td>some loss</td></tr>
+  </table>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">GQA (and MQA)</span></span>
+    <ol>
+      <li><b>The problem before</b> Shazeer's MQA paper put it exactly: incremental decoding is limited by “the memory-bandwidth cost of repeatedly loading the large ‘keys’ and ‘values’ tensors”. With 64 K/V heads, Llama 3 70B's cache would be 2.5 MiB per token.</li>
+      <li><b>What people tried</b> MQA (one K/V head for all): huge savings, but some quality loss and instability; plain MHA: best quality, biggest cache.</li>
+      <li><b>Why this works</b> Heads mostly need their own <i>queries</i> (what to look for); keys and values can be shared by a few heads with little loss. G groups → cache ÷ (heads ÷ G). The GQA paper also showed you can convert an existing MHA checkpoint by mean-pooling its K/V heads per group and “uptraining” with only <b>5%</b> of the original pretraining compute.</li>
+      <li><b>What it costs, when it fails</b> Fewer K/V parameters, so a small quality cost that grows as groups shrink; one more hyperparameter. It shrinks the cache but not the attention math, and with tensor parallelism you can't split fewer K/V heads across more GPUs.</li>
+      <li><b>What refined it</b> <b>Multi-head latent attention</b> (MLA, DeepSeek-V2, 2024): cache one small compressed latent vector per token and rebuild per-head K and V from it. DeepSeek reported a <b>93.3%</b> smaller KV cache than their earlier 67B dense model.</li>
+    </ol>
+  </div>
+  <p>How small is MLA? DeepSeek-V3 caches a 512-number latent plus one 64-number rotary key per layer: 61 layers × 576 × 2 bytes = <b>68.6 KiB per token</b>, for a 671B model. Full multi-head attention with its 128 heads of size 128 would need 3.8 MiB per token, 57× more.</p>
+
+  <p class="predict">🔮 <b>Predict:</b> you want Llama 3 70B with a 128k-token context on one 80 GiB GPU. Weights in 8-bit already take 65 GiB. Which knobs could make it fit?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · KV-cache memory calculator</span>
+    <p class="hint">Pick a model shape (or set your own), a context, a batch and the number formats. The bar shows weights + KV cache + 1 GiB of working buffers against the GPU's memory.</p>
+    <div class="goals">
+      <span class="goal" id="gOut">🎯 Make the KV cache bigger than the weights</span>
+      <span class="goal" id="g8b">🎯 8B model: 4 users × 32k tokens on a 24 GiB GPU</span>
+      <span class="goal" id="g70">🎯 70B model: 128k context on one 80 GiB GPU</span>
+    </div>
+    <div class="controls">
+      <button class="btn small" id="k8">Llama 3 8B</button>
+      <button class="btn small" id="k70">Llama 3 70B</button>
+      <button class="btn small" id="kG3">GPT-3 175B (MHA)</button>
+      <span class="seg" id="kGpu"><button data-v="24">24 GiB GPU</button><button data-v="80" class="on">80 GiB GPU</button></span>
+    </div>
+    <div class="ctl-grid">
+      <label>layers <input type="range" id="kL" min="12" max="128" step="1"> <b class="mono" id="kLV"></b></label>
+      <label>query heads <input type="range" id="kH" min="8" max="128" step="8"> <b class="mono" id="kHV"></b></label>
+      <label>K/V heads <input type="range" id="kKV" min="0" max="7" step="1"> <b class="mono" id="kKVV"></b></label>
+      <label>head dim <input type="range" id="kD" min="64" max="256" step="64"> <b class="mono" id="kDV"></b></label>
+      <label>context (tokens) <input type="range" id="kT" min="10" max="17" step="1"> <b class="mono" id="kTV"></b></label>
+      <label>batch <input type="range" id="kB" min="1" max="32" step="1"> <b class="mono" id="kBV"></b></label>
+    </div>
+    <div class="controls">
+      <label>weights <select id="kWd" class="btn small"><option value="4">fp32</option><option value="2" selected>bf16</option><option value="1">fp8</option><option value="0.5">int4</option></select></label>
+      <label>KV cache <select id="kKd" class="btn small"><option value="4">fp32</option><option value="2" selected>bf16</option><option value="1">fp8</option><option value="0.5">int4</option></select></label>
+      <span class="hint" id="kParams"></span>
+    </div>
+    <div class="membar" id="kBar"></div>
+    <div class="memleg"><span style="--sw:var(--c-w)">weights</span><span style="--sw:var(--c-at)">KV cache</span><span style="--sw:var(--muted)">buffers 1 GiB</span><span>black line = GPU memory</span></div>
+    <div class="stat-row">
+      <div class="stat">per token <b id="kPer" class="at">–</b></div>
+      <div class="stat">KV cache <b id="kKV2" class="at">–</b></div>
+      <div class="stat">weights <b id="kW" class="w">–</b></div>
+      <div class="stat">total <b id="kTot">–</b></div>
+      <div class="stat">fits? <b id="kFit">–</b></div>
+    </div>
+    <p class="hint" id="kMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the 8B preset at 128k tokens has a <b>16 GiB</b> cache, more than its 15 GiB of bf16 weights. For 4 users × 32k on 24 GiB, bf16 needs 31 GiB; an <b>fp8 cache</b> brings it to 24 GiB (just fits), and int4 weights with a bf16 cache also work. For the 70B at 128k: fp8 weights (65 GiB) + bf16 cache (40 GiB) is way over; int4 weights (33 GiB) + fp8 cache (20 GiB) fits with room to spare. Now slide K/V heads to 64 (plain multi-head attention) and watch the cache explode to 320 GiB. Try GPT-3: 4.5 MiB per token. Real engines also quantize carefully: 8-bit caches are common in production, 4-bit ones cost more quality.</p>
+
+  <h2>FlashAttention: never write the big matrix down</h2>
+  <p>So far, decoding. During <b>training</b> and when reading a long prompt (“prefill”), attention handles all n tokens at once, and the naive version builds the full n × n score matrix S = QKᵀ. At 4,096 tokens that's 16.8 million scores per head, written to the GPU's main memory (HBM), read back for the softmax, written again as probabilities P, read again to multiply by V.</p>
+  <p>The GPU has a tiny, fast scratchpad on each compute unit (SRAM). On an A100: <b>192 KB per unit</b>, 108 units, about <b>19 TB/s</b>, vs 40–80 GB of HBM at 1.5–2.0 TB/s. FlashAttention (Dao et al., 2022) cuts Q, K and V into <b>tiles</b> that fit in SRAM, computes each tile's scores, softmax and output contribution right there, and only writes the final output O. The n × n matrix never exists in HBM.</p>
+  <p>The clever bit is the softmax: you need the max and the sum over a <i>whole row</i>, but you only see one tile at a time. The fix is an <b>online softmax</b>: keep a running max m and running sum ℓ, and when a new tile has a bigger max, rescale what you had.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: online softmax over two tiles</span>
+    <p>One row of scores, seen as tile 1 = [1, 2] then tile 2 = [3].</p>
+    <ul>
+      <li>Tile 1: m = 2, ℓ = e<sup>1−2</sup> + e<sup>2−2</sup> = 0.368 + 1 = <b>1.368</b>.</li>
+      <li>Tile 2 has 3 &gt; 2. New m = 3; rescale the old sum by e<sup>2−3</sup> = 0.368: ℓ = 1.368 × 0.368 + e<sup>0</sup> = 0.503 + 1 = <b>1.503</b>.</li>
+      <li>Check against the whole row at once: e<sup>−2</sup> + e<sup>−1</sup> + e<sup>0</sup> = 0.135 + 0.368 + 1 = <b>1.503</b>. Identical.</li>
+    </ul>
+    <p>The partial outputs (weights × V) get the same rescaling. So FlashAttention is <b>exact</b>: same answer as the naive version, up to floating-point rounding. Numerics of softmax: <a href="../../math-course/phase8/5-numerics.html">math 8.5</a>.</p>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> FlashAttention does the same multiplications as the naive version (a bit more, even). So where does its speed-up come from?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Tiles vs the full n × n matrix</span>
+    <p class="hint">The square is the n × n score matrix (causal part only), drawn as tiles. <b>Standard</b>: compute S and write it to HBM, then read it back for softmax, write P, read P for P·V. <b>Flash</b>: for each row of query tiles, stream the K/V tiles through SRAM; scores live only in SRAM (gold flash), nothing n × n is written. Counters are in numbers moved to or from HBM (head dim 64, one head).</p>
+    <div class="goals">
+      <span class="goal" id="gStd">🎯 Watch standard attention finish</span>
+      <span class="goal" id="gFl">🎯 Flash with ≥ 3.5× less HBM traffic</span>
+      <span class="goal" id="gSram">🎯 Overflow the SRAM with a tile too big</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="tMode"><button data-v="std" class="on">Standard</button><button data-v="flash">FlashAttention</button></span>
+      <label>sequence n <select id="tN" class="btn small"><option>1024</option><option selected>4096</option><option>16384</option><option>65536</option></select></label>
+      <label>tile size <select id="tBk" class="btn small"><option>64</option><option selected>128</option><option>256</option></select></label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="tPlay">▶ Run</button>
+      <button class="btn" id="tStep">Step</button>
+      <button class="btn" id="tReset">↺ Reset</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="tile" id="tCv"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">HBM reads <b id="tR">0</b></div>
+          <div class="stat">HBM writes <b id="tW">0</b></div>
+        </div>
+        <div class="stat-row">
+          <div class="stat">extra HBM for scores <b id="tX">–</b></div>
+          <div class="stat">SRAM per tile <b id="tS">–</b></div>
+        </div>
+        <div class="stat-row"><div class="stat">total traffic, standard ÷ flash <b id="tRatio">–</b></div></div>
+        <p class="hint" id="tMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> at n = 4,096, standard attention moves about <b>35 million</b> numbers through HBM (writing and re-reading the score matrix twice dominates), and needs 32 MiB per head just to hold the scores. Flash with 128-wide tiles moves about <b>9 million</b> and stores no scores at all (3.8× less traffic). With 64-wide tiles it re-reads K and V twice as often and the gain halves. Bigger tiles mean fewer passes over K and V, but a 256 tile needs 224 KB of SRAM, more than the A100's 192 KB per unit: it doesn't fit. At n = 65,536 the standard method needs <b>8 GiB</b> per head per sequence for the scores; that, not the math, is why long-context training was impossible before. Same FLOPs, far fewer bytes: speed comes from not waiting on memory.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">FlashAttention</span></span>
+    <ol>
+      <li><b>The problem before</b> Naive attention reads and writes the n × n matrix several times: at n = 4,096 that's tens of millions of numbers per head through slow HBM, and O(n²) memory that rules out long sequences. The GPU's math units wait on memory.</li>
+      <li><b>What people tried</b> Approximate attention (sparse patterns, low-rank, linear kernels) to reduce the FLOPs. Many cut FLOPs on paper but weren't faster in wall-clock time, and they changed the model's output.</li>
+      <li><b>Why this works</b> Be <b>IO-aware</b>: count bytes, not FLOPs. Tile Q, K, V into SRAM-sized blocks, fuse scores, mask, softmax and P·V into one kernel with an online softmax, and recompute small pieces in the backward pass instead of storing S. Exact output, O(n) extra memory. The paper reported 3× faster training on GPT-2 (1k tokens) and 15% on BERT-large vs the MLPerf record.</li>
+      <li><b>What it costs, when it fails</b> Hand-written kernels per GPU generation (A100, H100, B200 differ); FLOPs are still O(n²), so very long contexts remain expensive (6.11). Custom attention variants need kernel support.</li>
+      <li><b>What refined it</b> FlashAttention-2 (2023: better work split, ~2× faster, up to 73% of A100 peak), FlashAttention-3 (2024: H100 asynchrony and FP8, up to 740 TFLOPs/s in FP16), FlashAttention-4 (2026: Blackwell B200, up to 1,613 TFLOPs/s in BF16). In PyTorch you get these through <code>F.scaled_dot_product_attention</code>.</li>
+    </ol>
+  </div>
+
+  <h2>Other ways to make attention cheaper (briefly)</h2>
+  <table>
+    <tr><th>Idea</th><th>What it does</th><th>Exact?</th><th>Where you'll meet it</th></tr>
+    <tr><td>Sparse / sliding-window attention</td><td>each token attends only to a local window (+ a few global tokens)</td><td>No, a different model</td><td>Longformer; Mistral 7B's sliding window (6.11)</td></tr>
+    <tr><td>Linear attention</td><td>replace softmax with a kernel so cost is O(n); behaves like an RNN at decode time</td><td>No</td><td>“Transformers are RNNs” (2020); state-space models (Lesson 9.3)</td></tr>
+    <tr><td>FlashAttention</td><td>same math, tiled for memory</td><td class="ev">Yes</td><td>everywhere, via SDPA</td></tr>
+    <tr><td>KV cache + GQA/MQA/MLA</td><td>shrink what decoding must read</td><td>cache is exact; GQA/MLA change the model</td><td>every modern LLM</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><code>F.scaled_dot_product_attention</code> (SDPA) picks the fastest backend for your hardware (FlashAttention, memory-efficient, cuDNN or plain math on CPU). <code>is_causal=True</code> applies the causal mask; <code>enable_gqa=True</code> lets K/V have fewer heads than Q. Here it is checked against attention written by hand, plus a KV-cache size helper.</p>
+<pre><code><span class="k">import</span> torch, torch.nn.functional <span class="k">as</span> F
+
+torch.manual_seed(<span class="n">0</span>)
+B, Hq, Hkv, T, d = <span class="n">2</span>, <span class="n">8</span>, <span class="n">2</span>, <span class="n">16</span>, <span class="n">64</span>                 <span class="c"># 8 query heads share 2 K/V heads (GQA, groups of 4)</span>
+q = torch.randn(B, Hq, T, d)
+k = torch.randn(B, Hkv, T, d)
+v = torch.randn(B, Hkv, T, d)
+
+<span class="c"># By hand: repeat each K/V head for its 4 query heads, then masked softmax(QK^T / sqrt(d)) V</span>
+k4, v4 = k.repeat_interleave(Hq // Hkv, dim=<span class="n">1</span>), v.repeat_interleave(Hq // Hkv, dim=<span class="n">1</span>)
+s = q @ k4.transpose(-<span class="n">2</span>, -<span class="n">1</span>) / d**<span class="n">0.5</span>
+s = s.masked_fill(torch.triu(torch.ones(T, T, dtype=torch.bool), <span class="n">1</span>), float(<span class="s">"-inf"</span>))
+manual = s.softmax(-<span class="n">1</span>) @ v4
+
+fused = F.scaled_dot_product_attention(q, k, v, is_causal=<span class="k">True</span>, enable_gqa=<span class="k">True</span>)
+print(<span class="s">"max difference:"</span>, (manual - fused).abs().max().item())
+
+<span class="k">def</span> kv_cache_bytes(layers, kv_heads, head_dim, seq, batch, bytes_per_value=<span class="n">2</span>):
+    <span class="k">return</span> <span class="n">2</span> * layers * kv_heads * head_dim * seq * batch * bytes_per_value   <span class="c"># 2 = one K and one V</span>
+
+print(<span class="s">"Llama 3 8B, 8k tokens, bf16: %.2f GiB"</span> % (kv_cache_bytes(<span class="n">32</span>, <span class="n">8</span>, <span class="n">128</span>, <span class="n">8192</span>, <span class="n">1</span>) / <span class="n">2</span>**<span class="n">30</span>))
+print(<span class="s">"same, if it had 32 K/V heads: %.2f GiB"</span> % (kv_cache_bytes(<span class="n">32</span>, <span class="n">32</span>, <span class="n">128</span>, <span class="n">8192</span>, <span class="n">1</span>) / <span class="n">2</span>**<span class="n">30</span>))
+
+<span class="c"># What we got (torch 2.8, CPU):</span>
+<span class="c"># max difference: 4.470348358154297e-07</span>
+<span class="c"># Llama 3 8B, 8k tokens, bf16: 1.00 GiB</span>
+<span class="c"># same, if it had 32 K/V heads: 4.00 GiB</span></code></pre>
+    <p class="hint">On a GPU, <code>with torch.nn.attention.sdpa_kernel(SDPBackend.FLASH_ATTENTION):</code> forces the flash backend (it errors if your shapes or dtype aren't supported, a handy check). In Hugging Face, the cache is a <code>DynamicCache</code> passed as <code>past_key_values</code>; serving engines (vLLM, SGLang, TensorRT-LLM) manage it in pages for you.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Technique</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>KV cache</td><td>Each new token costs one token's work</td><td>Memory grows with tokens × batch; decoding becomes memory-bound</td></tr>
+      <tr><td>GQA / MQA</td><td>Cache ÷ 4 to ÷ 32, faster decoding, bigger batches</td><td>Small quality loss (more for MQA); must be trained or uptrained in</td></tr>
+      <tr><td>MLA</td><td>Even smaller cache (DeepSeek: −93% vs their dense 67B)</td><td>More complex; extra projection math; trickier with RoPE</td></tr>
+      <tr><td>FP8 / INT4 cache</td><td>2–4× smaller cache, no retraining</td><td>Rounding error; 4-bit can hurt long-context quality</td></tr>
+      <tr><td>FlashAttention</td><td>Exact, O(n) memory, several × faster</td><td>Hardware-specific kernels; FLOPs still O(n²)</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Why is LLM inference memory-bound, and what would you do about it?” A strong answer:</p>
+    <ul>
+      <li>Decoding does ~2 FLOPs per weight per token but reads every weight: ~1 FLOP/byte vs a GPU's ~150. Batching amortizes the weights; the <b>KV cache</b> is the per-user memory that limits batch size.</li>
+      <li>Computes the cache: 2 · layers · kv_heads · head_dim · tokens · bytes (Llama 3 8B: 128 KiB/token in bf16).</li>
+      <li>Fixes: GQA/MQA/MLA, FP8 cache, paged memory, prefix caching, sliding windows; quantized weights.</li>
+      <li>Separates <b>prefill</b> (compute-bound, FlashAttention helps most) from <b>decode</b> (memory-bound, cache size matters most), and knows FlashAttention is exact, not an approximation.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>FlashAttention</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">Dao et al.: FlashAttention: Fast and Memory-Efficient Exact Attention with IO-Awareness</a></div>
+      <p><b>How:</b> tiling + online softmax + recomputation in the backward pass; later <a href="https://arxiv.org/abs/2307.08691" target="_blank" rel="noopener">v2</a>, <a href="https://arxiv.org/abs/2407.08608" target="_blank" rel="noopener">v3</a> (H100) and <a href="https://arxiv.org/abs/2603.05451" target="_blank" rel="noopener">v4</a> (B200). Code: <a href="https://github.com/Dao-AILab/flash-attention" target="_blank" rel="noopener">flash-attention</a>.</p>
+      <p><b>Why this method:</b> exact attention that is faster and fits long sequences; it became the default kernel in PyTorch and most training stacks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>GQA in Llama 3</b> <span class="tag co">🏢 Meta · 2024</span> <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></div>
+      <p><b>How:</b> 8 key/value heads in every model size (8B: 32 query heads; 405B: 128).</p>
+      <p><b>Why this method:</b> in their words, “to improve inference speed and to reduce the size of key-value caches during decoding”.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Multi-head latent attention</b> <span class="tag co">🏢 DeepSeek · 2024</span> <a href="https://arxiv.org/abs/2405.04434" target="_blank" rel="noopener">DeepSeek-V2</a></div>
+      <p><b>How:</b> cache a compressed latent per token instead of per-head K and V; reused in DeepSeek-V3.</p>
+      <p><b>Why this method:</b> KV cache reduced by 93.3% and maximum generation throughput up 5.76× vs DeepSeek 67B.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Multi-query attention</b> <span class="tag hist">📜 History · 2019</span> <a href="https://arxiv.org/abs/1911.02150" target="_blank" rel="noopener">Shazeer: Fast Transformer Decoding: One Write-Head is All You Need</a></div>
+      <p><b>How:</b> one shared K and V for all heads.</p>
+      <p><b>Why this method:</b> decoding speed is limited by memory bandwidth for K and V, so shrink them; GQA (<a href="https://arxiv.org/abs/2305.13245" target="_blank" rel="noopener">Ainslie et al. 2023</a>) later recovered most of the quality.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the fastest memory is the smallest</span>
+    <p>An A100's on-chip SRAM adds up to about 20 MB (192 KB × 108 units), roughly 4,000× smaller than its 80 GB of HBM, but around 10× faster. FlashAttention's whole trick is to treat that 20 MB like a workbench and HBM like a warehouse across town: carry over only what you need, finish the job on the bench, ship back only the result. The paper also proves a lower bound: no exact attention algorithm can asymptotically beat its number of HBM accesses across all SRAM sizes.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Multi-head attention (6.2) is what GQA groups; the causal mask (6.4) is what makes the KV cache valid. Long context (6.11) pushes the KV cache to its limits and adds sliding windows and sinks. MoE (6.10) has the same memory-bound decoding story with even more weights. State-space models avoid the cache altogether (9.3); distributed serving and parallelism are Phase 10. Applied serving (continuous batching, paged attention, vLLM): <a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a>; latency and cost: <a href="../../ai-engineer/phase8/2-cost-latency.html">AI Engineer 8.2</a>. Attention math: <a href="../../math-course/phase8/4-attention.html">math 8.4</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://tridao.me/blog/2024/flash3/" target="_blank" rel="noopener">Tri Dao: FlashAttention-3</a>. How the kernel overlaps memory and math on H100.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/docs/stable/generated/torch.nn.functional.scaled_dot_product_attention.html" target="_blank" rel="noopener">PyTorch: scaled_dot_product_attention</a>. Backends, masks, <code>enable_gqa</code>.</li>
+      <li><span class="kind">Docs</span> <a href="https://huggingface.co/docs/transformers/main/en/kv_cache" target="_blank" rel="noopener">Hugging Face: KV cache strategies</a>. Dynamic, static, quantized and offloaded caches in practice.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A model has 40 layers, 8 K/V heads of dimension 128, and caches in bf16. How much KV cache does one 16,384-token conversation need?</div>
+    <div class="opts"><button class="opt">1.25 GiB</button><button class="opt" data-ok>2.5 GiB</button><button class="opt">20 GiB</button></div>
+    <div class="explain">Per token: 2 × 40 × 8 × 128 × 2 bytes = 163,840 bytes = 160 KiB. × 16,384 tokens = 2,684,354,560 bytes = 2.5 GiB. (1.25 forgets that both K and V are stored; 20 uses 64 heads instead of 8.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your chat service runs fine with short chats, but when users paste long documents, throughput collapses and you hit out-of-memory errors at much smaller batch sizes. The GPU's math units show low utilization. What's the main culprit?</div>
+    <div class="opts"><button class="opt">The attention FLOPs are too high; buy a faster GPU</button><button class="opt" data-ok>The KV cache: it grows with every token of every user, filling memory and limiting the batch; shrink it (GQA/FP8 cache/paging) or cap context</button><button class="opt">The model weights got bigger with long inputs</button></div>
+    <div class="explain">Weights don't change with input length; the per-user KV cache does (e.g. 128 KiB per token for Llama 3 8B). Long documents fill memory, so fewer users fit per batch, and decoding stays memory-bound (low math utilization). Fixes target the cache: GQA/MLA models, FP8 caches, paged allocation, prefix caching, or limiting context.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A colleague says “FlashAttention is fast because it approximates attention with fewer FLOPs.” What's right?</div>
+    <div class="opts"><button class="opt">Correct: it skips small attention weights</button><button class="opt" data-ok>Wrong: it computes exact attention with about the same FLOPs; it's faster because tiling and an online softmax avoid writing and re-reading the n × n matrix in slow HBM</button><button class="opt">Wrong: it's fast because it uses a KV cache</button></div>
+    <div class="explain">FlashAttention is IO-aware, not approximate. It keeps tiles of Q, K, V in fast on-chip SRAM, fuses softmax and P·V with a running max and sum, and never materializes the n × n matrix in HBM. Output equals standard attention up to rounding. The KV cache is a separate (decoding) trick.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Decoding reads every weight for ~2 FLOPs each: ~1 FLOP/byte vs the GPU's ~150, so it's memory-bound. Batching helps until memory runs out.</li>
+      <li>KV cache: store each token's K and V once. Bytes = 2 · layers · kv_heads · head_dim · tokens · batch · bytes/value (Llama 3 8B: 128 KiB/token bf16, 16 GiB at 128k).</li>
+      <li>MQA shares one K/V head; GQA shares one per group (Llama 3: 8 K/V heads); MLA caches a compressed latent (DeepSeek: −93%).</li>
+      <li>FlashAttention: tiles in SRAM + online softmax; exact, O(n) memory, far less HBM traffic. v2, v3 (H100), v4 (B200). Use <code>F.scaled_dot_product_attention</code>.</li>
+      <li>Sparse and linear attention change the model; FlashAttention and the KV cache don't.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const GiB = 2 ** 30;
+  const fmtB = b => b >= GiB ? (b / GiB).toFixed(b >= 100 * GiB ? 0 : 1) + " GiB" : b >= 2 ** 20 ? (b / 2 ** 20).toFixed(1) + " MiB" : (b / 1024).toFixed(1) + " KiB";
+  const fmtN = n => n >= 1e9 ? (n / 1e9).toFixed(2) + "B" : n >= 1e6 ? (n / 1e6).toFixed(1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(0) + "k" : String(Math.round(n));
+  const bar = (el, parts, cap) => {
+    const tot = Math.max(cap, parts.reduce((s, p) => s + p.v, 0));
+    el.innerHTML = parts.map(p => `<i style="width:${100 * p.v / tot}%;background:var(${p.c})"></i>`).join("") + `<span class="cap" style="left:calc(${100 * cap / tot}% - 1px)"></span>`;
+  };
+
+  /* ---------- 1. decode throughput ---------- */
+  const BW = 2.039e12, PEAK = 312e12, NP = 8.03e9, KVT = 131072;   // A100 80GB SXM; Llama 3 8B shape, bf16
+  const CAP = 80 * GiB, base = (() => { const by = NP * 2 + 1024 * KVT; return 1 / Math.max(by / BW, 2 * NP / PEAK); })();
+  function dDraw() {
+    const b = Math.round(Math.pow(2, +$("dB").value)), T = Math.pow(2, +$("dT").value);
+    $("dBV").textContent = b; $("dTV").textContent = fmtN(T);
+    const wB = NP * 2, kB = b * T * KVT, by = wB + kB, fl = b * 2 * NP, t = Math.max(by / BW, fl / PEAK), oom = by > CAP;
+    bar($("dBar"), [{ v: wB, c: "--c-w" }, { v: kB, c: "--c-at" }], CAP);
+    $("dMem").innerHTML = oom ? `<span class="dead">${fmtB(by)} 💥</span>` : fmtB(by);
+    $("dTime").textContent = oom ? "–" : (t * 1e3).toFixed(2) + " ms";
+    $("dTps").textContent = oom ? "out of memory" : Math.round(b / t).toLocaleString();
+    $("dX").textContent = oom ? "–" : (b / t / base).toFixed(0) + "×";
+    $("dU").textContent = oom ? "–" : (100 * fl / PEAK / t).toFixed(0) + "%";
+    if (!oom) { win("gB50", b / t / base >= 50); win("gBusy", fl / PEAK / t >= 0.5); }
+    win("gOom", oom);
+    $("dMsg").textContent = oom ? "The KV caches don't fit next to the weights. Fewer users, shorter chats, or a smaller cache." : by / BW > fl / PEAK ? "Memory-bound: the step time is set by bytes read, so more users are almost free." : "Compute-bound: now the math is the bottleneck.";
+  }
+  $("dB").oninput = dDraw; $("dT").oninput = dDraw; dDraw();
+
+  /* ---------- 2. KV-cache calculator ---------- */
+  const PRE = { k8: { L: 32, H: 32, kv: 8, d: 128, P: 8.03e9, T: 13 }, k70: { L: 80, H: 64, kv: 8, d: 128, P: 70.6e9, T: 17 }, kG3: { L: 96, H: 96, kv: 96, d: 128, P: 175e9, T: 11 } };
+  let gpu = 80, Pn = PRE.k8.P;
+  const kvOpts = H => { const o = []; for (let v = 1; v <= H; v *= 2) if (H % v === 0) o.push(v); if (!o.includes(H)) o.push(H); return o; };
+  function setKV(v) { const o = kvOpts(+$("kH").value); $("kKV").max = o.length - 1; let i = o.indexOf(v); if (i < 0) i = o.length - 1; $("kKV").value = i; }
+  function kDraw() {
+    const L = +$("kL").value, H = +$("kH").value, o = kvOpts(H), kv = o[Math.min(+$("kKV").value, o.length - 1)], d = +$("kD").value;
+    const T = Math.pow(2, +$("kT").value), B = +$("kB").value, wd = +$("kWd").value, kd = +$("kKd").value;
+    $("kLV").textContent = L; $("kHV").textContent = H; $("kKVV").textContent = kv + (kv === H ? " (MHA)" : kv === 1 ? " (MQA)" : " (GQA)"); $("kDV").textContent = d;
+    $("kTV").textContent = fmtN(T); $("kBV").textContent = B;
+    const per = 2 * L * kv * d * kd, kvB = per * T * B, wB = Pn * wd, tot = kvB + wB + GiB, cap = gpu * GiB;
+    bar($("kBar"), [{ v: wB, c: "--c-w" }, { v: kvB, c: "--c-at" }, { v: GiB, c: "--muted" }], cap);
+    $("kPer").textContent = fmtB(per); $("kKV2").textContent = fmtB(kvB); $("kW").textContent = fmtB(wB); $("kTot").textContent = fmtB(tot);
+    const fits = tot <= cap; $("kFit").innerHTML = fits ? `<span class="ev">✅ yes</span>` : `<span class="dead">❌ no</span>`;
+    $("kParams").textContent = `model: ${(Pn / 1e9).toFixed(1)}B params`;
+    win("gOut", kvB > wB);
+    const is8 = Pn === PRE.k8.P && L === 32 && d === 128, is70 = Pn === PRE.k70.P && L === 80 && d === 128;
+    win("g8b", fits && gpu === 24 && is8 && T >= 32768 && B >= 4 && kv >= 8);
+    win("g70", fits && gpu === 80 && is70 && T >= 131072 && kv >= 8);
+    $("kMsg").textContent = fits ? (kvB > wB ? "The cache is now bigger than the model itself." : "") : `Over by ${fmtB(tot - cap)}. Try a smaller number format, fewer K/V heads (needs a model trained that way), a shorter context or a smaller batch.`;
+  }
+  function preset(k) { const p = PRE[k]; Pn = p.P; $("kL").value = p.L; $("kH").value = p.H; setKV(p.kv); $("kD").value = p.d; $("kT").value = p.T; $("kB").value = 1; kDraw(); }
+  ["kL", "kD", "kT", "kB", "kKV"].forEach(id => ($(id).oninput = kDraw));
+  $("kH").oninput = () => { setKV(+$("kH").value); kDraw(); };
+  $("kWd").onchange = kDraw; $("kKd").onchange = kDraw;
+  ["k8", "k70", "kG3"].forEach(k => ($(k).onclick = () => preset(k)));
+  seg("kGpu", v => { gpu = +v; kDraw(); });
+  preset("k8"); $("kT").value = 17; kDraw();
+
+  /* ---------- 3. tiling: standard vs flash ---------- */
+  const D = 64, SRAM = 192 * 1024;
+  let tMode = "std", step = 0, timer = null;
+  const cfg = () => { const n = +$("tN").value, B = +$("tBk").value, T = n / B, G = Math.min(T, 16); return { n, B, T, G }; };
+  // standard: 3 phases over the causal tiles (write S, read S + write P, read P); flash: one sweep over query-tile rows
+  const totalSteps = () => { const { G } = cfg(); return tMode === "std" ? 3 * G : G; };
+  function traffic(s) {
+    const { n, B, T, G } = cfg(), nd = n * D, n2 = n * n / 2;   // causal half of the n×n matrix
+    if (tMode === "std") {
+      const done = Math.min(s, 3 * G), ph = done / G;            // phases: 0..3 (fractional)
+      const p1 = Math.min(ph, 1), p2 = Math.min(Math.max(ph - 1, 0), 1), p3 = Math.min(Math.max(ph - 2, 0), 1);
+      return { r: p1 * 2 * nd + p2 * n2 + p3 * (n2 + nd), w: p1 * n2 + p2 * n2 + p3 * nd, extra: n2 * 2 * 2 };
+    }
+    const f = Math.min(s, G) / G;                                 // each query-tile row reads its Q once and the K/V tiles up to the diagonal
+    return { r: f * (nd + (T + 1) * nd), w: f * nd, extra: 0 };
+  }
+  function tDraw() {
+    const { n, B, T, G } = cfg(), cv = $("tCv"), S = totalSteps();
+    const M = Array.from({ length: G }, (_, r) => Array.from({ length: G }, (_, c) => (c > r ? NaN : 0.08)));
+    if (tMode === "std") {
+      const row = step % G;
+      for (let r = 0; r < G; r++) { const k = [0, 1, 2].filter(p => p * G + r < step).length; for (let c = 0; c <= r; c++) M[r][c] = [0.08, 0.5, 0.75, 1][k]; }
+      NN.heat(cv, M, { lo: 0, hi: 1, color: "--c-at", gap: 2, highlight: step < S ? [row, 0] : null });
+    } else {
+      for (let r = 0; r < Math.min(step, G); r++) for (let c = 0; c <= r; c++) M[r][c] = 0.25;
+      const cur = Math.min(step, G - 1);
+      if (step < G) for (let c = 0; c <= cur; c++) M[cur][c] = 1;
+      NN.heat(cv, M, { lo: 0, hi: 1, color: "--c-at", gap: 2, highlight: step < G ? [cur, cur] : null });
+    }
+    const t = traffic(step), tf = (() => { const a = tMode; tMode = "std"; const x = traffic(1e9); tMode = "flash"; const y = traffic(1e9); tMode = a; return x.r + x.w ? (x.r + x.w) / (y.r + y.w) : 0; })();
+    $("tR").textContent = fmtN(t.r); $("tW").textContent = fmtN(t.w);
+    $("tX").textContent = tMode === "std" ? fmtB(n * n * 2) + " per head" : "0 (O(n) stats only)";
+    const sram = (3 * B * D + B * B) * 2, over = sram > SRAM;
+    $("tS").innerHTML = over ? `<span class="dead">${(sram / 1024).toFixed(0)} KB &gt; 192 KB</span>` : (sram / 1024).toFixed(0) + " KB of 192 KB";
+    $("tRatio").textContent = tf.toFixed(1) + "×";
+    const finished = step >= S;
+    if (finished && tMode === "std") win("gStd", true);
+    if (finished && tMode === "flash" && tf >= 3.5 && !over) win("gFl", true);
+    win("gSram", over);
+    $("tMsg").textContent = over ? "This tile doesn't fit in one unit's SRAM: the kernel can't run like this. Pick a smaller tile." :
+      tMode === "std" ? (finished ? "Done: the score matrix went to HBM and back twice (S, then P)." : ["Phase 1: compute S = QKᵀ and write it to HBM.", "Phase 2: read S, softmax, write P.", "Phase 3: read P and V, write O."][Math.min(2, Math.floor(step / G))]) :
+      finished ? "Done: only Q, K, V were read and O written. No n × n matrix ever touched HBM." : "Gold row: one query tile streams the K/V tiles through SRAM, keeping a running max and sum.";
+    if (finished && timer) { clearInterval(timer); timer = null; $("tPlay").textContent = "▶ Run"; }
+  }
+  const tStop = () => { if (timer) clearInterval(timer); timer = null; $("tPlay").textContent = "▶ Run"; };
+  $("tPlay").onclick = () => { if (timer) return tStop(); if (step >= totalSteps()) step = 0; timer = setInterval(() => { step++; tDraw(); }, 120); $("tPlay").textContent = "⏸ Pause"; };
+  $("tStep").onclick = () => { tStop(); if (step < totalSteps()) step++; tDraw(); };
+  $("tReset").onclick = () => { tStop(); step = 0; tDraw(); };
+  seg("tMode", v => { tMode = v; tStop(); step = 0; tDraw(); });
+  $("tN").onchange = () => { tStop(); step = 0; tDraw(); };
+  $("tBk").onchange = () => { tStop(); step = 0; tDraw(); };
+  tDraw();
+})();
+</script>
+</body>
+</html>

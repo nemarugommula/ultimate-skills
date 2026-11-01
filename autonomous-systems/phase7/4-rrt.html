@@ -1,0 +1,464 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.4 Sampling planners: RRT & RRT* · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  canvas.sim { cursor: crosshair; }
+</style>
+</head>
+<body data-lesson="s7-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 4</div>
+  <h1>Sampling planners: RRT &amp; RRT*</h1>
+  <p class="subtitle">Grids die in high dimensions: a robot arm with six joints would need a trillion cells. So stop building the grid. Throw random darts at the space, grow a tree toward them, and you'll find a path surprisingly fast. Then rewire the tree as you go, and the path keeps getting better.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Grid search</b>: A* expands cells of a grid toward the goal (Lesson 7.2). Its cost grows with the number of cells.</li>
+      <li><b>Configuration space</b>: the list of numbers that pins down the robot. A car in a lot: (x, y, heading) = 3 numbers; a drone: position + yaw = 4; a 6-joint arm: 6 joint angles. Each number is one <b>dimension</b>.</li>
+      <li><b>Random sampling</b>: drawing points uniformly at random from a region. Refresher: <a href="../../math-course/phase4/6-sampling.html">sampling</a> in the Math course.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>You want to plan for a robot arm with 6 joints, and you'd like each joint split into 100 steps, like a fine grid. <b>How many cells is that?</b> A million? A billion? And if your computer checks 10 million cells a second, how long does one search take? Guess, then check the first playground.</p>
+    <p>In 1998 Steven LaValle proposed a way out: the <b>rapidly-exploring random tree</b> (RRT), which never builds the grid at all (<a href="http://msl.cs.uiuc.edu/~lavalle/papers/Lav98c.pdf" target="_blank" rel="noopener">LaValle 1998</a>). In 2011 Karaman and Frazzoli showed that plain RRT's path quality stops improving, and fixed it with <b>RRT*</b>, which provably converges to the shortest path (<a href="https://arxiv.org/abs/1105.1186" target="_blank" rel="noopener">Karaman &amp; Frazzoli</a>). Today OMPL, a library of these planners, is the default planning library in MoveIt, the ROS framework for robot arms (<a href="https://ompl.kavrakilab.org/" target="_blank" rel="noopener">OMPL</a>).</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · The curse of dimensions</span>
+    <p class="hint">Count the cells a grid would need: steps per axis raised to the number of dimensions. Time assumes a fast 10 million cells per second, memory 1 byte per cell.</p>
+    <div class="controls">
+      <label>dimensions <input type="range" id="dims" min="2" max="7" step="1" value="2"> <b class="mono" id="dimsV"></b></label>
+      <label>steps per axis <input type="range" id="steps" min="10" max="100" step="10" value="100"> <b class="mono" id="stepsV"></b></label>
+    </div>
+    <canvas class="chart" id="dimChart" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">cells <b id="dCells">–</b></div>
+      <div class="stat">one full sweep <b id="dTime">–</b></div>
+      <div class="stat">memory <b id="dMem">–</b></div>
+      <div class="stat">example <b id="dEx">–</b></div>
+    </div>
+    <div class="verdict" id="dVerdict"></div>
+    <p class="hint">🏆 <b>Mini-challenge:</b> at a coarse <b>20 steps per axis</b>, what's the most dimensions you can sweep in <b>under 1 second</b>?</p>
+  </div>
+
+  <h2>The RRT idea, in four lines</h2>
+  <ol>
+    <li><b>Sample</b> a random point in the space (sometimes, with probability called the <b>goal bias</b>, just pick the goal).</li>
+    <li><b>Nearest</b>: find the tree node closest to that point.</li>
+    <li><b>Steer</b>: take one step of at most <span class="ct">η</span> (the step size) from that node toward the point.</li>
+    <li><b>Check and add</b>: if the little segment is collision-free, add the new node, with the old one as its parent. Stop when a node lands near the goal.</li>
+  </ol>
+  <p>Why does such a dumb rule explore well? Because the nodes most likely to be “nearest” to a random point are those on the frontier, next to big empty regions: a big empty area catches more random darts. The tree is pulled outward into unexplored space, like roots growing toward water. That's the “rapidly exploring” part.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: one RRT step by hand</span>
+    <p>Tree so far: <b>A</b> = (2, 9) (the start) and <b>B</b> = (3.5, 9). Step size <span class="ct">η</span> = 1.5 m. A random sample lands at <b>S</b> = (6.5, 13).</p>
+    <ol>
+      <li><b>Nearest</b>: distance A→S = √(4.5² + 4²) = 6.02; B→S = √(3² + 4²) = <b>5.00</b>. B wins.</li>
+      <li><b>Steer</b>: direction B→S = (3, 4) ÷ 5 = (0.6, 0.8). One step: B + 1.5 × (0.6, 0.8) = <b>(4.4, 10.2)</b>.</li>
+      <li><b>Check</b>: test points along B → (4.4, 10.2) against obstacles (the playgrounds check every 0.15 m). Free? Add node C = (4.4, 10.2) with parent B. Its cost-from-start is 1.5 + 1.5 = <b>3.0 m</b>.</li>
+      <li><b>RRT* extra</b>: look at all nodes within a radius of C. If one offers a cheaper route to C (cost to it + distance to C), make it C's parent instead. Then, for each neighbour, if going <i>through</i> C is cheaper for it, re-parent the neighbour to C: that's <b>rewiring</b>.</li>
+    </ol>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Sampling planners replace “check every cell” with “check random points and the segments between them”. The work grows with the number of samples you take, not with how many cells a grid would have, so the same 30-line algorithm plans for a 2D robot, a 4D drone or a 7-joint arm. <b>RRT</b> finds <i>a</i> path quickly (and, given enough samples, will find one if it exists: <b>probabilistic completeness</b>). <b>RRT*</b> keeps improving it toward the shortest (<b>asymptotic optimality</b>).
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: exploring a dark cave with a ball of string</span>
+    <p>You can't map the whole cave first. So you pick a random direction, walk a few steps from the nearest point you've already reached, and tie a string there. Do it again and again, and the strings spread into every open chamber, fastest into the biggest ones. When one string reaches daylight, follow it back: that's your path. RRT* is a tidier explorer who, every time they tie a new string, checks whether nearby strings could be shortened by re-tying them through the new knot.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Draw a map: RRT vs RRT* vs A*</span>
+    <p class="hint">Paint obstacles by dragging on the map (circles, 0.6 m), or pick a preset. Then grow a tree. <b class="be">Purple</b> = the tree, <b class="pl">teal</b> = the best path found so far, <b class="ct">orange</b> = grid A* on a 0.5 m grid (for comparison). The chart shows path length vs samples for both RRT and RRT* on your map; the robot is a 0.6 m wide disc.</p>
+    <canvas class="sim" id="rrtW"></canvas>
+    <div class="controls">
+      <span class="seg" id="brushSeg"><button id="bPaint" class="on">🖌️ paint</button><button id="bErase">🧽 erase</button></span>
+      <button class="btn small" id="mForest">🌲 Forest</button>
+      <button class="btn small" id="mWall">🧱 Wall with a gap</button>
+      <button class="btn small" id="mClear">⬜ Clear</button>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="goRRT">▶ Grow RRT</button>
+      <button class="btn primary" id="goStar">▶ Grow RRT*</button>
+      <button class="btn" id="goA">▦ Grid A*</button>
+      <button class="btn" id="reseed">🎲 New random seed</button>
+    </div>
+    <div class="controls">
+      <label>samples <input type="range" id="nIt" min="250" max="3000" step="250" value="1500"> <b class="mono" id="nItV"></b></label>
+      <label>step <span class="ct">η</span> <input type="range" id="eta" min="0.5" max="3" step="0.25" value="1.5"> <b class="mono" id="etaV"></b></label>
+      <label>goal bias <input type="range" id="bias" min="0" max="0.5" step="0.05" value="0.05"> <b class="mono" id="biasV"></b></label>
+    </div>
+    <canvas class="chart" id="costChart" style="height:210px"></canvas>
+    <div class="stat-row">
+      <div class="stat">samples so far <b id="sIt">–</b></div>
+      <div class="stat">first path at sample <b id="sFirst">–</b></div>
+      <div class="stat">best path <b id="sBest">–</b></div>
+      <div class="stat">grid A* path · cells checked <b id="sA">–</b></div>
+    </div>
+    <div class="verdict" id="ch2"></div>
+    <p class="hint">🏆 <b>Challenge: beat grid A*.</b> Get a sampled path that's <b>shorter than A*'s</b> on the Forest map. Plain RRT usually can't: its first path is wiggly and it never gets better. Who can?</p>
+  </div>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> on the chart, RRT's line goes flat right after its first path, while RRT*'s keeps falling. Why does plain RRT <i>never</i> improve, even with 10× more samples?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">Because a node's parent is fixed forever: the first wiggly branch that reached the goal stays wiggly. New samples only add new branches; nothing goes back and straightens the old ones. Karaman and Frazzoli proved that, under mild conditions, RRT's path cost converges to a <b>non-optimal</b> value with probability one. RRT* fixes it by choosing the best parent among nearby nodes and rewiring neighbours through each new node, at a constant-factor extra cost.</div>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Grid search is exact but its size is steps<sup>dimensions</sup>. A 2D floor at 100 steps per axis is 10,000 cells; a 6-joint arm at the same resolution is 10<sup>12</sup>: about 28 hours for one sweep at 10 million cells a second, and a terabyte of memory.</li>
+      <li><b>What people tried.</b> <i>Coarser grids</i> (miss narrow gaps, Lesson 7.2). <i>Potential fields</i>: obstacles push, the goal pulls (fast, but gets stuck in local minima). <b>Probabilistic roadmaps</b> (PRM): sample many free points, connect neighbours into a graph once, then run A* on it for every query (great when the world doesn't change).</li>
+      <li><b>Why this works.</b> RRT only ever checks the points it samples and the short segments between them, so the cost doesn't depend on a grid's size. On this lesson's Forest map, RRT typically finds a path within about 100 samples (a few milliseconds), and RRT* drives it from ~35 m toward ~28.1 m, beating the 0.5 m grid A*'s 29.2 m, because it isn't stuck with 45° moves.</li>
+      <li><b>What it costs, when it fails.</b> Results are random: different seeds give different paths. RRT's paths are jagged and never improve; RRT* is slower per sample (neighbour search and rewiring). <b>Narrow passages</b> are the classic failure: the chance that a random sample lands inside a thin gap is tiny (Playground 3). And it plans a geometric path; a car's turning limits or a drone's dynamics need extra care (steering with real motion models, or smoothing afterwards).</li>
+      <li><b>What came next.</b> <b>RRT-Connect</b> grows two trees, from start and goal, and is OMPL's go-to for arms; <b>Informed RRT*</b> and <b>BIT*</b> focus samples where a shorter path could still be; <b>kinodynamic</b> RRTs steer with real motion models; smarter samplers (bridge tests, learned samplers) target narrow passages.</li>
+    </ol>
+  </div>
+
+  <h2>The narrow-passage problem</h2>
+  <p>Imagine a 1 m door in a 32 × 18 m room. A uniform sample lands inside the doorway with probability roughly (door area) ÷ (room area), well under 1%, and it has to land there <i>when the tree is next to it</i>. Every robot planner fights this. One elegant fix is the <b>bridge test</b>: pick a point that's <i>inside</i> an obstacle, pick a second one nearby that's also inside an obstacle, and keep their midpoint if it's free. Midpoints between two walls are, by construction, in gaps.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Thread the needle</span>
+    <p class="hint">A wall splits the room, with one gap near the top. Each press runs RRT <b>20 times</b> with different seeds and reports the average number of samples until the first path (capped at 5,000). Mix in bridge-test samples and see what happens. The canvas shows the last run's tree.</p>
+    <canvas class="sim" id="npW"></canvas>
+    <div class="controls">
+      <label>gap width <input type="range" id="gap" min="0.8" max="4" step="0.2" value="1"> <b class="mono" id="gapV"></b></label>
+      <label>bridge-test samples <input type="range" id="bridge" min="0" max="0.75" step="0.25" value="0"> <b class="mono" id="bridgeV"></b></label>
+      <button class="btn primary" id="npRun">▶ Run 20 trials</button>
+      <button class="btn" id="npSweep">📈 Sweep gap widths</button>
+    </div>
+    <canvas class="chart" id="npChart" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">average samples to a path <b id="npMean">–</b></div>
+      <div class="stat">worst of 20 <b id="npMax">–</b></div>
+      <div class="stat">failed (5,000 samples) <b id="npFail">–</b></div>
+    </div>
+    <div class="verdict" id="ch3"></div>
+    <p class="hint">🏆 <b>Challenge:</b> with the gap at <b>1.0 m</b>, get the average below <b>600 samples</b>. (Plain uniform sampling needs about 1,100.) Then try goal bias in Playground 2's “Wall with a gap” map: does steering toward the goal help when the gap isn't on the way?</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>OMPL</b> (the Open Motion Planning Library) is the standard: RRT, RRT-Connect, RRT*, Informed RRT*, BIT*, PRM and many more, with C++ and Python bindings. It deliberately contains no collision checker or visualization; you plug in your own validity function. <b>MoveIt</b> uses it for arms; you can call it directly for anything else.</p>
+<pre><code><span class="c"># pip install ompl   (Python bindings for OMPL)</span>
+<span class="k">from</span> ompl <span class="k">import</span> base <span class="k">as</span> ob, geometric <span class="k">as</span> og
+
+trees = [(<span class="n">10.0</span>, <span class="n">9.0</span>, <span class="n">1.5</span>), (<span class="n">18.0</span>, <span class="n">6.0</span>, <span class="n">1.2</span>)]          <span class="c"># (x, y, radius) obstacles</span>
+<span class="k">def</span> is_free(state):
+    x, y = state[<span class="n">0</span>], state[<span class="n">1</span>]
+    <span class="k">return</span> all((x - cx) ** <span class="n">2</span> + (y - cy) ** <span class="n">2</span> &gt; (r + <span class="n">0.3</span>) ** <span class="n">2</span> <span class="k">for</span> cx, cy, r <span class="k">in</span> trees)
+
+space = ob.RealVectorStateSpace(<span class="n">2</span>)
+bounds = ob.RealVectorBounds(<span class="n">2</span>)
+bounds.setLow(<span class="n">0</span>, <span class="n">0.0</span>); bounds.setHigh(<span class="n">0</span>, <span class="n">32.0</span>); bounds.setLow(<span class="n">1</span>, <span class="n">0.0</span>); bounds.setHigh(<span class="n">1</span>, <span class="n">18.0</span>)
+space.setBounds(bounds)
+ss = og.SimpleSetup(space)
+ss.setStateValidityChecker(is_free)
+start, goal = space.allocState(), space.allocState()
+start[<span class="n">0</span>], start[<span class="n">1</span>], goal[<span class="n">0</span>], goal[<span class="n">1</span>] = <span class="n">2.0</span>, <span class="n">9.0</span>, <span class="n">30.0</span>, <span class="n">9.0</span>
+ss.setStartAndGoalStates(start, goal)
+ss.setPlanner(og.RRTstar(ss.getSpaceInformation()))   <span class="c"># or og.RRTConnect, og.InformedRRTstar, og.BITstar</span>
+<span class="k">if</span> ss.solve(<span class="n">1.0</span>):                                     <span class="c"># plan for up to 1 second</span>
+    ss.simplifySolution()
+    print(ss.getSolutionPath())</code></pre>
+    <p class="hint">RRT* is <i>anytime</i>: the longer you let <code>solve</code> run, the shorter the path. On a robot you pick a time budget per replanning cycle, exactly the trade-off on Playground 2's chart.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🛸 Drones &amp; arms</h4><p>Sampling planners shine where the space has many dimensions or full 3D: drone flights through forests and buildings, and robot arms (OMPL is MoveIt's default planning library). Skydio describes its Pathfinder as autonomously planning “the best flight path” while factoring terrain, buildings, geofences, flight policies and airspace rules; it doesn't publish which algorithm. PX4's own built-in feature, Collision Prevention, only slows and stops near obstacles; planning around them runs on a companion computer (PX4's older ROS avoidance planners are archived).</p>
+        <p class="src">Sources: <a href="https://www.skydio.com/autonomy" target="_blank" rel="noopener">Skydio Autonomy</a>, <a href="https://docs.px4.io/main/en/computer_vision/collision_prevention.html" target="_blank" rel="noopener">PX4 Collision Prevention</a>, <a href="https://github.com/PX4/PX4-Avoidance" target="_blank" rel="noopener">PX4-Avoidance (archived)</a>, <a href="https://ompl.kavrakilab.org/" target="_blank" rel="noopener">OMPL</a></p></div>
+      <div><h4>🚘 Tesla</h4><p>Tesla's publicly described planner (AI Day 2021) is a <b>tree search</b> too, but not uniform random sampling: a neural network proposes promising maneuvers and a Monte Carlo tree search expands them (288 nodes on the parking-lot example). That's the same “grow a tree, keep the good branches” idea, with learned sampling instead of random darts.</p>
+        <p class="src">Sources: <a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo hasn't published using RRT-style planners on its cars. Road driving is structured: lanes give a natural coordinate system, so sampling is usually done along the road (lateral offsets and speeds, Lesson 7.5) rather than uniformly in space. Uniform random trees fit open, unstructured spaces better than lanes.</p>
+        <p class="src">Sources: <a href="https://waymo.com/research/" target="_blank" rel="noopener">Waymo research</a> (no RRT planner published)</p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> a drone or an arm lives in open, high-dimensional space with no lanes, where random sampling is the natural way to explore. Cars live on roads, where structure (lanes, rules) gives better samples than randomness, so they sample along the road or learn where to look. RRT's randomness is also harder to certify for a car: two runs can give two different paths.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Grid A*</td><td>Deterministic; optimal on its grid</td><td>Size explodes with dimensions; 45° kinks; loses narrow gaps at coarse resolution</td></tr>
+      <tr><td>RRT</td><td>Fast first path in any dimension; tiny code</td><td>Jagged; never improves; random</td></tr>
+      <tr><td>RRT*</td><td>Keeps improving toward optimal (anytime)</td><td>Slower per sample; still random; still needs smoothing for cars</td></tr>
+      <tr><td>Higher goal bias</td><td>Faster in open space</td><td>Drives the tree into walls when the gap isn't toward the goal</td></tr>
+      <tr><td>Bigger step η</td><td>Covers space faster</td><td>Misses thin gaps; more failed collision checks</td></tr>
+      <tr><td>PRM (roadmap)</td><td>Reuse one graph for many queries</td><td>Wasteful if the world keeps changing</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“When would you use RRT instead of A*?” A strong answer:</p>
+    <ul>
+      <li>High-dimensional or continuous spaces (arms, drones in 3D, car poses with dynamics), where a grid is too big; A* when the space is small and 2D and you want determinism.</li>
+      <li>Explains the loop (sample, nearest, steer, collision-check) and <b>probabilistic completeness</b> vs RRT*'s <b>asymptotic optimality</b> (choose-parent + rewire).</li>
+      <li>Knows the knobs and failure modes: step size, goal bias, narrow passages, the cost of nearest-neighbour search (k-d trees), and that output needs smoothing or a kinodynamic steer function.</li>
+      <li>Names practical variants: RRT-Connect (bidirectional), Informed RRT*, BIT*, PRM for multi-query; and OMPL/MoveIt as the tools.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The original RRT</b> <span class="tag hist">📜 History · 1998</span> <a href="http://msl.cs.uiuc.edu/~lavalle/papers/Lav98c.pdf" target="_blank" rel="noopener">LaValle, tech report TR 98-11</a></div>
+      <p><b>How:</b> grow a tree by extending the nearest node toward random samples.</p>
+      <p><b>Why this method:</b> designed for problems with nonholonomic and dynamic constraints, where exact grids and roadmaps were impractical.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>RRT* and PRM*</b> <span class="tag res">🧪 Research · 2011</span> <a href="https://arxiv.org/abs/1105.1186" target="_blank" rel="noopener">Karaman &amp; Frazzoli, IJRR</a></div>
+      <p><b>How:</b> connect each new node to its best nearby parent and rewire neighbours, within a radius shrinking like √(log n / n) in 2D.</p>
+      <p><b>Why this method:</b> proved that RRT's cost converges to a non-optimal value, and that the * versions converge to the optimum at a constant-factor extra cost.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>OMPL in MoveIt</b> <span class="tag oss">🧰 Open source</span> <a href="https://ompl.kavrakilab.org/" target="_blank" rel="noopener">ompl.kavrakilab.org</a></div>
+      <p><b>How:</b> a library of sampling planners (RRT-Connect, RRT*, Informed RRT*, BIT*, PRM…) used as MoveIt's default; you supply the collision checker.</p>
+      <p><b>Why this method:</b> robot arms have 6–7 joints; sampling makes them plannable in fractions of a second.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Skydio Pathfinder</b> <span class="tag co">🏢 Company · 2026</span> <a href="https://www.skydio.com/autonomy" target="_blank" rel="noopener">skydio.com/autonomy</a></div>
+      <p><b>How:</b> plans and executes a flight path to a destination considering terrain, buildings, geofences, flight policies and airspace rules (algorithm not published).</p>
+      <p><b>Why this method:</b> 3D routes for drone-as-first-responder missions must be planned automatically, quickly and within rules.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a robot arm with 150 joints</span>
+    <p>OMPL's own homepage shows a parallel manipulator with <b>over 150 degrees of freedom</b> (150 numbers to choose at once) for which feasible motions “can still be computed in seconds” (<a href="https://ompl.kavrakilab.org/" target="_blank" rel="noopener">OMPL</a>). A grid with just 10 steps per axis would need 10<sup>150</sup> cells: about 10<sup>70</sup> times the number of atoms in the observable universe (roughly 10<sup>80</sup>).</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>RRT trades Lesson 7.2's systematic grid for random samples; Lesson 7.3's Hybrid A* and this lesson both aim for drivable paths in continuous space, one by search over primitives, one by sampling. Lesson 7.5 samples too, but along the road (lateral offsets, speeds), and 7.7 smooths and optimizes whatever comes out. Drone autonomy (8.8) uses these ideas in 3D. The random sampling at the core is Monte Carlo: see <a href="../../math-course/phase4/6-sampling.html">sampling</a> in the Math course; growing a tree of choices and keeping good branches is also the heart of <a href="../../rl-course/phase6/3b-mcts.html">MCTS</a> in the RL course.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1105.1186" target="_blank" rel="noopener">Karaman &amp; Frazzoli: Sampling-based Algorithms for Optimal Motion Planning</a>. Why RRT isn't optimal and RRT* is.</li>
+      <li><span class="kind">Docs</span> <a href="https://ompl.kavrakilab.org/planners.html" target="_blank" rel="noopener">OMPL: available planners</a>. A guided tour of the sampling-planner zoo.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/AtsushiSakai/PythonRobotics" target="_blank" rel="noopener">PythonRobotics</a>. RRT, RRT*, Informed RRT* and more, animated.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A drone planner uses (x, y, z, yaw) with 50 steps per axis. How many cells would a grid need?</div>
+    <div class="opts"><button class="opt">200</button><button class="opt">125,000</button><button class="opt" data-ok>6.25 million</button></div>
+    <div class="explain">50<sup>4</sup> = 50 × 50 × 50 × 50 = <b>6,250,000</b>. Manageable in memory, but add speed (4 more numbers for velocities and yaw rate) and it's 50<sup>8</sup> ≈ 3.9 × 10<sup>13</sup>: that's where sampling takes over.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your RRT finds paths quickly in open areas but often needs thousands of samples to get through a doorway. Raising the goal bias from 5% to 30% made it worse. Why?</div>
+    <div class="opts"><button class="opt">Goal bias always slows RRT</button><button class="opt" data-ok>The doorway isn't on the straight line to the goal, so goal-biased samples pull the tree into the wall; you need samples near the gap (e.g., a bridge test) instead</button><button class="opt">The step size is too small</button></div>
+    <div class="explain">Goal bias helps when the way is open toward the goal and hurts when the route detours. Narrow passages need more samples <i>inside</i> them: bridge tests, obstacle-boundary samplers, or bidirectional trees that approach from both sides.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You give RRT and RRT* the same 3,000 samples on the same map and seed. Which statement is true?</div>
+    <div class="opts"><button class="opt">They return the same path, since they saw the same samples</button><button class="opt" data-ok>RRT* returns an equal or shorter path at a higher cost per sample, because it chooses better parents and rewires neighbours</button><button class="opt">RRT is guaranteed to find a path first</button></div>
+    <div class="explain">Both grow from the same samples, but RRT* reconnects nodes through cheaper routes as it goes, so its best path keeps shrinking. The price is the neighbour search and extra collision checks for every new node.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Grids cost steps<sup>dimensions</sup>: 10<sup>12</sup> cells for a 6-joint arm at 100 steps. Sampling avoids building the grid.</li>
+      <li>RRT: sample, nearest, steer by η, collision-check, add. Fast first path; probabilistically complete; never improves.</li>
+      <li>RRT*: choose the best nearby parent and rewire; converges toward the optimum (beat the 0.5 m grid A* in Playground 2).</li>
+      <li>Goal bias helps in the open, hurts in detours; narrow passages need smarter samples (bridge test: ~1,100 → ~500 samples for a 1 m gap here).</li>
+      <li>OMPL/MoveIt for arms and drones; cars prefer road-aligned sampling (7.5) or learned tree search (Tesla's AI Day demo).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+  const segOn = (segId, btnId) => $(segId).querySelectorAll("button").forEach(b => b.classList.toggle("on", b.id === btnId));
+
+  // ---------- Playground 1: curse of dimensions ----------
+  const EX = { 2: "a floor plan (x, y)", 3: "a car in a lot (x, y, heading)", 4: "a drone (x, y, z, yaw)", 5: "a 5-joint arm", 6: "a 6-joint industrial arm", 7: "a 7-joint arm (most cobots)" };
+  const human = s => s < 1 ? fmt(1000 * s, 1) + " ms" : s < 120 ? fmt(s, 1) + " s" : s < 7200 ? fmt(s / 60, 0) + " min" : s < 172800 ? fmt(s / 3600, 1) + " h" : s < 63e6 ? fmt(s / 86400, 0) + " days" : (s / 3.15e7).toExponential(1) + " years";
+  const bytes = b => b < 1e6 ? fmt(b / 1e3, 1) + " kB" : b < 1e9 ? fmt(b / 1e6, 1) + " MB" : b < 1e12 ? fmt(b / 1e9, 1) + " GB" : fmt(b / 1e12, 1) + " TB" + (b > 1e15 ? " (!)" : "");
+  function dimDraw() {
+    const d = +$("dims").value, n = +$("steps").value, cells = Math.pow(n, d), t = cells / 1e7;
+    $("dimsV").textContent = d; $("stepsV").textContent = n;
+    $("dCells").textContent = cells < 1e7 ? cells.toLocaleString() : cells.toExponential(1); $("dTime").textContent = human(t); $("dMem").textContent = bytes(cells); $("dEx").textContent = EX[d];
+    Plot.line($("dimChart"), { series: [
+      { label: "log₁₀(cells) for your steps per axis", color: MX.css("--c-ag"), data: [2, 3, 4, 5, 6, 7].map(k => [k, k * Math.log10(n)]), width: 3, dots: true },
+      { label: "1 second at 10M cells/s", color: MX.css("--c-mp"), data: [[2, 7], [7, 7]], width: 2, dash: [6, 4] },
+    ], xMin: 2, xMax: 7, yMin: 0, yMax: 14, xLabel: "dimensions", yLabel: "log₁₀ cells" });
+    const best20 = [2, 3, 4, 5, 6, 7].filter(k => Math.pow(20, k) / 1e7 < 1).pop();
+    $("dVerdict").innerHTML = n === 20 && d === best20 ? `<span class="badge-win">✅ ${d} dimensions: ${Math.pow(20, d).toLocaleString()} cells in ${human(t)}. One more and it's ${human(Math.pow(20, d + 1) / 1e7)}.</span>` :
+      n === 20 && t < 1 ? `<span class="badge-lose">Under a second; can you add a dimension?</span>` : n === 20 ? `<span class="badge-lose">${human(t)}: too slow</span>` : "";
+  }
+  ["dims", "steps"].forEach(id => ($(id).oninput = dimDraw)); dimDraw();
+
+  // ---------- shared geometry ----------
+  const WD = 32, HT = 18, RAD = 0.3;
+  const hit = (obs, x, y, r) => { for (const o of obs) { if (o.type === "circle") { if ((x - o.x) ** 2 + (y - o.y) ** 2 <= (o.r + r) ** 2) return true; } else { const cx = Math.max(o.x, Math.min(x, o.x + o.w)), cy = Math.max(o.y, Math.min(y, o.y + o.h)); if ((x - cx) ** 2 + (y - cy) ** 2 <= r * r) return true; } } return false; };
+  const segFree = (obs, a, b) => { const L = Math.hypot(b[0] - a[0], b[1] - a[1]), n = Math.max(1, Math.ceil(L / 0.15)); for (let k = 0; k <= n; k++) { const x = a[0] + (b[0] - a[0]) * k / n, y = a[1] + (b[1] - a[1]) * k / n; if (x < 0 || y < 0 || x > WD || y > HT || hit(obs, x, y, RAD)) return false; } return true; };
+  function makeTree(o) { return { o, X: [o.start[0]], Y: [o.start[1]], P: [-1], C: [0], R: Sim.rng(o.seed), n: 1, best: Infinity, bestIdx: -1, it: 0, firstAt: null, hist: [] }; }
+  function stepTree(T) {
+    const o = T.o, R = T.R; T.it++;
+    let sx, sy; if (R() < o.bias) { sx = o.goal[0]; sy = o.goal[1]; } else { sx = R() * WD; sy = R() * HT; }
+    let nb = 0, nd = Infinity; for (let i = 0; i < T.n; i++) { const d = (T.X[i] - sx) ** 2 + (T.Y[i] - sy) ** 2; if (d < nd) { nd = d; nb = i; } }
+    nd = Math.sqrt(nd); if (nd < 1e-9) { T.hist.push(T.best); return; }
+    const k = Math.min(1, o.eta / nd), nx = T.X[nb] + (sx - T.X[nb]) * k, ny = T.Y[nb] + (sy - T.Y[nb]) * k;
+    if (!segFree(o.obs, [T.X[nb], T.Y[nb]], [nx, ny])) { T.hist.push(T.best); return; }
+    let par = nb, c = T.C[nb] + Math.hypot(nx - T.X[nb], ny - T.Y[nb]); const near = [];
+    if (o.star) {
+      const rr = Math.min(o.eta * 2, 3.6 * Math.sqrt(WD * HT / Math.PI) * Math.sqrt(Math.log(T.n + 1) / (T.n + 1)));
+      for (let i = 0; i < T.n; i++) { const d = Math.hypot(T.X[i] - nx, T.Y[i] - ny); if (d <= rr) near.push([i, d]); }
+      for (const [i, d] of near) if (T.C[i] + d < c && segFree(o.obs, [T.X[i], T.Y[i]], [nx, ny])) { c = T.C[i] + d; par = i; }
+    }
+    const id = T.n++; T.X.push(nx); T.Y.push(ny); T.P.push(par); T.C.push(c);
+    if (o.star) for (const [i, d] of near) if (i !== par && c + d < T.C[i] && segFree(o.obs, [nx, ny], [T.X[i], T.Y[i]])) {
+      const dc = c + d - T.C[i]; T.P[i] = id; const stack = [i];
+      while (stack.length) { const j = stack.pop(); T.C[j] += dc; for (let m = 0; m < T.n; m++) if (T.P[m] === j) stack.push(m); } }
+    const gd = Math.hypot(nx - o.goal[0], ny - o.goal[1]);
+    if (gd <= 1 && T.C[id] + gd < T.best) { T.best = T.C[id] + gd; T.bestIdx = id; if (T.firstAt == null) T.firstAt = T.it; }
+    if (o.star && T.bestIdx >= 0) { let b = Infinity, bi = -1; for (let i = 0; i < T.n; i++) { const d = Math.hypot(T.X[i] - o.goal[0], T.Y[i] - o.goal[1]); if (d <= 1 && T.C[i] + d < b) { b = T.C[i] + d; bi = i; } } T.best = b; T.bestIdx = bi; }
+    T.hist.push(T.best);
+  }
+  const pathOf = T => { const p = [[...T.o.goal]]; for (let i = T.bestIdx; i >= 0; i = T.P[i]) p.push([T.X[i], T.Y[i]]); return p.reverse(); };
+  function gridAstar(obs, start, goal) { // 8-connected A* on a 0.5 m grid (cells blocked if their center is within the robot radius of an obstacle)
+    const res = 0.5, nx = 64, ny = 36, G = new Uint8Array(nx * ny); for (let j = 0; j < ny; j++) for (let i = 0; i < nx; i++) G[i + nx * j] = hit(obs, (i + 0.5) * res, (j + 0.5) * res, RAD) ? 1 : 0;
+    const s = Math.floor(start[0] / res) + nx * Math.floor(start[1] / res), g = Math.floor(goal[0] / res) + nx * Math.floor(goal[1] / res); G[s] = 0; G[g] = 0;
+    const cost = new Float64Array(nx * ny).fill(Infinity), prev = new Int32Array(nx * ny).fill(-1), closed = new Uint8Array(nx * ny), heap = [];
+    const gx = g % nx, gy = (g / nx) | 0, h = i => { const dx = Math.abs(i % nx - gx), dy = Math.abs(((i / nx) | 0) - gy); return Math.max(dx, dy) + 0.41421356 * Math.min(dx, dy); };
+    const push = e => { heap.push(e); let k = heap.length - 1; while (k > 0) { const p = (k - 1) >> 1; if (heap[p][0] <= e[0]) break; [heap[p], heap[k]] = [heap[k], heap[p]]; k = p; } };
+    const pop = () => { const t = heap[0], l = heap.pop(); if (heap.length) { heap[0] = l; let k = 0; for (;;) { const a = 2 * k + 1, b = a + 1; let m = k; if (a < heap.length && heap[a][0] < heap[m][0]) m = a; if (b < heap.length && heap[b][0] < heap[m][0]) m = b; if (m === k) break; [heap[m], heap[k]] = [heap[k], heap[m]]; k = m; } } return t; };
+    cost[s] = 0; push([h(s), s]); let exp = 0;
+    while (heap.length) { const i = pop()[1]; if (closed[i]) continue; closed[i] = 1; exp++; if (i === g) break; const x = i % nx, y = (i / nx) | 0;
+      for (let dy = -1; dy <= 1; dy++) for (let dx = -1; dx <= 1; dx++) { if (!dx && !dy) continue; const X = x + dx, Y = y + dy; if (X < 0 || Y < 0 || X >= nx || Y >= ny) continue; const j = X + nx * Y; if (G[j] || closed[j]) continue;
+        if (dx && dy && (G[x + dx + nx * y] || G[x + nx * (y + dy)])) continue; const c = cost[i] + Math.hypot(dx, dy); if (c < cost[j]) { cost[j] = c; prev[j] = i; push([c + h(j), j]); } } }
+    if (prev[g] < 0) return { len: Infinity, exp, path: null };
+    const path = []; for (let i = g; i !== -1; i = prev[i]) path.push([((i % nx) + 0.5) * res, (((i / nx) | 0) + 0.5) * res]); path.reverse();
+    return { len: cost[g] * res, exp, path };
+  }
+
+  // ---------- Playground 2: draw, grow, compare ----------
+  const START = [2, 9], GOAL = [30, 9];
+  const forest = () => { const R = Sim.rng(9), o = []; for (let k = 0; k < 16; k++) o.push({ type: "circle", x: 6 + R() * 20, y: 2 + R() * 14, r: 0.7 + R() * 0.8 }); return o; };
+  const wallGap = () => [{ type: "rect", x: 15, y: 0, w: 1.0, h: 13.5 }, { type: "rect", x: 15, y: 14.5, w: 1.0, h: 3.5 }];
+  let obs2 = forest(), brush = "paint", seed2 = 1, tree = null, other = null, astar = null, mode = null;
+  const W2 = new Sim($("rrtW"), { xRange: [0, WD], yRange: [0, HT], onPointer(type, p) {
+    if (type !== "down" && type !== "drag") return; if (Math.hypot(p[0] - START[0], p[1] - START[1]) < 1.5 || Math.hypot(p[0] - GOAL[0], p[1] - GOAL[1]) < 1.5) return;
+    if (brush === "paint") { if (!obs2.some(o => o.type === "circle" && Math.hypot(o.x - p[0], o.y - p[1]) < 0.5)) obs2.push({ type: "circle", x: p[0], y: p[1], r: 0.6 }); }
+    else obs2 = obs2.filter(o => o.type === "circle" ? Math.hypot(o.x - p[0], o.y - p[1]) > o.r + 0.4 : !(p[0] > o.x - 0.4 && p[0] < o.x + o.w + 0.4 && p[1] > o.y - 0.4 && p[1] < o.y + o.h + 0.4));
+    resetRun(); } });
+  W2.render(w => {
+    w.clear(); w.obstacles(obs2, { color: "--muted", alpha: 0.75 });
+    if (tree) { for (let i = 1; i < tree.n; i++) { const p = tree.P[i]; w.line([[tree.X[p], tree.Y[p]], [tree.X[i], tree.Y[i]]], { color: "--c-be", width: 1, alpha: 0.5 }); }
+      if (tree.bestIdx >= 0) w.line(pathOf(tree), { color: "--c-pl", width: 4 }); }
+    if (astar && astar.path) w.line(astar.path, { color: "--c-ct", width: 2.5, dash: [6, 4] });
+    w.circle(START[0], START[1], 0.45, { fill: "--c-be" }); w.circle(GOAL[0], GOAL[1], 1, { stroke: "--c-pl", width: 2, dash: [4, 3] }); w.dot(GOAL, { color: "--c-pl", r: 4 });
+    w.text([START[0], START[1] - 1.2], "start", { color: "--muted", size: 11 }); w.text([GOAL[0], GOAL[1] - 1.6], "goal", { color: "--muted", size: 11 });
+  });
+  const opts2 = star => ({ obs: obs2, start: START, goal: GOAL, star, eta: +$("eta").value, bias: +$("bias").value, seed: seed2 });
+  function labels2() { $("nItV").textContent = $("nIt").value; $("etaV").textContent = fmt(+$("eta").value, 2) + " m"; $("biasV").textContent = fmt(100 * +$("bias").value, 0) + "%"; }
+  function resetRun() { W2.stop(); tree = null; other = null; mode = null; astar = gridAstar(obs2, START, GOAL); chart2(); stats2(); W2.render(); }
+  function chart2() {
+    const N = +$("nIt").value, series = [];
+    const add = (T, label, color) => { if (T) series.push({ label, color, data: T.hist.map((c, i) => [i + 1, isFinite(c) ? c : null]).filter(p => p[1] != null), width: 2.5 }); };
+    if (tree && other) { const r = tree.o.star ? other : tree, s = tree.o.star ? tree : other; add(r, "RRT", MX.css("--c-be")); add(s, "RRT*", MX.css("--c-pl")); }
+    else if (tree) add(tree, tree.o.star ? "RRT*" : "RRT", MX.css(tree.o.star ? "--c-pl" : "--c-be"));
+    if (astar && isFinite(astar.len)) series.push({ label: "grid A* (0.5 m)", color: MX.css("--c-ct"), data: [[1, astar.len], [N, astar.len]], width: 2, dash: [6, 4] });
+    const lo = Math.hypot(GOAL[0] - START[0], GOAL[1] - START[1]) - 1;
+    Plot.line($("costChart"), { series: series.length ? series : [{ label: "grow a tree to see its path length", color: MX.css("--muted"), data: [[1, lo], [N, lo]] }], xMin: 1, xMax: N, yMin: lo, yMax: lo + 14, xLabel: "samples", yLabel: "path length (m)" });
+  }
+  function stats2() {
+    $("sIt").textContent = tree ? tree.it : "–"; $("sFirst").textContent = tree ? (tree.firstAt ?? "not yet") : "–";
+    $("sBest").textContent = tree && isFinite(tree.best) ? fmt(tree.best, 2) + " m" + (tree.o.star ? " (RRT*)" : " (RRT)") : "–";
+    $("sA").textContent = astar ? (isFinite(astar.len) ? fmt(astar.len, 2) + " m · " + astar.exp : "no path · " + astar.exp) : "–";
+    const done = tree && tree.it >= +$("nIt").value;
+    if (tree && isFinite(tree.best) && astar && isFinite(astar.len) && tree.best < astar.len) $("ch2").innerHTML = `<span class="badge-win">✅ ${tree.o.star ? "RRT*" : "RRT"} beat grid A*: ${fmt(tree.best, 2)} m vs ${fmt(astar.len, 2)} m</span>`;
+    else if (done && tree && isFinite(tree.best)) $("ch2").innerHTML = `<span class="badge-lose">${tree.o.star ? "RRT*" : "RRT"}: ${fmt(tree.best, 2)} m vs A*'s ${astar && isFinite(astar.len) ? fmt(astar.len, 2) + " m" : "no path"}</span>`;
+    else if (done && tree) $("ch2").innerHTML = `<span class="badge-lose">No path in ${tree.it} samples: try more samples or a bigger step</span>`;
+    else $("ch2").innerHTML = "";
+  }
+  function grow(star) {
+    W2.stop(); const N = +$("nIt").value; tree = makeTree(opts2(star)); other = null; mode = star;
+    const per = Math.max(10, Math.round(N / 75));
+    W2.run(() => { for (let k = 0; k < per && tree.it < N; k++) stepTree(tree); stats2(); if (tree.it % (per * 5) === 0) chart2();
+      if (tree.it >= N) { other = makeTree(opts2(!star)); for (let k = 0; k < N; k++) stepTree(other); chart2(); stats2(); return false; } });
+  }
+  $("goRRT").onclick = () => grow(false); $("goStar").onclick = () => grow(true);
+  $("goA").onclick = () => { astar = gridAstar(obs2, START, GOAL); stats2(); chart2(); W2.render(); };
+  $("reseed").onclick = () => { seed2++; if (mode != null) grow(mode); };
+  $("mForest").onclick = () => { obs2 = forest(); resetRun(); }; $("mWall").onclick = () => { obs2 = wallGap(); resetRun(); }; $("mClear").onclick = () => { obs2 = []; resetRun(); };
+  [["bPaint", "paint"], ["bErase", "erase"]].forEach(([id, b]) => ($(id).onclick = () => { brush = b; segOn("brushSeg", id); }));
+  ["nIt", "eta", "bias"].forEach(id => ($(id).oninput = () => { labels2(); chart2(); }));
+  labels2(); resetRun();
+
+  // ---------- Playground 3: narrow passage ----------
+  const GY = 14, START3 = [2, 9], GOAL3 = [30, 9];
+  const wall3 = gap => [{ type: "rect", x: 15, y: 0, w: 1.0, h: GY - gap / 2 }, { type: "rect", x: 15, y: GY + gap / 2, w: 1.0, h: HT - GY - gap / 2 }];
+  function runBridge(obs, bridge, seed, maxIt) { // plain RRT (η 1.5, goal bias 5%) with an optional bridge-test sampler
+    const R = Sim.rng(seed), X = [START3[0]], Y = [START3[1]], P = [-1], coll = (x, y) => x < 0 || y < 0 || x > WD || y > HT || hit(obs, x, y, RAD);
+    for (let it = 1; it <= maxIt; it++) {
+      let sx, sy;
+      if (R() < 0.05) { sx = GOAL3[0]; sy = GOAL3[1]; }
+      else if (R() < bridge) { let ok = false; for (let k = 0; k < 20 && !ok; k++) { const ax = R() * WD, ay = R() * HT; if (!coll(ax, ay)) continue; const bx = ax + 1.2 * Sim.randn(R), by = ay + 1.2 * Sim.randn(R); if (!coll(bx, by)) continue; const mx = (ax + bx) / 2, my = (ay + by) / 2; if (!coll(mx, my)) { sx = mx; sy = my; ok = true; } } if (!ok) { sx = R() * WD; sy = R() * HT; } }
+      else { sx = R() * WD; sy = R() * HT; }
+      let nb = 0, nd = Infinity; for (let i = 0; i < X.length; i++) { const d = (X[i] - sx) ** 2 + (Y[i] - sy) ** 2; if (d < nd) { nd = d; nb = i; } }
+      nd = Math.sqrt(nd); if (nd < 1e-9) continue; const k = Math.min(1, 1.5 / nd), nx = X[nb] + (sx - X[nb]) * k, ny = Y[nb] + (sy - Y[nb]) * k;
+      if (!segFree(obs, [X[nb], Y[nb]], [nx, ny])) continue; X.push(nx); Y.push(ny); P.push(nb);
+      if (Math.hypot(nx - GOAL3[0], ny - GOAL3[1]) <= 1) return { it, X, Y, P, ok: true };
+    }
+    return { it: maxIt, X, Y, P, ok: false };
+  }
+  let last3 = null;
+  const W3 = new Sim($("npW"), { xRange: [0, WD], yRange: [0, HT] });
+  W3.render(w => { w.clear(); w.obstacles(wall3(+$("gap").value).map(o => Object.assign({}, o)), { color: "--muted", alpha: 0.8 });
+    if (last3) { for (let i = 1; i < last3.X.length; i++) { const p = last3.P[i]; w.line([[last3.X[p], last3.Y[p]], [last3.X[i], last3.Y[i]]], { color: "--c-be", width: 1, alpha: 0.5 }); }
+      if (last3.ok) { const pts = []; for (let i = last3.X.length - 1; i >= 0; i = last3.P[i]) pts.push([last3.X[i], last3.Y[i]]); w.line(pts, { color: "--c-pl", width: 3.5 }); } }
+    w.circle(START3[0], START3[1], 0.45, { fill: "--c-be" }); w.circle(GOAL3[0], GOAL3[1], 1, { stroke: "--c-pl", width: 2, dash: [4, 3] }); });
+  function labels3() { $("gapV").textContent = fmt(+$("gap").value, 1) + " m"; $("bridgeV").textContent = fmt(100 * +$("bridge").value, 0) + "%"; }
+  function trials(gap, bridge, n) { const obs = wall3(gap); let sum = 0, mx = 0, fail = 0, last = null; for (let s = 1; s <= n; s++) { const r = runBridge(obs, bridge, s, 5000); sum += r.it; mx = Math.max(mx, r.it); if (!r.ok) fail++; last = r; } return { mean: sum / n, mx, fail, last }; }
+  $("npRun").onclick = () => {
+    labels3(); const gap = +$("gap").value, br = +$("bridge").value, r = trials(gap, br, 20); last3 = r.last;
+    $("npMean").textContent = Math.round(r.mean).toLocaleString(); $("npMax").textContent = r.mx.toLocaleString(); $("npFail").textContent = r.fail + " / 20";
+    $("ch3").innerHTML = Math.abs(gap - 1) < 1e-9 && r.mean < 600 ? `<span class="badge-win">✅ 1 m gap in ${Math.round(r.mean)} samples on average</span>` : Math.abs(gap - 1) < 1e-9 ? `<span class="badge-lose">${Math.round(r.mean)} samples on average for the 1 m gap</span>` : `<span class="muted">Set the gap to 1.0 m for the challenge.</span>`;
+    W3.render();
+  };
+  $("npSweep").onclick = () => {
+    labels3(); const br = +$("bridge").value, gaps = [0.8, 1.2, 1.6, 2, 3, 4];
+    const data = gaps.map(g => [g, trials(g, br, 10).mean]), base = br > 0 ? gaps.map(g => [g, trials(g, 0, 10).mean]) : null;
+    const series = [{ label: `average samples (bridge ${fmt(100 * br, 0)}%)`, color: MX.css("--c-be"), data, width: 3, dots: true }];
+    if (base) series.push({ label: "uniform only", color: MX.css("--muted"), data: base, width: 2, dash: [5, 4], dots: true });
+    Plot.line($("npChart"), { series, xMin: 0.8, xMax: 4, yMin: 0, xLabel: "gap width (m)", yLabel: "samples" });
+  };
+  ["gap", "bridge"].forEach(id => ($(id).oninput = () => { labels3(); last3 = null; W3.render(); }));
+  labels3(); Plot.line($("npChart"), { series: [{ label: "press 📈 to sweep", color: MX.css("--muted"), data: [[0.8, 0], [4, 0]] }], xMin: 0.8, xMax: 4, yMin: 0, yMax: 2000, xLabel: "gap width (m)", yLabel: "samples" });
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,482 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10.1 GPU basics: compute, memory and why matmul is king · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.roof { width: 100%; height: 300px; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  canvas.race { width: 100%; height: 230px; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .bound { font-weight: 800; padding: 1px 10px; border-radius: 999px; }
+  .bound.mem { background: color-mix(in srgb, var(--c-x) 16%, var(--bg2)); color: var(--c-x); }
+  .bound.cmp { background: color-mix(in srgb, var(--c-w) 18%, var(--bg2)); color: var(--c-w); }
+  svg.flow { width: 100%; height: auto; max-height: 260px; }
+</style>
+</head>
+<body data-lesson="d10-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 10 · Lesson 1</div>
+  <h1>GPU basics: compute, memory and why matmul is king</h1>
+  <p class="subtitle">A GPU can do about a thousand trillion multiplications a second, yet most of the operations in your network leave it idle. Learn the one ratio that tells you which operations are fast, which are slow, and what to do about it.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>A dense layer is a <b>matrix multiplication</b> (matmul): a batch of <span class="x">inputs</span> times a <span class="w">weight</span> matrix (Lesson 0.3, <a href="../../math-course/phase2/2-matmul.html">math 2.2</a>).</li>
+      <li>Training runs a <b>forward pass</b>, a <b>backward pass</b> and an optimizer step, over and over (Lesson 1.3).</li>
+      <li>Attention builds an L × L table of scores for a sequence of L tokens (Lesson 6.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Take an NVIDIA <b>H100</b>, the workhorse training chip of 2023–2025. Give it two jobs on 16-bit numbers:</p>
+    <ul>
+      <li><b>Job A:</b> multiply two 8192 × 8192 matrices. That's <b>1.1 trillion</b> floating-point operations (FLOPs).</li>
+      <li><b>Job B:</b> add two vectors of 1 billion numbers. That's <b>1 billion</b> FLOPs, a thousand times less work.</li>
+    </ul>
+    <p>Using NVIDIA's own spec sheet, the best possible time for Job A is about <b>1.1 ms</b>. For Job B it's about <b>1.8 ms</b>. <b>The job with a thousand times less math takes longer.</b></p>
+    <p>This is why engineers at every lab obsess over “memory-bound” vs “compute-bound”, why FlashAttention made GPT-2 training up to 3× faster without changing the math, and why your batch size and even your vocabulary size are rounded to multiples of 64. By the end you'll be able to predict which of any two operations is faster, with a calculator you build in your head.</p>
+  </div>
+
+  <h2>Numbers first: a GPU is a stadium of simple workers</h2>
+  <p>A laptop CPU has a handful of big, clever cores (8 to 24 is common). Each one is fast at a single task and very good at messy code with branches. A data-center GPU is built the other way round: an NVIDIA A100 has <b>108 streaming multiprocessors</b> (SMs), each running many simple arithmetic lanes in lockstep, so thousands of multiplications happen at once.</p>
+  <p>The lanes are grouped in bundles of 32 called <b>warps</b>. All 32 lanes of a warp execute the <i>same instruction</i> at the same time, each on its own data. NVIDIA calls this <b>SIMT</b> (single instruction, multiple threads). It's perfect when every number gets the same treatment, like every cell of a matrix product. It hurts when lanes disagree: if half a warp takes an <code>if</code> branch and half the <code>else</code>, the warp runs both, one after the other.</p>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: four professors vs a stadium of students</span>
+    <p>A CPU is four professors: each solves any problem fast, including tricky ones. A GPU is a stadium of 5,000 students who can each only do one multiplication at a time and must all follow the same instruction from the loudspeaker. Give them 5 million independent multiplications and the stadium wins by miles. Give them one long chain where each step needs the previous answer and the professors win, because 4,999 students sit idle.</p>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> with only 16 independent tasks, who finishes first, 16 CPU cores or 2,048 GPU lanes? What about 65,536 tasks?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · CPU vs GPU: the many-simple-workers race</span>
+    <p class="hint">A toy model, not a benchmark: the CPU has 16 cores that each finish a task in 1 tick. The GPU has 2,048 lanes (64 warps × 32) that each need 4 ticks per task, plus 20 ticks to launch the job (a “kernel launch”). Pick a workload and a task count, then race.</p>
+    <div class="goals"><span class="goal" id="gCpu">🎯 Find a job where the CPU wins</span><span class="goal" id="gGpu">🎯 Make the GPU ≥ 10× faster</span><span class="goal" id="gDiv">🎯 See branch divergence slow the GPU down</span></div>
+    <div class="controls">
+      <span class="seg" id="rWork"><button data-v="indep" class="on">Independent (like a matmul)</button><button data-v="branchy">Branchy (if/else per task)</button><button data-v="chain">Chain (each needs the last)</button></span>
+    </div>
+    <div class="controls">
+      <label>tasks <input type="range" id="rN" min="4" max="16" step="1" value="10"> <b class="mono" id="rNV"></b></label>
+      <button class="btn primary" id="rGo">▶ Race</button>
+    </div>
+    <canvas class="race" id="rCan"></canvas>
+    <div class="stat-row">
+      <div class="stat">CPU time <b id="rCpu">–</b></div>
+      <div class="stat">GPU time <b id="rGpu">–</b></div>
+      <div class="stat">GPU speed-up <b id="rSp">–</b></div>
+    </div>
+    <p class="hint" id="rMsg"></p>
+  </div>
+  <p><b>What you should see:</b> at 16 tasks the CPU finishes in 1 tick while the GPU is still launching (24 ticks). At 65,536 independent tasks the CPU needs 4,096 ticks and the GPU 148: about <b>28× faster</b>. Switch to <b>Branchy</b> and the GPU's time per batch doubles (both sides of every <code>if</code> run). Switch to <b>Chain</b> and the GPU loses at every size: parallel hardware can't speed up work that isn't parallel.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">GPUs for deep learning</span></span>
+    <ol>
+      <li><b>The problem before</b> Neural nets are mostly matmuls: a 4096 × 4096 layer applied to 512 tokens is 17 billion FLOPs, for one layer, one step. A CPU core doing a few billion FLOPs a second needs seconds for that.</li>
+      <li><b>What people tried</b> Clusters of CPUs and hand-tuned math libraries. Then researchers started borrowing graphics cards built for video games: AlexNet (2012) trained for five to six days on two NVIDIA GTX 580 gaming GPUs with 3 GB each.</li>
+      <li><b>Why this works</b> Every output cell of a matmul is an independent dot product: exactly the “millions of identical small jobs” a GPU is built for. Modern GPUs add <b>tensor cores</b>: units that multiply a whole small tile of a matrix in one step. On an H100, tensor cores give about 989 trillion bf16 FLOPs per second (dense), versus 67 trillion for its ordinary fp32 units.</li>
+      <li><b>What it costs, when it fails</b> Branchy, sequential or tiny work leaves lanes idle. Each kernel launch costs a few microseconds. And the lanes can only compute as fast as memory feeds them numbers, which is the rest of this lesson.</li>
+      <li><b>What refined it</b> Tensor cores (first in NVIDIA's V100), lower-precision formats that double throughput (Lesson 10.2), kernel fusion (below) and compilers that do it automatically (Lesson 10.5). TPUs and other accelerators follow the same idea: a huge matmul engine fed by fast memory.</li>
+    </ol>
+  </div>
+
+  <h2>The catch: the workers are faster than the trucks</h2>
+  <p>Numbers live in two kinds of memory. <b>HBM</b> (high-bandwidth memory) is big: 80 GB on an H100. On-chip <b>SRAM</b> (the SMs' shared memory, caches and registers) is tiny but about 10× faster. The FlashAttention paper gives the A100's numbers: 40–80 GB of HBM at 1.5–2.0 TB/s, and 192 KB of SRAM per SM (108 SMs) at around 19 TB/s.</p>
+  <p>Every operation must haul its inputs from HBM to the SMs and its outputs back. So each operation has two speed limits:</p>
+  <table>
+    <tr><th>Example GPU (NVIDIA datasheets, checked Nov 2026)</th><th>Math: dense tensor-core FLOP/s</th><th>Memory: HBM bandwidth</th><th>Ratio (FLOPs per byte)</th></tr>
+    <tr><td>H100 SXM, bf16</td><td class="w">989 T (1,979 T listed “with sparsity”)</td><td class="x">3.35 TB/s, 80 GB</td><td><b>295</b></td></tr>
+    <tr><td>H200, bf16</td><td class="w">989 T (same chip compute)</td><td class="x">4.8 TB/s, 141 GB</td><td><b>206</b></td></tr>
+    <tr><td>H100 SXM, fp8</td><td class="w">1,979 T</td><td class="x">3.35 TB/s</td><td><b>591</b></td></tr>
+  </table>
+  <p class="muted">NVIDIA's headline numbers assume 2:4 structured sparsity (Lesson 10.4), which doubles throughput; dense math is half. Real kernels reach a fraction of either peak.</p>
+  <p>That last column is the most important number in this lesson. An H100 can do <b>295 FLOPs in the time it takes to fetch one byte</b>. If your operation does fewer than 295 FLOPs per byte it moves, the math units wait for memory: the operation is <span class="x">memory-bound</span>. If it does more, memory waits for the math: it's <span class="w">compute-bound</span>.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Arithmetic intensity</b> = FLOPs ÷ bytes moved. Compare it with the GPU's ratio (295 for an H100 in bf16). Below the ratio you're paying for trucks, above it you're paying for workers. Matmuls reuse every number many times, so they can climb above the line; elementwise operations touch each number once and never can.
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: three operations by hand (bf16 = 2 bytes per number)</span>
+    <table>
+      <tr><th>Operation</th><th>FLOPs</th><th>Bytes moved</th><th>Intensity</th><th>On an H100</th></tr>
+      <tr><td>Add two vectors of N numbers</td><td>N (one add each)</td><td>read 2N + write N numbers = 6N bytes</td><td><b>1/6 ≈ 0.17</b></td><td class="x">memory-bound (1,770× below 295)</td></tr>
+      <tr><td>n × n matmul</td><td>2n³ (n multiply-adds per output, n² outputs)</td><td>read 2n² + write n² = 6n² bytes</td><td><b>n / 3</b></td><td>n = 8192: 2,731 → <span class="w">compute-bound</span></td></tr>
+      <tr><td>Layer: B tokens × (4096 × 4096 weight)</td><td>2 · B · 4096²</td><td>(2 · B · 4096 + 4096²) × 2</td><td><b>≈ B</b> for small B</td><td>B = 1 (chat decoding): <b>1</b> → <span class="x">memory-bound</span></td></tr>
+    </table>
+    <p>Now the hook makes sense. Job A: 1.1 × 10¹² FLOPs ÷ 989 × 10¹² FLOP/s = <b>1.11 ms</b> (moving its 0.4 GB takes only 0.12 ms). Job B: moving 6 GB at 3.35 TB/s = <b>1.79 ms</b>, while its math alone would take 1 µs. A matmul of size n reuses each number it loads n times; an add uses it once.</p>
+  </div>
+
+  <h2>The roofline: one picture for every operation</h2>
+  <p>Plot speed against arithmetic intensity on log axes and you get a <b>roofline</b> (Williams, Waterman and Patterson, 2009): a slanted line on the left (memory bandwidth × intensity) that hits a flat roof (peak FLOP/s) at the <b>ridge point</b>. Every operation sits under the roof at its own intensity. To get faster, either move right (more reuse per byte) or buy a taller roof.</p>
+  <p class="predict">🔮 <b>Predict:</b> what is the smallest square matmul (in multiples of 64) that is compute-bound on an H100 in bf16? Use the n/3 rule, then check with the calculator.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Roofline calculator</span>
+    <p class="hint">Choose an operation and its size. The dot shows where it lands on the roofline of the chosen GPU. Readouts are ideal (spec-sheet) numbers: real kernels get maybe 50–80% of them.</p>
+    <div class="goals"><span class="goal" id="gMat">🎯 Smallest compute-bound matmul on H100 bf16</span><span class="goal" id="gLin">🎯 Make one 4096 × 4096 layer compute-bound</span><span class="goal" id="gAtt">🎯 Make long-context attention compute-bound</span></div>
+    <div class="controls">
+      <span class="seg" id="oSeg"><button data-v="matmul" class="on">Matmul n × n</button><button data-v="linear">Layer, B tokens</button><button data-v="add">Elementwise add</button><button data-v="attn">Attention (prefill)</button><button data-v="decode">Attention (decode 1 token)</button></span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="gSeg"><button data-v="h100" class="on">H100 · bf16</button><button data-v="h200">H200 · bf16</button><button data-v="h100f8">H100 · fp8</button></span>
+      <label><span id="szL">n</span> <input type="range" id="sz" min="64" max="8192" step="64" value="512"> <b class="mono" id="szV"></b></label>
+      <label id="fuseL" style="display:none"><input type="checkbox" id="fuse"> fused (FlashAttention-style: never write the L × L scores to HBM)</label>
+    </div>
+    <canvas class="roof" id="roof"></canvas>
+    <div class="stat-row">
+      <div class="stat">FLOPs <b id="oF" class="w">–</b></div>
+      <div class="stat">bytes moved <b id="oB" class="x">–</b></div>
+      <div class="stat">intensity <b id="oI">–</b></div>
+      <div class="stat">ridge point <b id="oR">–</b></div>
+      <div class="stat">bound <b id="oBound">–</b></div>
+      <div class="stat">ideal time <b id="oT">–</b></div>
+      <div class="stat">% of peak FLOP/s <b id="oP">–</b></div>
+    </div>
+    <p class="hint" id="oMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the matmul crosses the ridge at <b>n = 896</b> (intensity 299; n = 832 gives 277). On the H200, with faster memory, the ridge drops to 206 and n = 640 is enough. A 4096 × 4096 layer with <b>one</b> token runs at 0.3% of peak; you need a batch of <b>345 tokens</b> before it's compute-bound. That is exactly why chat decoding (one new token per step) is memory-bound and why servers batch many users together (Lesson 10.5). Plain attention is stuck near intensity 64 at any length, because it writes and re-reads the L × L score table; tick <b>fused</b> and intensity grows as L/2, compute-bound from L = 1024. Decoding one token against a long cache stays at intensity ≈ 1 no matter what.</p>
+
+  <h3>Why shapes come in multiples of 8 and 64</h3>
+  <p>Tensor cores chew matrices in fixed-size tiles. NVIDIA's performance guide says fp16 matmuls are “most efficient with multiples of 8; on A100, multiples of 64”. A dimension of 50,257 leaves a ragged edge of partial tiles that wastes work or falls back to slower code. Karpathy's nanoGPT pads GPT-2's vocabulary of 50,257 up to <b>50,304</b>, “padded up to nearest multiple of 64 for efficiency”. It costs 47 unused rows and makes the output layer faster.</p>
+  <p>Batch size matters for the same reason, and for intensity: a bigger batch reuses each loaded weight across more tokens (the layer row of the table). That's the hardware half of the batch-size story from Lesson 1.7.</p>
+
+  <h2>Kernel fusion: stop shipping half-finished work</h2>
+  <p>Each GPU operation is a <b>kernel</b>: a small program launched on the GPU. In plain (“eager”) PyTorch, <code>y = gelu(x * 2 + 1)</code> launches three kernels. Each one reads its input from HBM and writes its output back, so the intermediate results make a pointless round trip. A <b>fused</b> kernel does all three steps while the numbers sit in on-chip SRAM and writes only the final answer.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Watch the memory round trips</span>
+    <p class="hint">Each dot is one pass of N = 1 billion bf16 numbers between HBM and the SMs. Run the unfused chain, then the fused kernel, and compare the bytes and time (H100, memory-bound, so time = bytes ÷ 3.35 TB/s).</p>
+    <div class="goals"><span class="goal" id="gFuse">🎯 Run both and cut memory traffic 3×</span></div>
+    <svg id="fuseSvg"></svg>
+    <div class="controls">
+      <button class="btn" id="fUn">▶ Unfused: 3 kernels</button>
+      <button class="btn primary" id="fFu">▶ Fused: 1 kernel</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">kernels <b id="fK">–</b></div>
+      <div class="stat">HBM traffic <b id="fBy" class="x">–</b></div>
+      <div class="stat">ideal time <b id="fT">–</b></div>
+    </div>
+    <p class="hint" id="fMsg"></p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Kernel fusion</span></span>
+    <ol>
+      <li><b>The problem before</b> Elementwise ops, normalizations, activations, dropout and softmax have intensity well under 10 (NVIDIA lists ReLU at 0.25 FLOPs per byte, layer norm under 10). Run as separate kernels, a chain of k of them moves the data 2k times. In transformers these ops can take a large share of the time despite doing a tiny share of the FLOPs.</li>
+      <li><b>What people tried</b> Hand-written fused CUDA kernels for the hottest patterns (fused Adam, fused LayerNorm, fused bias + GELU) inside libraries like Apex and Megatron.</li>
+      <li><b>Why this works</b> Time for a memory-bound op ≈ bytes ÷ bandwidth. Fusing <code>x*2</code>, <code>+1</code> and <code>gelu</code> drops traffic from 12 to 4 bytes per number: 12 GB → 4 GB for a billion numbers, 3.6 ms → 1.2 ms. FlashAttention is fusion plus tiling for attention: by never writing the L × L scores to HBM it reported a 3× speed-up training GPT-2 (sequence length 1K) with exactly the same result.</li>
+      <li><b>What it costs, when it fails</b> Hand-fused kernels are hard to write, debug and keep up to date; each new architecture needs new ones. Fusion only helps memory-bound chains: a big matmul is already compute-bound.</li>
+      <li><b>What refined it</b> Compilers that fuse automatically: <code>torch.compile</code> with TorchInductor generates fused Triton kernels on GPUs and C++ on CPUs (Lesson 10.5); XLA does the same for JAX and TPUs. FlashAttention lives on as <code>F.scaled_dot_product_attention</code> (Lesson 6.9).</li>
+    </ol>
+  </div>
+
+  <h2>MFU: how much of the GPU are you really using?</h2>
+  <p>Training throughput is reported as <b>MFU</b> (model FLOPs utilization): the FLOPs your model mathematically needs per second, divided by the hardware's peak. The PaLM paper (2022) popularized it. A dense transformer needs about <b>6 FLOPs per parameter per token</b> for a training step (2 forward, 4 backward; Lesson 6.8).</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: MFU of a 7B-parameter model</span>
+    <p>One H100 processes 9,000 tokens per second for a 7-billion-parameter model.</p>
+    <div class="calc">6 × 7 × 10⁹ × 9,000 = 3.78 × 10¹⁴ FLOP/s → 378 ÷ 989 = <b>38% MFU</b></div>
+    <p>That's a good number. Real runs: PaLM 540B reached <b>46.2%</b> MFU on 6,144 TPU v4 chips; Llama 3 405B reported <b>38–43%</b> bf16 MFU on 8,192–16,384 H100s. The missing 55–60% goes to memory-bound ops, communication between GPUs (Lesson 10.3), pipeline bubbles and recomputation.</p>
+  </div>
+
+  <table>
+    <tr><th>Operation</th><th>Typical intensity</th><th>Usually</th><th>How to speed it up</th></tr>
+    <tr><td>Big matmul / conv with many channels</td><td>hundreds–thousands</td><td class="w">compute-bound</td><td>lower precision (bf16 → fp8), tensor-core-friendly shapes</td></tr>
+    <tr><td>Linear layer with a small batch (LLM decoding)</td><td>≈ batch size</td><td class="x">memory-bound</td><td>batch more requests, quantize weights (Lesson 10.4)</td></tr>
+    <tr><td>Elementwise, activation, dropout</td><td>&lt; 1</td><td class="x">memory-bound</td><td>fuse into neighbours</td></tr>
+    <tr><td>Normalization, softmax</td><td>&lt; 10</td><td class="x">memory-bound</td><td>fuse; fused kernels (FlashAttention)</td></tr>
+    <tr><td>Attention, naive</td><td>≈ head dim ÷ 2</td><td class="x">memory-bound</td><td>FlashAttention / SDPA</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>You can feel the roofline even on a laptop CPU: a matmul does thousands of times more math than an add of the same matrices, but takes only tens of times longer.</p>
+<pre><code><span class="k">import</span> torch, time
+
+<span class="k">def</span> bench(fn, reps=<span class="n">10</span>):
+    fn()                                   <span class="c"># warm-up</span>
+    t = time.perf_counter()
+    <span class="k">for</span> _ <span class="k">in</span> range(reps):
+        fn()
+    <span class="k">return</span> (time.perf_counter() - t) / reps
+
+n = <span class="n">2048</span>
+a, b = torch.randn(n, n), torch.randn(n, n)
+t_mm = bench(<span class="k">lambda</span>: a @ b)               <span class="c"># 2·n³ FLOPs, touches 3·n² numbers</span>
+t_add = bench(<span class="k">lambda</span>: a + b)              <span class="c"># n² FLOPs, touches 3·n² numbers</span>
+print(<span class="s">f"matmul: {2 * n**3 / t_mm / 1e9:7.1f} GFLOP/s"</span>)
+print(<span class="s">f"add:    {n**2 / t_add / 1e9:7.1f} GFLOP/s"</span>)
+print(<span class="s">f"matmul does {2 * n:,}x more math, but takes only {t_mm / t_add:.0f}x longer"</span>)
+
+<span class="c"># One run on a laptop CPU (torch 2.8); your numbers will differ:</span>
+<span class="c"># matmul:   918.7 GFLOP/s</span>
+<span class="c"># add:        7.8 GFLOP/s</span>
+<span class="c"># matmul does 4,096x more math, but takes only 35x longer</span></code></pre>
+    <p>On a GPU, the habits that follow from this lesson (not run here: no GPU on this laptop):</p>
+<pre><code>torch.set_float32_matmul_precision(<span class="s">"high"</span>)   <span class="c"># let fp32 matmuls use TF32 tensor cores</span>
+props = torch.cuda.get_device_properties(<span class="n">0</span>)    <span class="c"># name, total memory, SM count</span>
+out = torch.nn.functional.scaled_dot_product_attention(q, k, v, is_causal=<span class="k">True</span>)  <span class="c"># fused attention</span>
+model = torch.compile(model)                      <span class="c"># fuse the memory-bound glue (Lesson 10.5)</span></code></pre>
+    <p class="hint">Gotcha: GPU calls are asynchronous. Time them with <code>torch.cuda.synchronize()</code> before reading the clock (or <code>torch.cuda.Event</code>), or you'll measure only the launch. For a real breakdown use <code>torch.profiler</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Bigger batch</td><td>Higher intensity, higher MFU</td><td>More activation memory; very large batches can hurt generalization (Lesson 1.7)</td></tr>
+      <tr><td>Padding shapes to multiples of 64</td><td>Full tensor-core tiles</td><td>A little wasted memory and compute (nanoGPT: 47 extra vocab rows)</td></tr>
+      <tr><td>Fusing kernels</td><td>Fewer HBM round trips: big wins for memory-bound chains</td><td>Hand-written kernels are costly; compilers add compile time and occasional bugs</td></tr>
+      <tr><td>Faster memory (H200 vs H100)</td><td>Memory-bound work (decoding) speeds up ≈ 4.8 / 3.35 = 1.4×</td><td>Compute-bound work gains nothing from bandwidth</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Why is LLM token generation memory-bound, and what would you do about it?” A strong answer:</p>
+    <ul>
+      <li>Defines <b>arithmetic intensity</b> and the GPU's FLOPs-per-byte ratio (≈ 300 for an H100 in bf16).</li>
+      <li>Explains that decoding one token per sequence reads every weight once for ~2 FLOPs per weight: intensity ≈ batch size, far below the ridge.</li>
+      <li>Lists fixes that raise intensity or shrink bytes: <b>batch</b> many requests, <b>quantize</b> weights to 8 or 4 bits, shrink the KV cache (GQA), speculative decoding.</li>
+      <li>Knows the contrast: training and prompt processing (prefill) run big matmuls and are compute-bound, so there precision and MFU matter instead.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>FlashAttention: attention made memory-aware</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2205.14135" target="_blank" rel="noopener">Dao et al.: FlashAttention</a></div>
+      <p><b>How:</b> computes attention in tiles that fit in SRAM and never writes the L × L score matrix to HBM.</p>
+      <p><b>Why this method:</b> attention was memory-bound, not compute-bound; cutting HBM traffic gave 3× faster GPT-2 training (sequence length 1K) and a 15% end-to-end speed-up on BERT-large, with exact results.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>MFU as the scoreboard of a training run</b> <span class="tag co">🏢 Google · 2022</span> <a href="https://arxiv.org/abs/2204.02311" target="_blank" rel="noopener">Chowdhery et al.: PaLM</a></div>
+      <p><b>How:</b> defined model FLOPs utilization and reported 46.2% for PaLM 540B on 6,144 TPU v4 chips (vs 21.3% they list for GPT-3).</p>
+      <p><b>Why this method:</b> hardware utilization can be inflated by recomputation; MFU counts only the FLOPs the model truly needs, so runs on different hardware compare fairly.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Llama 3 405B at 38–43% MFU</b> <span class="tag co">🏢 Meta · 2024</span> <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></div>
+      <p><b>How:</b> pre-trained on up to 16,384 H100s at 380–430 TFLOPs per GPU in bf16.</p>
+      <p><b>Why this method:</b> every point of MFU on a cluster that size is worth thousands of GPU-hours, so the paper reports it per training stage.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Tensor-core-friendly shapes</b> <span class="tag co">🏢 NVIDIA</span> <a href="https://docs.nvidia.com/deeplearning/performance/dl-performance-matrix-multiplication/index.html" target="_blank" rel="noopener">Matrix Multiplication Background User's Guide</a></div>
+      <p><b>How:</b> tables of which dimensions use tensor cores most efficiently, and worked intensity examples (an 8192³ GEMM: 2,730 FLOPs per byte, compute-bound).</p>
+      <p><b>Why this method:</b> the cheapest speed-up in deep learning is often changing a 50,257 into a 50,304.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the 2,730 that NVIDIA computed too</span>
+    <p>Our n/3 rule gives an 8192 × 8192 matmul an intensity of 8192 ÷ 3 ≈ 2,731 FLOPs per byte. NVIDIA's performance guide works the same example and gets 2,730. Shrink one side to 128 (an 8192 × 128 × 8192 product) and their number drops to 124: memory-bound on the older V100. Same formula, same answer, no GPU needed.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Matmul mechanics: <a href="../../math-course/phase2/2-matmul.html">math 2.2</a>; how floating-point numbers are stored: <a href="../../math-course/phase8/5-numerics.html">math 8.5</a>. In this course: batch size (1.7), FlashAttention, KV cache and GQA (6.9), the 6·N·D compute rule (6.8). Next: halving the bytes and doubling the FLOPs with lower precision (10.2), spreading work across many GPUs (10.3), quantization for memory-bound inference (10.4) and automatic fusion with <code>torch.compile</code> (10.5). Serving LLMs at scale: <a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://horace.io/brrr_intro.html" target="_blank" rel="noopener">Horace He: Making Deep Learning Go Brrrr From First Principles</a>. Compute, memory bandwidth and overhead, explained with great pictures.</li>
+      <li><span class="kind">Book</span> <a href="https://jax-ml.github.io/scaling-book/roofline/" target="_blank" rel="noopener">How to Scale Your Model: All About Rooflines</a>. The roofline worked through for TPUs and GPUs.</li>
+      <li><span class="kind">Paper</span> <a href="https://www2.eecs.berkeley.edu/Pubs/TechRpts/2008/EECS-2008-134.pdf" target="_blank" rel="noopener">Williams, Waterman &amp; Patterson: the Roofline model</a> (Berkeley tech report; published in CACM, 2009).</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. On an H100 in bf16 (989 TFLOP/s, 3.35 TB/s), you multiply a 512 × 512 matrix by a 512 × 512 matrix. Using intensity ≈ n / 3, is it compute- or memory-bound?</div>
+    <div class="opts"><button class="opt">Compute-bound: matmuls always are</button><button class="opt" data-ok>Memory-bound: 512 / 3 ≈ 171 FLOPs per byte is below the ridge of about 295</button><button class="opt">Neither: it's exactly at the ridge</button></div>
+    <div class="explain">The ridge is 989 ÷ 3.35 ≈ 295 FLOPs per byte. A square matmul has intensity n/3, so you need n ≥ 886 (896 in multiples of 64) before the math units become the bottleneck. Small matmuls are memory-bound too, which is one reason tiny models leave big GPUs idle.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your profiler shows a transformer step where LayerNorm, GELU, dropout and residual adds take 40% of the time but under 1% of the FLOPs. What's the best first move?</div>
+    <div class="opts"><button class="opt">Buy GPUs with more FLOP/s</button><button class="opt">Switch to fp8 matmuls</button><button class="opt" data-ok>Fuse those memory-bound ops (e.g. <code>torch.compile</code> or fused kernels) so their data makes fewer HBM round trips</button></div>
+    <div class="explain">These ops have intensity well under 10, so their time is bytes ÷ bandwidth. More FLOP/s or lower-precision matmuls don't touch them. Fusion keeps intermediates in on-chip SRAM, so a chain of k ops moves the data once instead of 2k times.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A chatbot serves one user at a time. Each new token multiplies a 4096-vector by 4096 × 4096 weight matrices. Which change raises GPU utilization the most?</div>
+    <div class="opts"><button class="opt" data-ok>Serve many users in one batch, so each loaded weight is used for many tokens</button><button class="opt">Increase the context length</button><button class="opt">Use a GPU with more tensor-core FLOP/s but the same memory bandwidth</button></div>
+    <div class="explain">With one token, intensity is ≈ 1 FLOP per byte: the GPU spends almost all its time loading weights. Batching B requests reuses each weight B times, so intensity ≈ B (compute-bound from about 345 for this layer on an H100). More FLOP/s doesn't help a memory-bound op; more bandwidth or fewer bytes (quantization) would.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>A GPU is thousands of simple lanes in warps of 32 running the same instruction (SIMT), plus tensor cores that multiply small matrix tiles. Great for matmuls; bad at branchy or sequential work.</li>
+      <li>Two speed limits: peak FLOP/s and memory bandwidth. Their ratio (≈ 295 FLOPs per byte for an H100 in bf16) is the ridge point of the <b>roofline</b>.</li>
+      <li><b>Arithmetic intensity</b> = FLOPs ÷ bytes. Matmuls (n/3, or ≈ batch size for a layer) can be compute-bound; elementwise ops (≈ 0.17) and decoding (≈ 1) are memory-bound.</li>
+      <li>Speed up memory-bound work by moving fewer bytes: fusion, FlashAttention, batching, quantization. Speed up compute-bound work with lower precision and tensor-core shapes (multiples of 8/64).</li>
+      <li>MFU = useful model FLOPs ÷ peak. 40% on a big cluster is excellent (PaLM 46%, Llama 3 405B 38–43%).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const setup = c => { const d = window.devicePixelRatio || 1, w = c.clientWidth || 600, h = c.clientHeight || 240; c.width = w * d; c.height = h * d; const x = c.getContext("2d"); x.setTransform(d, 0, 0, d, 0, 0); x.clearRect(0, 0, w, h); x.font = "12px " + css("--font"); return { x, w, h }; };
+  const eng = v => { const a = Math.abs(v); return a >= 1e15 ? (v / 1e15).toFixed(2) + " P" : a >= 1e12 ? (v / 1e12).toFixed(2) + " T" : a >= 1e9 ? (v / 1e9).toFixed(2) + " G" : a >= 1e6 ? (v / 1e6).toFixed(2) + " M" : a >= 1e3 ? (v / 1e3).toFixed(1) + " k" : v.toFixed(0) + " "; };
+  const tfmt = s => (s >= 1 ? s.toFixed(2) + " s" : s >= 1e-3 ? (s * 1e3).toFixed(2) + " ms" : s >= 1e-6 ? (s * 1e6).toFixed(2) + " µs" : (s * 1e9).toFixed(1) + " ns");
+
+  /* ---------- 1. CPU vs GPU race (toy model) ---------- */
+  let work = "indep", raf = null, lastF = 0;
+  const N = () => 2 ** +$("rN").value;
+  const cpuT = n => (work === "chain" ? n : Math.ceil(n / 16));
+  const gpuT = n => 20 + (work === "chain" ? 4 * n : Math.ceil(n / 2048) * (work === "branchy" ? 8 : 4));
+  function drawRace(f) {   // f = elapsed ticks
+    lastF = f;
+    const { x, w, h } = setup($("rCan")), n = N(), tc = cpuT(n), tg = gpuT(n);
+    const fc = Math.min(1, f / tc), fg = Math.min(1, f / tg);
+    x.fillStyle = css("--text"); x.textAlign = "left";
+    x.fillText("CPU · 16 cores", 10, 18); x.fillText("GPU · 2,048 lanes (64 warps × 32)", 10, 118);
+    // CPU cores: 16 big squares
+    const busyC = fc < 1 && f > 0;
+    for (let i = 0; i < 16; i++) { x.fillStyle = busyC && (work !== "chain" || i === 0) ? css("--c-w") : css("--panel"); x.fillRect(10 + i * 22, 26, 18, 18); }
+    // GPU lanes: 64 × 32 tiny squares
+    const launching = f < 20, busyG = !launching && fg < 1 && f > 0;
+    const cw = Math.max(2, Math.min(5, (w - 20) / 64 - 1));
+    for (let r = 0; r < 64; r++) for (let c = 0; c < 32; c++) {
+      let on = busyG;
+      if (work === "chain") on = busyG && r === 0 && c === 0;
+      if (work === "branchy" && busyG) on = ((Math.floor(f / 4) % 2) === 0) === (c < 16);
+      x.fillStyle = on ? css("--c-x") : css("--panel");
+      x.fillRect(10 + r * (cw + 1), 126 + c * 2, cw, 1.5);
+    }
+    // progress bars
+    const bar = (y, frac, color, label) => { x.fillStyle = css("--panel"); x.fillRect(10, y, w - 20, 12); x.fillStyle = color; x.fillRect(10, y, (w - 20) * frac, 12); x.fillStyle = css("--muted"); x.fillText(label, 10, y + 26); };
+    bar(56, fc, css("--c-w"), fc >= 1 ? `done in ${tc.toLocaleString()} ticks` : `working… ${Math.round(100 * fc)}%`);
+    bar(198, fg, css("--c-x"), launching && f > 0 ? "launching kernel…" : fg >= 1 ? `done in ${tg.toLocaleString()} ticks` : `working… ${Math.round(100 * fg)}%`);
+  }
+  function raceStats() {
+    const n = N(), tc = cpuT(n), tg = gpuT(n), sp = tc / tg;
+    $("rNV").textContent = n.toLocaleString();
+    $("rCpu").textContent = tc.toLocaleString() + " ticks"; $("rGpu").textContent = tg.toLocaleString() + " ticks";
+    $("rSp").innerHTML = sp >= 1 ? `<span class="ev">${sp.toFixed(1)}×</span>` : `<span class="dead">${sp.toFixed(2)}× (CPU wins)</span>`;
+    return { tc, tg, sp };
+  }
+  function race() {
+    cancelAnimationFrame(raf);
+    const { tc, tg, sp } = raceStats(), T = Math.max(tc, tg), t0 = performance.now(), dur = 1800;
+    win("gCpu", sp < 1); win("gGpu", sp >= 10); win("gDiv", work === "branchy" && N() >= 4096);
+    $("rMsg").textContent = work === "chain" ? "Each task waits for the previous one: only one worker can ever be busy. Parallel hardware can't help sequential work." :
+      work === "branchy" ? "Lanes in a warp disagree on the if/else, so the warp runs both branches one after the other: half the lanes idle at any moment." :
+      sp < 1 ? "Too little work: the GPU spends longer launching than the CPU spends finishing." : "Every task is independent, so 2,048 slow lanes beat 16 fast cores.";
+    const step = now => { const f = Math.min(1, (now - t0) / dur) * T; drawRace(f); if (f < T) raf = requestAnimationFrame(step); };
+    raf = requestAnimationFrame(step);
+  }
+  seg("rWork", v => { work = v; raceStats(); drawRace(0); });
+  $("rN").oninput = () => { raceStats(); drawRace(0); };
+  $("rGo").onclick = race;
+  raceStats(); drawRace(0);
+
+  /* ---------- 2. roofline calculator ---------- */
+  const GPUS = { h100: { name: "H100 SXM · bf16", peak: 989e12, bw: 3.35e12, e: 2 }, h200: { name: "H200 · bf16", peak: 989e12, bw: 4.8e12, e: 2 }, h100f8: { name: "H100 SXM · fp8", peak: 1979e12, bw: 3.35e12, e: 1 } };
+  const SL = {
+    matmul: { label: "n", min: 64, max: 8192, step: 64, val: 512, show: v => v + "" },
+    linear: { label: "batch tokens B", min: 1, max: 1024, step: 1, val: 1, show: v => v + "" },
+    add: { label: "numbers N = 10^", min: 3, max: 10, step: 0.5, val: 9, show: v => eng(10 ** v).trim() },
+    attn: { label: "context L = 2^", min: 8, max: 17, step: 1, val: 12, show: v => (2 ** v).toLocaleString() },
+    decode: { label: "cached tokens L = 2^", min: 8, max: 17, step: 1, val: 12, show: v => (2 ** v).toLocaleString() },
+  };
+  let opK = "matmul", gK = "h100";
+  function cost() {
+    const g = GPUS[gK], e = g.e, v = +$("sz").value, d = 128;
+    if (opK === "matmul") return { F: 2 * v ** 3, B: 3 * v * v * e };
+    if (opK === "linear") { const D = 4096; return { F: 2 * v * D * D, B: (2 * v * D + D * D) * e }; }
+    if (opK === "add") { const n = 10 ** v; return { F: n, B: 3 * n * e }; }
+    const L = 2 ** v;
+    if (opK === "attn") return { F: 4 * L * L * d, B: ($("fuse").checked ? 4 * L * d : 4 * L * d + 4 * L * L) * e };
+    return { F: 4 * L * d, B: (2 * L * d + 2 * d) * e };   // decode: one query reads the whole K and V cache
+  }
+  function drawRoof(I, perf) {
+    const g = GPUS[gK], { x, w, h } = setup($("roof")), m = { l: 58, r: 26, t: 14, b: 34 };
+    const lx0 = -1, lx1 = 4, ly0 = 11, ly1 = 15.5;   // log10 intensity, log10 FLOP/s
+    const X = v => m.l + (Math.log10(v) - lx0) / (lx1 - lx0) * (w - m.l - m.r), Y = v => h - m.b - (Math.log10(v) - ly0) / (ly1 - ly0) * (h - m.t - m.b);
+    x.strokeStyle = css("--line"); x.fillStyle = css("--muted"); x.lineWidth = 1;
+    for (let k = lx0; k <= lx1; k++) { x.beginPath(); x.moveTo(X(10 ** k), m.t); x.lineTo(X(10 ** k), h - m.b); x.stroke(); x.textAlign = "center"; x.fillText(k < 0 ? "0.1" : (10 ** k).toLocaleString(), X(10 ** k), h - m.b + 14); }
+    for (let k = 11; k <= 15; k++) { x.beginPath(); x.moveTo(m.l, Y(10 ** k)); x.lineTo(w - m.r, Y(10 ** k)); x.stroke(); x.textAlign = "right"; x.fillText(["100 G", "1 T", "10 T", "100 T", "1 P"][k - 11], m.l - 6, Y(10 ** k) + 4); }
+    x.textAlign = "center"; x.fillText("arithmetic intensity (FLOPs per byte, log)", (m.l + w - m.r) / 2, h - 4);
+    x.save(); x.translate(12, (m.t + h - m.b) / 2); x.rotate(-Math.PI / 2); x.fillText("FLOP/s (log)", 0, 0); x.restore();
+    const ridge = g.peak / g.bw;
+    x.lineWidth = 3; x.strokeStyle = css("--c-x"); x.beginPath(); x.moveTo(X(0.1), Y(0.1 * g.bw)); x.lineTo(X(ridge), Y(g.peak)); x.stroke();
+    x.strokeStyle = css("--c-w"); x.beginPath(); x.moveTo(X(ridge), Y(g.peak)); x.lineTo(X(1e4), Y(g.peak)); x.stroke();
+    x.setLineDash([4, 4]); x.lineWidth = 1; x.strokeStyle = css("--muted"); x.beginPath(); x.moveTo(X(ridge), Y(g.peak)); x.lineTo(X(ridge), h - m.b); x.stroke(); x.setLineDash([]);
+    x.fillStyle = css("--c-x"); x.textAlign = "left"; x.fillText("memory roof: bandwidth × intensity", X(0.12), Y(0.12 * g.bw * 2.2));
+    x.fillStyle = css("--c-w"); x.textAlign = "right"; x.fillText("compute roof " + eng(g.peak) + "FLOP/s", X(1e4) - 4, Y(g.peak) - 8);
+    x.fillStyle = css("--muted"); x.textAlign = "left"; x.fillText("ridge " + ridge.toFixed(0), X(ridge) + 4, h - m.b - 6);
+    const cx = X(Math.min(1e4, Math.max(0.1, I))), cy = Y(Math.max(1e11, perf));
+    x.fillStyle = css("--c-ac"); x.beginPath(); x.arc(cx, cy, 7, 0, 7); x.fill();
+    x.strokeStyle = css("--bg2"); x.lineWidth = 2; x.stroke();
+  }
+  function roof() {
+    const g = GPUS[gK], s = SL[opK], v = +$("sz").value, { F, B } = cost(), I = F / B, ridge = g.peak / g.bw;
+    const t = Math.max(F / g.peak, B / g.bw), perf = F / t, cmp = I >= ridge;
+    $("szL").textContent = s.label; $("szV").textContent = s.show(v);
+    $("oF").textContent = eng(F) + "FLOP"; $("oB").textContent = eng(B) + "B"; $("oI").textContent = I < 10 ? I.toFixed(2) : I.toFixed(0);
+    $("oR").textContent = ridge.toFixed(0); $("oT").textContent = tfmt(t); $("oP").textContent = (100 * perf / g.peak).toFixed(perf / g.peak < 0.01 ? 2 : 0) + "%";
+    $("oBound").innerHTML = cmp ? `<span class="bound cmp">compute-bound</span>` : `<span class="bound mem">memory-bound</span>`;
+    drawRoof(I, perf);
+    win("gMat", opK === "matmul" && gK === "h100" && v === 896);
+    win("gLin", opK === "linear" && gK === "h100" && cmp);
+    win("gAtt", opK === "attn" && cmp);
+    const M = {
+      matmul: cmp ? (gK === "h100" && v === 896 ? "That's it: 896 / 3 ≈ 299 just clears the ridge of 295." : "Compute-bound: each loaded number is reused n times. Try smaller n to find the edge.") : "Memory-bound: not enough reuse yet. Intensity is n / 3; the ridge is " + ridge.toFixed(0) + ".",
+      linear: cmp ? "Enough tokens share each loaded weight: compute-bound." : v === 1 ? "One token: every weight is loaded for 2 FLOPs. This is LLM decoding, and why servers batch users." : "Intensity ≈ B for small batches. Keep batching.",
+      add: "Intensity 1/6 at every size: each number is used once. Only fusion or fewer bytes can help.",
+      attn: $("fuse").checked ? (cmp ? "Fused: the score table stays on chip, so intensity grows as L / 2." : "Fused, but the sequence is short: intensity L / 2 is still under the ridge.") : "Writing and re-reading the L × L score table caps intensity near 64. Tick ‘fused’.",
+      decode: "One query against L cached keys and values: about 1 FLOP per byte at any length. Memory-bound by design.",
+    };
+    $("oMsg").textContent = M[opK];
+  }
+  seg("oSeg", v => { opK = v; const s = SL[v], el = $("sz"); el.min = s.min; el.max = s.max; el.step = s.step; el.value = s.val; $("fuseL").style.display = v === "attn" ? "" : "none"; roof(); });
+  seg("gSeg", v => { gK = v; roof(); });
+  $("sz").oninput = roof; $("fuse").onchange = roof;
+  window.addEventListener("resize", () => { roof(); drawRace(lastF); });
+  window.addEventListener("themechange", () => { roof(); drawRace(lastF); });
+  roof();
+
+  /* ---------- 3. fusion round trips ---------- */
+  const F = new Flow($("fuseSvg"), { width: 720, height: 200 });
+  F.node("hbm", { x: 110, y: 100, w: 170, h: 60, label: "HBM (80 GB)", sub: "3.35 TB/s", kind: "x" })
+   .node("sm", { x: 400, y: 100, w: 170, h: 60, label: "SM: SRAM + registers", sub: "tiny, ~10× faster", kind: "ac" })
+   .node("tc", { x: 630, y: 100, w: 150, h: 60, label: "Math units", sub: "x*2, +1, gelu", kind: "w" })
+   .edge("hbm", "sm", { label: "read / write" }).edge("sm", "tc").render();
+  let busy = false, did = { un: false, fu: false };
+  async function runFuse(fused) {
+    if (busy) return; busy = true;
+    const ops = fused ? [["x*2 → +1 → gelu", "--c-y"]] : [["x*2", "--c-x"], ["+1", "--c-at"], ["gelu", "--c-y"]];
+    $("fK").textContent = fused ? "1" : "3"; $("fBy").textContent = "…"; $("fT").textContent = "…";
+    let bytes = 0;
+    for (const [name, c] of ops) {
+      F.set("tc", { sub: name, hot: true });
+      await F.packet(["hbm", "sm", "tc"], { color: c, dur: 650 });
+      await F.packet(["tc", "sm", "hbm"], { color: c, dur: 650 });
+      bytes += 4e9; $("fBy").textContent = (bytes / 1e9).toFixed(0) + " GB so far";
+    }
+    F.set("tc", { sub: "x*2, +1, gelu", hot: false });
+    $("fBy").textContent = (bytes / 1e9).toFixed(0) + " GB"; $("fT").textContent = tfmt(bytes / 3.35e12);
+    $("fMsg").textContent = fused ? "Fused: read x once, keep the intermediates on chip, write y once. 4 bytes per number." : "Unfused: every intermediate goes back to HBM and is read again by the next kernel. 12 bytes per number.";
+    did[fused ? "fu" : "un"] = true; win("gFuse", did.un && did.fu);
+    busy = false;
+  }
+  $("fUn").onclick = () => runFuse(false);
+  $("fFu").onclick = () => runFuse(true);
+})();
+</script>
+</body>
+</html>

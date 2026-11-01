@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.6 ROS 2 & tf2: the transform tree · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .tferr { font-family: var(--mono); font-size: .85rem; color: var(--bad); }
+  .tfok { font-family: var(--mono); font-size: .85rem; color: var(--good); }
+  .checklist { list-style: none; padding-left: 0; margin: 6px 0; }
+  .checklist li { margin: 3px 0; }
+  .controls select, .controls input[type="number"] { font: inherit; font-size: .9rem; padding: 3px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); }
+  .controls input[type="number"] { width: 6.5em; }
+</style>
+</head>
+<body data-lesson="s1-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 1 · Lesson 6</div>
+  <h1>ROS 2 &amp; tf2: the transform tree</h1>
+  <p class="subtitle">A real robot has dozens of frames, some bolted down, some moving, all changing over time. tf2 keeps every one of them in a tree, remembers the last ten seconds, and answers “where was the camera, in the map, when this image was taken?” in one call. Here's how it works and how it breaks.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>map → odom → base_link</b>: map doesn't drift but jumps, odom is smooth but drifts (Lesson 1.1, REP 105).</li>
+      <li><b>Chaining transforms</b>: T<sub>map_camera</sub> = T<sub>map_odom</sub> · T<sub>odom_base</sub> · T<sub>base_camera</sub>, inner names cancel; inverse = [Rᵀ, −Rᵀt] (Lesson 1.5).</li>
+      <li><b>Quaternions</b> store the rotation part in ROS messages, as (x, y, z, w) with w last (Lesson 1.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>Your robot drives at <b class="ct">2 m/s</b>. Its camera spots a person. The image reaches your code <b class="un">200 ms</b> after it was taken. You ask: “where is the camera in the map frame <i>right now</i>?”, and use that to place the person. <b>How far off is the person, and what does tf2 say when you ask for “right now”?</b></p>
+    <p>Timing matters even for the best-calibrated cars. The Waymo Open Dataset gives <b>every lidar point its own vehicle pose</b>, “the pose at the time the LiDAR point is captured”, and reports camera–lidar synchronization within −6 to +7 ms for 99.7% of images (<a href="https://arxiv.org/abs/1912.04838" target="_blank" rel="noopener">Sun et al.</a>). In ROS, the library that handles “which frame, at what time?” is <b>tf2</b>: the transform library, introduced (as tf) by Tully Foote in 2013 (<a href="https://doi.org/10.1109/TePRA.2013.6556373" target="_blank" rel="noopener">TePRA 2013</a>).</p>
+  </div>
+
+  <div class="predict" id="pr0">
+    <b class="q">🧩 Predict:</b> 2 m/s, image 200 ms old. If you use the robot's latest pose instead of its pose when the image was taken, how far off is the person?
+    <div><button class="btn small" data-open="pr0">Show the answer</button></div>
+    <div class="ans">About <b>2 m/s × 0.2 s = 40 cm</b> (a bit less if the latest pose is itself slightly old). And if you literally ask tf2 for the transform at <i>now</i>, it usually refuses: “Lookup would require extrapolation into the future”, because no odometry message stamped “now” has arrived yet. The right question is “at the image's timestamp”. Playground 2 lets you try all three.</div>
+  </div>
+
+  <h2>One tree, many frames</h2>
+  <p>tf2 stores <b>one transform per link</b> between a parent frame and a child frame, and links them into a <b>tree</b>: every frame has exactly one parent (except the root), and any number of children. A typical mobile robot:</p>
+  <table>
+    <tr><th>Link (parent → child)</th><th>Kind</th><th>Who publishes it</th></tr>
+    <tr><td class="mp">map → odom</td><td>dynamic</td><td>Localization (it corrects drift by moving odom inside map)</td></tr>
+    <tr><td class="be">odom → base_link</td><td>dynamic, e.g. 20–50 Hz</td><td>Wheel odometry or a state estimator</td></tr>
+    <tr><td class="se">base_link → laser, imu_link, camera_link</td><td>static</td><td>Calibration: <code>static_transform_publisher</code> or the robot description (URDF)</td></tr>
+    <tr><td class="se">camera_link → camera_optical</td><td>static</td><td>Fixed rotation to the optical convention (z forward, x right, y down)</td></tr>
+  </table>
+  <p>Why a tree and not a web? Because a frame with two parents could get two different answers for where it is. REP 105 makes the point directly: you might expect both map and odom to attach to base_link, but that's not allowed, because each frame can only have one parent; so map is the parent of odom, and odom the parent of base_link.</p>
+  <p>To answer a lookup, tf2 walks from the source frame <b>up</b> to the closest common ancestor and <b>down</b> to the target frame, multiplying (and inverting) the transforms it passes. You never write the chain by hand.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: where is the camera on the map?</span>
+    <p>Three links (2D for simplicity, as x, y, yaw):</p>
+    <ul>
+      <li><span class="mp">map → odom</span> = (0.5, −0.2, 0°): localization says odometry has drifted by that much.</li>
+      <li><span class="be">odom → base_link</span> = (4, 3, 90°): the robot, facing “up” the odom frame.</li>
+      <li><span class="se">base_link → camera_link</span> = (0.3, 0, 0°): the camera, 30 cm ahead of the robot's center.</li>
+    </ul>
+    <ol>
+      <li>Camera in odom: the robot faces 90°, so “0.3 m ahead” is +0.3 in odom y: (4, 3 + 0.3) = (4, 3.3), facing 90°.</li>
+      <li>Camera in map: add map → odom's shift (no turn): (4 + 0.5, 3.3 − 0.2) = <b class="mp">(4.5, 3.1)</b>, facing 90°.</li>
+    </ol>
+    <p>That's T<sub>map_odom</sub> · T<sub>odom_base</sub> · T<sub>base_camera</sub>, the product tf2 computes for <code>lookup_transform("map", "camera_link", time)</code>. Note the argument order: <b>target first, source second</b>; the result turns source-frame data into target-frame data.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Build, break and fix a tf tree</span>
+    <p class="hint">A robot's tf tree. Pick a <b>source</b> and a <b>target</b> and press lookup: a packet travels the path tf2 would take, and you get the composed transform or tf2's real error message. Something is wrong with this robot: the camera driver's static transform was never published.</p>
+    <svg id="tfTree"></svg>
+    <div class="controls">
+      <label>target <select id="tgt"></select></label>
+      <label>source <select id="src"></select></label>
+      <button class="btn primary" id="look">🔎 lookup_transform(target, source)</button>
+    </div>
+    <div class="readout" id="lookOut">Pick two frames and press lookup.</div>
+    <div class="controls">
+      <label>static link: child <select id="child"></select></label>
+      <label>parent <select id="parent"></select></label>
+      <button class="btn" id="setP">🔗 Publish static transform</button>
+      <button class="btn" id="drive">🚗 Drive 2 m forward</button>
+      <button class="btn" id="tfReset">↺ Reset</button>
+    </div>
+    <ul class="checklist" id="todo"></ul>
+    <p class="hint">🏆 <b>Challenge:</b> (1) look up <b>map ← camera_optical</b> and read the error; (2) publish the missing static link for <b>camera_link</b> with the right parent; (3) prove it's right: drive the robot and check that the camera moves with it. Try attaching it to <i>map</i> first, to see why that's wrong.</p>
+    <div class="verdict" id="verdict1"></div>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    tf2 turns “which frame?” into data. Every node <b>publishes</b> the links it knows (static ones once, moving ones continuously, each with a <b>timestamp</b>); every node that needs geometry <b>asks</b> for any frame pair at any recent time. The tree guarantees one answer, the timestamps make it the answer for the right moment.
+  </div>
+
+  <h2>Static vs dynamic, and the role of time</h2>
+  <p>Each link arrives as a <code>geometry_msgs/TransformStamped</code>: a header with a <b>timestamp</b> and the parent's name (<code>frame_id</code>), the <code>child_frame_id</code>, and a transform (translation x, y, z and a quaternion x, y, z, w). Its definition says it “expresses a transform from coordinate frame header.frame_id to the coordinate frame child_frame_id at the time of header.stamp”.</p>
+  <ul>
+    <li><b>Static</b> links (sensor mounts) go on the <code>/tf_static</code> topic, once. The ROS 2 docs: “static transforms are published once and assumed to not change, so no history is stored.”</li>
+    <li><b>Dynamic</b> links (odometry, localization, joints) go on <code>/tf</code>, continuously. Each listener keeps a <b>buffer</b>: tf2 stores a time snapshot for every transform “for up to 10 seconds by default”.</li>
+    <li>A lookup <b>at time t</b> interpolates between the two stored samples around t. If base_link was at x = 2.0 at t = 1.00 s and x = 2.2 at t = 1.10 s, at t = 1.04 s tf2 answers x = 2.0 + 0.4 × 0.2 = <b>2.08</b>.</li>
+    <li>Ask for a time after the newest sample and you get “<span class="tferr">Lookup would require extrapolation into the future</span>”; older than the buffer and you get “…extrapolation into the past”. tf2 never guesses outside its data.</li>
+    <li>Ask with time 0 (<code>rclpy.time.Time()</code>) and you get the <b>latest</b> available transform, whatever its age. Convenient, and wrong for anything that moves fast.</li>
+  </ul>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a family tree with dated photos</span>
+    <p>Every frame is a family member with exactly one parent. Static links are birth certificates: written once, never updated. Dynamic links are a shoebox of dated photos showing where each child stood relative to its parent. Asking tf2 a question is like asking “where was cousin Camera relative to grandma Map at 3:04 pm?”: tf2 walks up and down the family tree and, for each moving link, picks the photos taken just before and after 3:04 and splits the difference. No photos after 3:04 yet? It won't make one up.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> A robot has dozens of frames: map, odom, the base, every sensor, every arm joint. Each program needs some of them, at the time its data was captured, and every program used to carry its own copy of the offsets and its own chaining code. Sensor data from 100 ms ago was routinely combined with the robot's pose “now”.</li>
+      <li><b>What people tried.</b> <i>Hard-coded offsets in each node</i> (copies drift apart when a sensor is remounted). <i>One central “pose” topic</i> (fine for the base, useless for arms, gimbals and multiple sensors). <i>Always using the latest pose</i> (simple, but at 2 m/s a 200 ms-old image is placed 40 cm wrong).</li>
+      <li><b>Why tf2 works.</b> A shared, timestamped tree: publishers own their links, listeners query any pair at any buffered time, and tf2 does the path finding, multiplication, inversion and time interpolation. map → odom (0.5, −0.2) · odom → base (4, 3, 90°) · base → camera (0.3, 0) gives the camera at (4.5, 3.1) with no hand-written chain. Looking up at the image stamp removes the 40 cm error.</li>
+      <li><b>What it costs, when it fails.</b> Every message must carry the right <code>frame_id</code> and timestamp; a sensor driver that stamps with arrival time instead of capture time silently reintroduces the lag. Buffers cost memory and lookups cost CPU at high rates. Common failures: a missing link (“frame does not exist”, or “not part of the same tree”), a link published by two nodes (the frame jumps between two parents), clocks that disagree between machines or with simulation time, and asking for “now” (extrapolation errors).</li>
+      <li><b>What came next.</b> Message filters that hold sensor data until the transform for its timestamp is available, the robot description (URDF) with <code>robot_state_publisher</code> to publish all static and joint links from one file, lookups between two different times through a fixed frame (“time travel”), and, beyond ROS, estimators that fuse each measurement at its own timestamp (PX4's delayed fusion horizon, Lesson 3.7).</li>
+    </ol>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Ask at the right time</span>
+    <p class="hint">Odometry publishes <span class="be">odom → base_link</span> every 50 ms; each message arrives 30 ms after its timestamp. The chart shows the robot's true position (line) and the messages in the buffer (dots). A camera image stamped <b class="se">t<sub>img</sub></b> = now − latency shows a person 5 m ahead. Try the four lookups.</p>
+    <canvas class="chart" id="timeChart" style="height:230px"></canvas>
+    <div class="controls">
+      <label><span class="ct">speed</span> <input type="range" id="tv" min="0.5" max="3" step="0.1" value="2"> <b class="mono" id="tvV"></b></label>
+      <label><span class="se">image latency</span> <input type="range" id="tl" min="0" max="1500" step="10" value="200"> <b class="mono" id="tlV"></b></label>
+      <label><span class="un">buffer length</span> <input type="range" id="tb" min="0.5" max="10" step="0.5" value="10"> <b class="mono" id="tbV"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn" id="qLatest">Time() — latest</button>
+      <button class="btn primary" id="qStamp">at the image stamp</button>
+      <button class="btn" id="qNow">at now()</button>
+      <button class="btn" id="qNowT">at now(), timeout 100 ms</button>
+    </div>
+    <div class="readout" id="tOut">Press a lookup button.</div>
+    <div class="stat-row">
+      <div class="stat">person placed at <b id="tPer">–</b></div>
+      <div class="stat">error <b id="tErr">–</b></div>
+      <div class="stat">challenge <b id="tChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> at <b>2 m/s or faster</b> with <b>150 ms or more</b> of latency, place the person within <b>2 cm</b>. Then break it on purpose: make the latency longer than the buffer.</p>
+  </div>
+
+  <h2>Doing it for real: the commands and the code</h2>
+  <p>The <code>tf2_ros</code> package ships a command-line static publisher. In current ROS 2 releases (Jazzy is the long-term-support release, supported until May 2029) it takes named arguments, angles in <b>radians</b>:</p>
+<pre><code>ros2 run tf2_ros static_transform_publisher --x <span class="n">0.3</span> --y <span class="n">0</span> --z <span class="n">1.2</span> \
+    --yaw <span class="n">0</span> --pitch <span class="n">0</span> --roll <span class="n">0</span> --frame-id base_link --child-frame-id camera_link
+
+ros2 run tf2_ros static_transform_publisher --x <span class="n">0</span> --y <span class="n">0</span> --z <span class="n">0</span> \
+    --qx <span class="n">0</span> --qy <span class="n">0</span> --qz <span class="n">0</span> --qw <span class="n">1</span> --frame-id world --child-frame-id mystaticturtle   <span class="c"># quaternion form</span></code></pre>
+  <p class="hint">All arguments except <code>--frame-id</code> and <code>--child-frame-id</code> are optional and default to the identity. Angles are radians: 15° is 0.2618, not 15.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Write the static transforms</span>
+    <p class="hint">Three mounting jobs from a real car. Fill in the numbers (meters and <b>radians</b>, ROS axes: x forward, y left, z up; positive pitch tips the nose <b>down</b>). The 3D view shows your frame on the car; the command line is generated for you. Press <b>Check</b>.</p>
+    <div class="verdict" id="sTask"></div>
+    <canvas class="view3d" id="stView" style="aspect-ratio: 16 / 9"></canvas>
+    <div class="controls">
+      <label>--frame-id <select id="sPar"><option>base_link</option><option>camera_front</option><option>map</option><option>odom</option></select></label>
+      <label>--child-frame-id <select id="sChi"><option>lidar_rear</option><option>camera_front</option><option>camera_front_optical</option></select></label>
+    </div>
+    <div class="controls">
+      <label>--x <input type="number" id="sx" step="0.1" value="0"></label>
+      <label>--y <input type="number" id="sy" step="0.1" value="0"></label>
+      <label>--z <input type="number" id="sz" step="0.1" value="0"></label>
+      <label>--yaw <input type="number" id="syaw" step="0.01" value="0"></label>
+      <label>--pitch <input type="number" id="spit" step="0.01" value="0"></label>
+      <label>--roll <input type="number" id="sroll" step="0.01" value="0"></label>
+    </div>
+    <div class="readout" id="sCmd"></div>
+    <div class="controls"><button class="btn primary" id="sCheck">✔ Check</button><button class="btn" id="sNext">Next job →</button><span class="mono" id="sScore">0 / 3 jobs</span></div>
+    <div class="verdict" id="sVerdict"></div>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>In Python (<code>rclpy</code>), a node owns a <code>Buffer</code> and a <code>TransformListener</code> that fills it from /tf and /tf_static. This is the pattern from the official ROS 2 tf2 tutorials, with the lookup done at the data's own timestamp:</p>
+<pre><code><span class="k">import</span> rclpy
+<span class="k">from</span> rclpy.node <span class="k">import</span> Node
+<span class="k">from</span> rclpy.duration <span class="k">import</span> Duration
+<span class="k">from</span> tf2_ros <span class="k">import</span> TransformException
+<span class="k">from</span> tf2_ros.buffer <span class="k">import</span> Buffer
+<span class="k">from</span> tf2_ros.transform_listener <span class="k">import</span> TransformListener
+<span class="k">import</span> tf2_geometry_msgs                    <span class="c"># registers PointStamped etc. with tf2</span>
+
+<span class="k">class</span> PersonLocator(Node):
+    <span class="k">def</span> __init__(self):
+        super().__init__(<span class="s">"person_locator"</span>)
+        self.tf_buffer = Buffer()                          <span class="c"># keeps ~10 s of transforms</span>
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
+    <span class="k">def</span> on_detection(self, point_stamped):                <span class="c"># a geometry_msgs/PointStamped from the camera</span>
+        <span class="k">try</span>:
+            t = self.tf_buffer.lookup_transform(
+                <span class="s">"map"</span>,                                     <span class="c"># target frame</span>
+                point_stamped.header.frame_id,             <span class="c"># source frame, e.g. camera_optical</span>
+                point_stamped.header.stamp,                <span class="c"># at the time the image was taken</span>
+                timeout=Duration(seconds=<span class="n">0.1</span>))
+        <span class="k">except</span> TransformException <span class="k">as</span> ex:
+            self.get_logger().info(<span class="s">f"Could not transform: {ex}"</span>)
+            <span class="k">return</span>
+        p_map = tf2_geometry_msgs.do_transform_point(point_stamped, t)</code></pre>
+<pre><code><span class="c"># Debugging on a live robot</span>
+ros2 run tf2_tools view_frames                 <span class="c"># PDF of the whole tree, with publish rates and buffer ages</span>
+ros2 run tf2_ros tf2_echo map camera_link      <span class="c"># translation, quaternion, RPY and the 4×4 matrix, live</span>
+ros2 topic echo /tf_static                     <span class="c"># see every static link</span></code></pre>
+    <p class="hint">Static links in a broadcaster node use <code>StaticTransformBroadcaster</code> from <code>tf2_ros.static_transform_broadcaster</code>; moving links use <code>TransformBroadcaster</code>. Both send <code>TransformStamped</code> messages.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚕 Waymo</h4><p>Waymo doesn't use ROS on its cars as far as it has published, but its open dataset shows the same two ideas tf2 implements: a full set of frames with 4×4 transforms between them, and <b>time-correct poses</b>: each lidar range-image pixel carries the vehicle pose at the moment that point was captured, and lidar-to-camera projections compensate for the cameras' rolling shutter. Camera–lidar synchronization error is within −6 to +7 ms for 99.7% of images.</p>
+        <p class="src">Sources: <a href="https://arxiv.org/abs/1912.04838" target="_blank" rel="noopener">Waymo Open Dataset paper</a></p></div>
+      <div><h4>🛸 Drones (PX4)</h4><p>PX4 solves the same timing problem inside its estimator: each sensor has a delay parameter (<code>EKF2_*_DELAY</code>), and EKF2 fuses measurements on a <b>delayed time horizon</b> so that, for example, a GPS fix is combined with the state from when the fix was actually taken, then a fast filter carries the result forward to now. ROS 2 users talking to PX4 still need tf2-style care with frames (NED vs ENU, Lesson 1.1).</p>
+        <p class="src">Sources: <a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4 EKF2 docs</a>, <a href="https://docs.px4.io/main/en/ros2/user_guide.html" target="_blank" rel="noopener">PX4 ROS 2 guide</a></p></div>
+      <div><h4>🚘 Tesla</h4><p>Tesla hasn't published its internal transform or timing infrastructure. Publicly, at AI Day 2021, it described networks that fuse camera features into one vehicle-centered vector space and across time. Combining frames from different moments while the car moves requires accounting for the car's own motion between them, the same “transform at time t” question tf2 answers, though Tesla hasn't said how its stack does it.</p>
+        <p class="src">Sources: <a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a></p></div>
+      <div><h4>🤖 ROS robots</h4><p>ROS 2 robots run tf2 throughout. The Nav2 navigation stack's docs say the tree must contain “a full map → odom → base_link → [sensor frames]” (REP 105): localization or SLAM provides map → odom, odometry provides odom → base_link, and the sensor links are static, defined in the robot's URDF description. <code>robot_state_publisher</code> reads that file and publishes fixed joints once to /tf_static and moving joints to /tf.</p>
+        <p class="src">Sources: <a href="https://docs.nav2.org/jazzy/getting_started/navigation_concepts/state_estimation/" target="_blank" rel="noopener">Nav2: state estimation</a>, <a href="https://github.com/ros/robot_state_publisher" target="_blank" rel="noopener">robot_state_publisher</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> ROS needs a general, shared service because its robots are assembled from packages by different authors. A company with one vertically integrated stack (Waymo, Tesla) can build frames and timing into its own data formats and code. A flight controller has a fixed set of sensors, so it bakes the timing into the estimator instead of a general library.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Lookup at Time() (latest)</td><td>Never fails once the frames exist; simplest code</td><td>Wrong by speed × age for moving robots (40 cm at 2 m/s, 200 ms)</td></tr>
+      <tr><td>Lookup at the data's stamp</td><td>Correct geometry for that moment</td><td>Can fail until newer transforms arrive: needs a timeout or a message filter</td></tr>
+      <tr><td>Static links via /tf_static</td><td>Published once, no history, cheap</td><td>A missing publisher breaks the tree with no warning until someone looks up</td></tr>
+      <tr><td>Longer buffer</td><td>Can process older data (slow detectors, logs)</td><td>Memory; doesn't help with future-time requests</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your detections are placed 30 cm off on the map when the robot moves fast, and fine when it's still. Debug it.” A strong answer:</p>
+    <ul>
+      <li>Suspects <b>time</b>: lookup at Time() (latest) instead of the image stamp, or a driver stamping with arrival time; error ≈ speed × latency.</li>
+      <li>Knows tf2's API: <code>lookup_transform(target, source, time, timeout)</code>, its errors (<b>does not exist</b>, <b>not part of the same tree</b>, <b>extrapolation into the future/past</b>) and the 10 s default buffer.</li>
+      <li>Checks the tree with <code>view_frames</code> / <code>tf2_echo</code>: one parent per frame, static links present, map → odom → base_link per REP 105.</li>
+      <li>Mentions clocks: all machines synchronized, <code>use_sim_time</code> consistent in simulation and playback.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>tf, the transform library</b> <span class="tag res">🧪 Research · 2013</span> <a href="https://doi.org/10.1109/TePRA.2013.6556373" target="_blank" rel="noopener">Foote, TePRA 2013</a></div>
+      <p><b>How:</b> a distributed, timestamped tree of coordinate frames that any node can publish to and query.</p>
+      <p><b>Why this method:</b> robots built from many independent programs need one shared, consistent answer to “where is X relative to Y, at time t?”.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Navigation on ROS 2</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.nav2.org/jazzy/getting_started/navigation_concepts/state_estimation/" target="_blank" rel="noopener">Nav2: state estimation</a></div>
+      <p><b>How:</b> localization publishes map → odom, odometry publishes odom → base_link, sensors hang off base_link; the planner and costmaps look everything up through tf2.</p>
+      <p><b>Why this method:</b> swap the lidar or the localization package and nothing else changes, as long as the frames are published.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Time-correct sensor fusion</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.px4.io/main/en/advanced_config/tuning_the_ecl_ekf.html" target="_blank" rel="noopener">PX4 EKF2</a></div>
+      <p><b>How:</b> each measurement is fused against the state at its own (delayed) time, then the result is propagated to now.</p>
+      <p><b>Why this method:</b> the same lesson as lookups at the image stamp: combine data with the pose from when it was measured.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · tf2 won't guess the future</span>
+    <p>The exact error text you'll meet, straight from tf2's source: “Lookup would require extrapolation into the future. Requested time … but the latest data is at time …”. It's a feature: tf2 interpolates between messages it has, but refuses to extrapolate, because a guessed pose that's wrong is worse than an honest failure. The fix is almost always to ask at the data's timestamp and allow a short timeout, not to ask for “now”.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This lesson put Lessons 1.1–1.5 into a running system: frames (1.1), rotations as quaternions (1.4), chains and inverses (1.5), now stored in a timestamped tree. Phase 2 adds the sensors that publish into it and the time-sync problem in depth (2.7), Phase 3 builds the estimators that publish odom → base_link, and Phase 5's localization publishes map → odom. The recap's build-it-yourself designs a drone's whole tree. The chaining itself is <a href="../../math-course/phase2/2-matmul.html">matrix multiplication</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.ros.org/en/rolling/Concepts/Intermediate/About-Tf2.html" target="_blank" rel="noopener">ROS 2: About tf2</a>. The concepts page, with links to every tutorial.</li>
+      <li><span class="kind">Tutorial</span> <a href="https://docs.ros.org/en/jazzy/Tutorials/Intermediate/Tf2/Writing-A-Tf2-Listener-Py.html" target="_blank" rel="noopener">Writing a tf2 listener (Python, Jazzy)</a>. The Buffer + TransformListener pattern used above.</li>
+      <li><span class="kind">Tutorial</span> <a href="https://docs.ros.org/en/jazzy/Tutorials/Intermediate/Tf2/Debugging-Tf2-Problems.html" target="_blank" rel="noopener">Debugging tf2 problems</a>. “Does not exist” and “extrapolation into the future”, found and fixed step by step.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. odom → base_link was published at t = 5.00 s with x = 3.0 m and at t = 5.05 s with x = 3.1 m. What does tf2 return for x at t = 5.02 s?</div>
+    <div class="opts"><button class="opt">3.0 m (the older sample)</button><button class="opt" data-ok>3.04 m</button><button class="opt">An extrapolation error</button></div>
+    <div class="explain">5.02 s is 40% of the way from 5.00 to 5.05, so tf2 interpolates: 3.0 + 0.4 × 0.1 = <b>3.04 m</b>. Errors only happen outside the stored samples.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your node calls lookup_transform("map", "laser", node.get_clock().now()) and keeps getting “Lookup would require extrapolation into the future”. What's the usual fix?</div>
+    <div class="opts"><button class="opt">Increase the buffer length to 60 s</button><button class="opt" data-ok>Look up at the scan's own header.stamp (with a short timeout), not at now()</button><button class="opt">Publish map → laser directly as a static transform</button></div>
+    <div class="explain">The newest transform is always a few milliseconds older than “now”, so tf2 refuses to extrapolate. Ask at the data's timestamp, which is in the past, and give it a timeout so it can wait for the transform that brackets it. A bigger buffer only helps for requests that are too old.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Two nodes both publish a transform with child_frame_id = base_link: one with parent odom, one with parent map. What happens?</div>
+    <div class="opts"><button class="opt">tf2 averages the two</button><button class="opt">tf2 picks map because it's closer to the root</button><button class="opt" data-ok>It breaks the tree rule (one parent per frame): base_link's parent flips between messages and lookups jump. Publish map → odom instead</button></div>
+    <div class="explain">tf2 assumes one parent per frame. REP 105's design is exactly the fix: localization publishes <b>map → odom</b> (computed from map → base_link and odom → base_link), so base_link keeps a single parent, odom.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>tf2 keeps a tree of frames (one parent each); lookups walk up to the common ancestor and down, multiplying transforms for you.</li>
+      <li>Static links (/tf_static) are published once; dynamic ones (/tf) are timestamped and buffered (10 s by default) and interpolated.</li>
+      <li>lookup_transform(target, source, time, timeout): ask at the data's stamp. Time() = latest (stale for movers); now() → extrapolation into the future.</li>
+      <li>Errors: frame does not exist, not part of the same tree, extrapolation into the future / past. Tools: static_transform_publisher (radians!), tf2_echo, view_frames.</li>
+      <li>Waymo stores per-point poses and tight sensor sync; PX4 fuses each measurement at its own time; ROS robots get both from tf2.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script src="../assets/space.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 2 : d);
+  const r = MX.rad, D = MX.deg;
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+  const R_OPT = [[0, 0, 1], [-1, 0, 0], [0, -1, 0]];
+
+  // ---------- Playground 1: the tf tree ----------
+  const POS = { map: [360, 32], odom: [360, 102], base_link: [360, 172], laser: [150, 250], imu_link: [300, 250], camera_link: [560, 250], camera_optical: [560, 318] };
+  const KIND = { map: "mp", odom: "be", base_link: "be", laser: "se", imu_link: "se", camera_link: "se", camera_optical: "se" };
+  const LOCAL = {   // each child's transform relative to its parent (only the numbers; the parent can change)
+    odom: SP.hom(SP.rotZ(0), [0.5, -0.2, 0]), laser: SP.hom(SP.rotZ(0), [0.2, 0, 0.3]), imu_link: SP.hom(SP.rotZ(0), [0, 0, 0.1]),
+    camera_link: SP.hom(SP.rotZ(0), [0.3, 0, 1.2]), camera_optical: SP.hom(R_OPT, [0, 0, 0]),
+  };
+  const STATIC = { laser: true, imu_link: true, camera_link: true, camera_optical: true };
+  let parent, driven, steps, odomBase;
+  const F = new Flow($("tfTree"), { width: 720, height: 345 });
+  function resetTF() {
+    parent = { map: null, odom: "map", base_link: "odom", laser: "base_link", imu_link: "base_link", camera_link: null, camera_optical: "camera_link" };
+    driven = 0; odomBase = SP.hom(SP.rotZ(r(90)), [4, 3, 0]); steps = { err: false, fixed: false, drove: false, wrongTried: false };
+    $("verdict1").innerHTML = ""; $("lookOut").textContent = "Pick two frames and press lookup."; drawTree(); todo();
+  }
+  const local = f => (f === "base_link" ? odomBase : LOCAL[f]);
+  function drawTree() {
+    F.nodes = {}; F.edges = [];
+    Object.keys(POS).forEach(f => F.node(f, { x: POS[f][0], y: POS[f][1], w: 130, h: 42, label: f, kind: KIND[f], sub: f === "map" ? "root" : !parent[f] ? "no parent!" : STATIC[f] ? "static" : f === "odom" ? "localization" : "odometry" }));
+    Object.entries(parent).forEach(([c, p]) => { if (p) F.edge(p, c, { dashed: !!STATIC[c] }); });
+    F.render();
+    if (!parent.camera_link) F.set("camera_link", { down: true });
+  }
+  function ancestors(f) { const out = [f]; const seen = new Set([f]); while (parent[out[out.length - 1]]) { const p = parent[out[out.length - 1]]; if (seen.has(p)) break; seen.add(p); out.push(p); } return out; }
+  const toRoot = f => ancestors(f).slice(0, -1).reduceRight((T, g) => SP.hmul(T, local(g)), SP.hom(SP.rotZ(0), [0, 0, 0]));   // T_root_f
+  const exists = f => f === "map" || !!parent[f] || Object.values(parent).includes(f);
+  function lookup(target, source) {
+    if (!exists(target)) return { err: `"${target}" passed to lookupTransform argument target_frame does not exist. ` };
+    if (!exists(source)) return { err: `"${source}" passed to lookupTransform argument source_frame does not exist. ` };
+    const a = ancestors(source), b = ancestors(target);
+    if (a[a.length - 1] !== b[b.length - 1]) return { err: `Could not find a connection between '${target}' and '${source}' because they are not part of the same tree.Tf has two or more unconnected trees.` };
+    const common = a.find(f => b.includes(f));
+    const path = [...a.slice(0, a.indexOf(common) + 1), ...b.slice(0, b.indexOf(common)).reverse()];
+    const T = SP.hmul(SP.hinv(toRoot(target)), toRoot(source));
+    return { T, path };
+  }
+  function describe(T) {
+    const e = SP.toEuler([T[0].slice(0, 3), T[1].slice(0, 3), T[2].slice(0, 3)]), q = SP.q.fromMatrix([T[0].slice(0, 3), T[1].slice(0, 3), T[2].slice(0, 3)]);
+    return `- Translation: [${[T[0][3], T[1][3], T[2][3]].map(v => fmt(v, 3)).join(", ")}]\n- Rotation: in Quaternion (x, y, z, w) [${[q[1], q[2], q[3], q[0]].map(v => fmt(v, 3)).join(", ")}]\n- Rotation: in RPY (degree) [${[e.roll, e.pitch, e.yaw].map(v => fmt(D(v), 1)).join(", ")}]`;
+  }
+  const frames = Object.keys(POS);
+  [["tgt", "map"], ["src", "camera_optical"], ["child", "camera_link"]].forEach(([id, def]) => { const s = $(id); (id === "child" ? frames.filter(f => f !== "map") : frames).forEach(f => s.add(new Option(f, f, f === def, f === def))); });
+  function fillParents() { const s = $("parent"), c = $("child").value; s.innerHTML = ""; s.add(new Option("(remove link)", "")); frames.filter(f => f !== c && !ancestors(f).includes(c)).forEach(f => s.add(new Option(f, f, f === parent[c], f === parent[c]))); }
+  $("child").onchange = fillParents;
+  async function doLookup() {
+    const t = $("tgt").value, s = $("src").value, res = lookup(t, s);
+    F.clearPackets();
+    if (res.err) {
+      $("lookOut").innerHTML = `<span class="tferr">tf2.LookupException: ${res.err}</span>`;
+      if (t === "map" && s === "camera_optical" || t === "camera_optical" && s === "map") steps.err = true;
+    } else {
+      $("lookOut").innerHTML = `<span class="tfok">lookup_transform("${t}", "${s}") ✓</span>  path: ${res.path.join(" → ")}\n` + describe(res.T);
+      if (res.path.length > 1) await F.packet(res.path, { color: "--c-pl", dur: 350 * (res.path.length - 1) });
+    }
+    todo();
+  }
+  $("look").onclick = doLookup;
+  $("setP").onclick = () => {
+    const c = $("child").value, p = $("parent").value || null;
+    if (c === "base_link" || c === "odom") { $("lookOut").innerHTML = `<span class="muted">${c} is a dynamic link owned by ${c === "odom" ? "localization" : "odometry"}; this button publishes static links only. Try camera_link.</span>`; return; }
+    parent[c] = p; drawTree(); fillParents();
+    if (c === "camera_link" && p && p !== "base_link") steps.wrongTried = true;
+    steps.fixed = parent.camera_link === "base_link";
+    $("lookOut").textContent = p ? `ros2 run tf2_ros static_transform_publisher --x ${fmt(LOCAL[c][0][3], 1)} --y ${fmt(LOCAL[c][1][3], 1)} --z ${fmt(LOCAL[c][2][3], 1)} --frame-id ${p} --child-frame-id ${c}` : `Removed the link ${c}'s parent → ${c}.`;
+    todo();
+  };
+  $("drive").onclick = () => {
+    const before = parent.camera_link ? lookup("map", "camera_link") : null;
+    odomBase = SP.hmul(odomBase, SP.hom(SP.rotZ(0), [2, 0, 0])); driven += 2;
+    const after = parent.camera_link ? lookup("map", "camera_link") : null;
+    let msg = `Drove 2 m: odom → base_link is now at (${fmt(odomBase[0][3], 1)}, ${fmt(odomBase[1][3], 1)}).`;
+    if (before && after && !before.err && !after.err) {
+      const moved = Math.hypot(after.T[0][3] - before.T[0][3], after.T[1][3] - before.T[1][3]);
+      msg += moved > 1.9 ? `\nThe camera moved ${fmt(moved, 1)} m with the robot. ✓` : `\nThe camera moved ${fmt(moved, 1)} m: it stayed behind! It's attached to ${parent.camera_link}, not to the robot.`;
+      if (moved > 1.9 && parent.camera_link === "base_link") steps.drove = true;
+    } else msg += "\n(camera_link isn't connected to map, so there's nothing to compare yet.)";
+    $("lookOut").textContent = msg; drawTree(); todo();
+  };
+  $("tfReset").onclick = () => { resetTF(); fillParents(); };
+  function todo() {
+    const items = [[steps.err, "See the error for map ← camera_optical"], [steps.fixed, "Publish camera_link's static link with the right parent"], [steps.drove, "Drive, and see the camera move with the robot"]];
+    $("todo").innerHTML = items.map(([ok, t]) => `<li>${ok ? "✅" : "⬜"} ${t}</li>`).join("");
+    if (steps.err && steps.fixed && steps.drove) $("verdict1").innerHTML = `<span class="badge-win">🏆 Tree repaired!</span> camera_link hangs off base_link, so it moves with the robot.` + (steps.wrongTried ? " You also saw why attaching it to a fixed frame makes lookups succeed but gives the wrong answer." : " Try attaching it to map and driving, to see a lookup that succeeds with the wrong answer.");
+  }
+  resetTF(); fillParents();
+
+  // ---------- Playground 2: time ----------
+  const NOW = 10.0, DTPUB = 0.05, ARR = 0.03, AHEAD = 5;
+  const xTrue = (t, v) => v * t + 0.15 * Math.sin(2 * t);
+  let lastErr = null, won2 = false;
+  function buffer() {
+    const v = +$("tv").value, B = +$("tb").value, msgs = [];
+    for (let k = Math.round((NOW - 12) / DTPUB); k * DTPUB + ARR <= NOW + 0.2 + 1e-9; k++) { const t = +(k * DTPUB).toFixed(3); msgs.push({ t, x: xTrue(t, v), arrives: t + ARR }); }
+    return msgs.filter(m => m.t >= NOW - B - 1e-9);
+  }
+  function query(time, timeout) {
+    const all = buffer(), have = all.filter(m => m.arrives <= NOW + (timeout || 0) + 1e-9);
+    const latest = have[have.length - 1], earliest = have[0];
+    if (time === "latest") return { x: latest.x, used: latest.t, note: `latest available: stamped ${fmt(latest.t, 3)} s` };
+    if (time > latest.t + 1e-9) return { err: `Lookup would require extrapolation into the future.  Requested time ${fmt(time, 3)} but the latest data is at time ${fmt(latest.t, 3)}` };
+    if (time < earliest.t - 1e-9) return { err: `Lookup would require extrapolation into the past.  Requested time ${fmt(time, 3)} but the earliest data is at time ${fmt(earliest.t, 3)}` };
+    const i = have.findIndex(m => m.t >= time - 1e-9), b = have[i], a = Math.abs(b.t - time) < 1e-9 ? b : have[Math.max(0, i - 1)], f = b.t === a.t ? 0 : (time - a.t) / (b.t - a.t);
+    return { x: a.x + f * (b.x - a.x), used: time, note: (a === b ? `exact sample at ${fmt(b.t, 3)} s` : `interpolated between ${fmt(a.t, 3)} s and ${fmt(b.t, 3)} s`) + (timeout && b.arrives > NOW ? ` (waited ${fmt((b.arrives - NOW) * 1000, 0)} ms for it)` : "") };
+  }
+  function draw2(mark) {
+    const v = +$("tv").value, tImg = NOW - +$("tl").value / 1000, all = buffer(), t0 = Math.min(tImg, NOW - 0.6) - 0.15;
+    const xs = MX.linspace(t0, NOW + 0.12, 120), lo = xTrue(t0, v) - 0.2, hi = xTrue(NOW + 0.12, v) + 0.2;
+    const vline = (t, label, color) => ({ label, color, data: [[t, lo], [t, hi]], width: 2, dash: [5, 4] });
+    const series = [
+      { label: "true position", color: MX.css("--c-be"), data: xs.map(t => [t, xTrue(t, v)]), width: 2 },
+      { label: "in the buffer", color: MX.css("--c-se"), data: all.filter(m => m.t >= t0 && m.arrives <= NOW).map(m => [m.t, m.x]), dots: true, dash: [0.001, 99999] },
+      { label: "still in flight", color: MX.css("--muted"), data: all.filter(m => m.t >= t0 && m.arrives > NOW && m.t <= NOW + 0.1).map(m => [m.t, m.x]), dots: true, dash: [0.001, 99999] },
+      vline(tImg, "image stamp", MX.css("--c-se")), vline(NOW, "now", MX.css("--c-ct")),
+    ];
+    if (mark != null) series.push({ label: "your lookup", color: MX.css("--c-un"), data: [[mark.t, mark.x], [mark.t, mark.x]], dots: true, width: 8 });
+    Plot.line($("timeChart"), { series, xMin: t0, xMax: NOW + 0.12, yMin: lo, yMax: hi, xLabel: "time (s)", yLabel: "odom x (m)" });
+  }
+  function run2(kind) {
+    const v = +$("tv").value, lat = +$("tl").value, tImg = NOW - lat / 1000;
+    const res = kind === "latest" ? query("latest") : kind === "stamp" ? query(tImg) : kind === "now" ? query(NOW) : query(NOW, 0.1);
+    const call = { latest: "rclpy.time.Time()", stamp: "image.header.stamp", now: "node.get_clock().now()", nowT: "now(), timeout=Duration(seconds=0.1)" }[kind];
+    if (res.err) { $("tOut").innerHTML = `lookup_transform("odom", "base_link", ${call})\n<span class="tferr">tf2.ExtrapolationException: ${res.err}</span>`; $("tPer").textContent = "–"; $("tErr").textContent = "–"; draw2(); return; }
+    const person = res.x + AHEAD, truth = xTrue(tImg, v) + AHEAD, err = Math.abs(person - truth);
+    $("tOut").innerHTML = `lookup_transform("odom", "base_link", ${call})\n<span class="tfok">✓ ${res.note}</span>\nrobot x = ${fmt(res.x, 3)} m used for an image taken at ${fmt(tImg, 3)} s`;
+    $("tPer").textContent = `x = ${fmt(person, 2)} m (true ${fmt(truth, 2)})`;
+    $("tErr").textContent = err < 0.01 ? fmt(err * 1000, 1) + " mm" : fmt(err * 100, 1) + " cm";
+    if (!won2 && v >= 2 && lat >= 150 && err < 0.02) { won2 = true; $("tChal").innerHTML = `<span class="badge-win">✅ ${fmt(err * 100, 1)} cm at ${fmt(v, 1)} m/s</span>`; }
+    draw2({ t: res.used, x: res.x });
+  }
+  function upd2() {
+    $("tvV").textContent = fmt(+$("tv").value, 1) + " m/s"; $("tlV").textContent = $("tl").value + " ms"; $("tbV").textContent = fmt(+$("tb").value, 1) + " s";
+    if (!won2) $("tChal").innerHTML = `<span class="muted">≥ 2 m/s, ≥ 150 ms, error < 2 cm</span>`;
+    draw2();
+  }
+  ["tv", "tl", "tb"].forEach(id => ($(id).oninput = upd2));
+  $("qLatest").onclick = () => run2("latest"); $("qStamp").onclick = () => run2("stamp"); $("qNow").onclick = () => run2("now"); $("qNowT").onclick = () => run2("nowT");
+  upd2();
+
+  // ---------- Playground 3: static transform builder ----------
+  const JOBS = [
+    { text: "Job 1: a <b>rear lidar</b> mounted 0.9 m behind base_link's origin, 1.6 m up, <b>facing backwards</b>.", par: "base_link", chi: "lidar_rear", t: [-0.9, 0, 1.6], R: SP.euler(Math.PI, 0, 0) },
+    { text: "Job 2: a <b>front camera</b> 2.0 m ahead, 1.4 m up, <b>tilted 15° down</b> toward the road.", par: "base_link", chi: "camera_front", t: [2.0, 0, 1.4], R: SP.euler(0, r(15), 0) },
+    { text: "Job 3: the camera's <b>optical frame</b> on camera_front: same origin, but z out of the lens, x right, y down (REP 103).", par: "camera_front", chi: "camera_front_optical", t: [0, 0, 0], R: R_OPT },
+  ];
+  let job = 0, done3 = [false, false, false];
+  const val = id => { const v = parseFloat($(id).value); return isFinite(v) ? v : 0; };
+  const V3 = new View3D($("stView"), { yaw: -2.3, pitch: 0.45, dist: 9, target: [0.5, 0, 0.8] });
+  V3.render(V => {
+    V.clear(); V.grid(4, 1);
+    V.box([0.6, 0, 0.75], [4.4, 1.8, 1.5], SP.rotZ(0), { color: "--c-be", alpha: 0.6 });
+    V.axes({ R: SP.rotZ(0), t: [0, 0, 0] }, { len: 1, width: 2, name: "base_link" });
+    const J = JOBS[job];
+    const base = J.par === "camera_front" ? SP.hom(JOBS[1].R, JOBS[1].t) : SP.hom(SP.rotZ(0), [0, 0, 0]);
+    if (J.par === "camera_front") V.axes(base, { len: 0.7, width: 1.5, alpha: 0.5, name: "camera_front" });
+    const T = SP.hmul(base, SP.hom(SP.euler(val("syaw"), val("spit"), val("sroll")), [val("sx"), val("sy"), val("sz")]));
+    V.axes(T, { len: 0.9, width: 3, name: $("sChi").value });
+    const o = [T[0][3], T[1][3], T[2][3]], fx = J.chi === "camera_front_optical" ? 2 : 0;
+    V.line([o, o.map((v, i) => v + 2.5 * T[i][fx])], { color: "--c-se", width: 1.5, dash: [5, 4] });
+  });
+  function upd3() {
+    $("sTask").innerHTML = JOBS[job].text;
+    $("sCmd").textContent = `ros2 run tf2_ros static_transform_publisher --x ${val("sx")} --y ${val("sy")} --z ${val("sz")} \\\n    --yaw ${val("syaw")} --pitch ${val("spit")} --roll ${val("sroll")} --frame-id ${$("sPar").value} --child-frame-id ${$("sChi").value}`;
+    $("sScore").textContent = done3.filter(Boolean).length + " / 3 jobs";
+    V3.render();
+  }
+  ["sx", "sy", "sz", "syaw", "spit", "sroll"].forEach(id => ($(id).oninput = upd3));
+  ["sPar", "sChi"].forEach(id => ($(id).onchange = upd3));
+  $("sCheck").onclick = () => {
+    const J = JOBS[job], Rm = SP.euler(val("syaw"), val("spit"), val("sroll"));
+    const dAng = D(SP.q.angle(SP.q.fromMatrix(Rm), SP.q.fromMatrix(J.R))), dPos = Math.hypot(val("sx") - J.t[0], val("sy") - J.t[1], val("sz") - J.t[2]);
+    const issues = [];
+    if ($("sPar").value !== J.par) issues.push(`--frame-id should be the parent the sensor is bolted to (${J.par})`);
+    if ($("sChi").value !== J.chi) issues.push(`--child-frame-id should be ${J.chi}`);
+    if (dPos > 0.011) issues.push(`position is ${fmt(dPos, 2)} m off`);
+    if (dAng > 1) issues.push(`orientation is ${fmt(dAng, 1)}° off` + (Math.abs(val("syaw")) > 6.3 || Math.abs(val("spit")) > 6.3 || Math.abs(val("sroll")) > 6.3 ? " (angles are radians!)" : ""));
+    if (!issues.length) {
+      done3[job] = true;
+      $("sVerdict").innerHTML = `<span class="badge-win">✅ Job ${job + 1} done!</span> ` + (done3.every(Boolean) ? "🏆 All three: you can mount any sensor. (Job 3's answer, yaw −π/2 and roll −π/2, is the standard optical-frame rotation.)" : "Press Next job →");
+    } else $("sVerdict").innerHTML = `<span class="badge-lose">Not yet</span> ${issues.join("; ")}.`;
+    upd3();
+  };
+  $("sNext").onclick = () => { job = (job + 1) % 3; $("sVerdict").innerHTML = ""; ["sx", "sy", "sz", "syaw", "spit", "sroll"].forEach(id => ($(id).value = 0)); upd3(); };
+  upd3();
+})();
+</script>
+</body>
+</html>

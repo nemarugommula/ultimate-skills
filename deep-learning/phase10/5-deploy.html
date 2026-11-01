@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10.5 Export and deploy: torch.compile, ONNX, TensorRT · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .chain { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 8px 0; }
+  .chain .op { border: 2px solid var(--line); border-radius: 10px; padding: 6px 10px; font-size: .85rem; cursor: pointer; background: var(--bg2); user-select: none; }
+  .chain .op.on { border-color: var(--c-ac); background: color-mix(in srgb, var(--c-ac) 12%, var(--bg2)); }
+  .chain .op.fixed { border-color: var(--c-w); cursor: default; }
+  .chain .op small { display: block; color: var(--muted); font-size: .72rem; }
+  .trips { display: flex; flex-wrap: wrap; gap: 3px; margin: 6px 0; }
+  .trips i { width: 16px; height: 16px; border-radius: 4px; display: inline-block; }
+  .trips i.r { background: var(--c-x); } .trips i.w { background: var(--c-gr); }
+  .check { display: grid; gap: 6px; }
+  .check label { display: flex; gap: 8px; align-items: flex-start; padding: 6px 10px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg2); cursor: pointer; font-size: .93rem; }
+  .check label.done { border-color: var(--good); background: color-mix(in srgb, var(--good) 8%, var(--bg2)); }
+  select.btn { padding: 3px 8px; }
+</style>
+</head>
+<body data-lesson="d10-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 10 · Lesson 5</div>
+  <h1>Export and deploy: torch.compile, ONNX, TensorRT</h1>
+  <p class="subtitle">A trained model is a Python object in a notebook. A product is a fast, predictable service or an app on a phone. This lesson covers the bridge: compiling the model into a graph, exporting it to a portable format, and serving it so that many users get answers quickly.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Memory-bound ops get faster when fused; small batches leave a GPU idle (Lesson 10.1).</li>
+      <li>Quantized and pruned models need kernels that understand their formats (Lesson 10.4).</li>
+      <li>A PyTorch model is an <code>nn.Module</code> whose <code>forward</code> is ordinary Python (Lesson 1.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>With PyTorch 2 (announced in late 2022), the PyTorch team added one line to the library: <code>model = torch.compile(model)</code>. Their paper reports that its compiler gave a <b>2.27× inference</b> and <b>1.41× training</b> speed-up (geometric mean) on an NVIDIA A100 across more than 180 real-world models, with no change to the models' code.</p>
+    <p>We ran it on this course's laptop CPU on a small block. It was <b>slower</b>: 13.7 ms compiled vs 12.3 ms eager, after 3–8 seconds of compiling.</p>
+    <p>Both results are real. <b>What does a compiler actually do to a network, when does it help, and how do you get a model out of Python and onto a server or a phone?</b></p>
+  </div>
+
+  <h2>Numbers first: eager mode pays three taxes</h2>
+  <p>Plain PyTorch runs in <b>eager mode</b>: Python executes your <code>forward</code> line by line, and each operation launches its own kernel. That's wonderful for debugging and costs you three ways:</p>
+  <table>
+    <tr><th>Tax</th><th>Where it hurts</th><th>Graph-mode fix</th></tr>
+    <tr><td>Memory round trips: every op reads and writes HBM</td><td>chains of elementwise ops, norms (Lesson 10.1)</td><td>fuse them into one kernel</td></tr>
+    <tr><td>Launch and Python overhead per op</td><td>small models, small batches, decoding</td><td>fewer, bigger kernels; CUDA graphs replay a whole step</td></tr>
+    <tr><td>No global view</td><td>can't plan memory, pick kernels for exact shapes, or drop unused work</td><td>see the whole graph, then optimize it</td></tr>
+  </table>
+  <p>A <b>graph</b> is the list of operations and the tensors flowing between them, captured once so a compiler can rewrite it. The rest of this lesson is about capturing graphs (<code>torch.compile</code>, <code>torch.export</code>), moving them between tools (ONNX) and running them fast (ONNX Runtime, TensorRT, ExecuTorch).</p>
+
+  <h2>Fusion, counted</h2>
+  <p>The glue after a transformer's matmul is a chain of cheap ops: add the bias, GELU, dropout, add the residual, LayerNorm. Each reads its input from HBM and writes its output back. Let's count the traffic for one activation tensor of 8 sequences × 2,048 tokens × 4,096 features in bf16 (134 MB).</p>
+  <p class="predict">🔮 <b>Predict:</b> with all five ops, how many times more HBM traffic does the unfused version move than a single fused kernel?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Operator-fusion counter</span>
+    <p class="hint">Click ops to include them in the chain (the matmul output always comes first). Blue squares = tensor reads from HBM, pink = writes; each square is one full 134 MB pass. Time assumes an H100's 3.35 TB/s.</p>
+    <div class="goals"><span class="goal" id="gF3">🎯 Cut memory traffic ≥ 3× by fusing</span><span class="goal" id="gF1">🎯 Turn 5 kernel launches into 1</span></div>
+    <div class="chain" id="fChain"></div>
+    <div class="controls"><span class="seg" id="fMode"><button data-v="eager" class="on">Eager: one kernel per op</button><button data-v="fused">Fused: one kernel for the chain</button></span></div>
+    <div class="trips" id="fTrips"></div>
+    <div class="stat-row">
+      <div class="stat">kernel launches <b id="fK">–</b></div>
+      <div class="stat">HBM traffic <b id="fB" class="x">–</b></div>
+      <div class="stat">memory time <b id="fT">–</b></div>
+      <div class="stat">vs eager <b id="fX" class="ev">–</b></div>
+    </div>
+    <p class="hint" id="fMsg"></p>
+  </div>
+  <p><b>What you should see:</b> all five ops unfused move <b>11 passes</b> (1.48 GB, 0.44 ms); fused, the kernel reads the matmul output and the residual once and writes once: <b>3 passes</b> (0.40 GB, 0.12 ms), 3.7× less. This is exactly the kind of rewrite <code>torch.compile</code> does for you.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Graph compilation (torch.compile: TorchDynamo + TorchInductor)</span></span>
+    <ol>
+      <li><b>The problem before</b> Eager mode launches every op separately and round-trips every intermediate through memory. Hand-fusing kernels doesn't scale to every new model.</li>
+      <li><b>What people tried</b> Static-graph frameworks (TensorFlow 1's sessions: fast but painful to debug); TorchScript, which the PyTorch 2 paper reports works only about half the time on real-world models when scripting; tracing with example inputs, which silently misses Python control flow; lazy tensors, which recompile whenever the traced graph changes.</li>
+      <li><b>Why this works</b> <b>TorchDynamo</b> watches Python bytecode as it runs and captures the PyTorch operations into a graph, falling back to normal Python for anything it can't capture (a “graph break”). <b>AOTAutograd</b> also traces the backward pass. <b>TorchInductor</b> then fuses and generates kernels: Triton code for GPUs, C++ for CPUs. You keep eager-mode Python and get graph-mode speed: 2.27× inference and 1.41× training geomean on an A100 in the PyTorch 2 paper.</li>
+      <li><b>What it costs, when it fails</b> Compile time (seconds to minutes) on the first call and on new shapes (recompiles); graph breaks from data-dependent Python (<code>if x.sum() &gt; 0:</code>, <code>.item()</code>, printing) cut the graph into pieces; harder debugging. If time is dominated by one big matmul that's already optimal, there's little to gain; on our laptop CPU it was about 10% slower.</li>
+      <li><b>What refined it</b> <code>mode="reduce-overhead"</code> (CUDA graphs to remove launch overhead), <code>mode="max-autotune"</code> (benchmark kernel choices), regional compilation of repeated blocks, and <code>torch.export</code> for ahead-of-time deployment (next).</li>
+    </ol>
+  </div>
+
+  <h2>Getting out of Python: export</h2>
+  <p><code>torch.compile</code> is <b>just-in-time</b>: it runs inside your Python program and can fall back to Python. Deployment usually needs <b>ahead-of-time</b> export: one complete graph with no Python left, saved to a file that a C++ server or a phone can load.</p>
+  <ul>
+    <li><b><code>torch.export</code></b> traces the model into an <code>ExportedProgram</code>: a single full graph of core ATen operations, with no graph breaks allowed (it errors instead), plus declared dynamic dimensions (for example a variable batch size). It's the entry point for ExecuTorch and AOT compilation.</li>
+    <li><b>ONNX</b> (Open Neural Network Exchange) is an open standard: “a common set of operators” and a common file format, so a model trained in one framework can run in many engines. PyTorch's exporter is <code>torch.onnx.export(model, args, "model.onnx", dynamo=True)</code>, built on <code>torch.export</code>; <code>dynamo=True</code> is the default since PyTorch 2.9.</li>
+  </ul>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">ONNX as an interchange format</span></span>
+    <ol>
+      <li><b>The problem before</b> N training frameworks × M inference engines and hardware vendors = N × M converters, each with its own bugs. A model trained in PyTorch couldn't easily run on a phone runtime, a browser or a vendor's accelerator.</li>
+      <li><b>What people tried</b> Framework-specific runtimes (TensorFlow Serving, TorchScript), rewriting models by hand in C++ for each target.</li>
+      <li><b>Why this works</b> One shared operator set and file format turns N × M into N + M: every framework exports to ONNX, every engine imports ONNX. <b>ONNX Runtime</b> then splits the graph across “execution providers” (CPU, CUDA, TensorRT, Core ML, DirectML and others) and optimizes it for the hardware it finds.</li>
+      <li><b>What it costs, when it fails</b> New or custom ops may be missing from the standard (or from a given engine); numerical results can differ slightly between engines; export can fail on dynamic Python control flow; version mismatches between opsets bite. You must test the exported model against the original.</li>
+      <li><b>What refined it</b> The dynamo-based exporter built on <code>torch.export</code>; PyTorch-native paths that skip ONNX entirely (ExecuTorch, AOTInductor, coremltools' direct PyTorch conversion).</li>
+    </ol>
+  </div>
+
+  <h3>Where the exported graph runs</h3>
+  <table>
+    <tr><th>Target</th><th>Typical tool (2026)</th><th>What it adds</th></tr>
+    <tr><td>Any CPU/GPU, many languages</td><td><a href="https://onnxruntime.ai/docs/" target="_blank" rel="noopener">ONNX Runtime</a></td><td>graph optimizations, execution providers, quantization tools</td></tr>
+    <tr><td>NVIDIA GPUs, lowest latency</td><td><a href="https://developer.nvidia.com/tensorrt" target="_blank" rel="noopener">TensorRT</a></td><td>“layer and tensor fusion”, kernel tuning per GPU, FP8/FP4/INT8/INT4 quantization</td></tr>
+    <tr><td>Phones, wearables, microcontrollers</td><td><a href="https://docs.pytorch.org/executorch/stable/index.html" target="_blank" rel="noopener">ExecuTorch</a> (1.0 GA, Oct 2025)</td><td><code>torch.export</code> → .pte file; backends such as XNNPACK (CPU), Core ML, Qualcomm, Arm Ethos-U, Vulkan</td></tr>
+    <tr><td>Apple devices</td><td><a href="https://apple.github.io/coremltools/docs-guides/" target="_blank" rel="noopener">Core ML Tools</a></td><td>converts PyTorch directly (no ONNX step) for the Apple Neural Engine/GPU</td></tr>
+    <tr><td>Server, PyTorch all the way</td><td><code>torch.compile</code>, AOTInductor</td><td>no format change; same numerics as training</td></tr>
+    <tr><td>LLMs</td><td>vLLM, SGLang, TensorRT-LLM…</td><td>KV-cache paging, continuous batching: see <a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a></td></tr>
+  </table>
+
+  <h2>Serving: many users, one GPU</h2>
+  <p>A model server receives requests one at a time, but GPUs love batches (a 4096 × 4096 layer is memory-bound until about 345 tokens share the weights, Lesson 10.1). <b>Dynamic batching</b> holds requests in a queue for a few milliseconds and runs them together. Two numbers describe a server: <b>throughput</b> (requests per second) and <b>tail latency</b>, usually p99: the time 99% of requests beat. Users feel the tail.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: why batching is nearly free</span>
+    <p>Suppose a batch of b requests takes 10 + 0.5·b ms (mostly the fixed cost of reading the weights, because it's memory-bound). One at a time, the GPU finishes 1 request per 10.5 ms: <b>95 requests/s</b> at most. In batches of 32: 32 requests per 26 ms ≈ <b>1,230 requests/s</b>, 13× more from the same GPU, while each request waits at most a few tens of milliseconds.</p>
+  </div>
+  <p class="predict">🔮 <b>Predict:</b> with max batch 1, what happens to p99 latency when traffic goes from 50 to 150 requests per second? And at quiet times, does a longer batching timeout help or hurt?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Dynamic batching simulator</span>
+    <p class="hint">3,000 requests arrive at random (Poisson, seeded). The server takes up to <b>max batch</b> waiting requests whenever the GPU is free, but if fewer are waiting it holds the batch open for up to <b>timeout</b> ms after the oldest one arrived. Batch time = 10 + 0.5 × batch size ms (a toy memory-bound model).</p>
+    <div class="goals"><span class="goal" id="gMelt">🎯 Watch batch-size 1 melt down</span><span class="goal" id="gQuiet">🎯 See a timeout hurt at quiet times</span><span class="goal" id="gP99">🎯 Serve ≥ 1,000 req/s with p99 ≤ 50 ms</span></div>
+    <div class="controls">
+      <label>arrival rate <input type="range" id="bR" min="50" max="2000" step="50" value="50"> <b class="mono" id="bRV"></b></label>
+      <label>max batch <select class="btn" id="bB"><option>1</option><option>2</option><option>4</option><option selected>8</option><option>16</option><option>32</option><option>64</option></select></label>
+      <label>timeout <select class="btn" id="bT"><option>0</option><option>1</option><option selected>2</option><option>5</option><option>10</option><option>20</option></select> ms</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">p50 latency <b id="b50">–</b></div>
+      <div class="stat">p99 latency <b id="b99" class="dead">–</b></div>
+      <div class="stat">throughput <b id="bThr" class="ev">–</b></div>
+      <div class="stat">average batch <b id="bAvg">–</b></div>
+      <div class="stat">GPU busy <b id="bU">–</b></div>
+    </div>
+    <canvas class="chart" id="bCan" style="height:190px"></canvas>
+    <p class="hint" id="bMsg"></p>
+  </div>
+  <p><b>What you should see:</b> with max batch 1 the GPU tops out near 95 req/s; at 150 req/s the queue grows without limit and p99 shoots into seconds. Batching lets the same GPU serve about 1,100 req/s with p99 under 50 ms (max batch 32 or 64). At 50 req/s, a 20 ms timeout <i>adds</i> latency (p50 goes from about 10 to 30 ms) because it holds requests waiting for company that rarely comes. Real servers (NVIDIA Triton Inference Server's <code>max_queue_delay_microseconds</code>, for example) expose exactly these two knobs.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Dynamic batching</span></span>
+    <ol>
+      <li><b>The problem before</b> One request at a time leaves a memory-bound model at a tiny arithmetic intensity: the GPU reads all the weights for one input. In our toy it caps out at 95 req/s and latency explodes beyond that.</li>
+      <li><b>What people tried</b> More GPUs (expensive), client-side batching (clients don't know about each other), fixed batch sizes (requests wait for a full batch even at night).</li>
+      <li><b>Why this works</b> The server sees all clients. Waiting a millisecond or two to group requests reuses each weight load across the batch, so throughput rises almost linearly while latency grows only a little. A timeout bounds the extra wait when traffic is light.</li>
+      <li><b>What it costs, when it fails</b> Extra queueing latency (bad timeouts hurt quiet periods); padding when inputs have different lengths; memory for bigger batches. For LLMs, requests finish at different times, so static batches waste slots.</li>
+      <li><b>What refined it</b> <b>Continuous batching</b> for LLMs (add and remove sequences every decoding step) and paged KV caches, in vLLM and similar servers (<a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a>). Autoscaling and load balancing across replicas: <a href="../../system-design-course/phase1/2-load-balancers.html">System Design 1.2</a>.</li>
+    </ol>
+  </div>
+
+  <h2>The shipping checklist</h2>
+  <div class="playground">
+    <span class="label">🎮 Playground · Is your model ready to ship?</span>
+    <p class="hint">Tick what you've done. Each item is something that has broken a real launch somewhere. The bar fills as you go.</p>
+    <div class="goals"><span class="goal" id="gShip">🎯 Ship-ready: every box ticked</span></div>
+    <div class="check" id="chk"></div>
+    <div class="meterbar" style="margin-top:10px"><i id="chkBar" style="width:0%"></i></div>
+    <p class="hint" id="chkMsg"></p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Eager vs <code>torch.compile</code>, then <code>torch.export</code>, on a laptop CPU (torch 2.8). Notice the honest result:</p>
+<pre><code><span class="k">import</span> time, torch, torch.nn <span class="k">as</span> nn
+
+<span class="k">class</span> Block(nn.Module):                       <span class="c"># the memory-bound glue around a matmul</span>
+    <span class="k">def</span> __init__(self, d=<span class="n">1024</span>):
+        super().__init__()
+        self.lin, self.norm = nn.Linear(d, d), nn.LayerNorm(d)
+    <span class="k">def</span> forward(self, x):
+        h = torch.nn.functional.gelu(self.lin(x) * <span class="n">0.5</span> + <span class="n">1.0</span>)
+        <span class="k">return</span> self.norm(h + x)
+
+torch.manual_seed(<span class="n">0</span>)
+model, x = Block().eval(), torch.randn(<span class="n">4096</span>, <span class="n">1024</span>)
+
+<span class="k">def</span> bench(f, reps=<span class="n">20</span>):
+    <span class="k">with</span> torch.no_grad():
+        f(x)                                  <span class="c"># warm-up (compiles the first time)</span>
+        t = time.perf_counter()
+        <span class="k">for</span> _ <span class="k">in</span> range(reps):
+            f(x)
+    <span class="k">return</span> (time.perf_counter() - t) / reps * <span class="n">1e3</span>
+
+compiled = torch.compile(model)
+print(<span class="s">f"eager:    {bench(model):.2f} ms"</span>)
+print(<span class="s">f"compiled: {bench(compiled):.2f} ms"</span>)
+
+ep = torch.export.export(model, (x,))       <span class="c"># one full graph, no Python left</span>
+print([n.target.__name__ <span class="k">for</span> n <span class="k">in</span> ep.graph.nodes <span class="k">if</span> n.op == <span class="s">"call_function"</span>])
+
+<span class="c"># Output on our laptop CPU (compile took 3–8 s on the first call):</span>
+<span class="c"># eager:    12.32 ms</span>
+<span class="c"># compiled: 13.70 ms        ← slower here: the matmul dominates and eager already uses a fast CPU BLAS</span>
+<span class="c"># ['linear.default', 'mul.Tensor', 'add.Tensor', 'gelu.default', 'add.Tensor', 'layer_norm.default']</span></code></pre>
+    <p>ONNX export and inference (not run here: the <code>onnx</code>, <code>onnxscript</code> and <code>onnxruntime</code> packages aren't installed on this laptop, and we don't download packages for lessons):</p>
+<pre><code>torch.onnx.export(model, (x,), <span class="s">"block.onnx"</span>, dynamo=<span class="k">True</span>)   <span class="c"># needs onnx + onnxscript</span>
+
+<span class="k">import</span> onnxruntime <span class="k">as</span> ort
+sess = ort.InferenceSession(<span class="s">"block.onnx"</span>, providers=[<span class="s">"CPUExecutionProvider"</span>])
+out = sess.run(<span class="k">None</span>, {sess.get_inputs()[<span class="n">0</span>].name: x.numpy()})[<span class="n">0</span>]
+<span class="c"># always compare: assert abs(out - model(x).detach().numpy()).max() &lt; 1e-4</span></code></pre>
+    <p class="hint">Gotchas: call <code>model.eval()</code> before exporting (dropout and BatchNorm behave differently in training mode); declare dynamic dimensions (<code>dynamic_shapes</code>) or the export bakes in your example's batch size; and always measure on the real target hardware, as our CPU result shows.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Path</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Eager PyTorch</td><td>Easiest to debug, any Python</td><td>Launch overhead, no fusion</td></tr>
+      <tr><td><code>torch.compile</code></td><td>One line; fusion; training and inference</td><td>Compile time, recompiles, graph breaks; needs Python at runtime</td></tr>
+      <tr><td><code>torch.export</code> / AOT</td><td>Python-free artifact; feeds ExecuTorch, AOTInductor</td><td>No graph breaks allowed; dynamic shapes must be declared</td></tr>
+      <tr><td>ONNX + ONNX Runtime</td><td>Portable across engines, languages, vendors</td><td>Op coverage gaps; numerics to re-verify</td></tr>
+      <tr><td>TensorRT</td><td>Fastest on NVIDIA; low-precision kernels</td><td>NVIDIA-only; engines tied to GPU type and version; build time</td></tr>
+      <tr><td>Bigger batches / longer timeout</td><td>Throughput, cost per request</td><td>Latency, especially the tail and at quiet times</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your image model's p99 latency in production is 400 ms; the target is 100 ms. What do you look at?” A strong answer:</p>
+    <ul>
+      <li>Separates <b>queueing</b> from <b>compute</b>: if the GPU is saturated, latency is queue time; add replicas or raise throughput (batching, quantization). If the GPU is idle, look at batching timeouts, preprocessing, network and data loading.</li>
+      <li>Profiles the model: fuse/compile (TensorRT or <code>torch.compile</code>), lower precision (fp16/int8), tensor-core-friendly shapes.</li>
+      <li>Tunes dynamic batching: max batch and max queue delay against the p99 target; checks padding waste.</li>
+      <li>Verifies numerics after every conversion, and watches p99 (not the mean) on real traffic.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>torch.compile</b> <span class="tag oss">🧰 Open source · PyTorch 2</span> <a href="https://docs.pytorch.org/assets/pytorch2-2.pdf" target="_blank" rel="noopener">Ansel et al.: PyTorch 2 (ASPLOS 2024)</a></div>
+      <p><b>How:</b> TorchDynamo captures graphs from Python bytecode; TorchInductor generates Triton (GPU) and C++ (CPU) kernels.</p>
+      <p><b>Why this method:</b> keeps eager-mode flexibility; 2.27× inference and 1.41× training geomean speed-ups on an A100 over 180+ models.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>On-device AI across Meta's apps</b> <span class="tag co">🏢 Meta · 2025</span> <a href="https://pytorch.org/blog/introducing-executorch-1-0/" target="_blank" rel="noopener">Introducing ExecuTorch 1.0</a></div>
+      <p><b>How:</b> <code>torch.export</code> → a compact program run by a small C++ runtime with hardware backends; used in Instagram, WhatsApp, Messenger, Facebook and Ray-Ban Display glasses, per the announcement.</p>
+      <p><b>Why this method:</b> no conversion to another format, so fewer numerical mismatches between the trained and the deployed model.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Dynamic batching in a production server</b> <span class="tag co">🏢 NVIDIA</span> <a href="https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/user_guide/batcher.html" target="_blank" rel="noopener">Triton Inference Server: Batchers</a></div>
+      <p><b>How:</b> a per-model <code>dynamic_batching</code> block with <code>max_queue_delay_microseconds</code> and optional preferred batch sizes.</p>
+      <p><b>Why this method:</b> the same throughput-vs-latency dial you just played with, made a config line.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One format, many engines</b> <span class="tag oss">🧰 Open source · ONNX</span> <a href="https://onnxruntime.ai/docs/execution-providers/" target="_blank" rel="noopener">ONNX Runtime execution providers</a></div>
+      <p><b>How:</b> assigns graph nodes or subgraphs to hardware-specific providers (CUDA, TensorRT, Core ML, CPU…).</p>
+      <p><b>Why this method:</b> export once, run on whatever hardware the customer has.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the compiler writes Triton for you</span>
+    <p>On GPUs, TorchInductor doesn't call a fixed library of fused kernels: it generates new <b>Triton</b> programs for the exact chain of ops in your model. Set the environment variable <code>TORCH_LOGS="output_code"</code> before running a compiled model and PyTorch prints the kernels it wrote (on our CPU it prints C++ instead).</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Fusion and memory traffic: 10.1. Low-precision formats the engines run: 10.2 and 10.4. LLM serving (continuous batching, paged attention, speculative decoding): <a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a>; cost and latency trade-offs: <a href="../../ai-engineer/phase8/2-cost-latency.html">AI Engineer 8.2</a>. Deployment pipelines and monitoring: <a href="../../system-design-course/phase6/2-deployments.html">System Design 6.2</a> and <a href="../../system-design-course/phase6/3-observability.html">6.3</a>. Next: making experiments reproducible so you know what you shipped (10.6).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Tutorial</span> <a href="https://docs.pytorch.org/tutorials/intermediate/torch_compile_tutorial.html" target="_blank" rel="noopener">Introduction to torch.compile</a>. Modes, graph breaks and how to read them.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/docs/stable/export.html" target="_blank" rel="noopener">torch.export</a>. ExportedProgram, dynamic shapes, and what “no graph breaks” means.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.pytorch.org/docs/stable/onnx.html" target="_blank" rel="noopener">torch.onnx</a>. The dynamo-based ONNX exporter.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A chain of 4 elementwise ops runs on a 200 MB tensor. Unfused, each op reads its input and writes its output. Fused, the kernel reads once and writes once. How much HBM traffic does fusion save?</div>
+    <div class="opts"><button class="opt">200 MB</button><button class="opt" data-ok>1,600 MB → 400 MB, saving 1.2 GB (4× less)</button><button class="opt">Nothing: elementwise ops are compute-bound</button></div>
+    <div class="explain">Unfused: 4 ops × (200 MB read + 200 MB write) = 1,600 MB. Fused: 200 MB in + 200 MB out = 400 MB. For memory-bound ops, time ≈ bytes ÷ bandwidth, so this is close to a 4× speed-up for that chain.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You wrap your model in <code>torch.compile</code> and training gets slower. The logs show dozens of graph breaks, many from a line that prints <code>loss.item()</code> inside <code>forward</code>. What's going on?</div>
+    <div class="opts"><button class="opt">torch.compile only works for inference</button><button class="opt" data-ok>Data-dependent Python (like <code>.item()</code>) forces graph breaks, so the model runs as many small graphs plus Python, losing fusion and adding overhead; move the logging out of the compiled region</button><button class="opt">The GPU is too old for Triton</button></div>
+    <div class="explain"><code>.item()</code> needs the actual value on the CPU, so Dynamo must stop the graph, run Python, and start a new graph. Many breaks mean little fusion and extra overhead (and possibly recompiles). Keep compiled regions free of prints, <code>.item()</code> and data-dependent branches.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your server's GPU sits at 30% utilization, and p99 latency is fine, but cost per request is too high. Requests arrive steadily at high volume. What do you change first?</div>
+    <div class="opts"><button class="opt">Add more GPU replicas</button><button class="opt">Reduce the batching timeout to 0</button><button class="opt" data-ok>Raise the max batch size (and allow a small queue delay) so each weight load serves more requests</button></div>
+    <div class="explain">Low utilization with steady traffic means the GPU runs small batches. Larger batches raise arithmetic intensity and throughput per GPU, cutting cost per request; watch that p99 stays within target. More replicas would raise cost; a zero timeout makes batches even smaller.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Eager mode pays for memory round trips, per-op overhead and no global view. Graph mode captures the ops and optimizes them together (fusion: 11 → 3 passes in our chain).</li>
+      <li><code>torch.compile</code> = TorchDynamo (capture, graph breaks fall back to Python) + TorchInductor (Triton/C++ kernels). Big wins on GPUs; measure on your hardware (our CPU: slower).</li>
+      <li><code>torch.export</code> gives one Python-free graph for deployment; ONNX is the cross-engine format; ONNX Runtime, TensorRT, ExecuTorch (1.0, 2025) and Core ML run it.</li>
+      <li>Serving: dynamic batching trades a little queueing for much more throughput; watch p99. LLMs use continuous batching (AI Engineer 7.4).</li>
+      <li>Before shipping: eval mode, numerics check after every conversion, dynamic shapes declared, p99 measured on target hardware.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+  /* ---------- 1. fusion counter ---------- */
+  const T = 8 * 2048 * 4096 * 2;   // bytes of one activation tensor in bf16
+  const OPS = [
+    { k: "bias", name: "+ bias", reads: 1, note: "read y, write" },
+    { k: "gelu", name: "GELU", reads: 1, note: "read, write" },
+    { k: "drop", name: "dropout", reads: 1, note: "read, write" },
+    { k: "res", name: "+ residual", reads: 2, note: "read y and x, write" },
+    { k: "ln", name: "LayerNorm", reads: 1, note: "read, write" },
+  ];
+  const on = new Set(OPS.map(o => o.k));
+  let fMode = "eager";
+  function fuse() {
+    $("fChain").innerHTML = `<span class="op fixed">matmul output y<small>already in HBM</small></span>` + OPS.map(o => `<span class="op ${on.has(o.k) ? "on" : ""}" data-k="${o.k}">${o.name}<small>${o.note}</small></span>`).join("");
+    [...$("fChain").querySelectorAll(".op[data-k]")].forEach(el => (el.onclick = () => { const k = el.dataset.k; on.has(k) ? on.delete(k) : on.add(k); fuse(); }));
+    const act = OPS.filter(o => on.has(o.k));
+    const eagerR = act.reduce((s, o) => s + o.reads, 0), eagerW = act.length;
+    const fusedR = act.length ? 1 + (on.has("res") ? 1 : 0) : 0, fusedW = act.length ? 1 : 0;
+    const R = fMode === "eager" ? eagerR : fusedR, Wr = fMode === "eager" ? eagerW : fusedW, bytes = (R + Wr) * T, eb = (eagerR + eagerW) * T;
+    $("fTrips").innerHTML = '<i class="r"></i>'.repeat(R) + '<i class="w"></i>'.repeat(Wr);
+    $("fK").textContent = fMode === "eager" ? act.length : act.length ? 1 : 0;
+    $("fB").textContent = (bytes / 1e9).toFixed(2) + " GB (" + (R + Wr) + " passes)";
+    $("fT").textContent = (bytes / 3.35e12 * 1e3).toFixed(2) + " ms";
+    $("fX").textContent = !bytes ? "–" : fMode === "eager" ? "baseline" : (eb / bytes).toFixed(1) + "× less traffic";
+    win("gF3", fMode === "fused" && bytes && eb / bytes >= 3);
+    win("gF1", fMode === "fused" && act.length === 5);
+    $("fMsg").textContent = !act.length ? "Pick some ops." : fMode === "eager" ? `Eager: ${act.length} kernels, each one a full round trip of the tensor through HBM.` : "Fused: the intermediates never leave the chip. Only the inputs are read and the final result written.";
+  }
+  seg("fMode", v => { fMode = v; fuse(); });
+  fuse();
+
+  /* ---------- 2. dynamic batching simulator ---------- */
+  function sim(rate, maxB, timeout, n = 3000) {
+    const r = NN.rng(42), arr = []; let t = 0;
+    for (let i = 0; i < n; i++) { t += -Math.log(1 - r.u()) / rate * 1000; arr.push(t); }
+    const L = b => 10 + 0.5 * b;
+    let free = 0, i = 0, busy = 0, batches = 0; const lat = [];
+    while (i < n) {
+      const first = Math.max(free, arr[i]), deadline = Math.max(first, arr[i] + timeout);
+      let j = i; while (j < n && j - i < maxB && arr[j] <= first) j++;
+      let start = first;
+      if (j - i < maxB) { let k = j; while (k < n && k - i < maxB && arr[k] <= deadline) k++; start = k - i >= maxB ? Math.max(first, arr[k - 1]) : deadline; j = k; }
+      const b = j - i, end = start + L(b);
+      for (let q = i; q < j; q++) lat.push(end - arr[q]);
+      busy += L(b); batches++; free = end; i = j;
+    }
+    lat.sort((a, b) => a - b);
+    const span = free - arr[0];
+    return { lat, p50: lat[Math.floor(0.5 * n)], p99: lat[Math.floor(0.99 * n)], thr: n / span * 1000, util: busy / span, avg: n / batches };
+  }
+  const ms = v => (v >= 1000 ? (v / 1000).toFixed(1) + " s" : v.toFixed(1) + " ms");
+  function batch() {
+    const rate = +$("bR").value, B = +$("bB").value, to = +$("bT").value, s = sim(rate, B, to);
+    $("bRV").textContent = rate + " req/s";
+    $("b50").textContent = ms(s.p50); $("b99").textContent = ms(s.p99);
+    $("bThr").textContent = s.thr.toFixed(0) + " req/s"; $("bAvg").textContent = s.avg.toFixed(1); $("bU").textContent = Math.round(100 * s.util) + "%";
+    const pts = []; const cap = Math.min(s.lat[s.lat.length - 1], 200);
+    for (let k = 0; k <= 100; k++) { const q = Math.min(s.lat.length - 1, Math.floor(k / 100 * (s.lat.length - 1))); pts.push([Math.min(cap, s.lat[q]), k]); }
+    Plot.line($("bCan"), { series: [{ label: "share of requests finished within x ms (%)", color: css("--c-ls"), data: pts, width: 2.5 }], yMin: 0, yMax: 100, xLabel: "latency (ms, capped at 200)", hlines: [{ y: 99, label: "p99", color: css("--muted") }] });
+    win("gMelt", B === 1 && s.p99 > 1000);
+    win("gQuiet", rate <= 100 && to >= 10 && s.p50 > 20);
+    win("gP99", rate >= 1000 && s.p99 <= 50);
+    $("bMsg").textContent = s.p99 > 1000 ? "Overloaded: requests arrive faster than batches finish, so the queue (and latency) grows without limit." :
+      rate <= 100 && to >= 10 ? "Quiet traffic: the timeout makes requests wait for company that rarely comes." :
+      s.p99 <= 50 && rate >= 1000 ? "Big batches amortize the weight reads: high throughput with p99 under target." :
+      s.util > 0.95 ? "The GPU is nearly always busy. More traffic will push latency up: raise max batch or add a replica." : "";
+  }
+  ["bR", "bB", "bT"].forEach(id => ($(id).oninput = $(id).onchange = batch));
+  batch();
+
+  /* ---------- 3. ship checklist ---------- */
+  const ITEMS = [
+    "model.eval() before export (dropout off, BatchNorm uses running stats)",
+    "Exported model's outputs compared with the original on real inputs (max difference checked)",
+    "Accuracy re-measured after quantization or conversion, on the real eval set",
+    "Dynamic dimensions (batch size, sequence length) declared and tested at the extremes",
+    "Preprocessing identical in training and serving (same resize, normalization, tokenizer version)",
+    "p50 and p99 latency measured on the target hardware under realistic load",
+    "Batching limits and timeouts tuned against the latency target",
+    "Model file versioned with its training config, data version and code commit (Lesson 10.6)",
+    "Monitoring for input drift, errors and latency, with a rollback path",
+    "A fallback when the model is down or unsure (cached answer, simpler model, human)",
+  ];
+  const ticked = new Set();
+  function chk() {
+    $("chk").innerHTML = ITEMS.map((t, i) => `<label class="${ticked.has(i) ? "done" : ""}"><input type="checkbox" data-i="${i}" ${ticked.has(i) ? "checked" : ""}> ${t}</label>`).join("");
+    [...$("chk").querySelectorAll("input")].forEach(el => (el.onchange = () => { const i = +el.dataset.i; el.checked ? ticked.add(i) : ticked.delete(i); chk(); }));
+    $("chkBar").style.width = (100 * ticked.size / ITEMS.length) + "%";
+    win("gShip", ticked.size === ITEMS.length);
+    $("chkMsg").textContent = ticked.size === ITEMS.length ? "Ship it. 🚀" : `${ticked.size} of ${ITEMS.length} done.`;
+  }
+  chk();
+  window.addEventListener("resize", batch); window.addEventListener("themechange", batch);
+})();
+</script>
+</body>
+</html>

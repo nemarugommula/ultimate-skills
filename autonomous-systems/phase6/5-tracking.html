@@ -1,0 +1,484 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.5 Multi-object tracking: association, Hungarian, SORT & ByteTrack · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .pg-row { display: grid; grid-template-columns: 1.6fr 1fr; gap: 12px; align-items: start; }
+  @media (max-width: 760px) { .pg-row { grid-template-columns: 1fr; } }
+  table.cm td, table.cm th { text-align: center; font-family: var(--mono); font-size: .85rem; padding: 4px 8px; }
+  table.cm td.g { outline: 2px solid var(--c-ct); outline-offset: -2px; }
+  table.cm td.h { background: color-mix(in srgb, var(--c-pl) 25%, transparent); font-weight: 800; }
+</style>
+</head>
+<body data-lesson="s6-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 5</div>
+  <h1>Multi-object tracking: association, Hungarian, SORT &amp; ByteTrack</h1>
+  <p class="subtitle">A detector says “there are two people” 10 times a second. A planner needs to know “person #7 is walking left at 1.4 m/s and has been for 3 seconds”. Tracking turns a flicker of boxes into a cast of characters with names, histories and velocities, and the hard part is never mixing up the names.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The Kalman filter</b>: predict where something will be from its velocity, then correct with each new measurement, weighted by trust (<a href="../phase3/3-kalman-filter.html">Lesson 3.3</a>). Here every tracked object gets its own little filter.</li>
+      <li><b>Detections</b>: per frame, a list of boxes with confidence scores from a detector (Lessons 6.1, 6.2). They have no names: box 3 now isn't necessarily box 3 next frame.</li>
+      <li><b>IoU</b>, intersection over union: overlap of two boxes, 0 to 1 (Lesson 6.1). Distance between centers works too, especially in 3D.</li>
+      <li><b>Process noise q</b>: how much the filter expects the velocity to change between steps. Small q = “they walk in straight lines”; large q = “they may turn any moment” (Lesson 3.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>Two pedestrians cross paths in front of your car. For half a second the one behind is half hidden, and your detector gives it a shaky 0.3 confidence or misses it entirely. When they separate, <b>which one is which?</b> If your tracker gets it wrong, the planner suddenly believes the person who was walking away is now walking toward the road.</p>
+    <p>This name-swapping, called an <b>ID switch</b>, is the classic tracking failure. In 2021 the <b>ByteTrack</b> paper showed a surprisingly simple fix: don't throw away the low-confidence boxes. Using them in a second matching pass cut ID switches on the MOT17 validation set from <b>291 to 159</b> compared with the classic SORT tracker, and the full tracker hit 80.3 MOTA at <b>30 frames per second</b> (<a href="https://arxiv.org/abs/2110.06864" target="_blank" rel="noopener">Zhang et al.</a>). You'll rebuild that trick and tune it until the swap disappears.</p>
+  </div>
+
+  <h2>Tracking-by-detection, in four steps</h2>
+  <p>Almost every production tracker, for cars, drones and robots, follows the same loop every frame:</p>
+  <ol>
+    <li><b>Predict.</b> Move every existing <span class="be">track</span> forward with its own constant-velocity Kalman filter: “#7 was at (4.0, 2.1) moving +1.4 m/s in x, so now it's at about (4.14, 2.1)”. Its uncertainty grows.</li>
+    <li><b>Associate.</b> Decide which new <span class="se">detection</span> belongs to which track: an <b>assignment problem</b> over a cost matrix (distance or 1 − IoU between every track's prediction and every detection).</li>
+    <li><b>Update.</b> Matched tracks run the Kalman correction with their detection.</li>
+    <li><b>Manage the lifecycle.</b> Unmatched detections may be <b>born</b> as new tentative tracks (confirmed after a few hits in a row); unmatched tracks <b>coast</b> on prediction and <b>die</b> after a maximum age without a match.</li>
+  </ol>
+  <p>Step 2 is where IDs get swapped, so let's look at it closely.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: greedy vs optimal matching</span>
+    <p>Two tracks A and B (predicted positions) and two detections a and b, with costs = distance in meters:</p>
+    <table>
+      <tr><th></th><th>detection a</th><th>detection b</th></tr>
+      <tr><td>track A</td><td>0.9</td><td>2.9</td></tr>
+      <tr><td>track B</td><td>0.8</td><td>1.1</td></tr>
+    </table>
+    <ul>
+      <li><b>Greedy</b> (take the cheapest pair first, repeat): B–a (0.8) first, then A is stuck with b (2.9). Total = <b>3.7 m</b>.</li>
+      <li><b>Optimal</b>: A–a + B–b = 0.9 + 1.1 = <b>2.0 m</b>. Almost half the total, and the IDs are right.</li>
+    </ul>
+    <p>Greedy grabs the locally best pair and forces a bad pair elsewhere. The <b>Hungarian algorithm</b> (Kuhn, 1955) finds the assignment with the smallest total cost in O(n³) time for n tracks: instant for the dozens of objects around a car. Trying every assignment instead would take n! steps: 3.6 million for just 10 objects.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Greedy vs Hungarian</span>
+    <p class="hint"><span class="be">Purple</span> dots are three tracks' predicted positions; <span class="se">blue</span> dots are this frame's detections. <b>Drag any dot.</b> The cost matrix (distances) updates live: the <span class="pl">teal</span> cells are the Hungarian (optimal) assignment, the <span class="ct">orange</span> outlines are what greedy picks.</p>
+    <div class="pg-row">
+      <canvas class="sim" id="asCanvas"></canvas>
+      <div><table class="cm" id="asTable"></table></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">greedy total <b id="asG">–</b></div>
+      <div class="stat">Hungarian total <b id="asH">–</b></div>
+      <div class="stat">pairs that differ <b id="asD">–</b></div>
+      <div class="stat">challenge <b id="asChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> arrange the dots so greedy pays at least <b>1.5×</b> the optimal total cost. Hint: put one detection almost exactly between two tracks.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Tracking is <b>filtering plus bookkeeping</b>. The Kalman filter makes a good guess of where each object will be; the assignment step decides who is who by solving a small optimization every frame; the lifecycle rules decide who is real. Most ID switches are not filter failures but <b>bookkeeping</b> failures: a track died too early, a gate was too wide, or a weak detection was thrown away.
+  </div>
+
+  <h2>SORT, DeepSORT, ByteTrack</h2>
+  <table>
+    <tr><th>Tracker (year)</th><th>Idea</th><th>Reported result</th></tr>
+    <tr><td><b>SORT</b> (Bewley et al., 2016)</td><td>Kalman filter per box + Hungarian on IoU; nothing else</td><td>Accuracy comparable to state-of-the-art online trackers at <b>260 Hz</b>, over 20× faster; swapping the detector changed tracking by up to 18.9%</td></tr>
+    <tr><td><b>DeepSORT</b> (Wojke et al., 2017)</td><td>Adds an <b>appearance</b> embedding per box (a re-identification, or re-ID, network) to the cost</td><td><b>45% fewer ID switches</b> than SORT, tracking through longer occlusions</td></tr>
+    <tr><td><b>ByteTrack</b> (Zhang et al., 2021)</td><td>Match high-score boxes first; then match the <b>leftover tracks to low-score boxes</b> (by IoU), recovering occluded objects and leaving background boxes unmatched</td><td>MOT17 test: <b>80.3 MOTA, 77.3 IDF1, 63.1 HOTA</b> at 30 FPS; adding its matching to 9 trackers raised IDF1 by 1–10 points</td></tr>
+    <tr><td><b>AB3DMOT</b> (Weng et al., 2019)</td><td>SORT in 3D: a 3D Kalman filter + Hungarian on 3D boxes from lidar</td><td>207.4 FPS on KITTI; a standard 3D baseline</td></tr>
+    <tr><td><b>CenterPoint</b> tracking (2020)</td><td>The detector predicts each object's velocity, so tracking is a <b>greedy closest-center</b> match to the previous frame</td><td>63.8 AMOTA on nuScenes (Lesson 6.1)</td></tr>
+  </table>
+  <p>ByteTrack's settings are worth remembering: a high-score threshold of <b>0.6</b>, matches with IoU below <b>0.2</b> rejected, and lost tracks kept for <b>30 frames</b> before deletion. The appearance networks of DeepSORT are covered in <span class="dlref" data-href="phase4/7-pose-video.html">the Deep Learning course, Phase 4 (pose, video and tracking)</span>.</p>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> in the crossing game below, the half-hidden pedestrian's boxes score 0.2–0.4 while they overlap. With a plain SORT-style tracker (score threshold 0.5, tracks die after 3 missed frames), what happens to that pedestrian's ID?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">Its boxes are below the threshold, so they're ignored; the track gets no match for several frames and <b>dies</b>. When the pedestrian reappears at full confidence, a <b>new track is born with a new ID</b>: an ID switch, even though nobody was confused. Fix it by keeping tracks alive longer and, better, by matching leftover tracks to the low-score boxes (ByteTrack). But keep tracks alive too loosely and they start stealing each other's boxes.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · The crossing: tune the tracker to zero ID switches</span>
+    <p class="hint">Two pedestrians walk across in an X (grey dashed = truth, 7 s at 10 frames per second). The detector stand-in adds ±12 cm noise, occasional misses, a little clutter, and while they cross, the farther person's boxes drop to 0.2–0.4 confidence or vanish. <span class="se">Blue</span> = high-score boxes, hollow = low-score boxes. Each <b>track ID</b> gets its own color. Change any setting and the whole run recomputes; press <b>▶ Replay</b> to watch.</p>
+    <canvas class="sim" id="trCanvas"></canvas>
+    <div class="controls">
+      <label>association gate <input type="range" id="trGate" min="0.4" max="3" step="0.1" value="2"> <b class="mono" id="trGateV"></b></label>
+      <label>high-score threshold <input type="range" id="trHigh" min="0.3" max="0.9" step="0.05" value="0.5"> <b class="mono" id="trHighV"></b></label>
+      <label>max age (frames) <input type="range" id="trAge" min="1" max="20" step="1" value="3"> <b class="mono" id="trAgeV"></b></label>
+      <label>process noise q <input type="range" id="trQ" min="-1" max="1.5" step="0.25" value="0"> <b class="mono" id="trQV"></b></label>
+      <label><input type="checkbox" id="trByte"> ByteTrack 2nd pass (low-score boxes)</label>
+      <label><input type="checkbox" id="trGreedy"> greedy instead of Hungarian</label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="trPlay">▶ Replay</button>
+      <button class="btn" id="trSeed">🎲 New noise</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">ID switches <b id="trSw">–</b></div>
+      <div class="stat">missed (FN) <b id="trFn">–</b></div>
+      <div class="stat">false (FP) <b id="trFp">–</b></div>
+      <div class="stat">MOTA <b id="trMota">–</b></div>
+      <div class="stat">track IDs created <b id="trIds">–</b></div>
+      <div class="stat">challenge <b id="trChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> <b>zero ID switches</b> through the crossing with MOTA ≥ <b>0.85</b> on the default noise (seed 1). The defaults are plain SORT and lose one ID. Then press 🎲: does your setting survive other noise? (Some seeds stay hard; real trackers have bad days too.)</p>
+  </div>
+  <p>What you should find: turning on the second pass alone isn't enough if tracks still die after 3 frames; keeping them for 6 or more is needed. Then the motion model matters: with very small q the filter insists on straight lines and misreads the slight wobble in the walk at the crossing point; with moderate q it follows. A very tight gate refuses the noisy boxes; a very loose one lets a coasting track grab the wrong person. Tuning a tracker is balancing those four knobs.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Detectors work frame by frame: no identity, no velocity, misses during occlusion, flicker. A planner needs each object's history and velocity to predict its future (Phase 7), and a pedestrian that blinks out for 5 frames must not be forgotten.</li>
+      <li><b>What people tried.</b> <i>Nearest neighbour</i> (each track takes the closest detection): two tracks can claim the same box, and greedy choices swap IDs. <i>Multiple-hypothesis tracking</i> (keep every possible association history and decide later): very accurate, but the number of hypotheses explodes. <i>Appearance only</i>: fails for look-alike objects and in the dark.</li>
+      <li><b>Why this works.</b> A Kalman prediction makes the right detection the <i>closest</i> one most of the time; the Hungarian algorithm then finds the globally best one-to-one assignment (greedy 3.7 m vs optimal 2.0 m in the example). Lifecycle rules (confirm after k hits, delete after max age) filter clutter and bridge short gaps. ByteTrack adds one more pass with the low-score boxes, which are often real but occluded objects: on MOT17 validation that alone cut ID switches from 291 to 159 versus SORT.</li>
+      <li><b>What it costs, when it fails.</b> Every knob trades two failures: a wide gate or long max age bridges occlusions but lets tracks steal neighbours' boxes; a low threshold recovers occluded objects but tracks clutter. Constant velocity fails on sharp turns; camera motion breaks image-space prediction (ByteTrack's paper notes the Kalman filter fails with large camera motion on BDD100K). Long occlusions need appearance or a better motion model.</li>
+      <li><b>What came next.</b> Appearance re-ID (DeepSORT and successors), 3D tracking in BEV with velocity from the detector (CenterPoint), learned association (transformers that match objects across frames, like Waymo's STT), and offline auto-labeling that stitches tracks through occlusion using future frames (Lesson 6.7).</li>
+    </ol>
+  </div>
+
+  <h2>Scoring a tracker: MOTA, IDF1, HOTA</h2>
+  <p>You can't improve what you can't count. Three metrics dominate, each with a different idea of “good”:</p>
+  <div class="eq">
+    MOTA = 1 − (<span class="ag">FN</span> + <span class="ag">FP</span> + <span class="ag">IDSW</span>) ÷ GT
+    <span class="say">Multi-object tracking accuracy: start at 100% and subtract every miss (false negative), every false track (false positive) and every ID switch, as a fraction of all ground-truth objects summed over frames. Simple, but dominated by detection quality; one ID switch costs as little as one miss.</span>
+  </div>
+  <ul>
+    <li><b>IDF1</b> (identity F1, 2016) asks: over the whole video, what fraction of detections carry the <i>right</i> long-term identity? It punishes swaps much harder than MOTA does.</li>
+    <li><b>HOTA</b> (higher-order tracking accuracy, 2020) balances detection, association and localization in one number, and splits into sub-scores to show which one is weak. It's now the headline metric on many benchmarks. The <b>TrackEval</b> library computes all three.</li>
+  </ul>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: MOTA by hand</span>
+    <p>A 100-frame clip with 10 pedestrians in every frame: GT = 1,000. Your tracker misses 80 (FN), adds 50 false boxes (FP), and switches IDs 10 times. MOTA = 1 − (80 + 50 + 10) ÷ 1,000 = <b>0.86</b>. Notice the 10 swaps barely dent the score. A pedestrian whose ID swapped with another's, though, might get the other person's velocity, which is why AV teams watch IDF1, HOTA and raw switch counts too.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Birth and death: ghosts vs lost IDs</span>
+    <p class="hint">One pedestrian walks right and is <b>fully hidden behind a pillar for 12 frames</b> (1.2 s); another drifts slowly. The detector stand-in also fires random <span class="ag">clutter</span> boxes, some with high scores. Tune when a track is <b>born</b> (hits in a row before it's confirmed and reported) and when it <b>dies</b> (frames without a match). The motion model here trusts straight lines (small q).</p>
+    <canvas class="sim" id="lcCanvas"></canvas>
+    <div class="controls">
+      <label>hits to confirm <input type="range" id="lcHits" min="1" max="6" step="1" value="1"> <b class="mono" id="lcHitsV"></b></label>
+      <label>max age (frames) <input type="range" id="lcAge" min="1" max="30" step="1" value="3"> <b class="mono" id="lcAgeV"></b></label>
+      <label>gate <input type="range" id="lcGate" min="0.4" max="2.5" step="0.1" value="1.5"> <b class="mono" id="lcGateV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">ghost track frames (FP) <b id="lcFp">–</b></div>
+      <div class="stat">ID switches <b id="lcSw">–</b></div>
+      <div class="stat">MOTA <b id="lcMota">–</b></div>
+      <div class="stat">challenge <b id="lcChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> no ghost tracks at all and <b>no lost ID</b> for the pedestrian behind the pillar. A quick birth reports clutter as people; a quick death forgets the hidden person; a slow death plus a wide gate lets clutter hijack the coasting track.</p>
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a nursery teacher on a field trip</span>
+    <p>Every few seconds the teacher glances at the playground and sees some kids (detections). She doesn't re-learn who's who each time: she expects Mia near the slide because Mia was running that way (prediction), pairs each kid she sees with the name that fits best overall, not just the first one that comes to mind (Hungarian), and when Leo ducks behind a tree she doesn't decide he's gone after one glance (max age), nor does she count a coat on a bench as a new child until she's seen it move a few times (hits to confirm). A blurry glimpse of a sleeve behind the tree still counts as “probably Leo” (ByteTrack).</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>The assignment step is one SciPy call; the filter is FilterPy or a dozen NumPy lines (Lesson 3.3). Reference trackers: <b>SORT</b> and <b>ByteTrack</b> (official repos), <b>AB3DMOT</b> for 3D; metrics: <b>TrackEval</b> (MOTA, IDF1, HOTA).</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+<span class="k">from</span> scipy.optimize <span class="k">import</span> linear_sum_assignment
+
+<span class="k">def</span> associate(track_xy, det_xy, gate=<span class="n">1.0</span>):
+    <span class="s">"""Hungarian matching on center distance with a gate. Returns matches, unmatched tracks, unmatched detections."""</span>
+    <span class="k">if</span> len(track_xy) == <span class="n">0</span> <span class="k">or</span> len(det_xy) == <span class="n">0</span>:
+        <span class="k">return</span> [], list(range(len(track_xy))), list(range(len(det_xy)))
+    cost = np.linalg.norm(track_xy[:, <span class="k">None</span>, :] - det_xy[<span class="k">None</span>, :, :], axis=<span class="n">2</span>)   <span class="c"># (T, D) distances</span>
+    rows, cols = linear_sum_assignment(cost)                                      <span class="c"># optimal one-to-one</span>
+    matches = [(r, c) <span class="k">for</span> r, c <span class="k">in</span> zip(rows, cols) <span class="k">if</span> cost[r, c] &lt;= gate]            <span class="c"># gate rejects far pairs</span>
+    mt, md = {r <span class="k">for</span> r, _ <span class="k">in</span> matches}, {c <span class="k">for</span> _, c <span class="k">in</span> matches}
+    <span class="k">return</span> matches, [t <span class="k">for</span> t <span class="k">in</span> range(len(track_xy)) <span class="k">if</span> t <span class="k">not in</span> mt], [d <span class="k">for</span> d <span class="k">in</span> range(len(det_xy)) <span class="k">if</span> d <span class="k">not in</span> md]
+
+<span class="c"># ByteTrack's idea in two calls: high-score boxes first, then leftover tracks vs low-score boxes</span>
+hi, lo = dets[scores &gt;= <span class="n">0.6</span>], dets[(scores &lt; <span class="n">0.6</span>) &amp; (scores &gt;= <span class="n">0.1</span>)]
+m1, left_tracks, new_dets = associate(pred_xy, hi)
+m2, lost, _ = associate(pred_xy[left_tracks], lo)        <span class="c"># low-score boxes never start new tracks</span></code></pre>
+    <p class="hint"><code>linear_sum_assignment</code> handles rectangular matrices (more detections than tracks or the reverse). Apply the gate <i>after</i> solving, or set gated entries to a large cost before solving, never to <code>inf</code> for a whole row (it can make the problem infeasible).</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚘 Tesla</h4><p>Tesla's public talks describe networks that output object kinematics directly: “position, orientation, depth, velocity” in the vector space, using a video module with a feature queue so an object occluded for a moment is remembered (AI Day 2021). Offline, its auto-labeler uses “the benefit of hindsight”: past and future frames give exact velocities and let tracks be stitched through occlusions, such as pedestrians persisting while cars pass in front of them. Its in-car association logic isn't public.</p>
+        <p class="src">Sources: <a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a>, <a href="https://www.youtube.com/watch?v=g6bOwQdCJrc" target="_blank" rel="noopener">CVPR'21 WAD keynote</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo publishes tracking research: <b>STT</b> (ICRA 2024) is a transformer that does association and state estimation together from long histories of detections, with new metrics that also score velocity and acceleration; <b>SoDA</b> learns soft data association. Its open dataset gives <b>12.6 million 3D boxes with tracking IDs</b>, the basis of public 3D tracking benchmarks. Radar's direct speed measurement helps velocity from the first frame (Lesson 2.4).</p>
+        <p class="src">Sources: <a href="https://arxiv.org/abs/2405.00236" target="_blank" rel="noopener">STT</a>, <a href="https://waymo.com/research/" target="_blank" rel="noopener">Waymo research</a>, <a href="https://waymo.com/open/about/" target="_blank" rel="noopener">Waymo Open Dataset</a></p></div>
+      <div><h4>🛸 Drones</h4><p>Follow-me filming and security drones live on tracking. Skydio's <b>Shadow</b> mode tracks <b>people and vehicles</b>, keeps them in frame, and <b>reacquires them automatically</b> when they briefly move out of view; Skydio says it predicts motion from “speed, direction, and visual appearance”: motion model plus appearance, the DeepSORT recipe in spirit. It runs on the X10's onboard NVIDIA Jetson Orin. The architecture isn't published.</p>
+        <p class="src">Sources: <a href="https://www.skydio.com/x10" target="_blank" rel="noopener">Skydio X10</a>, <a href="https://www.skydio.com/autonomy" target="_blank" rel="noopener">Skydio autonomy</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> Tesla pushes tracking into the networks (video in, kinematics out) and leans on fleet auto-labels. Waymo has lidar boxes with good 3D positions and radar speeds, so classic and learned association both work well, and it researches learning both jointly. A drone tracks one subject at close range with appearance as the main cue, on a small onboard GPU.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Greedy matching</td><td>Simplest; fine when objects are far apart (CenterPoint uses it with good velocities)</td><td>Swaps IDs in crowds</td></tr>
+      <tr><td>Hungarian matching</td><td>Optimal one-to-one assignment; O(n³), instant for dozens</td><td>Still only as good as the cost; gating needed</td></tr>
+      <tr><td>Wide gate / long max age</td><td>Bridges occlusions and noise</td><td>Tracks steal neighbours' boxes; ghosts linger</td></tr>
+      <tr><td>Low-score second pass (ByteTrack)</td><td>Recovers occluded objects; fewer ID switches</td><td>Needs a calibrated score; can feed clutter to lost tracks</td></tr>
+      <tr><td>Appearance re-ID (DeepSORT)</td><td>Long occlusions; look-alike motion</td><td>Extra network; fails in the dark, with similar clothes, or when blurred</td></tr>
+      <tr><td>Larger process noise q</td><td>Follows turns and wobble</td><td>Noisier velocity; predictions spread, more ambiguity</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Design a multi-object tracker for pedestrians around a robotaxi.” A strong answer:</p>
+    <ul>
+      <li>Lays out <b>predict → associate → update → lifecycle</b>, with a constant-velocity (or constant-turn) Kalman filter per track in BEV.</li>
+      <li>Uses <b>Hungarian</b> on a gated cost (distance, IoU, Mahalanobis distance from the filter's covariance, plus appearance), and explains greedy's failure with a 2×2 example.</li>
+      <li>Explains <b>birth/death</b> parameters and ByteTrack's low-score pass, and what each knob trades.</li>
+      <li>Measures with <b>MOTA, IDF1 and HOTA</b>, knows MOTA under-weights ID switches, and evaluates crowded and occluded scenes separately.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>SORT</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/abewley/sort" target="_blank" rel="noopener">abewley/sort</a> · <a href="https://arxiv.org/abs/1602.00763" target="_blank" rel="noopener">paper</a></div>
+      <p><b>How:</b> Kalman filter on box center, area and aspect ratio; Hungarian on IoU; minimal lifecycle rules.</p>
+      <p><b>Why this method:</b> showed detection quality matters most and a simple tracker at 260 Hz can match complex ones; still the baseline everyone extends.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>ByteTrack</b> <span class="tag res">🧪 Research · 2021</span> <a href="https://github.com/ifzhang/ByteTrack" target="_blank" rel="noopener">ifzhang/ByteTrack</a></div>
+      <p><b>How:</b> two association passes, high-score then low-score boxes; YOLOX detector; 30-frame track buffer.</p>
+      <p><b>Why this method:</b> low-score boxes are often occluded people; using them raised IDF1 by 1–10 points across 9 trackers.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>AB3DMOT for lidar</b> <span class="tag res">🧪 Research · 2019</span> <a href="https://arxiv.org/abs/1907.03961" target="_blank" rel="noopener">Weng et al.</a></div>
+      <p><b>How:</b> 3D Kalman filter + Hungarian on 3D boxes, with 3D tracking metrics.</p>
+      <p><b>Why this method:</b> lidar gives metric 3D boxes, so a simple filter is strong; 207.4 FPS made it the standard 3D baseline.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>STT at Waymo</b> <span class="tag av">🚗 AV</span> <a href="https://arxiv.org/abs/2405.00236" target="_blank" rel="noopener">Jing et al., ICRA 2024</a></div>
+      <p><b>How:</b> a transformer consumes appearance, geometry and motion over long histories and is trained for association and state estimation jointly.</p>
+      <p><b>Why this method:</b> planners need accurate velocity and acceleration, not just correct IDs; heuristics for both were brittle.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a Latin manuscript beat Kuhn by 65 years</span>
+    <p>Harold Kuhn published the Hungarian method in 1955 and named it after the Hungarian mathematicians Dénes Kőnig and Jenő Egerváry, whose work it built on. In 2006 it came out that <b>Carl Gustav Jacobi</b> had already solved the assignment problem in the 19th century; his solution was published after his death, in 1890, in Latin (<a href="https://en.wikipedia.org/wiki/Hungarian_algorithm" target="_blank" rel="noopener">Wikipedia</a>).</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Each track is the Kalman filter of <a href="../phase3/3-kalman-filter.html">Lesson 3.3</a> (predict, then blend by trust), with outlier gating from 3.7. Detections come from 6.1 (lidar) and 6.2 (camera BEV); 6.6 fuses sensors before or after tracking; 6.7's offline auto-labeler is a tracker that can see the future. Tracks with velocities are the input to prediction (Lesson 7.1). The assignment problem is a small linear program (<a href="../../math-course/phase7/5-constraints.html">constraints</a> in the Math course).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1602.00763" target="_blank" rel="noopener">SORT (2016)</a>. Four pages; read it next to the playground.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2110.06864" target="_blank" rel="noopener">ByteTrack (2021)</a>. Figure 2 shows the low-score recovery you tuned.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/JonathonLuiten/TrackEval" target="_blank" rel="noopener">TrackEval</a>. Official HOTA/MOTA/IDF1 implementations for MOT benchmarks.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Over a clip, GT = 200 object-frames. Your tracker has 20 misses, 10 false positives and 2 ID switches. What's its MOTA?</div>
+    <div class="opts"><button class="opt">0.95</button><button class="opt" data-ok>0.84</button><button class="opt">0.68</button></div>
+    <div class="explain">MOTA = 1 − (20 + 10 + 2) ÷ 200 = 1 − 0.16 = <b>0.84</b>. The 2 switches cost only 1 point, which is why IDF1 and HOTA are reported alongside it.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. In a crowded crosswalk your tracker keeps giving pedestrians new IDs right after they pass behind each other. Detections of the hidden person score around 0.3; your threshold is 0.6 and tracks die after 2 missed frames. Best first fix?</div>
+    <div class="opts"><button class="opt">Lower the detection threshold to 0.2 for everything, including track birth</button><button class="opt" data-ok>Keep lost tracks longer and add a second association pass that matches unmatched tracks to the low-score boxes (ByteTrack), without letting low-score boxes start new tracks</button><button class="opt">Switch from Hungarian to greedy matching</button></div>
+    <div class="explain">The occluded person's boxes exist but are thrown away, and the track dies too soon. ByteTrack's second pass uses them only to continue existing tracks, so clutter can't spawn new ones. Lowering the threshold globally would create ghost tracks.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Costs: track A to detections (a, b) = (1, 4); track B = (2, 8). What do greedy and Hungarian pick, and their totals?</div>
+    <div class="opts"><button class="opt">Both pick A–a, B–b, total 9</button><button class="opt" data-ok>Greedy picks A–a (1) then B–b (8), total 9; Hungarian picks A–b (4) + B–a (2), total 6</button><button class="opt">Greedy picks A–b, Hungarian picks A–a</button></div>
+    <div class="explain">Greedy grabs the cheapest pair (A–a = 1) and is forced into B–b = 8. The optimum gives A the second-best option so B can take its much better one: 4 + 2 = 6.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Tracking-by-detection: predict each track (constant-velocity Kalman), associate (cost matrix + Hungarian, gated), update, then birth/death rules.</li>
+      <li>Greedy can be far from optimal (3.7 m vs 2.0 m); Hungarian is optimal in O(n³). SORT = Kalman + Hungarian at 260 Hz; DeepSORT adds appearance (45% fewer ID switches).</li>
+      <li>ByteTrack: a second pass matches leftover tracks to low-score boxes (τ = 0.6, IoU ≥ 0.2, 30-frame buffer): 80.3 MOTA, 77.3 IDF1, 63.1 HOTA at 30 FPS; ID switches 291 → 159 vs SORT.</li>
+      <li>MOTA = 1 − (FN + FP + IDSW) ÷ GT; IDF1 and HOTA weight identity much more.</li>
+      <li>Every knob trades failures: gate, max age, thresholds, q. Tesla puts kinematics in networks and hindsight auto-labels; Waymo researches learned association (STT); Skydio's Shadow reacquires subjects after brief occlusion.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+  // ==MODEL65==
+  // Hungarian algorithm (Kuhn–Munkres with potentials, O(n³)). cost: rows × cols (rows ≤ cols after padding). Returns assignment row → col.
+  function hungarian(cost){
+    const nR=cost.length,nC=nR?cost[0].length:0,n=Math.max(nR,nC),BIG=1e9;
+    const a=Array.from({length:n+1},(_,i)=>Array.from({length:n+1},(_,j)=>i&&j&&i<=nR&&j<=nC?cost[i-1][j-1]:(i&&j?BIG/1e3:0)));
+    const u=Array(n+1).fill(0),v=Array(n+1).fill(0),p=Array(n+1).fill(0),way=Array(n+1).fill(0);
+    for(let i=1;i<=n;i++){p[0]=i;let j0=0;const minv=Array(n+1).fill(Infinity),used=Array(n+1).fill(false);
+      do{used[j0]=true;const i0=p[j0];let delta=Infinity,j1=0;
+        for(let j=1;j<=n;j++)if(!used[j]){const cur=a[i0][j]-u[i0]-v[j];if(cur<minv[j]){minv[j]=cur;way[j]=j0;}if(minv[j]<delta){delta=minv[j];j1=j;}}
+        for(let j=0;j<=n;j++){if(used[j]){u[p[j]]+=delta;v[j]-=delta;}else minv[j]-=delta;}
+        j0=j1;}while(p[j0]!==0);
+      do{const j1=way[j0];p[j0]=p[j1];j0=j1;}while(j0);}
+    const ans=Array(nR).fill(-1);for(let j=1;j<=n;j++)if(p[j]&&p[j]<=nR&&j<=nC)ans[p[j]-1]=j-1;return ans;}
+  function greedyAssign(cost){const nR=cost.length,nC=nR?cost[0].length:0,pairs=[];for(let i=0;i<nR;i++)for(let j=0;j<nC;j++)pairs.push([cost[i][j],i,j]);pairs.sort((x,y)=>x[0]-y[0]);
+    const ans=Array(nR).fill(-1),usedC=new Set();for(const [c,i,j] of pairs){if(ans[i]<0&&!usedC.has(j)){ans[i]=j;usedC.add(j);}}return ans;}
+  // ---- scenario: pedestrians + a noisy detector stand-in ----
+  function rngT(seed){let a=seed>>>0;return()=>{a|=0;a=(a+0x6D2B79F5)|0;let t=Math.imul(a^(a>>>15),1|a);t=(t+Math.imul(t^(t>>>7),61|t))^t;return((t^(t>>>14))>>>0)/4294967296;};}
+  function gaussT(r){let u=0,v=0;while(!u)u=r();while(!v)v=r();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
+  function makeScene(kind,seed){
+    const r=rngT(seed),DT=0.1,F=kind==="cross"?70:80,gt=[];
+    const peds=kind==="cross"?[{p:[0,0.2],v:[1.4,0.55]},{p:[0,4.0],v:[1.4,-0.55]}]:[{p:[0,1.5],v:[1.2,0]},{p:[9,4.5],v:[-0.6,-0.2]}];
+    for(let f=0;f<F;f++)gt.push(peds.map((q,i)=>({id:i,x:q.p[0]+q.v[0]*f*DT+(kind==="cross"?0.12*Math.sin(f*0.23+i*2):0),y:q.p[1]+q.v[1]*f*DT})));
+    const dets=[];
+    for(let f=0;f<F;f++){const D=[];const g=gt[f];
+      g.forEach((o,i)=>{let score=0.75+0.2*r(),miss=r()<0.04;
+        if(kind==="cross"){const other=g[1-i],d=Math.hypot(o.x-other.x,o.y-other.y);if(d<1.3&&i===1){score=0.22+0.15*r();if(d<0.7)miss=r()<0.5;}}   // the farther pedestrian is half hidden while they cross
+        else if(i===0&&f>=30&&f<42){miss=true;}                                                      // fully occluded behind a pillar for 12 frames
+        if(!miss)D.push({x:o.x+0.12*gaussT(r),y:o.y+0.12*gaussT(r),s:score,gt:i});});
+      const nClutter=kind==="cross"?(r()<0.12?1:0):(r()<0.35?1:0);
+      for(let k=0;k<nClutter;k++)D.push({x:1+8*r(),y:-0.5+5.5*r(),s:kind==="cross"?0.15+0.35*r():0.3+0.5*r(),gt:-1});
+      dets.push(D);}
+    return {gt,dets,F,DT};}
+  // ---- SORT-lite tracker: constant-velocity Kalman per track, Hungarian on distance, optional ByteTrack second stage ----
+  function track(scene,o){
+    const DT=scene.DT,q=o.q,R=0.12*0.12;let tracks=[],nextId=1;const out=[];
+    const predict=t=>{t.x=[t.x[0]+DT*t.x[2],t.x[1]+DT*t.x[3],t.x[2],t.x[3]];const P=t.P,dt=DT;
+      // P = F P F^T + Q for each axis independently (pos, vel) blocks
+      for(const [ip,iv] of [[0,2],[1,3]]){const pp=P[ip][ip],pv=P[ip][iv],vv=P[iv][iv];
+        P[ip][ip]=pp+2*dt*pv+dt*dt*vv+q*dt*dt*dt*dt/4;P[ip][iv]=P[iv][ip]=pv+dt*vv+q*dt*dt*dt/2;P[iv][iv]=vv+q*dt*dt;}
+      t.age++;t.miss++;};
+    const update=(t,d)=>{for(const [ip,iv] of [[0,2],[1,3]]){const z=ip===0?d.x:d.y,P=t.P,S=P[ip][ip]+R,Kp=P[ip][ip]/S,Kv=P[iv][ip]/S,y=z-t.x[ip];
+        t.x[ip]+=Kp*y;t.x[iv]+=Kv*y;const pp=P[ip][ip],pv=P[ip][iv],vv=P[iv][iv];P[ip][ip]=(1-Kp)*pp;P[ip][iv]=P[iv][ip]=(1-Kp)*pv;P[iv][iv]=vv-Kv*pv;}
+      t.hits++;t.miss=0;};
+    const assoc=(T,D)=>{if(!T.length||!D.length)return {pairs:[],uT:T.map((_,i)=>i),uD:D.map((_,i)=>i)};
+      const C=T.map(t=>D.map(d=>{const c=Math.hypot(t.x[0]-d.x,t.x[1]-d.y);return c>o.gate?1e3:c;}));
+      const A=(o.greedy?greedyAssign:hungarian)(C),pairs=[],mT=new Set(),mD=new Set();
+      A.forEach((j,i)=>{if(j>=0&&C[i][j]<1e3){pairs.push([i,j]);mT.add(i);mD.add(j);}});
+      return {pairs,uT:T.map((_,i)=>i).filter(i=>!mT.has(i)),uD:D.map((_,i)=>i).filter(j=>!mD.has(j))};};
+    for(let f=0;f<scene.F;f++){
+      tracks.forEach(predict);
+      const D=scene.dets[f],hi=D.filter(d=>d.s>=o.high),lo=D.filter(d=>d.s<o.high&&d.s>=0.1);
+      const a1=assoc(tracks,hi);a1.pairs.forEach(([i,j])=>update(tracks[i],hi[j]));
+      if(o.byte){const rest=a1.uT.map(i=>tracks[i]),a2=assoc(rest,lo);a2.pairs.forEach(([i,j])=>update(rest[i],lo[j]));}
+      a1.uD.forEach(j=>{const d=hi[j];tracks.push({id:nextId++,x:[d.x,d.y,0,0],P:[[R,0,0,0],[0,R,0,0],[0,0,4,0],[0,0,0,4]],hits:1,age:0,miss:0});});
+      tracks=tracks.filter(t=>t.miss<=o.maxAge);
+      out.push(tracks.filter(t=>t.hits>=o.minHits&&t.miss===0||t.hits>=o.minHits&&t.miss<=o.maxAge&&o.coast).map(t=>({id:t.id,x:t.x[0],y:t.x[1],miss:t.miss})));
+    }
+    return out;}
+  // ---- evaluation: per-frame matching of GT to confirmed, currently-updated tracks; ID switches; MOTA ----
+  function evaluate(scene,out){let FN=0,FP=0,IDSW=0,GT=0;const last={},swapsAt=[];const usedIds=new Set();
+    for(let f=0;f<scene.F;f++){const g=scene.gt[f],T=out[f].filter(t=>t.miss===0);GT+=g.length;
+      const C=g.map(o=>T.map(t=>{const d=Math.hypot(o.x-t.x,o.y-t.y);return d>1.0?1e3:d;}));
+      const A=T.length?hungarian(C):g.map(()=>-1),mt=new Set();
+      g.forEach((o,i)=>{const j=A[i];if(j>=0&&C[i][j]<1e3){mt.add(j);const id=T[j].id;if(last[o.id]!=null&&last[o.id]!==id){IDSW++;swapsAt.push(f);}last[o.id]=id;usedIds.add(id);}else FN++;});
+      FP+=T.length-mt.size;}
+    return {FN,FP,IDSW,GT,mota:1-(FN+FP+IDSW)/GT,swapsAt};}
+  // ==END65==
+  const PAL = ["--c-be", "--c-pl", "--c-ct", "--c-mp", "--c-un", "--c-ag", "--accent"];
+  const colOf = id => PAL[(id - 1) % PAL.length];
+
+  // ---------- Playground 1: greedy vs Hungarian ----------
+  const TR = [[2, 3.4], [5, 3.4], [8, 3.4]], DE = [[2.3, 2.0], [5.2, 1.9], [7.7, 2.1]];
+  let drag = null;
+  const AW = new Sim($("asCanvas"), { xRange: [0, 10], yRange: [0, 5.625], grid: 1, onPointer(type, [x, y]) {
+    if (type === "down") { let best = null, bd = 0.5; [["t", TR], ["d", DE]].forEach(([k, L]) => L.forEach((p, i) => { const d = Math.hypot(p[0] - x, p[1] - y); if (d < bd) { bd = d; best = [L, i]; } })); drag = best; }
+    else if (type === "drag" && drag) { drag[0][drag[1]] = [Math.max(0.2, Math.min(9.8, x)), Math.max(0.2, Math.min(5.4, y))]; refreshAs(); }
+    else if (type === "up") drag = null;
+  } });
+  let asRes = null;
+  AW.render(w => {
+    if (!asRes) return;
+    w.clear();
+    asRes.H.forEach((j, i) => w.line([TR[i], DE[j]], { color: "--c-pl", width: 5, alpha: 0.45 }));
+    asRes.G.forEach((j, i) => w.line([TR[i], DE[j]], { color: "--c-ct", width: 2, dash: [5, 4] }));
+    TR.forEach((p, i) => { w.dot(p, { color: "--c-be", r: 9 }); w.text(p, "ABC"[i], { color: "#fff", size: 11, bold: true }); });
+    DE.forEach((p, i) => { w.dot(p, { color: "--c-se", r: 9 }); w.text(p, "abc"[i], { color: "#fff", size: 11, bold: true }); });
+  });
+  function refreshAs() {
+    const C = TR.map(t => DE.map(d => Math.hypot(t[0] - d[0], t[1] - d[1])));
+    const H = hungarian(C), G = greedyAssign(C);
+    const tot = A => A.reduce((s, j, i) => s + C[i][j], 0), th = tot(H), tg = tot(G);
+    asRes = { C, H, G };
+    let html = "<tr><th></th><th>a</th><th>b</th><th>c</th></tr>";
+    C.forEach((row, i) => { html += `<tr><th>${"ABC"[i]}</th>` + row.map((c, j) => `<td class="${H[i] === j ? "h" : ""} ${G[i] === j ? "g" : ""}">${c.toFixed(2)}</td>`).join("") + "</tr>"; });
+    $("asTable").innerHTML = html;
+    $("asG").textContent = fmt(tg, 2) + " m"; $("asH").textContent = fmt(th, 2) + " m";
+    $("asD").textContent = H.filter((j, i) => G[i] !== j).length;
+    const ratio = tg / Math.max(th, 1e-6);
+    $("asChal").innerHTML = ratio >= 1.5 ? `<span class="badge-win">✅ greedy pays ${fmt(ratio, 2)}×</span>` : `<span class="muted">${fmt(ratio, 2)}×</span>`;
+    AW.render();
+  }
+  refreshAs();
+
+  // ---------- Playground 2: the crossing ----------
+  let seed = 1, scene = makeScene("cross", 3), outT = null, evT = null, frameT = -1;
+  const SEEDS = [3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+  const optsT = () => ({ gate: +$("trGate").value, high: +$("trHigh").value, byte: $("trByte").checked, maxAge: +$("trAge").value, minHits: 3, q: Math.pow(10, +$("trQ").value), greedy: $("trGreedy").checked, coast: false });
+  function drawScene(w, sc, out, upto, opts) {
+    w.clear();
+    for (let i = 0; i < sc.gt[0].length; i++) w.line(sc.gt.map(g => [g[i].x, g[i].y]), { color: "--muted", width: 1.5, dash: [5, 5], alpha: 0.7 });
+    if (opts && opts.pillar) w.rect(3.9, 0.6, 1.2, 1.8, { fill: "--muted", alpha: 0.6 });
+    const n = upto < 0 ? sc.F - 1 : upto;
+    for (let f = Math.max(0, n - (upto < 0 ? sc.F : 6)); f <= n; f++) sc.dets[f].forEach(d => {
+      const hiS = d.s >= (opts ? opts.high : 0.5), a = upto < 0 ? 0.35 : 0.25 + 0.75 * (f - n + 6) / 6;
+      if (hiS) w.dot([d.x, d.y], { color: d.gt < 0 ? "--c-ag" : "--c-se", r: 2.6, alpha: a });
+      else w.circle(d.x, d.y, 0.07, { stroke: d.gt < 0 ? "--c-ag" : "--c-se", width: 1.2, alpha: a });
+    });
+    const trails = {};
+    for (let f = 0; f <= n; f++) out[f].forEach(t => { if (t.miss === 0) (trails[t.id] = trails[t.id] || []).push([t.x, t.y]); });
+    Object.entries(trails).forEach(([id, pts]) => { w.line(pts, { color: colOf(+id), width: 3, alpha: 0.85 }); const p = pts[pts.length - 1]; w.text([p[0] + 0.12, p[1] + 0.22], "#" + id, { color: colOf(+id), size: 12, bold: true, align: "left" }); });
+    out[n].forEach(t => w.dot([t.x, t.y], { color: colOf(t.id), r: 5 }));
+    w.text([10.2, 5.1], "t = " + fmt(n * sc.DT, 1) + " s", { color: "--muted", size: 11, align: "right" });
+  }
+  const TW = new Sim($("trCanvas"), { xRange: [-0.5, 10.5], yRange: [-0.85, 5.34] });
+  TW.render(w => { if (outT) drawScene(w, scene, outT, frameT, optsT()); });
+  function refreshTr() {
+    const o = optsT();
+    $("trGateV").textContent = o.gate.toFixed(1) + " m"; $("trHighV").textContent = o.high.toFixed(2); $("trAgeV").textContent = o.maxAge; $("trQV").textContent = fmt(o.q, o.q < 1 ? 2 : 1);
+    outT = track(scene, o); evT = evaluate(scene, outT);
+    const ids = new Set(); outT.forEach(T => T.forEach(t => ids.add(t.id)));
+    $("trSw").textContent = evT.IDSW + (evT.swapsAt.length ? " (at t = " + evT.swapsAt.map(f => fmt(f * scene.DT, 1)).join(", ") + " s)" : "");
+    $("trFn").textContent = evT.FN; $("trFp").textContent = evT.FP; $("trMota").textContent = fmt(evT.mota, 2); $("trIds").textContent = ids.size;
+    const win = evT.IDSW === 0 && evT.mota >= 0.85;
+    $("trChal").innerHTML = win ? `<span class="badge-win">✅ zero switches, MOTA ${fmt(evT.mota, 2)}${seed !== 1 ? " (seed " + seed + ")" : ""}</span>` : `<span class="badge-lose">${evT.IDSW ? evT.IDSW + " ID switch" + (evT.IDSW > 1 ? "es" : "") : "MOTA below 0.85"}</span>`;
+    if (!TW.running) { frameT = -1; TW.render(); }
+  }
+  ["trGate", "trHigh", "trAge", "trQ"].forEach(id => ($(id).oninput = refreshTr));
+  ["trByte", "trGreedy"].forEach(id => ($(id).onchange = refreshTr));
+  $("trSeed").onclick = () => { seed = seed % SEEDS.length + 1; scene = makeScene("cross", SEEDS[seed - 1]); $("trSeed").textContent = "🎲 New noise (seed " + seed + ")"; refreshTr(); };
+  $("trPlay").onclick = () => { frameT = 0; TW.run(() => { frameT++; if (frameT >= scene.F - 1) { frameT = -1; return false; } }); };
+  refreshTr();
+
+  // ---------- Playground 3: lifecycle ----------
+  const sceneL = makeScene("pillar", 3);
+  let outL = null;
+  const LW = new Sim($("lcCanvas"), { xRange: [-0.5, 10.5], yRange: [-0.85, 5.34] });
+  LW.render(w => { if (outL) drawScene(w, sceneL, outL, -1, { high: 0.5, pillar: true }); });
+  function refreshLc() {
+    const o = { gate: +$("lcGate").value, high: 0.5, byte: false, maxAge: +$("lcAge").value, minHits: +$("lcHits").value, q: 0.1, greedy: false, coast: false };
+    $("lcHitsV").textContent = o.minHits; $("lcAgeV").textContent = o.maxAge; $("lcGateV").textContent = o.gate.toFixed(1) + " m";
+    outL = track(sceneL, o); const e = evaluate(sceneL, outL);
+    $("lcFp").textContent = e.FP; $("lcSw").textContent = e.IDSW; $("lcMota").textContent = fmt(e.mota, 2);
+    const win = e.FP === 0 && e.IDSW === 0;
+    $("lcChal").innerHTML = win ? `<span class="badge-win">✅ no ghosts, no lost ID</span>` : `<span class="badge-lose">${e.FP ? "ghost tracks" : ""}${e.FP && e.IDSW ? " + " : ""}${e.IDSW ? "lost ID" : ""}</span>`;
+    LW.render();
+  }
+  ["lcHits", "lcAge", "lcGate"].forEach(id => ($(id).oninput = refreshLc));
+  refreshLc();
+})();
+</script>
+</body>
+</html>

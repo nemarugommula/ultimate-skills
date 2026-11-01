@@ -1,0 +1,551 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.1 3D object detection from lidar: PointNet → PointPillars · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .pg-row { display: grid; grid-template-columns: 2fr 1fr; gap: 10px; align-items: start; }
+  .pg-row.wide { grid-template-columns: 3fr 1.15fr; }
+  @media (max-width: 760px) { .pg-row, .pg-row.wide { grid-template-columns: 1fr; } }
+  table.feat td, table.feat th { text-align: center; font-family: var(--mono); font-size: .85rem; padding: 3px 8px; }
+  table.feat td.mx { background: color-mix(in srgb, var(--c-be) 22%, transparent); font-weight: 800; }
+  table.feat tr.gone td { opacity: .3; text-decoration: line-through; }
+</style>
+</head>
+<body data-lesson="s6-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 1</div>
+  <h1>3D object detection from lidar: PointNet → PointPillars</h1>
+  <p class="subtitle">A lidar hands you a bag of 100,000 dots in no particular order. Image networks want a tidy grid. This lesson is the story of how people turned that bag into boxes around every car and pedestrian, fast enough to run 60 times a second.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Point cloud</b>: a lidar fires laser pulses and times their echoes; each echo becomes one <span class="se">3D point</span> (x, y, z), often with an intensity. Dense up close, sparse far away (Lesson 2.3).</li>
+      <li><b>Bird's-eye view (BEV)</b>: the scene seen from straight above, x forward and y left, like a map. Cars drive on the ground, so most of what a planner needs lives in this flat picture.</li>
+      <li><b>A convolutional neural network (CNN)</b> slides small learned filters over a regular grid of pixels. You don't need the internals here: <span class="dlref" data-href="phase3/2-convolution.html">the Deep Learning course, Phase 3 (CNNs)</span> has them.</li>
+      <li><b>A 3D box</b> for an object: center (x, y, z), size (length, width, height) and heading (yaw). Seven numbers per car.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>Write down the lidar points of one parked car as a list: 300 rows of (x, y, z). Now shuffle the rows. <b>Is it still the same car?</b> Of course. But feed both lists to a normal neural network and it sees two completely different inputs, because row 1 is now row 217.</p>
+    <p>And here's the second trap. Lay a fine grid over the scene so you can use image tricks: almost every cell is empty. In the PointPillars paper, a typical 64-beam lidar sweep at 0.16 m cells fills only <b>6,000 to 9,000</b> columns of the grid, about <b>97% empty</b>. So: how do you build a detector that doesn't care about order, doesn't waste effort on empty air, and still runs in real time?</p>
+    <p>In 2018 a team at nuTonomy (an Aptiv company) answered with <b>PointPillars</b>: <b>62 detections per second</b>, 2–4× faster than the methods it beat, and a slimmer version at 105 Hz (<a href="https://arxiv.org/abs/1812.05784" target="_blank" rel="noopener">Lang et al.</a>). By the end of this lesson you'll have built its first step with your own hands.</p>
+  </div>
+
+  <div class="predict" id="pr0">
+    <b class="q">🧩 Predict:</b> the far edge of a lidar sweep is 60 m away. A pedestrian there is about 0.6 m wide. With a typical 0.2° gap between laser beams, roughly how many beams across hit them: about 3, about 30, or about 300?
+    <div><button class="btn small" data-open="pr0">Show the answer</button></div>
+    <div class="ans">About <b>3</b>. At 60 m, 0.2° spans 60 × 0.0035 ≈ 0.21 m, so 0.6 m of person catches about 3 beams across (times a handful of vertical rings). The same person at 6 m catches about 30. That 10× swing in density with distance is why lidar detectors must handle both crowded and nearly empty regions in one scan.</div>
+  </div>
+
+  <h2>Why a point cloud is awkward for a CNN</h2>
+  <p>Numbers first. Here is what one sweep looks like compared with a camera image:</p>
+  <table>
+    <tr><th></th><th>Camera image</th><th>Lidar sweep</th></tr>
+    <tr><td>Structure</td><td>Regular grid: pixel (row 412, col 900) always has neighbours</td><td>A list of <span class="se">points</span>; row order means nothing</td></tr>
+    <tr><td>Fill</td><td>100% of pixels have a value</td><td>~97% of BEV cells at 0.16 m are empty (PointPillars, 64-beam lidar)</td></tr>
+    <tr><td>Density</td><td>Same everywhere</td><td>Falls off roughly with distance squared</td></tr>
+    <tr><td>What it measures well</td><td>Color, texture, class</td><td>Exact range and shape in meters</td></tr>
+  </table>
+  <p>Three properties cause the trouble: the points are <b>unordered</b> (any shuffle is the same scene), <b>sparse</b> (most of space is air) and <b>uneven</b> (a hundred points on a near car, five on a far pedestrian). People tried three workarounds before PointNet: project the cloud into images (a range image, or a BEV picture with hand-made features like "max height in this cell"), chop it into a dense 3D voxel grid and run 3D convolutions (slow, mostly empty), or hand-craft features per object. Each threw away information or time.</p>
+
+  <h2>PointNet: one tiny network per point, then take the max</h2>
+  <p>PointNet (Qi et al., Stanford, 2017) had a beautifully simple idea. If order mustn't matter, only use operations that ignore order:</p>
+  <ol>
+    <li>Run <b>the same small network</b> on every point separately. It's a <b>multi-layer perceptron (MLP)</b>: a few layers of "multiply by weights, add, clip negatives to zero". PointNet's grows each 3-number point into 64, then 1,024 numbers, its <span class="be">features</span>.</li>
+    <li><b>Max-pool</b>: for each of the 1,024 feature slots, keep the largest value over all points. That gives one 1,024-number summary of the whole cloud, the <span class="be">global feature</span>.</li>
+    <li>A final small MLP turns that summary into a class (car? chair?) or, with extra pieces, a box.</li>
+  </ol>
+  <p>The max of a set doesn't care what order you list it in: max(3, 9, 1) = max(1, 3, 9) = 9. That's the whole trick. The paper calls max a <b>symmetric function</b>, and proves a surprising bonus: the summary only depends on a small <b>critical set</b> of points (at most one per feature slot). Lose other points and nothing changes. Try it.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Shuffle, delete, and watch the max</span>
+    <p class="hint">Eight <span class="se">points</span> of an L-shaped object. A stand-in for PointNet's shared MLP turns each point into 3 <span class="be">features</span> (real PointNet uses 1,024; the rule is the same). The <b>global feature</b> is the max of each column. <b>Click a point</b> to delete it; press <b>Shuffle</b> to reorder the list.</p>
+    <div class="pg-row">
+      <canvas class="sim square" id="pnCanvas"></canvas>
+      <div>
+        <table class="feat" id="pnTable"></table>
+      </div>
+    </div>
+    <div class="controls">
+      <button class="btn" id="pnShuffle">🔀 Shuffle the order</button>
+      <button class="btn" id="pnReset">↺ Bring all points back</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">max-pooled feature (order-free) <b id="pnMax">–</b></div>
+      <div class="stat">“just concatenate” feature (order-sensitive) <b id="pnCat">–</b></div>
+      <div class="stat">points left <b id="pnLeft">8</b></div>
+      <div class="stat">challenge <b id="pnChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> delete <b>5 or more points</b> while the max-pooled feature stays exactly the same. Which points can you never remove? (Shuffle first and notice which number changes.)</p>
+  </div>
+  <p>What you should find: shuffling scrambles the concatenated version but never the max. And only the 3 points that hold a column's maximum matter; the other 5 can vanish. That's why PointNet shrugs off missing points, and also its weakness: the global max ignores <i>local</i> structure (how neighbouring points relate). PointNet++ (2017) fixed that by running little PointNets on neighbourhoods, a pattern you're about to see again inside PointPillars.</p>
+
+  <h2>From one object to a whole street: voxels, then pillars</h2>
+  <p>PointNet classifies one object's points. A street has 100,000 points and dozens of objects. You need to know <i>where</i> things are, which is exactly what grids are good at. The next ideas mix the two.</p>
+  <table>
+    <tr><th>Method (year)</th><th>Turn points into…</th><th>Then</th><th>Speed reported</th></tr>
+    <tr><td><b>VoxelNet</b> (Apple, 2017)</td><td>3D cubes (<b>voxels</b>); a small PointNet-style “voxel feature encoder” per non-empty cube</td><td>3D convolutions, then a region proposal network</td><td>225 ms per sweep (4.4 Hz), too slow to deploy</td></tr>
+    <tr><td><b>SECOND</b> (2018)</td><td>Voxels</td><td><i>Sparse</i> 3D convolutions that skip empty cubes</td><td>20 Hz</td></tr>
+    <tr><td><b>PointPillars</b> (nuTonomy, 2018)</td><td>Tall columns (<b>pillars</b>) with no vertical split; one PointNet per pillar</td><td>Scatter into a 2D <b>pseudo-image</b>, then an ordinary fast 2D CNN</td><td><b>62 Hz</b>; slimmer version 105 Hz</td></tr>
+  </table>
+  <div class="eq">
+    <span class="se">points</span> → bin by (x, y) into pillars of <b>0.16 m</b> → keep up to <b>N = 100</b> points per pillar, up to <b>P = 12,000</b> pillars → each point gets 9 numbers (x, y, z, intensity, offsets to the pillar's mean and center) → <b>tensor P × N × 9</b> → shared MLP + max per pillar → <span class="be">64 numbers per pillar</span> → scatter back to the grid → <b>pseudo-image 64 × H × W</b> → 2D CNN → boxes
+    <span class="say">Group points into columns, summarize each column with a tiny PointNet, paint the summaries back onto a flat grid, and now it's “an image”: every 2D detection trick applies, at 2D speed.</span>
+  </div>
+  <p>Why pillars and not cubes? A car's height is small compared with its length, and objects rarely stack on top of each other on a road. Dropping the vertical split loses little and turns slow 3D convolutions into fast 2D ones. The cost is a hard cap: a pillar with more than N points gets <b>randomly sampled down</b>, and anything beyond P pillars is dropped. Those two numbers, and the cell size, are your memory dials.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how big is the grid?</span>
+    <p>Take a detection area 64 m ahead by 36 m wide, with 0.16 m pillars.</p>
+    <ol>
+      <li>Grid: 64 ÷ 0.16 = 400 cells by 36 ÷ 0.16 = 225 cells = <b>90,000 pillars</b> possible.</li>
+      <li>A typical sweep fills about 2,000 of them, so <b>97.8% are empty</b>.</li>
+      <li>The pseudo-image stores 64 float32 numbers (4 bytes each) per cell: 90,000 × 64 × 4 = <b>23 MB</b>, dense, mostly zeros.</li>
+      <li>The pillar tensor stores the points: 2,000 pillars × 100 points × 9 numbers × 4 bytes = <b>7.2 MB</b>.</li>
+      <li>Double the cell size to 0.32 m and the grid shrinks <b>4×</b> (to 22,500 cells): the pseudo-image drops to about 5.8 MB. But each pillar now holds about 4× as many points, so more of them overflow the cap of N.</li>
+    </ol>
+    <p>That's the whole trade in one example: <b>finer cells = more detail and more memory; coarser cells = cheaper, but crowded pillars and lost shapes</b>. (Real grids are bigger: OpenPCDet's KITTI config uses 0.16 m over 69.12 m × 79.36 m, a 432 × 496 grid.)</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Pillarize a lidar sweep</span>
+    <p class="hint">A simulated sweep (about 9,600 <span class="se">points</span>, seeded) of a street: two cars, a truck, a wall, and far away at 52 m a <b>pedestrian standing next to a pole</b>. Gold squares are non-empty pillars (brighter = more points); <span style="color:var(--bad)">red outlines</span> are pillars that overflow the cap N and drop points. The right panel zooms on the pedestrian (<span class="ag">red</span>) and pole (grey).</p>
+    <div class="pg-row wide">
+      <canvas class="sim" id="pilCanvas"></canvas>
+      <canvas class="sim square" id="pilZoom"></canvas>
+    </div>
+    <div class="controls">
+      <label>pillar size <input type="range" id="pilRes" min="0.08" max="0.8" step="0.02" value="0.16"> <b class="mono" id="pilResV"></b></label>
+      <label>max points per pillar N <input type="range" id="pilN" min="8" max="256" step="8" value="104"> <b class="mono" id="pilNV"></b></label>
+      <label><input type="checkbox" id="pilPts" checked> show points</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">non-empty pillars <b id="pilP">–</b></div>
+      <div class="stat">empty <b id="pilE">–</b></div>
+      <div class="stat">memory (pseudo-image + pillar tensor) <b id="pilM">–</b></div>
+      <div class="stat">points dropped by the cap <b id="pilD">–</b></div>
+      <div class="stat">pedestrian and pole separate? <b id="pilS">–</b></div>
+      <div class="stat">challenge <b id="pilChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> your car's chip has a <b>15 MB</b> budget for this stage. Fit under it while dropping <b>at most 10%</b> of the points and keeping the pedestrian and the pole in <b>separate</b> pillar blobs (no pedestrian pillar touching a pole pillar). The paper's defaults (0.16 m, about 100) are way over budget. Memory here is float32, 64 channels per cell, illustrative of the real cost.</p>
+  </div>
+  <p>What you should find: pillar size is the big dial, because the pseudo-image grows with 1/size². Coarsen to about 0.3 m and memory falls under budget, but now the near car's pillars overflow and you drop too many points, so raise N; go past about 0.4 m and the pedestrian's pillars merge into the pole's. The winning zone is narrow, which is exactly the tuning real teams do per sensor and per chip.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Every lidar detector answers one question: <b>how do I turn an unordered, sparse bag of points into something regular enough for fast learned filters?</b> PointNet's answer is “shared MLP + max” (order-free). Voxel methods answer “a 3D grid”. PointPillars combines them: PointNet <i>inside</i> each column, a 2D grid <i>across</i> columns. The grid buys speed; the PointNet keeps the details the grid would blur.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: counting votes by district</span>
+    <p>You have a million unsorted ballots. Reading them in a random order gives the same result, so you never rely on order (PointNet). But to see <i>where</i> people voted what, you sort ballots into districts first, summarize each district in one line, and draw a map of the summaries (pillars and the pseudo-image). Big districts are cheap to map but blur neighbourhoods; tiny ones show detail but the map gets huge, and the busiest polling station still has to be sampled when it overflows.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Lidar gives exact 3D shape, but as an unordered, ~97%-empty, unevenly dense list. Image CNNs, which had just become very good at detection, need a full regular grid. Hand-made rules (“a cluster of points about 4.5 m long is a car”) broke on trucks, people, and anything partly hidden.</li>
+      <li><b>What people tried.</b> <i>Project to images</i> (range images, BEV maps with hand-made height and density features): fast, but the hand-made features lose shape. <i>Dense 3D voxels with 3D convolutions</i> (VoxelNet): learns its own features, but 225 ms per sweep. <i>Sparse 3D convolutions</i> (SECOND): 20 Hz, better, still 3D. <i>PointNet on raw points</i>: order-free and elegant, but one global max can't localize dozens of objects in a street.</li>
+      <li><b>Why this works.</b> PointPillars learns its features (PointNet per pillar), then hands a flat grid to a mature 2D CNN. Tiny numbers: a 64 m × 36 m area at 0.16 m is 90,000 cells, but only about 2,000 hold points, so the expensive learned step runs on 2,000 pillars, not 90,000 cubes per height layer. Result: 62 Hz, and more accurate than the slower methods on the KITTI benchmark.</li>
+      <li><b>What it costs, when it fails.</b> Throwing away vertical structure hurts stacked or overhanging things (a branch above a car). The caps P and N randomly drop points in dense areas. Far objects have a handful of points and few pillars, so small, distant pedestrians are the classic miss, and pedestrians get confused with poles and tree trunks (the paper's own failure analysis). It also needs lots of labeled 3D boxes.</li>
+      <li><b>What came next.</b> <b>CenterPoint</b> (2020) keeps a BEV grid but predicts object <i>centers</i> as peaks in a heat map instead of matching thousands of pre-shaped “anchor” boxes, which handles any heading and adds velocity, and it makes tracking a simple nearest-center match. Range-image detectors (Waymo's RSN) target long range; multi-frame and offline detectors use whole sequences (Lesson 6.7); camera BEV methods do the same job without lidar (Lesson 6.2); occupancy grids drop boxes entirely (Lesson 6.3).</li>
+    </ol>
+  </div>
+
+  <h2>CenterPoint: find the middle, then the rest</h2>
+  <p>Box-based detectors like PointPillars place pre-shaped <b>anchor boxes</b> at every grid cell (PointPillars uses two headings per anchor, 0° and 90°) and learn to nudge them. A car parked at 45° doesn't fit either anchor well. <b>CenterPoint</b> (Yin, Zhou, Krähenbühl, 2020) asks a simpler question per BEV cell: <i>how likely is an object's center right here?</i> The peaks of that heat map are the objects; from each peak it reads off size, heading and velocity. A second stage refines each box with point features. It reached <b>65.5 NDS</b> on nuScenes (NDS, the nuScenes detection score, blends accuracy of position, size, heading, velocity and class into one 0–100 number) and ranked first among lidar-only entries on the Waymo Open Dataset when published. Bonus: since it predicts velocity, tracking becomes “match each center to the nearest predicted center from the last frame”, a greedy closest-point match (Lesson 6.5).</p>
+
+  <h2>Scoring a box: 3D IoU and BEV IoU</h2>
+  <p>How do you say a predicted box is “right”? The standard yardstick is <b>IoU, intersection over union</b>: the overlap volume divided by the combined volume. 1 means perfect, 0 means no overlap. (Full treatment of IoU in 2D: <span class="dlref" data-href="phase4/1-detection-basics.html">the Deep Learning course, Phase 4 (detection basics, IoU, NMS)</span>.)</p>
+  <ul>
+    <li><b>3D IoU</b> uses volumes, so it also punishes a wrong height or z position. KITTI counts a car as detected at 3D IoU ≥ 0.7.</li>
+    <li><b>BEV IoU</b> drops height and compares the <i>footprints</i> seen from above: rotated rectangles. Cheaper, and it's what matters most for not hitting things.</li>
+  </ul>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: BEV IoU of two boxes</span>
+    <p>Two 2 m × 2 m squares, the second shifted 1 m forward. Overlap = 1 m × 2 m = 2 m². Union = 4 + 4 − 2 = 6 m². IoU = 2 ÷ 6 = <b>0.33</b>. Rotate the second one by 45° about the same center instead: the overlap is an octagon of about 3.31 m², union ≈ 4.69 m², IoU ≈ <b>0.71</b>. For rotated rectangles you clip one polygon against the other (the Sutherland–Hodgman algorithm) and measure the area of what's left; the lab does exactly that.</p>
+  </div>
+
+  <h2>Non-maximum suppression: one box per object</h2>
+  <p>A detector fires several overlapping boxes on the same car. <b>Non-maximum suppression (NMS)</b> cleans up: sort boxes by score; keep the best; delete every other box whose IoU with it is above a <b>threshold</b>; repeat with the next survivor. PointPillars uses NMS at 0.5 IoU. The threshold is a bet: too low and you delete a real neighbour; too high and duplicates survive.</p>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict before you play:</b> in a tight parking lot two cars sit side by side, 30 cm apart. Someone sets the NMS threshold to a strict 0.1 “to be safe”. What happens?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">A whole car disappears. The detector's boxes are a bit wider than the cars, so the best box on car A overlaps the best box on car B by an IoU of about 0.2. With a threshold of 0.1 that counts as a “duplicate”, and NMS deletes the second car. A strict threshold isn't safe; it's a different failure. Check it in the playground.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · BEV IoU and NMS with draggable boxes</span>
+    <p class="hint">Two parked cars (grey dashed outlines are the truth). The detector stand-in produced five scored <span class="be">boxes</span>. Solid boxes survive NMS; faded dashed ones are suppressed. <b>Drag any box</b> to move it (rotate the selected one with the slider) and watch the IoU numbers update.</p>
+    <canvas class="sim" id="nmsCanvas"></canvas>
+    <div class="controls">
+      <label>NMS IoU threshold <input type="range" id="nmsT" min="0.05" max="0.95" step="0.01" value="0.1"> <b class="mono" id="nmsTV"></b></label>
+      <label>rotate selected <input type="range" id="nmsRot" min="-0.6" max="0.6" step="0.01" value="0"> <b class="mono" id="nmsRotV"></b></label>
+      <button class="btn" id="nmsReset">↺ Reset boxes</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">selected box <b id="nmsSel">–</b></div>
+      <div class="stat">its IoU with the top box <b id="nmsIoU">–</b></div>
+      <div class="stat">boxes kept <b id="nmsKept">–</b></div>
+      <div class="stat">cars found / duplicates <b id="nmsFound">–</b></div>
+      <div class="stat">challenge <b id="nmsChal">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> pick an NMS threshold that keeps <b>both cars</b> (one surviving box with IoU ≥ 0.5 to each truth) and <b>removes every duplicate</b>. Then find both edges of the winning window: what overlap number sets each edge?</p>
+  </div>
+  <p>The window's lower edge is the overlap between the two <i>neighbouring cars'</i> best boxes (about 0.19); the upper edge is the overlap of the weakest-overlapping duplicate (about 0.51). Every crowded scene has its own window, which is why detectors in parking lots and crowds struggle, and why CenterPoint-style “one peak per object” heads need less NMS fiddling. Also notice: the highest-scoring box is not the best-fitting one on car A (look at its IoU with the truth). Scores and localization quality are different things.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>OpenPCDet</b> and <b>MMDetection3D</b> are the two big open-source toolboxes; both ship PointPillars, SECOND, CenterPoint and friends with configs for KITTI, nuScenes and the Waymo Open Dataset. <b>Open3D</b> loads and views point clouds. First, pillarization in plain NumPy (the lab grows this):</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+
+<span class="k">def</span> pillarize(pts, res=<span class="n">0.16</span>, x_range=(<span class="n">0</span>, <span class="n">64</span>), y_range=(-<span class="n">18</span>, <span class="n">18</span>), max_pts=<span class="n">100</span>):
+    <span class="s">"""pts: (M, 3+) array of x, y, z, ... → dict pillar_id -> (≤ max_pts, D) array"""</span>
+    keep = (pts[:, <span class="n">0</span>] &gt;= x_range[<span class="n">0</span>]) &amp; (pts[:, <span class="n">0</span>] &lt; x_range[<span class="n">1</span>]) &amp; (pts[:, <span class="n">1</span>] &gt;= y_range[<span class="n">0</span>]) &amp; (pts[:, <span class="n">1</span>] &lt; y_range[<span class="n">1</span>])
+    pts = pts[keep]
+    ix = ((pts[:, <span class="n">0</span>] - x_range[<span class="n">0</span>]) // res).astype(int)
+    iy = ((pts[:, <span class="n">1</span>] - y_range[<span class="n">0</span>]) // res).astype(int)
+    nx = int(np.ceil((x_range[<span class="n">1</span>] - x_range[<span class="n">0</span>]) / res))
+    ids = ix + nx * iy                                   <span class="c"># one integer per pillar</span>
+    order = np.argsort(ids, kind=<span class="s">"stable"</span>)
+    uniq, start = np.unique(ids[order], return_index=<span class="k">True</span>)
+    groups = np.split(pts[order], start[<span class="n">1</span>:])
+    rng = np.random.default_rng(<span class="n">0</span>)
+    <span class="k">return</span> {int(u): (g <span class="k">if</span> len(g) &lt;= max_pts <span class="k">else</span> g[rng.choice(len(g), max_pts, replace=<span class="k">False</span>)])
+            <span class="k">for</span> u, g <span class="k">in</span> zip(uniq, groups)}</code></pre>
+<pre><code><span class="c"># OpenPCDet: run a pretrained model on your own cloud (an (N, 4) .npy of x, y, z, intensity)</span>
+cd OpenPCDet/tools
+python demo.py --cfg_file cfgs/kitti_models/pointpillar.yaml \
+    --ckpt pointpillar_7728.pth --data_path my_data.npy
+<span class="c"># its pointpillar.yaml: VOXEL_SIZE [0.16, 0.16, 4], MAX_POINTS_PER_VOXEL 32,
+#   POINT_CLOUD_RANGE [0, -39.68, -3, 69.12, 39.68, 1]</span>
+
+<span class="c"># MMDetection3D: the same idea, one line</span>
+python demo/pcd_demo.py demo/data/kitti/000008.bin \
+    configs/pointpillars/pointpillars_hv_secfpn_8xb6-160e_kitti-3d-car.py ${CHECKPOINT_FILE} --show</code></pre>
+    <p class="hint">Notice OpenPCDet caps pillars at 32 points, not the paper's 100: a memory/accuracy choice like the one you just made. Checkpoint names come from each toolbox's model zoo; download them from the README links.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚕 Waymo</h4><p>Lidar is central to the Waymo Driver, and its research team publishes lidar detectors. <b>RSN, Range Sparse Net</b> (CVPR 2021) works on the lidar's native <i>range image</i> to pick out foreground points, then runs sparse convolutions only on those, aimed at real-time detection at the longer ranges newer lidars reach. <b>3D Auto Labeling</b> (CVPR 2021) runs a big detector <i>offline</i> over whole sequences to make labels as good as humans' (Lesson 6.7). Its public Waymo Open Dataset has <b>12.6 million 3D box labels</b> with tracking IDs on lidar data, the benchmark CenterPoint topped. What runs in today's car isn't published; its Dec 2025 post describes a sensor-fusion encoder over camera, lidar and radar (Lesson 6.6).</p>
+        <p class="src">Sources: <a href="https://arxiv.org/abs/2106.13365" target="_blank" rel="noopener">RSN</a>, <a href="https://arxiv.org/abs/2103.05073" target="_blank" rel="noopener">3D Auto Labeling</a>, <a href="https://waymo.com/open/about/" target="_blank" rel="noopener">Waymo Open Dataset</a>, <a href="https://waymo.com/research/" target="_blank" rel="noopener">Waymo research</a></p></div>
+      <div><h4>🚘 Tesla</h4><p>No lidar at all. In its public talks Tesla describes networks that turn its eight cameras into a 3D “vector space” of objects with position, orientation, depth and velocity (AI Day 2021), and an <b>occupancy network</b> that predicts which 3D voxels are filled (CVPR 2022, AI Day 2022). The detection <i>problem</i> is the same as in this lesson; the input is pixels. In the CVPR 2022 talk Tesla said what it showed used no radar, lidar, ultrasonics or HD maps.</p>
+        <p class="src">Sources: <a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a>, <a href="https://www.youtube.com/watch?v=jPCV4GKX9Dw" target="_blank" rel="noopener">CVPR'22 WAD keynote (Elluswamy)</a></p></div>
+      <div><h4>🛸 Drones</h4><p>Spinning automotive lidars are heavy and power-hungry for a small drone, so consumer and enterprise drones mostly see with cameras. Skydio's X10 uses <b>six navigation cameras</b> for 360° coverage and an <b>onboard NVIDIA Jetson Orin</b> GPU, and its Shadow mode tracks people and vehicles. Skydio doesn't publish its network architectures. Lidar does fly on larger mapping and inspection drones, where point clouds are usually processed after the flight.</p>
+        <p class="src">Sources: <a href="https://www.skydio.com/x10" target="_blank" rel="noopener">Skydio X10</a>, <a href="https://www.skydio.com/autonomy" target="_blank" rel="noopener">Skydio autonomy</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> Waymo buys lidar so range and shape are measured, not guessed, and spends its learning on what lidar alone can't tell (class, intent). Tesla bets that cameras plus fleet-scale data can learn the geometry, saving sensor cost on millions of cars. A drone's weight and power budget rule out big lidars, so it leans on cameras and an efficient onboard GPU.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>PointNet on raw points</td><td>Order-free, no information lost to a grid, robust to missing points</td><td>One global summary can't localize many objects; slow on 100k points without grouping</td></tr>
+      <tr><td>3D voxels (VoxelNet, SECOND)</td><td>Keeps vertical structure; learned features</td><td>3D convolutions are costly; sparse convs need special libraries</td></tr>
+      <tr><td>Pillars (PointPillars)</td><td>Fast 2D CNN; 62 Hz; easy to deploy (TensorRT gave +45%)</td><td>No vertical split; caps drop points; small far objects are hard</td></tr>
+      <tr><td>Smaller cells</td><td>Separates close objects; better small-object detail</td><td>Memory and compute grow with 1/size²</td></tr>
+      <tr><td>Center heat maps (CenterPoint)</td><td>Any heading; velocity; simple tracking; less NMS tuning</td><td>Still a BEV grid; overlapping centers in crowds</td></tr>
+      <tr><td>Low NMS threshold</td><td>Few duplicates</td><td>Deletes real neighbours in parking lots and crowds</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you detect cars in a lidar point cloud, and what breaks?” A strong answer:</p>
+    <ul>
+      <li>Names the three properties: <b>unordered, sparse, uneven density</b>, and why a plain CNN can't eat a point list.</li>
+      <li>Explains <b>PointNet's shared MLP + max pool</b> as permutation invariance, and <b>PointPillars</b> as “PointNet per column, then a 2D CNN on a pseudo-image”, with the knobs: cell size, P, N.</li>
+      <li>Knows <b>BEV vs 3D IoU</b>, NMS and its threshold failure in crowds, and that CenterPoint predicts centers instead of anchors.</li>
+      <li>Talks about <b>failure modes and data</b>: far pedestrians with few points, poles vs people, rain and exhaust returns, the long tail of odd vehicles, and evaluating per distance band, not just one average number.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>PointPillars at nuTonomy</b> <span class="tag res">🧪 Research · 2018</span> <a href="https://arxiv.org/abs/1812.05784" target="_blank" rel="noopener">Lang et al.</a></div>
+      <p><b>How:</b> PointNet per pillar → pseudo-image → 2D CNN; final kernels built with NVIDIA TensorRT.</p>
+      <p><b>Why this method:</b> a self-driving company needed a lidar detector that was both accurate and real-time on car hardware: 62 Hz, 2–4× faster than the methods it beat on KITTI.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>CenterPoint</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/2006.11275" target="_blank" rel="noopener">Yin, Zhou, Krähenbühl</a></div>
+      <p><b>How:</b> BEV heat map of object centers, regress size, heading and velocity, refine with point features; greedy closest-center tracking.</p>
+      <p><b>Why this method:</b> rotated objects don't fit fixed anchors; points don't have orientations. 65.5 NDS on nuScenes and first among lidar-only Waymo entries at publication.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>RSN at Waymo</b> <span class="tag av">🚗 AV</span> <a href="https://arxiv.org/abs/2106.13365" target="_blank" rel="noopener">Sun et al., CVPR 2021</a></div>
+      <p><b>How:</b> cheap 2D convolutions on the dense range image select foreground points; sparse convolutions run only on those.</p>
+      <p><b>Why this method:</b> long-range lidar means huge BEV grids; skipping background points keeps detection real-time at range.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>OpenPCDet and MMDetection3D</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/open-mmlab/OpenPCDet" target="_blank" rel="noopener">OpenPCDet</a> · <a href="https://github.com/open-mmlab/mmdetection3d" target="_blank" rel="noopener">MMDetection3D</a></div>
+      <p><b>How:</b> shared data loaders, voxelizers and heads for dozens of lidar detectors and datasets.</p>
+      <p><b>Why this method:</b> almost every research comparison and many startups' first detector start from these configs.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the same team built the benchmark</span>
+    <p>Three of PointPillars' authors, Alex Lang, Sourabh Vora and Holger Caesar, are also authors of <b>nuScenes</b>, the first public dataset with a full self-driving sensor suite (6 cameras, 5 radars, 1 lidar) (<a href="https://arxiv.org/abs/1903.11027" target="_blank" rel="noopener">Caesar et al.</a>). Building the detector and the yardstick in the same building turns out to be a great way to find out what the yardstick misses.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This lesson stands on lidar basics (2.3) and frames (Phase 1: every point is in the lidar's frame until you transform it). Its boxes feed tracking (6.5), where a Kalman filter per object predicts each box forward (<a href="../phase3/3-kalman-filter.html">Lesson 3.3</a>, the two-guesses blend). Next, 6.2 builds the same BEV grid from <i>cameras</i>; 6.3 replaces boxes with occupancy; 6.6 fuses lidar with cameras; 6.7 shows where millions of 3D labels come from. The maths of max and symmetric functions is just sets; the convolution that the pseudo-image feeds is in <a href="../../math-course/phase8/3b-convolution.html">convolution</a> in the Math course, and 3D vision more broadly in <span class="dlref" data-href="phase4/8-3d-vision.html">the Deep Learning course, Phase 4 (3D vision)</span>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1612.00593" target="_blank" rel="noopener">PointNet (Qi et al., 2017)</a>. Short, readable, with the critical-points figures you just recreated.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1812.05784" target="_blank" rel="noopener">PointPillars (Lang et al., 2018)</a>. Section 2.1 is the pseudo-image in two paragraphs.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/open-mmlab/OpenPCDet" target="_blank" rel="noopener">OpenPCDet</a>. Read <code>pointpillar.yaml</code> next to this lesson: every knob you played with is there.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A 64 m × 40 m area is split into 0.16 m pillars, and a sweep fills 3,000 of them. About what fraction of pillars is empty?</div>
+    <div class="opts"><button class="opt">About 70%</button><button class="opt" data-ok>About 97%</button><button class="opt">About 99.9%</button></div>
+    <div class="explain">64 ÷ 0.16 = 400 and 40 ÷ 0.16 = 250, so 100,000 pillars. 3,000 filled means 97,000 empty: <b>97%</b>, the same sparsity the PointPillars paper reports for a 64-beam lidar.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After deployment, your detector keeps missing one of two cars parked side by side, but only in tight parking lots. The NMS threshold is 0.1. Best first fix?</div>
+    <div class="opts"><button class="opt">Lower the threshold to 0.05 to remove more duplicates</button><button class="opt" data-ok>Raise the NMS threshold (e.g. toward 0.3–0.5) and check the result with rotated BEV IoU; neighbouring cars' boxes overlap a little, so a very low threshold deletes real cars</button><button class="opt">Increase the pillar size so the two cars merge into one</button></div>
+    <div class="explain">NMS deletes any box overlapping a better one by more than the threshold. Adjacent cars' boxes often overlap by 0.1–0.2, so 0.1 suppresses one of them. Raise the threshold into the window between the neighbour overlap and the duplicate overlap, as in Playground 3.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Why does PointNet use a max over points instead of concatenating all the per-point features into one long vector?</div>
+    <div class="opts"><button class="opt">Max is faster to compute on GPUs</button><button class="opt" data-ok>Max gives the same answer for any ordering of the points (and any number of them), so the network can't depend on the arbitrary order of the list</button><button class="opt">Concatenation would make the features negative</button></div>
+    <div class="explain">A point cloud is a set: shuffling it doesn't change the scene. Concatenation changes when the order changes; max (a symmetric function) doesn't. It also handles any number of points, and the result depends only on a small critical set.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Point clouds are unordered, ~97% empty in a BEV grid, and much denser near than far: awkward for CNNs.</li>
+      <li>PointNet: the same MLP on every point, then max-pool → order-free; only a small critical set of points matters.</li>
+      <li>VoxelNet (3D voxels, 225 ms) → SECOND (sparse 3D, 20 Hz) → PointPillars (PointNet per column → 2D pseudo-image → 2D CNN, 62 Hz).</li>
+      <li>Knobs: cell size (memory ∝ 1/size²), points per pillar N, pillars P. Small far objects and poles vs people are the classic failures.</li>
+      <li>CenterPoint predicts center heat-map peaks plus size, heading and velocity. Score boxes with 3D or BEV IoU; clean up with NMS, whose threshold must sit between neighbour overlap and duplicate overlap.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+
+  // ---------- Playground 1: PointNet order invariance ----------
+  const PN0 = [[-1.6, -1.2], [-1.6, -0.2], [-1.6, 0.8], [-1.5, 1.7], [-0.6, -1.3], [0.4, -1.25], [1.3, -1.2], [-0.7, 0.1]];
+  let pn = PN0.map((p, i) => ({ p, id: i, alive: true })), pnOrder = pn.map((_, i) => i), pnSel = -1;
+  const relu = v => Math.max(0, v);
+  const feat = ([x, y]) => [relu(1.0 * x + 0.3 * y + 2), relu(-0.4 * x + 1.0 * y + 2), relu(-0.8 * x - 0.9 * y + 1)].map(v => Math.round(v * 100) / 100);
+  const pool = list => [0, 1, 2].map(k => Math.max(...list.map(q => feat(q.p)[k])));
+  const POOL0 = pool(pn);
+  const PNW = new Sim($("pnCanvas"), { xRange: [-2.5, 2.5], yRange: [-2.5, 2.5], grid: 0.5, onPointer(type, [x, y]) {
+    if (type !== "down") return;
+    let best = -1, bd = 0.35;
+    pn.forEach((q, i) => { const d = Math.hypot(q.p[0] - x, q.p[1] - y); if (q.alive && d < bd) { bd = d; best = i; } });
+    if (best >= 0) { pn[best].alive = false; drawPN(); }
+  } });
+  function drawPN() {
+    const alive = pn.filter(q => q.alive), mx = alive.length ? pool(alive) : [0, 0, 0];
+    const crit = new Set(); [0, 1, 2].forEach(k => { let bi = -1, bv = -1; alive.forEach(q => { const v = feat(q.p)[k]; if (v > bv) { bv = v; bi = q.id; } }); if (bi >= 0) crit.add(bi); });
+    PNW.render(w => {
+      w.clear();
+      pn.forEach(q => {
+        if (!q.alive) { w.circle(q.p[0], q.p[1], 0.12, { stroke: "--muted", width: 1, alpha: 0.5 }); return; }
+        w.circle(q.p[0], q.p[1], 0.14, { fill: crit.has(q.id) ? "--c-be" : "--c-se", alpha: 0.95 });
+        w.text([q.p[0] + 0.28, q.p[1] + 0.22], "p" + (q.id + 1), { color: "--muted", size: 11 });
+      });
+      w.text([0.6, 2.2], "purple = holds a column max (critical)", { color: "--c-be", size: 11 });
+    });
+    let rows = `<tr><th>list row</th><th>point</th><th>f₁</th><th>f₂</th><th>f₃</th></tr>`;
+    pnOrder.forEach((idx, r) => {
+      const q = pn[idx], f = feat(q.p);
+      rows += `<tr class="${q.alive ? "" : "gone"}"><td>${r + 1}</td><td>p${q.id + 1}</td>${f.map((v, k) => `<td class="${q.alive && v === mx[k] ? "mx" : ""}">${v.toFixed(2)}</td>`).join("")}</tr>`;
+    });
+    rows += `<tr><th colspan="2">max</th>${mx.map(v => `<th>${v.toFixed(2)}</th>`).join("")}</tr>`;
+    $("pnTable").innerHTML = rows;
+    $("pnMax").textContent = "[" + mx.map(v => v.toFixed(2)).join(", ") + "]";
+    const cat = pnOrder.filter(i => pn[i].alive).slice(0, 2).map(i => feat(pn[i].p).map(v => v.toFixed(1)).join(" ")).join(" | ");
+    $("pnCat").textContent = "[" + cat + " | …]";
+    $("pnLeft").textContent = alive.length + " of 8";
+    const same = mx.every((v, k) => Math.abs(v - POOL0[k]) < 1e-9), removed = 8 - alive.length;
+    $("pnChal").innerHTML = !same ? `<span class="badge-lose">feature changed</span> <span class="muted">you deleted a critical point</span>`
+      : removed >= 5 ? `<span class="badge-win">✅ ${removed} deleted, feature unchanged</span>` : `<span class="muted">${removed} deleted, unchanged so far</span>`;
+  }
+  $("pnShuffle").onclick = () => { const r = Sim.rng(Math.floor(Math.random() * 1e6)); for (let i = pnOrder.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [pnOrder[i], pnOrder[j]] = [pnOrder[j], pnOrder[i]]; } drawPN(); };
+  $("pnReset").onclick = () => { pn.forEach(q => (q.alive = true)); drawPN(); };
+  drawPN();
+
+  // ---------- Playground 2: pillarization ----------
+  // ==MODEL61==
+  function rng(seed){let a=seed>>>0;return()=>{a|=0;a=(a+0x6D2B79F5)|0;let t=Math.imul(a^(a>>>15),1|a);t=(t+Math.imul(t^(t>>>7),61|t))^t;return((t^(t>>>14))>>>0)/4294967296;};}
+  function randn(r){let u=0,v=0;while(!u)u=r();while(!v)v=r();return Math.sqrt(-2*Math.log(u))*Math.cos(2*Math.PI*v);}
+  const AREA={x0:0,x1:64,y0:-18,y1:18};
+  const OBJ=[
+   {name:"car",cx:9,cy:-3,l:4.5,w:1.9,th:0.05},
+   {name:"car",cx:21,cy:3.5,l:4.6,w:1.9,th:-0.1},
+   {name:"truck",cx:36,cy:-6,l:9,w:2.5,th:0},
+   {name:"pedestrian",cx:52,cy:2.5,r:0.3},
+   {name:"pole",cx:52,cy:1.5,r:0.12},
+   {name:"wall",x0:4,x1:62,y:13}];
+  function makeCloud(seed){
+    const r=rng(seed),pts=[];const az0=-0.62,az1=0.62,dAz=0.0035;
+    const rings=[4,4.6,5.3,6.1,7,8.1,9.4,11,13,15.5,18.5,22,27,33,40,48,58];
+    for(let a=az0;a<=az1;a+=dAz){
+      const dx=Math.cos(a),dy=Math.sin(a);
+      let tmin=Infinity,hitName=null;
+      for(const o of OBJ){let t=Infinity;
+        if(o.r){const fx=-o.cx,fy=-o.cy,b=fx*dx+fy*dy,c=fx*fx+fy*fy-o.r*o.r,d=b*b-c;if(d>=0)t=-b-Math.sqrt(d);}
+        else if(o.name==="wall"){if(dy>1e-6){const tt=o.y/dy;const x=tt*dx;if(x>=o.x0&&x<=o.x1)t=tt;}}
+        else{const c=Math.cos(o.th),s=Math.sin(o.th),pts4=[[o.l/2,o.w/2],[-o.l/2,o.w/2],[-o.l/2,-o.w/2],[o.l/2,-o.w/2]].map(([u,v])=>[o.cx+u*c-v*s,o.cy+u*s+v*c]);
+          for(let i=0;i<4;i++){const p=pts4[i],q=pts4[(i+1)%4],ex=q[0]-p[0],ey=q[1]-p[1],den=dx*ey-dy*ex;if(Math.abs(den)<1e-12)continue;const tt=(p[0]*ey-p[1]*ex)/den,u=(p[0]*dy-p[1]*dx)/den;if(tt>0&&u>=0&&u<=1)t=Math.min(t,tt);}}
+        if(t<tmin){tmin=t;hitName=o.name;}}
+      const H={car:1.5,truck:3,pedestrian:1.7,pole:4,wall:2.5}[hitName]||0;
+      const layers=hitName?Math.max(1,Math.min(40,Math.round(H/(tmin*0.006)))) :0;
+      for(let k=0;k<layers;k++){const t=tmin+0.03*randn(r);pts.push([t*dx,t*dy,hitName]);}
+      for(const rr of rings){ if(rr<tmin-0.3){const t=rr+0.05*randn(r);pts.push([t*dx,t*dy,"ground"]);}}
+    }
+    return pts.filter(p=>p[0]>=AREA.x0&&p[0]<AREA.x1&&p[1]>=AREA.y0&&p[1]<AREA.y1);
+  }
+  function pillarize(pts,res,N){
+    const nx=Math.ceil((AREA.x1-AREA.x0)/res),ny=Math.ceil((AREA.y1-AREA.y0)/res),map=new Map();
+    for(const p of pts){const i=Math.floor((p[0]-AREA.x0)/res),j=Math.floor((p[1]-AREA.y0)/res),k=i+nx*j;let c=map.get(k);if(!c){c={n:0,ped:0,pole:0};map.set(k,c);}c.n++;if(p[2]==="pedestrian")c.ped++;if(p[2]==="pole")c.pole++;}
+    let dropped=0,pedPillars=0,pedKept=0,maxN=0,mixed=0;
+    for(const c of map.values()){if(c.n>N)dropped+=c.n-N;maxN=Math.max(maxN,c.n);if(c.ped){pedPillars++;pedKept+=Math.min(c.ped,N);}}
+    for(const [k,c] of map){if(!c.ped)continue;const i=k%nx,j=(k-i)/nx;for(let di=-1;di<=1;di++)for(let dj=-1;dj<=1;dj++){const q=map.get(i+di+nx*(j+dj));if(q&&q.pole)mixed++;}}
+    const P=map.size,cells=nx*ny;
+    const tensorMB=P*N*9*4/1e6, imageMB=cells*64*4/1e6;
+    return {nx,ny,cells,P,empty:1-P/cells,dropped,dropFrac:dropped/pts.length,pedPillars,pedKept,maxN,mixed,tensorMB,imageMB,memMB:tensorMB+imageMB,map};
+  }
+  // ==END61==
+  const CLOUD = makeCloud(3);
+  let pil = null;
+  const colOf = n => n === "pedestrian" ? "--c-ag" : n === "pole" ? "--muted" : "--c-se";
+  function drawPillars(w, zoom) {
+    if (!pil) return;
+    const res = +$("pilRes").value, N = +$("pilN").value, showPts = $("pilPts").checked;
+    w.clear();
+    if (!zoom) { w.rect(-1.4, -1, 2.8, 2, { fill: "--muted", alpha: 0.5 }); w.text([1.5, -2], "lidar car", { color: "--muted", size: 10, align: "left" }); }
+    const vis = zoom ? (x, y) => x > 49.5 && x < 54.5 && y > -0.5 && y < 4.5 : () => true;
+    pil.map.forEach((c, k) => {
+      const i = k % pil.nx, j = (k - i) / pil.nx, x = AREA.x0 + i * res, y = AREA.y0 + j * res;
+      if (!vis(x + res / 2, y + res / 2)) return;
+      const s = Math.max(res, 1.6 / w.sx);   // at least ~1.6 px so tiny pillars stay visible
+      w.rect(x, y, s, s, { fill: c.ped ? "--c-ag" : c.pole ? "--muted" : "--c-un", alpha: 0.45 + 0.55 * Math.min(1, c.n / 40) });
+      if (c.n > N) w.rect(x, y, s, s, { stroke: "--bad", width: zoom ? 2 : 1 });
+    });
+    if (showPts || zoom) CLOUD.forEach(p => { if (vis(p[0], p[1])) w.dot([p[0], p[1]], { color: colOf(p[2]), r: zoom ? 2.4 : 0.8, alpha: zoom ? 0.95 : 0.35 }); });
+    if (zoom) { w.text([52, 4.1], "52 m away", { color: "--muted", size: 11 }); w.text([53.2, 2.5], "person", { color: "--c-ag", size: 11, align: "left" }); w.text([53.2, 1.5], "pole", { color: "--muted", size: 11, align: "left" }); }
+    else { w.text([52, 6], "person + pole", { color: "--c-ag", size: 11 }); }
+  }
+  const PW = new Sim($("pilCanvas"), { xRange: [-3, 64], yRange: [-18.8, 18.8] });
+  const PZ = new Sim($("pilZoom"), { xRange: [49.5, 54.5], yRange: [-0.5, 4.5] });
+  PW.render(w => drawPillars(w, false)); PZ.render(w => drawPillars(w, true));
+  function refreshPil() {
+    const res = +$("pilRes").value, N = +$("pilN").value;
+    $("pilResV").textContent = res.toFixed(2) + " m"; $("pilNV").textContent = N;
+    pil = pillarize(CLOUD, res, N);
+    $("pilP").textContent = pil.P.toLocaleString() + " of " + pil.cells.toLocaleString();
+    $("pilE").textContent = fmt(100 * pil.empty, 1) + "%";
+    $("pilM").textContent = fmt(pil.memMB, 1) + " MB (" + fmt(pil.imageMB, 1) + " + " + fmt(pil.tensorMB, 1) + ")";
+    $("pilD").textContent = fmt(100 * pil.dropFrac, 1) + "%";
+    const sep = pil.mixed === 0;
+    $("pilS").innerHTML = sep ? "✅ yes" : "❌ merged";
+    const win = pil.memMB <= 15 && pil.dropFrac <= 0.10 && sep;
+    const why = [pil.memMB > 15 ? "over budget" : "", pil.dropFrac > 0.10 ? "too many points dropped" : "", sep ? "" : "person merged with pole"].filter(Boolean).join(", ");
+    $("pilChal").innerHTML = win ? `<span class="badge-win">✅ fits in ${fmt(pil.memMB, 1)} MB</span>` : `<span class="badge-lose">${why}</span>`;
+    PW.render(); PZ.render();
+  }
+  ["pilRes", "pilN"].forEach(id => ($(id).oninput = refreshPil));
+  $("pilPts").onchange = () => { PW.render(); };
+  refreshPil();
+
+  // ---------- Playground 3: rotated BEV IoU + NMS ----------
+  // ==MODEL61B==
+  function corners(b){const c=Math.cos(b.th),s=Math.sin(b.th);return [[b.l/2,b.w/2],[-b.l/2,b.w/2],[-b.l/2,-b.w/2],[b.l/2,-b.w/2]].map(([u,v])=>[b.x+u*c-v*s,b.y+u*s+v*c]);}
+  function area(P){let a=0;for(let i=0;i<P.length;i++){const p=P[i],q=P[(i+1)%P.length];a+=p[0]*q[1]-q[0]*p[1];}return Math.abs(a)/2;}
+  function clip(subj,clipP){
+    let out=subj;
+    for(let i=0;i<clipP.length&&out.length;i++){const A=clipP[i],B=clipP[(i+1)%clipP.length],inp=out;out=[];
+      const side=p=>(B[0]-A[0])*(p[1]-A[1])-(B[1]-A[1])*(p[0]-A[0]);
+      for(let j=0;j<inp.length;j++){const P=inp[j],Q=inp[(j+1)%inp.length],sp=side(P),sq=side(Q);
+        if(sp>=0)out.push(P);
+        if((sp>=0)!==(sq>=0)){const t=sp/(sp-sq);out.push([P[0]+t*(Q[0]-P[0]),P[1]+t*(Q[1]-P[1])]);}}}
+    return out;}
+  function iou(a,b){const A=corners(a),B=corners(b),I=clip(A,B),ia=I.length>2?area(I):0;return ia/(a.l*a.w+b.l*b.w-ia);}
+  function nms(boxes,thr){const order=boxes.map((b,i)=>i).sort((i,j)=>boxes[j].s-boxes[i].s),keep=[],sup={};
+    for(const i of order){if(sup[i]!=null)continue;keep.push(i);for(const j of order){if(j!==i&&sup[j]==null&&keep.indexOf(j)<0&&iou(boxes[i],boxes[j])>thr)sup[j]=i;}}
+    return {keep,sup};}
+  // ==END61B==
+  const GT = [{ x: 12, y: 3, l: 4.6, w: 1.9, th: 0.08 }, { x: 12.2, y: 5.3, l: 4.6, w: 1.9, th: 0.08 }];
+  const D0 = [{ x: 12.1, y: 3.45, l: 4.8, w: 2.3, th: 0.06, s: 0.93 }, { x: 11.6, y: 3.0, l: 4.4, w: 2.0, th: 0.16, s: 0.81 }, { x: 12.7, y: 3.3, l: 4.9, w: 2.0, th: 0.02, s: 0.62 },
+    { x: 12.3, y: 4.95, l: 4.7, w: 2.2, th: 0.12, s: 0.88 }, { x: 12.8, y: 5.1, l: 4.5, w: 2.1, th: 0.0, s: 0.71 }];
+  let D = D0.map(b => ({ ...b })), sel = 0, dragOff = null, nmsRes = null;
+  const NW = new Sim($("nmsCanvas"), { xRange: [6.5, 17.5], yRange: [0.9, 7.1], grid: 1, onPointer(type, [x, y]) {
+    if (type === "down") {
+      let best = -1, bd = 1.2; D.forEach((b, i) => { const d = Math.hypot(b.x - x, b.y - y); if (d < bd) { bd = d; best = i; } });
+      if (best >= 0) { sel = best; dragOff = [D[sel].x - x, D[sel].y - y]; $("nmsRot").value = D[sel].th; refreshNMS(); }
+    } else if (type === "drag" && dragOff) { D[sel].x = x + dragOff[0]; D[sel].y = y + dragOff[1]; refreshNMS(); }
+    else if (type === "up") dragOff = null;
+  } });
+  NW.render(w => {
+    if (!nmsRes) return;
+    w.clear();
+    GT.forEach((g, i) => { w.line(corners(g), { close: true, color: "--muted", width: 2, dash: [6, 4] }); w.text([g.x - 2.9, g.y], i ? "car B" : "car A", { color: "--muted", size: 12, bold: true, align: "right" }); });
+    const kept = new Set(nmsRes.keep);
+    D.forEach((b, i) => {
+      const k = kept.has(i), c = i === sel ? "--accent" : "--c-be";
+      w.line(corners(b), { close: true, color: c, width: k ? (i === sel ? 3.5 : 2.5) : 1.5, dash: k ? [] : [4, 4], alpha: k ? 1 : 0.45 });
+      w.dot([b.x, b.y], { color: c, r: i === sel ? 5 : 3.5, alpha: k ? 1 : 0.5 });
+      w.text([b.x + 2.55, b.y + (i % 2 ? -0.35 : 0.35)], (k ? "" : "✕ ") + b.s.toFixed(2), { color: c, size: 11, align: "left", alpha: k ? 1 : 0.6 });
+    });
+  });
+  function refreshNMS() {
+    const t = +$("nmsT").value; $("nmsTV").textContent = t.toFixed(2); $("nmsRotV").textContent = fmt(MX.deg ? MX.deg(+$("nmsRot").value) : +$("nmsRot").value * 57.3, 0) + "°";
+    nmsRes = nms(D, t);
+    const top = D.map((b, i) => i).sort((i, j) => D[j].s - D[i].s)[0];
+    // IoU with the highest-scoring box that isn't itself (or the overall top)
+    let ref = top; if (sel === top) { let bv = -1; D.forEach((b, i) => { if (i !== sel) { const v = iou(D[sel], b); if (v > bv) { bv = v; ref = i; } } }); }
+    $("nmsSel").textContent = `score ${D[sel].s.toFixed(2)} · IoU with nearest truth ${fmt(Math.max(iou(D[sel], GT[0]), iou(D[sel], GT[1])), 2)}`;
+    $("nmsIoU").textContent = fmt(iou(D[sel], D[ref]), 2) + (sel === top ? " (vs its biggest overlap)" : "");
+    $("nmsKept").textContent = nmsRes.keep.length + " of " + D.length;
+    const found = GT.map(g => nmsRes.keep.some(i => iou(D[i], g) >= 0.5));
+    const dup = nmsRes.keep.length - found.filter(Boolean).length;
+    $("nmsFound").textContent = found.filter(Boolean).length + " of 2 / " + Math.max(0, dup);
+    const win = found[0] && found[1] && nmsRes.keep.length === 2;
+    $("nmsChal").innerHTML = win ? `<span class="badge-win">✅ both cars, no duplicates</span>` : `<span class="badge-lose">${!found[0] || !found[1] ? "a car was lost" : "duplicates survive"}</span>`;
+    NW.render();
+  }
+  $("nmsT").oninput = refreshNMS;
+  $("nmsRot").oninput = () => { D[sel].th = +$("nmsRot").value; refreshNMS(); };
+  $("nmsReset").onclick = () => { D = D0.map(b => ({ ...b })); sel = 0; $("nmsRot").value = D[0].th; refreshNMS(); };
+  $("nmsRot").value = D[0].th;
+  refreshNMS();
+})();
+</script>
+</body>
+</html>

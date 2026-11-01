@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9.3 State-space models: Mamba and hybrids · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .toks { display: flex; flex-wrap: wrap; gap: 4px; margin: 10px 0; }
+  .tok { font-family: var(--mono); font-size: .8rem; border: 1px solid var(--line); border-radius: 8px; padding: 3px 6px; background: var(--panel); text-align: center; min-width: 44px; }
+  .tok.key { border-color: var(--c-at); font-weight: 700; }
+  .tok i { display: block; height: 5px; border-radius: 3px; margin-top: 3px; background: var(--c-ac); }
+  .tok small { display: block; color: var(--muted); font-size: .7rem; }
+  .statebar { height: 16px; border-radius: 99px; background: var(--panel); overflow: hidden; display: flex; margin: 6px 0; }
+  .statebar > i { display: block; height: 100%; }
+</style>
+</head>
+<body data-lesson="d9-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 9 · Lesson 3</div>
+  <h1>State-space models: Mamba and hybrids</h1>
+  <p class="subtitle">Attention remembers every token and pays for it in memory. A state-space model squeezes the past into a fixed-size state, like an RNN, yet trains in parallel like a transformer. Mamba made that state selective, and today's long-context LLMs increasingly mix both.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>An <b>RNN</b> keeps a hidden state and updates it one token at a time; LSTM <b>gates</b> decide what to keep and forget (Lessons 5.2, 5.3).</li>
+      <li>Self-attention compares every token with every other: n² work, and at generation time a <b>KV cache</b> (the stored keys and values of all past tokens) that grows with every token (Lessons 6.1, 6.9).</li>
+      <li>A <b>convolution</b> is a weighted sum of nearby inputs with one shared kernel (Lesson 3.2; <a href="../../math-course/phase8/3b-convolution.html">math 8.3b</a>).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In October 2025, IBM released <b>Granite 4.0</b>, a family of open LLMs in which most layers are not attention at all. They are <b>Mamba-2</b> layers, mixed with ordinary transformer blocks in a <b>9 : 1</b> ratio. IBM reports the hybrid needs <b>over 70% less memory</b> for long inputs and many simultaneous users. NVIDIA's Nemotron-H and Nemotron Nano 2 models do something similar: in Nano 2, only <b>6 of 62</b> layers are attention.</p>
+    <p>So the transformer, the architecture behind every chatbot, is being partly replaced by something that looks like a 1980s RNN with a twist.</p>
+    <p><b>Why would anyone go back to recurrence, and what does the 10% of attention that's left still do that the rest can't?</b> You'll measure the memory gap yourself, then build a tiny selective memory and make it remember one number through 20 distractors.</p>
+  </div>
+
+  <h2>Numbers first: the memory bill of attention</h2>
+  <p>When a transformer generates text, it keeps the <b>keys and values</b> of every past token in every layer, so the next token can attend to them. Take a Llama-style 8-billion-parameter configuration: 32 layers, 8 key-value heads of size 128, stored in bf16 (2 bytes):</p>
+  <div class="calc">KV cache per token = 2 (K and V) × 8 heads × 128 × 2 bytes × 32 layers = <b>131,072 bytes = 128 KiB</b></div>
+  <table>
+    <tr><th>Context length</th><th>KV cache (one sequence)</th><th>An RNN / SSM state</th></tr>
+    <tr><td>4,096 tokens</td><td>0.5 GiB</td><td rowspan="3" class="ac">the same fixed size, whatever the length</td></tr>
+    <tr><td>131,072 tokens (128K)</td><td class="dead">16 GiB</td></tr>
+    <tr><td>1,048,576 tokens (1M)</td><td class="dead">128 GiB</td></tr>
+  </table>
+  <p>Attention's cost grows with every token you've seen; generating each new token also reads that whole cache. An RNN summarizes the past in one fixed-size state: memory stays flat and every step costs the same. The catch: RNNs train <b>one step at a time</b> (slow on GPUs) and forget (Lesson 5.2). State-space models fix the first problem; Mamba attacks the second.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A state-space model (SSM) is a <b>linear</b> recurrence: state<sub>t</sub> = A · state<sub>t−1</sub> + B · input<sub>t</sub>. Because it's linear, the same computation can be run three ways: as a loop (cheap generation), as a <b>convolution</b> or a <b>parallel scan</b> (fast training). <b>Mamba</b> makes A and B depend on the current token, so the model can choose what to write and what to keep: a <b>selective</b> state.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a court reporter versus a note-taker</span>
+    <p>Attention is a court reporter who keeps a verbatim transcript and rereads all of it before every sentence: perfect recall, and the pile of paper grows all day. An SSM is a note-taker with one index card: after each sentence they update the card. Constant effort, constant space. A plain SSM updates the card the same way for every sentence (“fade old notes by 5%, add the new sentence”). Mamba is a note-taker who decides per sentence: “that's the verdict, write it big; that's small talk, leave the card alone”.</p>
+  </div>
+
+  <p class="predict">🔮 <b>Predict:</b> a 32-layer model at a 1-million-token context needs 128 GiB of KV cache. If you replace attention with an SSM in most layers, how many attention layers can you keep and still fit the cache in 24 GiB?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Memory versus context length</span>
+    <p class="hint">Same 32-layer model as above. Each attention layer stores 4 KiB per token (2 × 8 × 128 × 2 bytes). Each SSM layer stores a fixed state; here a toy 8,192 channels × state size 128 × 2 bytes = 2 MiB, whatever the length. Model weights aren't counted: this is just the memory that grows with users and context.</p>
+    <div class="goals"><span class="goal" id="gFit">🎯 1M tokens in ≤ 24 GiB with the most attention layers possible</span><span class="goal" id="g128">🎯 See the all-attention bill at 128K</span></div>
+    <div class="controls">
+      <label>context length <input type="range" id="sL" min="10" max="20" step="1" value="17"> <b class="mono" id="sLV"></b></label>
+      <label>attention layers (of 32) <input type="range" id="sA" min="0" max="32" step="1" value="32"> <b class="mono" id="sAV"></b></label>
+      <label>users at once <input type="range" id="sB" min="1" max="32" step="1" value="1"> <b class="mono" id="sBV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">KV cache <b class="dead" id="sKV">–</b></div>
+      <div class="stat">SSM states <b class="ac" id="sSS">–</b></div>
+      <div class="stat">total <b id="sTot">–</b></div>
+      <div class="stat">vs all-attention <b class="y" id="sSave">–</b></div>
+    </div>
+    <canvas class="chart" id="sChart" style="height:200px"></canvas>
+    <p class="hint" id="sMsg"></p>
+  </div>
+  <p><b>What you should see:</b> all-attention at 128K tokens is <b>16 GiB</b> per user; slide “users” to 8 and it's 128 GiB, before counting the model's own weights. Set the attention layers to 0 and the line goes flat at 64 MiB whatever the length. At 1M tokens, <b>5 attention layers</b> is the most that fits in 24 GiB (20.05 GiB; 6 layers is just over). That's a 1 : 5.4 mix, close to the ratios real hybrids use (Jamba 1 : 7, Granite 4.0 1 : 9).</p>
+
+  <h2>A linear recurrence you can compute three ways</h2>
+  <p>Strip an RNN down to its simplest linear form, one number per channel: <span class="ac">h<sub>t</sub></span> = <span class="w">a</span> · <span class="ac">h<sub>t−1</sub></span> + <span class="w">b</span> · <span class="x">x<sub>t</sub></span>. No tanh, no nonlinearity inside the loop. That one change unlocks parallel training.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: loop = convolution</span>
+    <p><span class="w">a</span> = 0.5, <span class="w">b</span> = 1, inputs <span class="x">x</span> = [1, 2, 3], starting from <span class="ac">h<sub>0</sub></span> = 0.</p>
+    <table>
+      <tr><th></th><th>As a loop (RNN view)</th><th>As a convolution (kernel K = [b, ab, a²b] = [1, 0.5, 0.25])</th></tr>
+      <tr><td><span class="ac">h<sub>1</sub></span></td><td>0.5·0 + 1 = <b>1</b></td><td>1·1 = <b>1</b></td></tr>
+      <tr><td><span class="ac">h<sub>2</sub></span></td><td>0.5·1 + 2 = <b>2.5</b></td><td>1·2 + 0.5·1 = <b>2.5</b></td></tr>
+      <tr><td><span class="ac">h<sub>3</sub></span></td><td>0.5·2.5 + 3 = <b>4.25</b></td><td>1·3 + 0.5·2 + 0.25·1 = <b>4.25</b></td></tr>
+    </table>
+    <p>Unroll the loop and h<sub>t</sub> is a weighted sum of past inputs with weights b, ab, a²b, …: exactly a convolution with one long kernel, which a GPU computes for the whole sequence at once (with FFTs, in n log n time). The third way, a <b>parallel scan</b>, combines pairs of steps like a tournament bracket: (a₁, b₁) then (a₂, b₂) equals (a₁a₂, a₂b₁ + b₂), so n steps take about log₂ n rounds. For 1,024 tokens that's 10 rounds instead of 1,024 sequential steps.</p>
+  </div>
+
+  <p>A real SSM layer runs this for thousands of channels, with a small state vector per channel instead of one number, and reads the state out with a vector C. <b>S4</b> (Gu, Goel and Ré, 2021) chose A carefully so the state remembers long histories, and trained it as a long convolution. It was the first model to solve <b>Path-X</b>, a 16,384-step benchmark task where every earlier model scored no better than chance.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Linear recurrence / structured state-space models (S4)</span></span>
+    <ol>
+      <li><b>The problem before</b> Attention costs n² compute and a KV cache that grows by 128 KiB per token in our 8B example. RNNs have a fixed state, but their nonlinear loop must run one step at a time during training, and gradients vanish over long sequences (Lessons 5.2, 2.1).</li>
+      <li><b>What people tried</b> LSTMs and GRUs (gates, still sequential), sparse and sliding-window attention, linear attention (Lesson 6.9), dilated convolutions.</li>
+      <li><b>Why this works</b> Keep the recurrence <b>linear</b> and the loop can be rewritten as one long convolution (training: fully parallel) or run step by step (generation: constant memory and time per token). S4's specific choice of the A matrix (from the “HiPPO” theory of compressing a history into a few numbers) lets the state hold information over thousands of steps.</li>
+      <li><b>What it costs, when it fails</b> With fixed A and B, the model treats every token the same: it can't decide “this word matters, that one doesn't”. S4 was strong on audio and long-range benchmarks but lagged transformers on language. The fixed-size state is a hard limit on how much it can remember.</li>
+      <li><b>What refined it</b> Mamba (2023) made the parameters depend on the input (selective); Mamba-2 (2024) simplified the structure to run on matrix-multiply hardware; hybrids put a few attention layers back.</li>
+    </ol>
+  </div>
+
+  <h2>Mamba: a state that chooses what to remember</h2>
+  <p>In Mamba (Gu and Dao, December 2023), the step size Δ and the matrices B and C are computed <b>from the current token</b>. In words: a large Δ means “reset towards this token and write it in”; a tiny Δ means “ignore this token, keep the state as it is”. That's an input-dependent gate, much like an LSTM's, but on a linear recurrence. The price: with parameters that change at every step there's no single kernel, so the convolution trick is gone. Mamba replaces it with a hardware-aware parallel scan that keeps the big state in fast on-chip memory.</p>
+  <p class="predict">🔮 <b>Predict:</b> below, the first token carries a number to remember; 20 filler tokens follow. With <b>one gate for every token</b> (no selection), what's the largest share of the final state that can come from the key? With a gate that depends on the token, can you get 90%?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Remember one token through 20 distractors</span>
+    <p class="hint">The state update per token is <span class="ac">h</span> ← (1 − g) · <span class="ac">h</span> + g · <span class="x">value</span>: the gate g says how much this token overwrites the state (g = 1: replace; g = 0: ignore the token, keep everything). The purple bar under each token shows how much of the final state comes from it. The answer the model reads out is the final <span class="ac">h</span>.</p>
+    <div class="goals">
+      <span class="goal" id="gLTI">🎯 Fixed gate: find the best key share you can (it's tiny)</span>
+      <span class="goal" id="gSel">🎯 Selective: ≥ 90% of the state from the key</span>
+      <span class="goal" id="gNew">🎯 Two keys: make the state hold the newer one (≥ 90%)</span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="rMode"><button data-v="fixed" class="on">Fixed gate (S4-style)</button><button data-v="sel">Selective (Mamba-style)</button></span>
+      <label><input type="checkbox" id="rTwo"> a second key at position 15</label>
+    </div>
+    <div class="controls" id="rFixedBox">
+      <label>gate g for every token <input type="range" id="rG" min="0.005" max="1" step="0.005" value="0.3"> <b class="mono" id="rGV"></b></label>
+    </div>
+    <div class="controls" id="rSelBox" style="display:none">
+      <label>gate when the token is a <b class="at">KEY</b> <input type="range" id="rGK" min="0" max="1" step="0.01" value="0.5"> <b class="mono" id="rGKV"></b></label>
+      <label>gate when the token is filler <input type="range" id="rGF" min="0" max="1" step="0.005" value="0.3"> <b class="mono" id="rGFV"></b></label>
+    </div>
+    <div class="toks" id="rToks"></div>
+    <div class="stat-row">
+      <div class="stat">target value <b class="y" id="rT">–</b></div>
+      <div class="stat">model's answer (final <span class="ac">h</span>) <b class="ac" id="rH">–</b></div>
+      <div class="stat">share of state from the target key <b id="rShare">–</b></div>
+    </div>
+    <div class="statebar" id="rBar"></div>
+    <p class="hint" id="rMsg"></p>
+  </div>
+  <p><b>What you should see:</b> with a fixed gate of 0.3 the key is overwritten within a few tokens: its share is 0.02% and the answer is just a blend of recent filler. Lower the gate and the share creeps up, but it can never pass <b>1 ÷ 21 ≈ 4.8%</b>: a fixed gate either forgets the key fast or averages it equally with all 20 distractors. Switch to selective, set the key gate to 1 and the filler gate to 0: the answer is the key, <b>100%</b>. Even a filler gate of 0.005 lets about 10% leak away over 20 tokens (0.995²⁰ = 0.905), which is why real Mamba layers can push Δ to nearly zero for irrelevant tokens. With two keys, a key gate of 1 overwrites the old key with the new one: “remember the latest instruction”.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Selective state spaces (Mamba)</span></span>
+    <ol>
+      <li><b>The problem before</b> S4-style SSMs apply the same update to every token. You just saw the ceiling: a fixed gate can't keep one important token through 20 distractors (≤ 4.8% of the state). Language is full of filler between the words that matter.</li>
+      <li><b>What people tried</b> Gated linear RNNs, linear attention, adding short convolutions and gates around S4 (H3, Hyena).</li>
+      <li><b>Why this works</b> Make Δ, B and C functions of the token. Now each token decides whether to write itself in (big Δ) or leave the state alone (tiny Δ): your selective playground went from 0.02% to 100%. The authors designed it around synthetic tasks like <b>selective copying</b> and <b>induction heads</b> (“after A came B before, so predict B”). Mamba reported 5× higher generation throughput than transformers of similar size, and a 3B Mamba matching transformers twice its size.</li>
+      <li><b>What it costs, when it fails</b> No convolution shortcut, so it needs a custom scan kernel (fast on GPUs, harder to port). And the state is still a <b>fixed size</b>: whatever wasn't written in is gone. Tasks that need exact recall of something arbitrary from far back (copy this 500-character string, find the phone number in this document) are where it loses to attention.</li>
+      <li><b>What refined it</b> Mamba-2 (2024): simpler A (a scalar per head), much bigger states, 2–8× faster; and hybrids with a few attention layers for exact recall.</li>
+    </ol>
+  </div>
+
+  <h2>Mamba-2: an SSM is a kind of attention</h2>
+  <p>Dao and Gu's 2024 paper (“Transformers are SSMs”) showed that if A is restricted to a <b>scalar times the identity</b>, a selective SSM equals a form of <b>masked linear attention</b>: the whole sequence's output is one big matrix (lower-triangular, with decaying weights) times the inputs. They call it <b>structured state space duality (SSD)</b>. Practical payoff: the computation can be done with matrix multiplications, which GPUs are built for. Their SSD layer is 2–8× faster than Mamba's scan and allows states 8× larger or more.</p>
+  <p>It also says something conceptual: attention and SSMs are two ends of one family. Attention keeps every token's key and value (memory grows); an SSM compresses them into a running sum with decay (memory fixed).</p>
+
+  <h2>Where SSMs fall short: copying and recall</h2>
+  <p>Jelassi et al. (2024), in a paper titled “Repeat After Me: Transformers are Better than State Space Models at Copying”, proved that a two-layer transformer can copy strings of exponential length, while SSMs are “fundamentally limited by their fixed-size latent state”. Testing pretrained models, they found transformers “dramatically outperform” SSMs at copying and retrieving information from context. The Zoology study (Arora et al., 2023) found that 82% of the quality gap between attention and attention-free models on real text came from <b>associative recall</b> (“earlier, key K was paired with value V; what goes with K?”): a 70M-parameter attention model beat a 1.4B-parameter attention-free one at it.</p>
+  <p>That's the court reporter versus the index card again: if you didn't know a detail would matter, it isn't on the card.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Hybrid models: mostly SSM, a little attention</span></span>
+    <ol>
+      <li><b>The problem before</b> Pure transformers: KV cache grows with context (16 GiB at 128K in our example, per user). Pure SSMs: constant memory, but weaker at exact copying and recall.</li>
+      <li><b>What people tried</b> Sliding-window attention (forgets beyond the window), compressing the KV cache (Lesson 6.9), pure SSM LLMs.</li>
+      <li><b>Why this works</b> Most layers do “local” work, blending nearby context, which a cheap SSM layer does well. A few attention layers keep an exact lookup into the full history for recall. Memory then scales with the number of <i>attention</i> layers: your playground fit a 1M context in 24 GiB with 5 of 32 attention layers, where all-attention needs 128 GiB.</li>
+      <li><b>What it costs, when it fails</b> Two kinds of layer to implement, optimize and serve; a ratio to tune; the attention layers' cache still grows, just more slowly. IBM shipped a transformer-only Granite 4.0 Micro for platforms without hybrid support.</li>
+      <li><b>What refined it</b> Jamba (AI21, March 2024): 1 attention layer per 7 Mamba layers plus mixture-of-experts (Lesson 6.10), 52B total / 12B active parameters, 256K context on one 80 GB GPU. NVIDIA Nemotron-H (2025): most attention layers replaced by Mamba-2, up to 3× faster inference than similar transformers; Nemotron Nano 2: 6 attention layers out of 62, up to 6× throughput on long reasoning outputs. IBM Granite 4.0 (October 2025): Mamba-2 and transformer blocks 9 : 1.</li>
+    </ol>
+  </div>
+
+  <h2>Side by side</h2>
+  <table>
+    <tr><th></th><th>Transformer</th><th>RNN / LSTM</th><th>SSM (S4)</th><th>Mamba</th><th>Hybrid</th></tr>
+    <tr><td>Training</td><td>parallel</td><td class="dead">sequential</td><td>parallel (convolution)</td><td>parallel (scan / SSD)</td><td>parallel</td></tr>
+    <tr><td>Memory while generating</td><td class="dead">grows with context</td><td>fixed</td><td>fixed</td><td>fixed</td><td>grows slowly (few attention layers)</td></tr>
+    <tr><td>Cost per new token</td><td>grows with context</td><td>constant</td><td>constant</td><td>constant</td><td>mostly constant</td></tr>
+    <tr><td>Exact recall of the past</td><td class="y">excellent</td><td>weak</td><td>weak</td><td>limited by state</td><td class="y">good</td></tr>
+    <tr><td>Decides what to keep per token?</td><td>attends to everything</td><td>gates</td><td class="dead">no</td><td class="y">yes</td><td>yes</td></tr>
+  </table>
+  <p class="muted">Other members of the family: <b>RWKV</b> (Peng et al., 2023) is an RNN that “combines the efficient parallelizable training of transformers with the efficient inference of RNNs” using a linear-attention formulation; gated linear-attention variants keep appearing in 2025–26 hybrid LLMs. The names change quickly; the trade-off in the table doesn't.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>The official <code>mamba_ssm</code> package (GitHub <code>state-spaces/mamba</code>) provides <code>Mamba</code> and <code>Mamba2</code> layers with fused CUDA kernels; Hugging Face <code>transformers</code> includes Mamba, Mamba-2, Jamba, Granite 4.0 hybrid and others, so loading one looks like loading any causal LM. The core math runs in plain PyTorch on a CPU:</p>
+<pre><code><span class="k">import</span> torch, torch.nn.functional <span class="k">as</span> F
+
+torch.manual_seed(<span class="n">0</span>)
+T, a, b = <span class="n">1000</span>, <span class="n">0.95</span>, <span class="n">0.5</span>
+x = torch.randn(T)
+
+<span class="c"># 1) RNN-style: one step at a time, a fixed-size state</span>
+h, hs = torch.tensor(<span class="n">0.0</span>), []
+<span class="k">for</span> t <span class="k">in</span> range(T):
+    h = a * h + b * x[t]
+    hs.append(h)
+h_loop = torch.stack(hs)
+
+<span class="c"># 2) S4-style: the same thing as ONE convolution with kernel K = [b, ab, a²b, ...]</span>
+K = b * a ** torch.arange(T, dtype=torch.float32)
+h_conv = F.conv1d(F.pad(x, (T - <span class="n">1</span>, <span class="n">0</span>))[<span class="k">None</span>, <span class="k">None</span>], K.flip(<span class="n">0</span>)[<span class="k">None</span>, <span class="k">None</span>])[<span class="n">0</span>, <span class="n">0</span>]
+print(<span class="s">"loop vs convolution, max difference:"</span>, <span class="s">f"{(h_loop - h_conv).abs().max().item():.1e}"</span>)
+
+<span class="c"># 3) Mamba-style: the gate depends on the input, so there is no single kernel any more</span>
+x_sel = torch.zeros(<span class="n">21</span>); x_sel[<span class="n">0</span>] = <span class="n">7.0</span>; x_sel[<span class="n">1</span>:] = torch.randint(<span class="n">0</span>, <span class="n">10</span>, (<span class="n">20</span>,)).float()
+is_key = torch.zeros(<span class="n">21</span>, dtype=torch.bool); is_key[<span class="n">0</span>] = <span class="k">True</span>
+g = torch.where(is_key, <span class="n">1.0</span>, <span class="n">0.0</span>)        <span class="c"># write the key, ignore the filler</span>
+h = torch.tensor(<span class="n">0.0</span>)
+<span class="k">for</span> t <span class="k">in</span> range(<span class="n">21</span>):
+    h = (<span class="n">1</span> - g[t]) * h + g[t] * x_sel[t]  <span class="c"># selective update</span>
+print(<span class="s">"state after 20 distractors:"</span>, h.item())
+
+g_fixed = torch.full((<span class="n">21</span>,), <span class="n">0.3</span>)          <span class="c"># one gate for every token (no selection)</span>
+h = torch.tensor(<span class="n">0.0</span>)
+<span class="k">for</span> t <span class="k">in</span> range(<span class="n">21</span>):
+    h = (<span class="n">1</span> - g_fixed[t]) * h + g_fixed[t] * x_sel[t]
+print(<span class="s">"same, with a fixed gate of 0.3:"</span>, round(h.item(), <span class="n">2</span>))
+
+<span class="c"># What we got on a laptop CPU (torch 2.8):</span>
+<span class="c"># loop vs convolution, max difference: 9.5e-07</span>
+<span class="c"># state after 20 distractors: 7.0</span>
+<span class="c"># same, with a fixed gate of 0.3: 4.97</span></code></pre>
+    <p class="hint">Gotcha: <code>F.conv1d</code> is cross-correlation, so the kernel is flipped and the input left-padded to keep it causal (no peeking at future tokens). For long sequences real SSM code uses FFT convolutions or a scan kernel, not a Python loop.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Pure transformer</td><td>Best exact recall and in-context learning; most mature tooling</td><td>KV cache grows per token; n² prefill; per-token cost grows</td></tr>
+      <tr><td>Pure SSM (Mamba)</td><td>Fixed memory; constant time per token; linear-time training</td><td>Fixed-size state forgets; weaker copying and associative recall</td></tr>
+      <tr><td>Hybrid (e.g. 1 attention : 7–9 SSM)</td><td>Most of the memory savings, most of the recall</td><td>Two layer types to build, tune and serve; a ratio to choose</td></tr>
+      <tr><td>Bigger SSM state (Mamba-2)</td><td>Remembers more</td><td>More memory and compute per layer</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“What is Mamba, and why are new LLMs hybrids?” A strong answer:</p>
+    <ul>
+      <li>Attention's KV cache grows linearly with context (do the arithmetic: layers × 2 × KV heads × head dim × bytes per token) and prefill is n²; an SSM keeps a fixed-size state.</li>
+      <li>A linear recurrence can be computed as a loop (generation), a convolution (S4) or a parallel scan (training), unlike a nonlinear RNN.</li>
+      <li>Mamba's selectivity: Δ, B, C depend on the token, so it chooses what to write and what to ignore; costs the convolution trick, needs a scan kernel.</li>
+      <li>Weakness: fixed state limits exact copying and recall (Jelassi et al. 2024; Zoology). Hybrids keep a few attention layers (Jamba 1 : 7; Granite 4.0 9 : 1; Nemotron-H) for recall and get most of the memory savings.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The selective SSM</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2312.00752" target="_blank" rel="noopener">Gu &amp; Dao: Mamba: Linear-Time Sequence Modeling with Selective State Spaces</a></div>
+      <p><b>How:</b> input-dependent Δ, B, C; a hardware-aware parallel scan; a simple block with no attention and no separate MLP.</p>
+      <p><b>Why this method:</b> linear scaling in sequence length and 5× generation throughput versus similar-size transformers, while matching their quality on language.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The first production-grade hybrid</b> <span class="tag co">🏢 AI21 Labs · 2024</span> <a href="https://arxiv.org/abs/2403.19887" target="_blank" rel="noopener">Lieber et al.: Jamba: A Hybrid Transformer-Mamba Language Model</a></div>
+      <p><b>How:</b> blocks of 8 layers with 1 attention and 7 Mamba layers, mixture-of-experts every other layer; 12B active of 52B total parameters.</p>
+      <p><b>Why this method:</b> a 256K-token context that fits on a single 80 GB GPU, with throughput far above a similar-size transformer.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Hybrids for long reasoning traces</b> <span class="tag co">🏢 NVIDIA · 2025</span> <a href="https://arxiv.org/abs/2508.14444" target="_blank" rel="noopener">NVIDIA: Nemotron Nano 2, a hybrid Mamba-Transformer reasoning model</a></div>
+      <p><b>How:</b> 62 layers: 28 Mamba-2, 28 feed-forward and only 6 self-attention layers spread through the model (the Nemotron-H recipe).</p>
+      <p><b>Why this method:</b> reasoning models generate very long outputs, where per-token cost matters most; NVIDIA reports up to 6× higher throughput than Qwen3-8B at similar accuracy.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Enterprise LLMs on less memory</b> <span class="tag co">🏢 IBM · 2025</span> <a href="https://www.ibm.com/new/announcements/ibm-granite-4-0-hyper-efficient-high-performance-hybrid-models" target="_blank" rel="noopener">IBM: Granite 4.0 hybrid models</a></div>
+      <p><b>How:</b> Mamba-2 layers and transformer blocks in a 9 : 1 ratio, open weights under Apache 2.0.</p>
+      <p><b>Why this method:</b> long documents and many concurrent sessions are memory-bound; IBM reports over 70% less RAM than conventional transformers for those workloads.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the benchmark nobody could pass</span>
+    <p>Path-X shows a model a 128 × 128 image as a flat sequence of 16,384 pixels and asks whether two dots are connected by a dashed path. When the Long Range Arena benchmark was published in 2020, every model tested, ten transformer variants included, was marked FAIL on it: none learned anything. S4 was the first to solve it, which is what made the deep-learning world take state-space models seriously.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>SSMs are linear RNNs (5.2) with LSTM-like gates (5.3) and a convolution view (3.2, <a href="../../math-course/phase8/3b-convolution.html">math 8.3b</a>). The KV-cache arithmetic and linear attention are in 6.9; long-context tricks for transformers are 6.11; mixture-of-experts (used in Jamba) is 6.10. Serving memory, batching and throughput are in <a href="../../ai-engineer/phase7/4-serving.html">AI Engineer 7.4</a>. GPU memory and why matmul-friendly layers (Mamba-2's SSD) are faster: 10.1. Induction heads, the pattern Mamba was designed to handle, get dissected in 9.4.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Code</span> <a href="https://github.com/state-spaces/mamba" target="_blank" rel="noopener">state-spaces/mamba on GitHub</a>. The official Mamba and Mamba-2 layers, with usage examples.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2405.21060" target="_blank" rel="noopener">Dao &amp; Gu: Transformers are SSMs (Mamba-2)</a>. The SSD view that connects SSMs to attention.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2402.01032" target="_blank" rel="noopener">Jelassi et al.: Repeat After Me</a>. Why fixed-state models struggle to copy, with clean experiments.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A model has 40 layers, 8 KV heads of size 128, and stores K and V in bf16 (2 bytes). How big is the KV cache for one 64K-token (65,536) sequence?</div>
+    <div class="opts"><button class="opt">2.5 MiB</button><button class="opt" data-ok>10 GiB</button><button class="opt">160 GiB</button></div>
+    <div class="explain">Per token: 2 (K and V) × 8 × 128 × 2 bytes × 40 layers = 163,840 bytes = 160 KiB. Times 65,536 tokens = 10,737,418,240 bytes = 10 GiB. An SSM layer's state would stay the same size at any length.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A pure-Mamba model summarizes long documents well but fails when asked to quote a 12-digit account number from page 3 of a 50-page contract. A transformer of the same size gets it right. Best explanation and fix?</div>
+    <div class="opts"><button class="opt">Mamba can't handle numbers; tokenize digits differently</button><button class="opt" data-ok>Exact recall of an arbitrary detail is limited by the fixed-size state; a hybrid with a few attention layers (or retrieval) restores exact lookup</button><button class="opt">The context is too short; increase it to 1M tokens</button></div>
+    <div class="explain">An SSM compresses the past into a fixed state as it reads; if the model didn't write the number in, it's gone. Attention keeps every token's key and value, so it can look the number up. That's the copying/recall gap measured by Jelassi et al. and the Zoology study, and why hybrids keep some attention layers.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Why can S4 be trained as one big convolution, while Mamba can't?</div>
+    <div class="opts"><button class="opt">S4 uses smaller states</button><button class="opt">Mamba has a nonlinearity inside its recurrence</button><button class="opt" data-ok>S4's A and B are the same at every step, so the unrolled recurrence is one fixed kernel [B, AB, A²B, …]; Mamba's depend on each token, so the weights change with position and there's no single kernel (it uses a parallel scan instead)</button></div>
+    <div class="explain">A convolution applies the same kernel everywhere. That's only true when the recurrence's parameters are fixed (time-invariant). Mamba's selectivity makes them input-dependent, which is exactly what lets it choose what to remember, and what forces a different parallel algorithm. Both are still linear in the state.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Attention's KV cache grows per token (128 KiB per token in a Llama-style 8B: 16 GiB at 128K); an SSM keeps a fixed-size state.</li>
+      <li>A linear recurrence h = a·h + b·x can run as a loop (generation), a convolution (S4) or a parallel scan (training).</li>
+      <li>Mamba is <b>selective</b>: Δ, B, C depend on the token, so it writes what matters and ignores filler. A fixed gate can't keep 1 token through 20 (≤ 4.8%); a selective one can (100%).</li>
+      <li>Mamba-2 (SSD) shows SSMs are a form of masked linear attention and runs on matmuls. Weakness: exact copying and recall.</li>
+      <li>2024–26 LLMs mix them: Jamba 1 : 7, Nemotron-H / Nano 2 (6 of 62 layers attention), Granite 4.0 9 : 1.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+  /* ---------- 1. memory vs context ---------- */
+  const PER_ATT = 2 * 8 * 128 * 2, SSM_STATE = 8192 * 128 * 2, L = 32, GiB = 2 ** 30;
+  const fmtB = v => (v >= GiB ? (v / GiB).toFixed(v >= 100 * GiB ? 0 : 2) + " GiB" : (v / 2 ** 20).toFixed(0) + " MiB");
+  const mem = (n, att, users) => users * (att * PER_ATT * n + (L - att) * SSM_STATE);
+  function drawS() {
+    const n = 2 ** +$("sL").value, att = +$("sA").value, users = +$("sB").value;
+    const kv = users * att * PER_ATT * n, ss = users * (L - att) * SSM_STATE, tot = kv + ss, full = mem(n, L, users);
+    $("sLV").textContent = n >= 2 ** 20 ? (n / 2 ** 20) + "M" : (n / 1024) + "K"; $("sAV").textContent = `${att} (+${L - att} SSM)`; $("sBV").textContent = users;
+    $("sKV").textContent = fmtB(kv); $("sSS").textContent = fmtB(ss); $("sTot").textContent = fmtB(tot);
+    $("sSave").textContent = att === L ? "–" : (100 * (1 - tot / full)).toFixed(1) + "% less";
+    const xs = []; for (let k = 0; k <= 40; k++) xs.push(n * k / 40);
+    const ser = (a, label, color, dash) => ({ label, color, dash, width: 2.5, data: xs.map(t => [t / 1024, mem(t, a, users) / GiB]) });
+    Plot.line($("sChart"), { series: [ser(L, "all attention (32)", css("--c-dead")), ser(att, `your mix (${att} attention)`, css("--c-at")), ser(0, "pure SSM", css("--c-ac"), [6, 4])], yMin: 0, yMax: Math.max(25, 1.05 * mem(n, L, users) / GiB), xLabel: "context length (thousands of tokens)", yLabel: "GiB", hlines: [{ y: 24, label: "24 GiB", color: css("--muted") }] });
+    win("gFit", n === 2 ** 20 && users === 1 && att === 5 && tot <= 24 * GiB);
+    win("g128", n === 2 ** 17 && att === L);
+    $("sMsg").textContent = n === 2 ** 20 && users === 1 && tot <= 24 * GiB && att === 5 ? "5 attention layers is the most that fits: 6 would need 24.05 GiB." :
+      n === 2 ** 20 && users === 1 && tot > 24 * GiB ? "Over 24 GiB: each attention layer costs 4 GiB at 1M tokens. Try fewer." :
+      att === 0 ? "Pure SSM: flat memory at every length, but recall suffers (see below)." : "";
+  }
+  ["sL", "sA", "sB"].forEach(id => ($(id).oninput = drawS));
+  drawS();
+
+  /* ---------- 2. selective recurrence ---------- */
+  const rr = NN.rng(7), FILL = ["the", "and", "of", "so", "um", "a", "it", "is", "to", "we"];
+  const toks = [{ w: "KEY", v: 7, key: true }];
+  for (let i = 1; i <= 20; i++) toks.push({ w: FILL[rr.int(FILL.length)], v: rr.int(10), key: false });
+  const KEY2 = { w: "KEY", v: 3, key: true };
+  let mode = "fixed";
+  function drawR() {
+    const two = $("rTwo").checked, seq = toks.map((t, i) => (two && i === 15 ? KEY2 : t));
+    const gK = +$("rGK").value, gF = +$("rGF").value, g0 = +$("rG").value;
+    const gate = t => (mode === "fixed" ? g0 : t.key ? gK : gF);
+    // weight of each token in the final state: g_t × Π_{s>t} (1 − g_s)
+    const W = seq.map((t, i) => { let w = gate(t); for (let s = i + 1; s < seq.length; s++) w *= 1 - gate(seq[s]); return w; });
+    const h = seq.reduce((acc, t) => (1 - gate(t)) * acc + gate(t) * t.v, 0), tot = W.reduce((a, b) => a + b, 0);
+    const target = two ? 15 : 0, share = tot ? W[target] / tot : 0;
+    $("rGV").textContent = g0.toFixed(3); $("rGKV").textContent = gK.toFixed(2); $("rGFV").textContent = gF.toFixed(3);
+    const mx = Math.max(1e-9, ...W);
+    $("rToks").innerHTML = seq.map((t, i) => `<div class="tok${t.key ? " key" : ""}">${t.w}<small>${t.v} · g ${gate(t).toFixed(2)}</small><i style="width:${Math.max(2, 100 * W[i] / mx)}%;opacity:${0.25 + 0.75 * W[i] / mx}"></i></div>`).join("");
+    $("rT").textContent = seq[target].v; $("rH").textContent = h.toFixed(2);
+    $("rShare").innerHTML = `<span class="${share >= 0.9 ? "y" : "dead"}">${(100 * share).toFixed(share < 0.01 ? 2 : 1)}%</span>`;
+    $("rBar").innerHTML = `<i style="width:${100 * share}%;background:var(--c-at)"></i><i style="width:${100 * (1 - share)}%;background:var(--muted);opacity:.4"></i>`;
+    if (mode === "fixed" && share >= 0.045) win("gLTI", true);
+    if (mode === "sel" && !two && share >= 0.9) win("gSel", true);
+    if (mode === "sel" && two && share >= 0.9) win("gNew", true);
+    $("rMsg").textContent = mode === "fixed" ? (share >= 0.045 ? "That's the ceiling for a fixed gate: about 1/21, an equal average of everything. No fixed gate can single out the key." : "One gate for all tokens: either the key gets overwritten fast, or everything is averaged together.") :
+      share >= 0.9 ? "Selective: the key wrote itself in and the filler left the state alone." : gF > 0 && gK > 0.9 ? "The key is written in, but each filler token chips a little away. Push the filler gate towards 0." : "Try: write the key fully, ignore the filler.";
+  }
+  seg("rMode", v => { mode = v; $("rFixedBox").style.display = v === "fixed" ? "" : "none"; $("rSelBox").style.display = v === "sel" ? "" : "none"; drawR(); });
+  ["rG", "rGK", "rGF"].forEach(id => ($(id).oninput = drawR));
+  $("rTwo").onchange = drawR;
+  drawR();
+})();
+</script>
+</body>
+</html>

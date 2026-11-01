@@ -1,0 +1,544 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.2 Intrinsics, extrinsics, distortion & calibration · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  canvas.img { width: 100%; aspect-ratio: 4 / 3; height: auto; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); touch-action: none; }
+  .imgwrap { max-width: 640px; margin: 0 auto; }
+  .mat { display: inline-grid; grid-template-columns: repeat(3, auto); gap: 2px 14px; padding: 4px 10px; border-left: 2px solid var(--muted); border-right: 2px solid var(--muted); border-radius: 6px; font-family: var(--mono, monospace); vertical-align: middle; }
+</style>
+</head>
+<body data-lesson="s2-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 2</div>
+  <h1>Intrinsics, extrinsics, distortion &amp; calibration</h1>
+  <p class="subtitle">The pinhole formula only works if you know the camera's exact numbers: its focal length, its center, how its lens bends lines and where it's bolted on. Get them from a checkerboard, check them with the reprojection error, and meet the two camera quirks that bite moving robots: rolling shutter and brutal contrast.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The pinhole model</b>: a point (X, Y, Z) in the camera frame lands at <span class="se">u</span> = f·X/Z + c<sub>x</sub>, <span class="se">v</span> = f·Y/Z + c<sub>y</sub> (Lesson 2.1). Camera frame: z forward, x right, y down.</li>
+      <li><b>Rotation + translation</b>: moving a point from one frame to another is “rotate by R, then shift by t”, often packed into one 4×4 homogeneous transform (Lesson 1.5).</li>
+      <li><b>Least squares</b>: pick the parameters that make the sum of squared errors smallest. It's what “fit a line to points” means, and it's what calibration does (refresher: <a href="../../math-course/phase3/4-gradient-descent.html">gradient descent</a> in the Math course).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>A windshield is replaced and the forward camera is put back <b>1° too far down</b>. One degree: you'd never see it by eye. The car uses the flat-ground trick from Lesson 2.1 (camera 1.4 m up, f = 800 px) to judge the distance to a stopped car <b>50 m</b> ahead.</p>
+    <p><b>What distance does it now believe?</b> 49 m? 45 m? Something much worse? Make a guess before you scroll.</p>
+    <p>Tesla takes this seriously enough that its Model Y manual says the cameras calibrate themselves as you drive: calibration “typically completes after driving 20-25 miles (32-40 km)”, and self-driving and active safety features stay unavailable until it's done. There's even a menu item to clear it after a camera or windshield is replaced (<a href="https://www.tesla.com/ownersmanual/modely/en_us/GUID-682FF4A7-D083-4C95-925A-5EE3752F4865.html" target="_blank" rel="noopener">Tesla Model Y manual</a>, checked Nov 2026).</p>
+  </div>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> with the camera tilted 1° down, the car 50 m ahead appears to be at about: <b>(a)</b> 49 m, <b>(b)</b> 45 m, <b>(c)</b> 31 m.
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans"><b>(c) about 31 m.</b> At 50 m the wheels sit f × 1.4 / 50 = <b>22.4 px</b> below the horizon. Tilting the camera 1° down shifts the whole picture up by f × tan 1° ≈ <b>14 px</b>, so the wheels now look 22.4 + 14 = 36.4 px below where the camera thinks the horizon is. Distance = 800 × 1.4 / 36.4 ≈ <b>30.8 m</b>. A one-degree mounting error turned 50 m into 31 m: a 38% error. Far objects sit close to the horizon, so tiny angle errors swamp them. That's why calibration isn't optional.</div>
+  </div>
+
+  <h2>Intrinsics: the camera's own numbers, packed in K</h2>
+  <p>Lesson 2.1 used one f and a center (c<sub>x</sub>, c<sub>y</sub>). Real sensors need a little more: pixels may not be perfectly square (so a separate f<sub>x</sub> and f<sub>y</sub>), and the lens is never exactly centered on the chip (c<sub>x</sub>, c<sub>y</sub> are a few pixels off the middle). These are the <b>intrinsics</b>: properties of the camera itself, wherever it's mounted. They fit in a 3×3 <b>intrinsic matrix K</b>:</p>
+  <div class="eq">
+    K = <span class="mat"><span>f<sub>x</sub></span><span>s</span><span>c<sub>x</sub></span><span>0</span><span>f<sub>y</sub></span><span>c<sub>y</sub></span><span>0</span><span>0</span><span>1</span></span>
+    &nbsp;&nbsp; then &nbsp; [<span class="se">u</span>·Z, <span class="se">v</span>·Z, Z] = K · [X, Y, Z]
+    <span class="say">Multiply the camera-frame point by K, then divide the first two numbers by the third (Z). That gives exactly u = f<sub>x</sub>·X/Z + c<sub>x</sub>, v = f<sub>y</sub>·Y/Z + c<sub>y</sub>. The skew s is 0 for practically every modern sensor; it would mean the pixel rows and columns aren't at right angles.</span>
+  </div>
+  <p>Why a matrix and not just four numbers? Because now projection is one matrix product, and it chains with the rotations and translations from Phase 1. That brings in the second half of the story.</p>
+
+  <h2>Extrinsics: where the camera sits on the car</h2>
+  <p>Perception and planning work in the <b>car's</b> frame (x forward, y left, z up), but K wants points in the <b>camera's</b> frame (z forward, x right, y down). The rotation R and translation t that take you from one to the other are the <b>extrinsics</b>: they describe <i>where</i> and <i>which way</i> the camera is mounted. Together:</p>
+  <div class="eq">
+    <span class="se">pixel</span> ~ K · [R | t] · P<sub>car</sub>
+    <span class="say">Move the point from the car frame into the camera frame (R, t: extrinsics, Lesson 1.5), then project it (K: intrinsics), then divide by depth. Twelve numbers for [R | t], four or five for K: that's a calibrated camera.</span>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the full chain, by hand</span>
+    <p>A camera is mounted <b>2 m</b> ahead of the car's origin (the rear axle) and <b>1.4 m</b> up, looking straight forward. K has f<sub>x</sub> = f<sub>y</sub> = 800, c<sub>x</sub> = 320, c<sub>y</sub> = 240. A pedestrian's feet are at P<sub>car</sub> = (22, −2, 0): 22 m ahead of the axle, 2 m to the right, on the road.</p>
+    <ol>
+      <li><b>Shift</b> to the camera's position: P − C = (22 − 2, −2 − 0, 0 − 1.4) = (20, −2, −1.4).</li>
+      <li><b>Rotate</b> into camera axes. Camera x (right) = −car y, camera y (down) = −car z, camera z (forward) = car x. So R = [[0, −1, 0], [0, 0, −1], [1, 0, 0]] and P<sub>cam</sub> = (2, 1.4, 20).</li>
+      <li><b>Project</b> with K: u = 800 × 2 / 20 + 320 = <b>400</b>, v = 800 × 1.4 / 20 + 240 = <b>296</b>. The same pixel as in Lesson 2.1, as it should be.</li>
+      <li><b>Now break it</b>: pitch the camera 1° down. Every point's v grows by about 800 × tan 1° ≈ 14 px, so the feet land near row 310, and the flat-ground trick reads 800 × 1.4 / 70 ≈ <b>16 m</b> instead of 20. Near the bottom of the image the damage is smaller in percent than at 50 m, but still 20%.</li>
+    </ol>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A camera is only a <b>measuring instrument</b> once you know its numbers: <b>intrinsics</b> (K and the lens distortion: how this camera turns directions into pixels) and <b>extrinsics</b> (R, t: where it sits on the robot). Calibration measures both, and the <b>reprojection error</b>, in pixels, tells you how good the measurement is.
+  </div>
+
+  <h2>Real lenses bend straight lines</h2>
+  <p>A pinhole keeps straight lines straight. A real glass lens, especially a wide-angle one, doesn't: lines near the edge bow outward like a barrel (<b>barrel distortion</b>, typical of wide lenses) or pinch inward (<b>pincushion</b>, typical of telephoto lenses). OpenCV's standard model describes it with a few coefficients, applied to the normalized coordinates x = X/Z, y = Y/Z before multiplying by K. With r² = x² + y²:</p>
+  <div class="eq">
+    <b>radial</b> &nbsp; x<sub>d</sub> = x (1 + <span class="un">k<sub>1</sub></span> r² + <span class="un">k<sub>2</sub></span> r⁴ + <span class="un">k<sub>3</sub></span> r⁶)<br><br>
+    <b>tangential</b> &nbsp; x<sub>d</sub> += 2<span class="un">p<sub>1</sub></span>xy + <span class="un">p<sub>2</sub></span>(r² + 2x²) &nbsp;&nbsp; y<sub>d</sub> += <span class="un">p<sub>1</sub></span>(r² + 2y²) + 2<span class="un">p<sub>2</sub></span>xy
+    <span class="say">Radial: points are pushed in or out depending on how far they are from the center (r). Negative k<sub>1</sub> pulls the edges in (barrel); positive pushes them out (pincushion). Tangential: a slightly tilted lens shifts points sideways. OpenCV stores them in the order (k<sub>1</sub>, k<sub>2</sub>, p<sub>1</sub>, p<sub>2</sub>, k<sub>3</sub>).</span>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · Bend a grid</span>
+    <p class="hint">The faint grid is what a perfect pinhole would see (f = 500 px). The bold grid is what this lens produces. Drag the sliders: <span class="un">k<sub>1</sub></span> is the main barrel/pincushion knob, <span class="un">k<sub>2</sub></span> matters mostly near the corners, <span class="un">p<sub>1</sub></span> is a tilted lens.</p>
+    <div class="imgwrap"><canvas class="img" id="grid"></canvas></div>
+    <div class="controls">
+      <label><span class="un">k<sub>1</sub></span> <input type="range" id="k1" min="-0.5" max="0.5" step="0.01" value="-0.2"> <b class="mono" id="k1V"></b></label>
+      <label><span class="un">k<sub>2</sub></span> <input type="range" id="k2" min="-0.6" max="0.6" step="0.01" value="0"> <b class="mono" id="k2V"></b></label>
+      <label><span class="un">p<sub>1</sub></span> <input type="range" id="p1" min="-0.05" max="0.05" step="0.005" value="0"> <b class="mono" id="p1V"></b></label>
+      <button class="btn" id="g0">↺ Perfect pinhole</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">look <b id="gA">–</b></div>
+      <div class="stat">image corner moved <b id="gB">–</b></div>
+      <div class="stat">top edge bows <b id="gC">–</b></div>
+      <div class="stat">🏆 challenge <b id="gD">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge: build a “mustache” lens.</b> Make the image <b>corner land back where a pinhole would put it</b> (moved less than 1 px) while the top edge still visibly <b>bows by 5 px or more</b>. Hint: k<sub>1</sub> and k<sub>2</sub> have different reach; one can cancel the other at exactly one radius.</p>
+  </div>
+  <p>What you just built is real: some wide lenses have distortion that bends one way near the center and the other way near the edges, and photographers call it mustache distortion. The lesson for robots: <b>you can't judge a lens by eye or by one point</b>. You need many measured points spread across the whole image, especially in the corners, to pin down k<sub>1</sub> and k<sub>2</sub> separately.</p>
+
+  <h2>Calibration: a checkerboard and a lot of corners</h2>
+  <p>How do you measure f<sub>x</sub>, f<sub>y</sub>, c<sub>x</sub>, c<sub>y</sub>, k<sub>1</sub>, k<sub>2</sub>, p<sub>1</sub>, p<sub>2</sub>, k<sub>3</sub>? Show the camera something whose geometry you know exactly: a printed <b>checkerboard</b>. Its corners are easy to find to a fraction of a pixel, and you know where they are on the board (say every 25 mm). Zhengyou Zhang's 2000 method, now built into OpenCV, needs only a flat pattern photographed from a few different angles (<a href="https://www.microsoft.com/en-us/research/publication/a-flexible-new-technique-for-camera-calibration/" target="_blank" rel="noopener">Zhang 2000</a>).</p>
+  <ol>
+    <li>Take 10–20 photos of the board, tilted and moved around, covering the corners of the image too.</li>
+    <li>Find the corners in each photo (the <b class="se">observed</b> pixels).</li>
+    <li>Guess all the parameters plus the board's pose in each photo; project the known corner positions with the model (the <b class="be">predicted</b> pixels).</li>
+    <li>Adjust everything to make the gaps between observed and predicted as small as possible (least squares).</li>
+  </ol>
+  <div class="eq">
+    <span class="un">reprojection error</span> (RMS) = √( mean over all corners of ‖ <span class="se">observed</span> − <span class="be">predicted</span> ‖² )
+    <span class="say">Project every known corner with your current guess, measure how many pixels each one misses by, square, average, square-root. Under about half a pixel is the usual rule of thumb for a good calibration; several pixels means something is wrong.</span>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Calibrate a camera by hand</span>
+    <p class="hint">Blue dots are the <b class="se">observed</b> checkerboard corners from a real-ish camera (with 0.15 px of corner-detection noise). Purple rings are where <b class="be">your model</b> says they should be. Gold lines are the misses, stretched (up to 10×, shown on the image) so you can see them. The board's pose is known; you tune the intrinsics.</p>
+    <div class="imgwrap"><canvas class="img" id="cal"></canvas></div>
+    <div class="controls">
+      <label>f <input type="range" id="cf" min="560" max="680" step="1" value="600"> <b class="mono" id="cfV"></b></label>
+      <label>c<sub>x</sub> <input type="range" id="ccx" min="300" max="360" step="1" value="320"> <b class="mono" id="ccxV"></b></label>
+      <label>c<sub>y</sub> <input type="range" id="ccy" min="210" max="270" step="1" value="240"> <b class="mono" id="ccyV"></b></label>
+      <label><span class="un">k<sub>1</sub></span> <input type="range" id="ck1" min="-0.4" max="0.2" step="0.005" value="0"> <b class="mono" id="ck1V"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn" id="cAuto">🤖 Let least squares do it</button>
+      <button class="btn" id="cReset">↺ Reset</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">RMS reprojection error <b id="cA">–</b></div>
+      <div class="stat">worst corner <b id="cB">–</b></div>
+      <div class="stat">🏆 by hand <b id="cC">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> get the RMS reprojection error <b>under 0.5 px by hand</b>. Fix the center first (are all the gold lines pointing the same way?), then f and k<sub>1</sub>. You'll notice f and k<sub>1</sub> fight each other: bigger f pushes edge corners out, negative k<sub>1</sub> pulls them in. The 🤖 button shows the answer, but it doesn't count.</p>
+  </div>
+  <p>That tug-of-war between f and k<sub>1</sub> is why real calibration wants <b>many views</b> with the board near the edges and tilted: each view constrains the parameters differently, so they can't trade off against each other. The best you can ever do here is about 0.22 px, set by the noise in the corners themselves. A calibration that claims much less than the corner noise is overfitting.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Lesson 2.1's formula needs exact numbers, and nobody ships them precisely: the lens sits a few pixels off center, the focal length varies from unit to unit, wide lenses bend lines by tens of pixels at the edges, and the camera's angle on the car changes with every mounting bracket. A 1° pitch error turns a car at 50 m into one at 31 m.</li>
+      <li><b>What people tried.</b> Trusting the datasheet's focal length and assuming the center is the middle of the image (off by percent, so meters at range). Measuring with a ruler and protractor (good to maybe a degree: far too coarse). Calibrating with a precisely built 3D rig of known points (accurate, but expensive and impractical outside a lab).</li>
+      <li><b>Why this works.</b> A flat, printed checkerboard has hundreds of corners at known positions that can be found to sub-pixel accuracy. One least-squares fit over many views pins down K, distortion and each view's pose at once, and the leftover reprojection error tells you how well it worked. Example: 63 corners, 0.15 px noise → a fitted RMS of about 0.22 px, versus 13 px with the naive guess (f = 600, center in the middle, no distortion).</li>
+      <li><b>What it costs, when it fails.</b> You need good photos: sharp, well lit, covering the edges and many tilts; a board that's not flat or a blurry corner poisons the fit. Calibration drifts: heat, vibration and a bumped bracket change the extrinsics. Very wide fisheye lenses need a different distortion model. And a low error on the calibration images doesn't guarantee accuracy where you had no corners (the image edges, if you skipped them).</li>
+      <li><b>What came next.</b> <b>Online (self-)calibration</b> while driving, as in Tesla's 20–25 mile calibration drive. Fisheye and omnidirectional models for drones' ultra-wide lenses. Toolboxes like <b>Kalibr</b> that calibrate several cameras <i>and</i> an IMU together, including time offsets and rolling shutter. Camera-to-lidar extrinsics (Lesson 2.7).</li>
+    </ol>
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: tuning a guitar with a tuner</span>
+    <p>You could tune by ear, string by string, but each string you adjust shifts how you hear the others, and your ear is the very thing you're unsure of. A tuner compares each note to a known reference and shows the error in cents. The checkerboard is the reference note, the reprojection error is the needle, and least squares turns every peg at once until the needle sits still.</p>
+  </div>
+
+  <h2>Rolling shutter: the photo that isn't one instant</h2>
+  <p>Most CMOS camera sensors (the cheap, fast, low-power kind in phones and cars) don't capture all pixels at the same moment. They read the image out <b>row by row</b>, top to bottom, over a <b>readout time</b> of typically several to a few tens of milliseconds. That's a <b>rolling shutter</b>. A <b>global shutter</b> exposes every pixel at once, but costs more and usually has noisier, less sensitive pixels.</p>
+  <p>For a still scene nobody notices. For a moving scene, the bottom of the picture is taken later than the top. A car crossing at 20 m/s moves 20 × 0.030 = <b>0.6 m</b> during a 30 ms readout, so its vertical edges lean. A propeller, turning hundreds of degrees in that time, turns into curved bananas.</p>
+
+  <div class="predict" id="pr2">
+    <b class="q">🧩 Predict:</b> a camera reads out in 30 ms. You film a truck crossing left to right. Its vertical back edge will look: <b>(a)</b> leaning, bottom further right; <b>(b)</b> leaning, bottom further left; <b>(c)</b> straight but blurry.
+    <div><button class="btn small" data-open="pr2">Show the answer</button></div>
+    <div class="ans"><b>(a).</b> Rows are read top to bottom, so the bottom rows are captured later, when the truck has moved further right. Every vertical edge leans with its bottom ahead, by speed × readout time. (Blur, option c, is a different effect: it comes from the <i>exposure</i> time of each row, which is usually much shorter than the readout.) Try it below.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · The rolling-shutter lean</span>
+    <p class="hint">A box truck 14 m away crosses the image, or a 3-blade propeller spins in front of the lens. The sensor reads rows top to bottom over the readout time; the stripes at the left edge show when each band of rows was read. Switch scenes, change the speed and the readout time, and press <b>▶ Animate</b>.</p>
+    <div class="imgwrap"><canvas class="img" id="rs"></canvas></div>
+    <div class="controls">
+      <label>scene <select id="rsMode"><option value="truck" selected>truck crossing</option><option value="prop">spinning propeller</option></select></label>
+      <label>readout time <input type="range" id="rsT" min="0" max="50" step="0.1" value="30"> <b class="mono" id="rsTV"></b></label>
+      <label>truck speed <input type="range" id="rsV" min="0" max="40" step="1" value="20"> <b class="mono" id="rsVV"></b></label>
+      <label>propeller <input type="range" id="rsR" min="300" max="6000" step="100" value="3000"> <b class="mono" id="rsRV"></b></label>
+      <button class="btn primary" id="rsGo">▶ Animate</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">truck moves during readout <b id="rA">–</b></div>
+      <div class="stat">top-to-bottom shift <b id="rB">–</b></div>
+      <div class="stat">propeller turns during readout <b id="rC">–</b></div>
+      <div class="stat">🏆 challenge <b id="rD">–</b></div>
+    </div>
+    <p class="hint">🏆 <b>Challenge:</b> with the truck at <b>30 m/s or more</b> (highway speed), get its rolling-shutter skew <b>under 10 cm</b>. What readout time do you need? Then switch to the propeller at 3000 rpm: how short must the readout be before its blades look straight? (That's why drones prefer global-shutter cameras for visual navigation.)</p>
+  </div>
+  <p>Skew is simply <b>speed × readout time</b>: 30 m/s needs a readout under 10 / 3000 s ≈ <b>3.3 ms</b>. Robots don't always buy a faster sensor; they <b>model</b> the shutter instead. The Waymo Open Dataset, for example, records rolling-shutter timing with each image and provides “rolling shutter aware” lidar-to-camera projection, so a point is projected using the instant its row was read (<a href="https://arxiv.org/abs/1912.04838" target="_blank" rel="noopener">Sun et al. 2020</a>). Calibration toolboxes such as Kalibr can estimate the readout time itself.</p>
+
+  <h2>Too bright and too dark at once: HDR, low light and flickering LEDs</h2>
+  <p>A camera leaving a tunnel at noon sees a sunlit road and a dark tunnel wall in the same frame. The ratio between the brightest and darkest things a sensor can record at once is its <b>dynamic range</b>, quoted in decibels: dB = 20 · log<sub>10</sub>(brightest / darkest).</p>
+  <table>
+    <tr><th>Dynamic range</th><th>Contrast ratio</th><th>What it means</th></tr>
+    <tr><td>60 dB</td><td>1,000 : 1</td><td>A basic sensor: tunnel exits blow out to white or crush to black</td></tr>
+    <tr><td>120 dB</td><td>1,000,000 : 1</td><td>Sony's automotive IMX490: <b>120 dB</b> HDR (140 dB when set to prioritize dynamic range)</td></tr>
+  </table>
+  <p><b>HDR</b> (high dynamic range) sensors get there by combining several exposures or pixel sensitivities into one frame. Their other trick matters just as much for driving: <b>LED flicker mitigation</b>. LED traffic lights and signs blink on and off faster than your eye notices. A short exposure, which a bright day forces on a normal camera, can land between pulses, so the red light looks <i>off</i>. The IMX490 datasheet advertises HDR and LED flicker mitigation working <i>simultaneously</i> (<a href="https://www.sony-semicon.com/files/62/pdf/p-15_IMX490.pdf" target="_blank" rel="noopener">Sony IMX490 datasheet</a>).</p>
+
+  <div class="playground">
+    <span class="label">🎮 Mini-playground · Catch the blinking red light</span>
+    <p class="hint">An illustrative LED traffic light pulses 100 times a second (one cycle every 10 ms) and is lit for a fraction of each cycle. Each video frame is exposed for a short time at a random moment. How often does the frame catch the light on?</p>
+    <div class="controls">
+      <label>exposure time <input type="range" id="le" min="-1" max="1.1" step="0.05" value="-1"> <b class="mono" id="leV"></b></label>
+      <label>LED lit fraction <input type="range" id="ld" min="5" max="50" step="5" value="10"> <b class="mono" id="ldV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">frames where the light looks on <b id="lA">–</b></div>
+      <div class="stat">sunny sky <b id="lB">–</b></div>
+    </div>
+    <p class="hint">The rule: a frame catches the LED if its exposure overlaps a pulse, so the chance is (lit time + exposure) ÷ 10 ms. With 1 ms lit and a 0.1 ms daylight exposure that's only 11%: the light looks dark in nine frames out of ten. Can you find an exposure that always catches it <i>and</i> keeps the sky from washing out? (With one ordinary exposure, you can't: that's exactly the job of LED-flicker-mitigation sensors.)</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>OpenCV's calibration pipeline, straight from its official tutorial: find the corners, refine them to sub-pixel, calibrate, check the reprojection error, undistort. ROS 2's <code>camera_calibration</code> package wraps the same functions in a GUI; <b>Kalibr</b> handles multi-camera rigs, camera-to-IMU calibration and rolling shutter.</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np, cv2 <span class="k">as</span> cv, glob
+
+criteria = (cv.TERM_CRITERIA_EPS + cv.TERM_CRITERIA_MAX_ITER, <span class="n">30</span>, <span class="n">0.001</span>)
+objp = np.zeros((<span class="n">6</span> * <span class="n">7</span>, <span class="n">3</span>), np.float32)
+objp[:, :<span class="n">2</span>] = np.mgrid[<span class="n">0</span>:<span class="n">7</span>, <span class="n">0</span>:<span class="n">6</span>].T.reshape(-<span class="n">1</span>, <span class="n">2</span>)   <span class="c"># corner positions on the board (units: squares)</span>
+objpoints, imgpoints = [], []
+
+<span class="k">for</span> fname <span class="k">in</span> glob.glob(<span class="s">"*.jpg"</span>):
+    gray = cv.cvtColor(cv.imread(fname), cv.COLOR_BGR2GRAY)
+    ret, corners = cv.findChessboardCorners(gray, (<span class="n">7</span>, <span class="n">6</span>), <span class="k">None</span>)
+    <span class="k">if</span> ret:
+        corners2 = cv.cornerSubPix(gray, corners, (<span class="n">11</span>, <span class="n">11</span>), (-<span class="n">1</span>, -<span class="n">1</span>), criteria)
+        objpoints.append(objp); imgpoints.append(corners2)
+
+ret, mtx, dist, rvecs, tvecs = cv.calibrateCamera(objpoints, imgpoints, gray.shape[::-<span class="n">1</span>], <span class="k">None</span>, <span class="k">None</span>)
+print(<span class="s">"RMS reprojection error (px):"</span>, ret)   <span class="c"># aim for well under 1, ideally under ~0.5</span>
+print(<span class="s">"K =\n"</span>, mtx)                           <span class="c"># fx, fy, cx, cy</span>
+print(<span class="s">"dist ="</span>, dist.ravel())                  <span class="c"># k1, k2, p1, p2, k3</span>
+
+h, w = gray.shape
+newK, roi = cv.getOptimalNewCameraMatrix(mtx, dist, (w, h), <span class="n">1</span>, (w, h))
+straight = cv.undistort(cv.imread(fname), mtx, dist, <span class="k">None</span>, newK)   <span class="c"># lines are straight again</span></code></pre>
+    <p class="hint">The first value <code>calibrateCamera</code> returns is the overall RMS reprojection error. The tutorial also recomputes a per-image error with <code>cv.projectPoints</code>: do it, and throw out photos whose error is far above the rest (usually a blurry or misdetected board).</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚘 Tesla</h4><p>Tesla's cars calibrate their cameras <b>while you drive</b>: the Model Y manual says calibration typically completes after 20–25 miles (32–40 km), that self-driving and active safety features are unavailable until then, and that you can clear it (Controls › Service › Camera Calibration) after a camera or windshield is replaced. In its AI Day 2021 presentation, Tesla also described correcting every car's camera images to a common, idealized camera before they enter its networks, so small per-car calibration differences don't confuse them. Tesla hasn't published its calibration math.</p>
+        <p class="src">Sources: <a href="https://www.tesla.com/ownersmanual/modely/en_us/GUID-682FF4A7-D083-4C95-925A-5EE3752F4865.html" target="_blank" rel="noopener">Model Y manual: cameras</a>, <a href="https://www.youtube.com/watch?v=j0z4FweCy4M" target="_blank" rel="noopener">Tesla AI Day 2021</a></p></div>
+      <div><h4>🚕 Waymo</h4><p>Waymo hasn't published how it calibrates its production fleet. Its public dataset shows what a calibrated car looks like: every camera ships with intrinsics, distortion and a pose on the vehicle, the cameras are rolling-shutter, and the lidar-to-camera projection is rolling-shutter aware, so each lidar point is matched to the instant its image row was read. With lidar, radar and cameras sharing one frame, the cross-sensor extrinsics matter as much as each camera's K (Lesson 2.7).</p>
+        <p class="src">Sources: <a href="https://arxiv.org/abs/1912.04838" target="_blank" rel="noopener">Waymo Open Dataset paper</a>, <a href="https://waymo.com/open/" target="_blank" rel="noopener">waymo.com/open</a></p></div>
+      <div><h4>🛸 Drones &amp; robots</h4><p>Drones doing visual navigation fuse a camera with an IMU, so they need the camera's intrinsics, its exact pose relative to the IMU <i>and</i> the time offset between the two. <b>Kalibr</b> (ETH Zurich) is the standard open tool: multi-camera calibration with many lens models, camera–IMU spatial and temporal calibration, and rolling-shutter calibration. Skydio's X10 navigation cameras have a 200° field of view, far beyond what the plain pinhole-plus-k<sub>1</sub> model above can describe; such lenses need fisheye-style models.</p>
+        <p class="src">Sources: <a href="https://github.com/ethz-asl/kalibr" target="_blank" rel="noopener">Kalibr</a>, <a href="https://www.skydio.com/x10/technical-specs" target="_blank" rel="noopener">Skydio X10 specs</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> Tesla has millions of customer cars and no technician at each one, so it must calibrate automatically on the road. Waymo runs its own fleet and depots, and its lidar gives a direct geometric reference for checking the cameras. A drone flies on camera + IMU alone, so the camera–IMU calibration (including timing) is the one that decides whether it holds position or drifts.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Target-based calibration (checkerboard)</td><td>Accurate, repeatable, with a clear error number</td><td>Needs a person, a target and time; only valid until something moves</td></tr>
+      <tr><td>Online self-calibration while driving</td><td>Scales to a whole fleet; tracks slow drift</td><td>Needs good roads and time; hard to verify; can lock in a wrong answer</td></tr>
+      <tr><td>Richer distortion model (k<sub>2</sub>, k<sub>3</sub>, fisheye)</td><td>Fits wide and fisheye lenses</td><td>More parameters to pin down; overfits with too few corners near the edges</td></tr>
+      <tr><td>Global shutter</td><td>No skew on fast motion; simpler math</td><td>Pricier; usually lower resolution and sensitivity</td></tr>
+      <tr><td>Rolling shutter + timing model</td><td>Cheap, high-resolution sensors</td><td>Every projection needs the per-row time; errors grow with speed</td></tr>
+      <tr><td>HDR sensor with LED flicker mitigation</td><td>Sees tunnel exits and blinking LEDs</td><td>More expensive sensor and processing; possible artifacts on moving objects</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you calibrate a new camera on a robot, and how do you know it worked?” A strong answer:</p>
+    <ul>
+      <li>Separates <b>intrinsics</b> (K and distortion: the camera itself) from <b>extrinsics</b> (R, t: where it's mounted), and writes pixel ~ K [R | t] P.</li>
+      <li>Describes a checkerboard session that covers the <b>whole image, including corners</b>, with many tilts, and judges it by the <b>reprojection error</b> (well under 1 px; per-image outliers removed), then checks on held-out images.</li>
+      <li>Quantifies why it matters: 1° of pitch at f = 800 is about 14 px, which turns a flat-ground estimate of 50 m into 31 m.</li>
+      <li>Mentions <b>rolling shutter</b> (skew = speed × readout, e.g. 20 m/s × 30 ms = 0.6 m), time sync with other sensors, and that calibration drifts and must be re-checked online.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Self-calibrating cameras in consumer cars</b> <span class="tag co">🏢 Tesla · 2026</span> <a href="https://www.tesla.com/ownersmanual/modely/en_us/GUID-682FF4A7-D083-4C95-925A-5EE3752F4865.html" target="_blank" rel="noopener">Model Y manual</a></div>
+      <p><b>How:</b> after delivery or a camera/windshield replacement, the car calibrates its cameras over roughly 32–40 km of driving; driver-assistance features wait until it's done.</p>
+      <p><b>Why this method:</b> a fleet of customer cars can't visit a checkerboard; the road's lane lines and horizon become the reference.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The checkerboard method everyone uses</b> <span class="tag hist">📜 History · 2000</span> <a href="https://www.microsoft.com/en-us/research/publication/a-flexible-new-technique-for-camera-calibration/" target="_blank" rel="noopener">Zhang, IEEE TPAMI 2000</a></div>
+      <p><b>How:</b> photograph a flat pattern in a few orientations; solve for the intrinsics and each view's pose in closed form, then refine everything with nonlinear least squares.</p>
+      <p><b>Why this method:</b> it replaced expensive 3D calibration rigs with a printout, and it's what <code>cv.calibrateCamera</code> implements.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Camera–IMU calibration for visual-inertial drones</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/ethz-asl/kalibr" target="_blank" rel="noopener">Kalibr (ETH Zurich)</a></div>
+      <p><b>How:</b> wave the rig in front of a calibration target; Kalibr estimates the camera models, the camera-to-IMU transform, the time offset between them and, if needed, rolling-shutter parameters.</p>
+      <p><b>Why this method:</b> visual-inertial odometry (Lesson 3.6) breaks if the camera and IMU disagree on where or when a measurement happened.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Rolling-shutter-aware projection in a driving dataset</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/1912.04838" target="_blank" rel="noopener">Waymo Open Dataset</a></div>
+      <p><b>How:</b> each image carries rolling-shutter timing; lidar points are projected into images with the shutter effect compensated.</p>
+      <p><b>Why this method:</b> at driving speeds, ignoring the per-row timing would paint lidar points tens of centimeters off the objects they hit.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a million to one</span>
+    <p>120 dB sounds abstract until you undo the logarithm: 10<sup>120/20</sup> = <b>1,000,000</b>. Sony's IMX490 automotive sensor records detail in a patch a million times brighter than another patch of the <i>same frame</i>, and 10 million times (140 dB) in its dynamic-range-priority mode (<a href="https://www.sony-semicon.com/files/62/pdf/p-15_IMX490.pdf" target="_blank" rel="noopener">Sony datasheet</a>). It does this while also catching flickering LED lights, which a normal fast-exposure camera would see as dark.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>K is the pinhole model of Lesson 2.1 in matrix form; [R | t] is a transform from Lesson 1.5. The same reprojection error, minimized over many cameras and thousands of 3D points at once, is <b>bundle adjustment</b> (Lesson 4.7), the engine of structure from motion and visual SLAM. Lesson 2.7 extends extrinsics across sensors (camera to lidar) and adds the time axis; Lesson 3.6's visual-inertial odometry needs exactly the camera–IMU calibration Kalibr produces. The least-squares fit you did by hand is <a href="../../math-course/phase3/4-gradient-descent.html">gradient descent</a> territory in the Math course; the matrix chain is <a href="../../math-course/phase2/2-matmul.html">matrix multiplication</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Tutorial</span> <a href="https://docs.opencv.org/4.x/dc/dbb/tutorial_py_calibration.html" target="_blank" rel="noopener">OpenCV: camera calibration in Python</a>. The distortion formulas, a full calibration script and the reprojection-error check.</li>
+      <li><span class="kind">Paper</span> <a href="https://www.microsoft.com/en-us/research/publication/a-flexible-new-technique-for-camera-calibration/" target="_blank" rel="noopener">Zhang (2000): A flexible new technique for camera calibration</a>. The idea behind every checkerboard you'll ever wave at a camera.</li>
+      <li><span class="kind">Tool</span> <a href="https://github.com/ethz-asl/kalibr" target="_blank" rel="noopener">Kalibr</a>. Multi-camera, camera–IMU and rolling-shutter calibration, used across drone and robotics research.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A camera's rolling shutter reads the frame in 25 ms. A cyclist crosses at 8 m/s. How far do they move between the top row and the bottom row of the frame?</div>
+    <div class="opts"><button class="opt">2 cm</button><button class="opt" data-ok>20 cm</button><button class="opt">2 m</button></div>
+    <div class="explain">Skew = speed × readout time = 8 m/s × 0.025 s = <b>0.2 m</b>. Small for a slow cyclist, but at 30 m/s the same sensor skews by 0.75 m, which is why fast robots either use global shutters or project with per-row timestamps.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your calibration reports an RMS reprojection error of 0.3 px, but lidar points projected into the image land a hand's width off near the image corners. All your checkerboard photos had the board in the middle. What's the likely cause?</div>
+    <div class="opts"><button class="opt">The lidar is broken</button><button class="opt" data-ok>The distortion (k<sub>1</sub>, k<sub>2</sub>) wasn't constrained near the edges: the fit is good where you had corners and poor where you didn't</button><button class="opt">0.3 px is too high; recalibrate until it's 0.01 px</button></div>
+    <div class="explain">A low error only describes the corners you measured. Radial distortion grows with distance from the center, so without corners near the edges, k<sub>1</sub>, k<sub>2</sub> and f can trade off and still fit the middle. Recalibrate with the board covering the corners and tilted in many ways (and check the lidar–camera extrinsics too, Lesson 2.7).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. What do the extrinsics of a car's front camera describe?</div>
+    <div class="opts"><button class="opt">Its focal length and image center</button><button class="opt">How much its lens bends straight lines</button><button class="opt" data-ok>Where the camera is mounted on the car and which way it points (R and t between the car frame and the camera frame)</button></div>
+    <div class="explain">Intrinsics (K, distortion) belong to the camera itself and stay the same wherever it's bolted. Extrinsics are its pose on the vehicle. Replace a windshield and the intrinsics are unchanged, but the extrinsics may shift, which is why Tesla clears and redoes calibration afterwards.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li><b>Intrinsics</b>: K (f<sub>x</sub>, f<sub>y</sub>, c<sub>x</sub>, c<sub>y</sub>, skew ≈ 0) plus distortion (k<sub>1</sub>, k<sub>2</sub>, p<sub>1</sub>, p<sub>2</sub>, k<sub>3</sub>). <b>Extrinsics</b>: R, t from car to camera. Pixel ~ K [R | t] P.</li>
+      <li>Small errors are big at range: 1° of pitch ≈ 14 px at f = 800, turning 50 m into 31 m with the flat-ground trick.</li>
+      <li>Negative k<sub>1</sub> = barrel (wide lenses), positive = pincushion; k<sub>2</sub> acts mostly near the corners, so calibrate with corners near the edges.</li>
+      <li>Checkerboard + least squares (Zhang, <code>cv.calibrateCamera</code>); judge it by RMS reprojection error, ideally under ~0.5 px.</li>
+      <li>Rolling shutter skew = speed × readout (20 m/s × 30 ms = 0.6 m). HDR (120 dB = 10⁶:1) and LED flicker mitigation keep tunnels and traffic lights visible.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  const css = n => MX.css(n);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+  const IW = 640, IH = 480;
+
+  function makeImg(canvas) {
+    const o = { c: canvas, g: canvas.getContext("2d"), fn: null };
+    o.resize = () => { const d = window.devicePixelRatio || 1; o.w = canvas.clientWidth || 400; o.h = canvas.clientHeight || 300; canvas.width = o.w * d; canvas.height = o.h * d; o.g.setTransform(d, 0, 0, d, 0, 0); o.s = o.w / IW; };
+    o.render = fn => { if (fn) o.fn = fn; if (o.fn) o.fn(o); };
+    o.X = u => u * o.s; o.Y = v => v * o.h / IH;
+    o.resize();
+    const redo = () => { if (canvas.isConnected) { o.resize(); o.render(); } };
+    window.addEventListener("resize", redo); window.addEventListener("themechange", redo);
+    return o;
+  }
+  const poly = (o, pts, color, width, alpha, dash) => {
+    const g = o.g; g.save(); g.strokeStyle = css(color); g.lineWidth = width; g.globalAlpha = alpha ?? 1; g.setLineDash(dash || []);
+    g.beginPath(); pts.forEach((p, i) => (i ? g.lineTo(o.X(p[0]), o.Y(p[1])) : g.moveTo(o.X(p[0]), o.Y(p[1])))); g.stroke(); g.restore();
+  };
+
+  // ---------- Playground 1: distortion grid ----------
+  const F1 = 500, C1 = [320, 240];
+  const distort = (x, y, k1, k2, p1) => { const r2 = x * x + y * y, rad = 1 + k1 * r2 + k2 * r2 * r2; return [x * rad + 2 * p1 * x * y, y * rad + p1 * (r2 + 2 * y * y)]; };
+  const toPx = q => [F1 * q[0] + C1[0], F1 * q[1] + C1[1]];
+  const G1 = makeImg($("grid"));
+  let won1 = false;
+  function grid1() {
+    const k1 = +$("k1").value, k2 = +$("k2").value, p1 = +$("p1").value;
+    $("k1V").textContent = fmt(k1, 2); $("k2V").textContent = fmt(k2, 2); $("p1V").textContent = fmt(p1, 3);
+    const xs = MX.linspace(-0.64, 0.64, 9), ys = MX.linspace(-0.48, 0.48, 7), N = 40;
+    G1.render(o => {
+      const g = o.g; g.clearRect(0, 0, o.w, o.h);
+      xs.forEach(x => poly(o, MX.linspace(-0.48, 0.48, N).map(y => toPx([x, y])), "--muted", 1, 0.35));
+      ys.forEach(y => poly(o, MX.linspace(-0.64, 0.64, N).map(x => toPx([x, y])), "--muted", 1, 0.35));
+      xs.forEach(x => poly(o, MX.linspace(-0.48, 0.48, N).map(y => toPx(distort(x, y, k1, k2, p1))), "--c-se", 2));
+      ys.forEach(y => poly(o, MX.linspace(-0.64, 0.64, N).map(x => toPx(distort(x, y, k1, k2, p1))), "--c-se", 2));
+      const cp = toPx(distort(0.64, -0.48, k1, k2, p1));
+      g.fillStyle = css("--c-un"); g.beginPath(); g.arc(o.X(cp[0]), o.Y(cp[1]), 5, 0, 7); g.fill();
+      g.strokeStyle = css("--c-un"); g.lineWidth = 2; g.beginPath(); g.arc(o.X(640), o.Y(0), 7, 0, 7); g.stroke();
+      g.fillStyle = css("--muted"); g.font = `11px ${css("--font")}`; g.textAlign = "right"; g.fillText("gold: where the corner lands", o.w - 8, o.h - 8);
+    });
+    const c0 = [640, 0], cp = toPx(distort(0.64, -0.48, k1, k2, p1)), cornerShift = Math.hypot(cp[0] - c0[0], cp[1] - c0[1]);
+    const top = MX.linspace(-0.64, 0.64, 81).map(x => toPx(distort(x, -0.48, k1, k2, p1))), a = top[0], b = top[top.length - 1];
+    const bow = Math.max(...top.map(p => { const t = (p[0] - a[0]) / ((b[0] - a[0]) || 1); return Math.abs(p[1] - (a[1] + t * (b[1] - a[1]))); }));
+    const r2c = 0.64 ** 2 + 0.48 ** 2, radC = k1 * r2c + k2 * r2c * r2c, radM = k1 * 0.2304 + k2 * 0.2304 ** 2;
+    const look = Math.abs(radC) < 0.004 && Math.abs(radM) < 0.004 ? (Math.abs(p1) > 0.001 ? "tilted (tangential)" : "pinhole: straight") : (radM < 0 && radC > 0) || (radM > 0 && radC < 0) ? "mustache 〰️" : radC < 0 ? "barrel ⭕" : "pincushion ✴️";
+    $("gA").textContent = look; $("gB").textContent = fmt(cornerShift) + " px"; $("gC").textContent = fmt(bow) + " px";
+    const ok = cornerShift < 1 && bow >= 5;
+    if (ok) won1 = true;
+    $("gD").innerHTML = ok ? `<span class="badge-win">✅ mustache lens!</span>` : won1 ? `<span class="badge-win">✅ solved</span>` : `<span class="muted">${cornerShift >= 1 ? "corner still off" : "edge too straight"}</span>`;
+  }
+  ["k1", "k2", "p1"].forEach(id => ($(id).oninput = grid1));
+  $("g0").onclick = () => { $("k1").value = 0; $("k2").value = 0; $("p1").value = 0; grid1(); };
+  grid1();
+
+  // ---------- Playground 2: calibrate by hand ----------
+  const TRUE = { f: 620, cx: 331, cy: 236, k1: -0.18 }, rngC = Sim.rng(42);
+  const PTS = []; for (let i = 0; i < 9; i++) for (let j = 0; j < 7; j++) { const X = -0.48 + 0.12 * i, Y = -0.36 + 0.12 * j; PTS.push([X, Y, 1.1 + 0.25 * X + 0.1 * Y]); }
+  const projC = (p, P) => { const x = p[0] / p[2], y = p[1] / p[2], rad = 1 + P.k1 * (x * x + y * y); return [P.f * x * rad + P.cx, P.f * y * rad + P.cy]; };
+  const OBS = PTS.map(p => { const q = projC(p, TRUE); return [q[0] + 0.15 * Sim.randn(rngC), q[1] + 0.15 * Sim.randn(rngC)]; });
+  const KEYS = [["cf", "f"], ["ccx", "cx"], ["ccy", "cy"], ["ck1", "k1"]];
+  const getP = () => ({ f: +$("cf").value, cx: +$("ccx").value, cy: +$("ccy").value, k1: +$("ck1").value });
+  const errs = P => PTS.map((p, i) => { const q = projC(p, P); return [q[0] - OBS[i][0], q[1] - OBS[i][1]]; });
+  const rmsOf = P => Math.sqrt(MX.mean(errs(P).map(e => e[0] * e[0] + e[1] * e[1])));
+  let auto = false, wonHand = false, shown = null;
+  const C2 = makeImg($("cal"));
+  function cal2() {
+    const P = shown || getP(), E = errs(P);
+    KEYS.forEach(([id, k]) => ($(id + "V").textContent = k === "k1" ? fmt(P[k], 3) : fmt(P[k], k === "f" ? 1 : 1)));
+    const mag = Math.min(10, 30 / Math.max(0.01, Math.max(...E.map(e => Math.hypot(e[0], e[1])))));
+    C2.render(o => {
+      const g = o.g; g.clearRect(0, 0, o.w, o.h);
+      for (let i = 0; i < 8; i++) for (let j = 0; j < 6; j++) {   // faint board squares (observed geometry)
+        if ((i + j) % 2) continue;
+        const q = [OBS[i * 7 + j], OBS[(i + 1) * 7 + j], OBS[(i + 1) * 7 + j + 1], OBS[i * 7 + j + 1]];
+        g.fillStyle = css("--muted"); g.globalAlpha = 0.18; g.beginPath(); q.forEach((p, n) => (n ? g.lineTo(o.X(p[0]), o.Y(p[1])) : g.moveTo(o.X(p[0]), o.Y(p[1])))); g.fill(); g.globalAlpha = 1;
+      }
+      OBS.forEach((ob, i) => {
+        const pr = [ob[0] + E[i][0], ob[1] + E[i][1]];
+        g.strokeStyle = css("--c-un"); g.lineWidth = 2; g.beginPath(); g.moveTo(o.X(ob[0]), o.Y(ob[1])); g.lineTo(o.X(ob[0] + mag * E[i][0]), o.Y(ob[1] + mag * E[i][1])); g.stroke();
+        g.fillStyle = css("--c-se"); g.beginPath(); g.arc(o.X(ob[0]), o.Y(ob[1]), 3, 0, 7); g.fill();
+        g.strokeStyle = css("--c-be"); g.lineWidth = 1.5; g.beginPath(); g.arc(o.X(pr[0]), o.Y(pr[1]), 5, 0, 7); g.stroke();
+      });
+      g.fillStyle = css("--muted"); g.font = `11px ${css("--font")}`; g.textAlign = "right"; g.fillText(`gold misses drawn ×${fmt(mag, 1)}`, o.w - 8, o.h - 8);
+    });
+    const rms = rmsOf(P), worst = Math.max(...E.map(e => Math.hypot(e[0], e[1])));
+    $("cA").textContent = fmt(rms, 2) + " px"; $("cB").textContent = fmt(worst, 2) + " px";
+    if (!shown && rms < 0.5) wonHand = true;
+    $("cC").innerHTML = wonHand ? `<span class="badge-win">✅ calibrated by hand: ${fmt(rmsOf(getP()), 2)} px</span>` : shown ? `<span class="muted">optimizer: ${fmt(rms, 2)} px (doesn't count)</span>` : `<span class="muted">${fmt(rms, 2)} px, target &lt; 0.5</span>`;
+  }
+  function gaussNewton(P) {   // what calibrateCamera does (minus the pose and the other coefficients)
+    const ks = ["f", "cx", "cy", "k1"];
+    for (let it = 0; it < 8; it++) {
+      const r0 = errs(P).flat(), J = r0.map(() => []);
+      ks.forEach((k, c) => { const h = k === "k1" ? 1e-5 : 1e-3, Q = Object.assign({}, P); Q[k] += h; errs(Q).flat().forEach((v, i) => (J[i][c] = (v - r0[i]) / h)); });
+      const A = ks.map((_, a) => ks.map((_, b) => J.reduce((s, row) => s + row[a] * row[b], 0)));
+      const gr = ks.map((_, a) => J.reduce((s, row, i) => s + row[a] * r0[i], 0));
+      const d = MX.matvec(MX.inv(A), gr);
+      ks.forEach((k, i) => (P[k] -= d[i]));
+    }
+    return P;
+  }
+  KEYS.forEach(([id]) => ($(id).oninput = () => { shown = null; cal2(); }));
+  $("cAuto").onclick = () => { shown = gaussNewton(getP()); cal2(); };
+  $("cReset").onclick = () => { shown = null; $("cf").value = 600; $("ccx").value = 320; $("ccy").value = 240; $("ck1").value = 0; cal2(); };
+  cal2();
+
+  // ---------- Playground 3: rolling shutter ----------
+  const R3 = makeImg($("rs")), FZ = 800 / 14;            // pixels per metre at 14 m
+  const off = document.createElement("canvas"); off.width = IW; off.height = IH;
+  let phase = 0, truckX = -120, anim = null, won3 = false;
+  function drawTruckOff(x0) {   // the truck at the instant the first row is read, in image pixels
+    const g = off.getContext("2d"); g.clearRect(0, 0, IW, IH);
+    const L = 7 * FZ, H = 3 * FZ, base = 360;
+    g.fillStyle = css("--c-ag"); g.fillRect(x0, base - H, L * 0.72, H);                              // box
+    g.fillStyle = css("--c-be"); g.fillRect(x0 + L * 0.74, base - H * 0.62, L * 0.26, H * 0.62);     // cab
+    g.fillStyle = css("--bg2"); g.fillRect(x0 + L * 0.8, base - H * 0.55, L * 0.15, H * 0.22);       // window
+    g.fillStyle = css("--text"); [0.15, 0.55, 0.88].forEach(t => { g.beginPath(); g.arc(x0 + L * t, base, 0.45 * FZ, 0, 7); g.fill(); });
+    g.strokeStyle = css("--bg2"); g.lineWidth = 3; [0.18, 0.36, 0.54].forEach(t => { g.beginPath(); g.moveTo(x0 + L * t, base - H + 6); g.lineTo(x0 + L * t, base - 6); g.stroke(); });
+  }
+  function rs3() {
+    const mode = $("rsMode").value, T = +$("rsT").value / 1000, v = +$("rsV").value, rpm = +$("rsR").value, w = rpm * 2 * Math.PI / 60;
+    $("rsTV").textContent = T === 0 ? "0 ms (global)" : fmt(T * 1000) + " ms"; $("rsVV").textContent = v + " m/s"; $("rsRV").textContent = rpm + " rpm";
+    R3.render(o => {
+      const g = o.g; g.clearRect(0, 0, o.w, o.h);
+      g.fillStyle = css("--panel"); g.fillRect(0, 0, o.w, o.Y(300)); g.fillStyle = css("--bg2"); g.fillRect(0, o.Y(300), o.w, o.h);
+      const band = 16;
+      for (let r = 0; r < IH; r += band) { g.fillStyle = css("--c-un"); g.globalAlpha = 0.15 + 0.6 * r / IH; g.fillRect(0, o.Y(r), o.X(10), o.Y(band) - 1); }
+      g.globalAlpha = 1;
+      if (mode === "truck") {
+        drawTruckOff(truckX);
+        const pxPerS = v * FZ;
+        for (let r = 0; r < IH; r += 2) { const dx = pxPerS * T * r / IH; g.drawImage(off, 0, r, IW, 2, o.X(dx), o.Y(r), o.X(IW), o.Y(2) + 0.5); }
+        g.strokeStyle = css("--muted"); g.setLineDash([4, 4]); g.lineWidth = 1;
+        const xe = truckX + 7 * FZ * 0.18; g.beginPath(); g.moveTo(o.X(xe), o.Y(360 - 3 * FZ)); g.lineTo(o.X(xe), o.Y(360)); g.stroke(); g.setLineDash([]);
+      } else {
+        const cx = 320, cy = 240, Rb = 170, hw = 14;
+        g.fillStyle = css("--c-ct");
+        for (let y = cy - Rb; y <= cy + Rb; y += 2) {
+          const ang = phase + w * T * y / IH;
+          for (let k = 0; k < 3; k++) {
+            const th = ang + k * 2 * Math.PI / 3, c = Math.cos(th), s = Math.sin(th);
+            for (let x = cx - Rb; x <= cx + Rb; x += 2) {
+              const dx = x - cx, dy = y - cy, along = dx * c + dy * s, across = -dx * s + dy * c;
+              if (along >= 0 && along <= Rb && Math.abs(across) <= hw * (1 - 0.5 * along / Rb)) g.fillRect(o.X(x), o.Y(y), o.X(2) + 0.6, o.Y(2) + 0.6);
+            }
+          }
+        }
+        g.fillStyle = css("--text"); g.beginPath(); g.arc(o.X(cx), o.Y(cy), 9 * o.s, 0, 7); g.fill();
+      }
+      g.fillStyle = css("--muted"); g.font = `11px ${css("--font")}`; g.textAlign = "left"; g.fillText("rows read ↓ (darker = later)", o.X(16), o.h - 8);
+    });
+    $("rA").textContent = fmt(v * T, 2) + " m";
+    $("rB").textContent = fmt(v * FZ * T, 0) + " px";
+    $("rC").textContent = fmt(MX.deg(w * T), 0) + "°";
+    const ok = v >= 30 && v * T < 0.1;
+    if (ok) won3 = true;
+    $("rD").innerHTML = ok ? `<span class="badge-win">✅ ${fmt(v * T * 100, 1)} cm at ${v} m/s</span>` : won3 ? `<span class="badge-win">✅ solved</span>` : `<span class="muted">${v < 30 ? "speed up to 30 m/s" : fmt(v * T * 100, 0) + " cm of skew"}</span>`;
+  }
+  ["rsT", "rsV", "rsR"].forEach(id => ($(id).oninput = rs3));
+  $("rsMode").onchange = rs3;
+  $("rsGo").onclick = () => {
+    if (anim) { cancelAnimationFrame(anim); anim = null; $("rsGo").textContent = "▶ Animate"; return; }
+    $("rsGo").textContent = "⏸ Pause"; let last = performance.now();
+    const step = now => {
+      if (!$("rs").isConnected) return;
+      const dt = Math.min(0.05, (now - last) / 1000); last = now;
+      truckX += +$("rsV").value * FZ * dt * 0.25; if (truckX > IW + 40) truckX = -7 * FZ;   // slow motion ×0.25
+      phase += +$("rsR").value * 2 * Math.PI / 60 * dt * 0.01;                          // stroboscopic slow spin
+      rs3(); anim = requestAnimationFrame(step);
+    };
+    anim = requestAnimationFrame(step);
+  };
+  truckX = 90; rs3();
+
+  // ---------- Mini-playground: LED flicker ----------
+  function led() {
+    const e = Math.pow(10, +$("le").value), duty = +$("ld").value / 100, on = 10 * duty;
+    const p = Math.min(1, (on + e) / 10);
+    $("leV").textContent = (e < 1 ? fmt(e, 2) : fmt(e, 1)) + " ms"; $("ldV").textContent = Math.round(duty * 100) + "%";
+    $("lA").innerHTML = p >= 1 ? `<span class="badge-win">100%</span>` : `${Math.round(p * 100)}%`;
+    $("lB").innerHTML = e > 1 ? `<span class="badge-lose">washed out white</span>` : `<span class="muted">fine</span>`;
+  }
+  ["le", "ld"].forEach(id => ($(id).oninput = led));
+  led();
+})();
+</script>
+</body>
+</html>

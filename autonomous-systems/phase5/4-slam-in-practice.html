@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.4 SLAM in practice: ICP, lidar SLAM &amp; ORB-SLAM · Autonomous Systems</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🚗</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .badge-win { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--good) 16%, transparent); color: var(--good); }
+  .badge-lose { display: inline-block; padding: 2px 10px; border-radius: 999px; font-weight: 700; font-size: .85rem; background: color-mix(in srgb, var(--bad) 12%, transparent); color: var(--bad); }
+  .predict { border: 2px dashed color-mix(in srgb, var(--accent) 45%, var(--line)); border-radius: 12px; padding: 10px 14px; margin: 12px 0; background: var(--bg2); }
+  .predict b.q { color: var(--accent); }
+  .predict .ans { display: none; margin-top: 8px; }
+  .predict.open .ans { display: block; }
+  .game-opts { display: grid; gap: 8px; margin: 10px 0; }
+  .game-opts button { text-align: left; font: inherit; padding: 8px 12px; border-radius: 10px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); cursor: pointer; }
+  .game-opts button.right { border-color: var(--good); background: color-mix(in srgb, var(--good) 15%, var(--bg2)); }
+  .game-opts button.wrong { border-color: var(--bad); background: color-mix(in srgb, var(--bad) 12%, var(--bg2)); }
+  .symptom { font-size: 1.02rem; font-weight: 700; margin: 8px 0; }
+</style>
+</head>
+<body data-lesson="s5-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 5 · Lesson 4</div>
+  <h1>SLAM in practice: ICP, lidar SLAM &amp; ORB-SLAM</h1>
+  <p class="subtitle">How do two lidar scans, taken a moment apart, tell a robot how far it moved? The answer is a beautifully simple loop called ICP. Then a tour of the real systems built on it and on camera features (LOAM, LIO-SAM, KISS-ICP, Cartographer, slam_toolbox, ORB-SLAM), and how to choose one for your robot.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>A 2D rigid motion</b> = a rotation by θ plus a shift (tx, ty): R p + t (Lessons 1.2 and 1.5).</li>
+      <li><b>Pose graphs</b>: SLAM back-ends that turn “I moved this much” and “I've been here” edges into a consistent map (Lesson 5.3). This lesson is about the <b>front-end</b> that produces those edges.</li>
+      <li><b>SVD</b> (singular value decomposition) splits a matrix into rotation-stretch-rotation; here it pulls the best rotation out of a 2×2 matrix. Refresher: <a href="../../math-course/phase2/6-svd-pca.html">SVD</a> in the Math course. <b>ORB features</b> and <b>RANSAC</b> are Lessons 4.1 and 4.2.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook · a puzzle first</span>
+    <p>A robot takes a lidar scan, drives a bit, and takes another. Same room, seen from a new spot: 180 points each. <b>How far did it move, and how much did it turn?</b></p>
+    <p>If someone told you which point in scan 2 is the same wall spot as which point in scan 1, this would be a one-line formula. Nobody tells you. Here's the cheeky trick that solves it: <b>pretend the nearest point is the match</b>, compute the motion, apply it, and do it again. It sounds like it shouldn't work. It usually does, within a few dozen rounds.</p>
+    <p>That trick is <b>ICP</b>, Iterative Closest Point, published by Paul Besl and Neil McKay (<a href="https://doi.org/10.1109/34.121791" target="_blank" rel="noopener">IEEE TPAMI, 1992</a>) and, in a point-to-plane flavour, by Yang Chen and Gérard Medioni (<a href="https://doi.org/10.1109/ROBOT.1991.132043" target="_blank" rel="noopener">ICRA 1991</a>). In 2023, a team from the University of Bonn showed that plain point-to-point ICP, “done the right way”, rivals much more complex lidar odometry systems: KISS-ICP (<a href="https://arxiv.org/abs/2209.15397" target="_blank" rel="noopener">arXiv</a>).</p>
+  </div>
+
+  <h2>ICP in two steps</h2>
+  <ol>
+    <li><b>Match</b>: for every point of the new scan (placed at the current guess), find the closest point in the old scan.</li>
+    <li><b>Align</b>: find the rotation and shift that best line up those pairs (least squares, solved exactly with an SVD). Apply it. Go back to 1 until nothing changes.</li>
+  </ol>
+
+  <div class="predict" id="pr1">
+    <b class="q">🧩 Predict:</b> in the playground below the robot really turned 14° and moved about 1 m. Starting ICP from “no motion at all” (a 14° error), will it find the answer? What about starting from a guess that's 90° wrong?
+    <div><button class="btn small" data-open="pr1">Show the answer</button></div>
+    <div class="ans">From “no motion” it converges, in about 20 iterations. From 90° off it locks onto a <b>wrong answer</b> and stops there, perfectly content: every point has a nearby partner, just the wrong one. In this room, starting guesses from roughly −65° to +70° work and beyond that ICP fails. That's a <b>local minimum</b>, and it's why ICP is always started from an odometry or IMU guess.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 1 · ICP, one step at a time</span>
+    <p class="hint"><b class="mp">Green</b> = the old scan (the reference). <b class="se">Blue</b> = the new scan, placed at ICP's current guess. Press <b>👣 Step</b> to see the <b class="un">gold</b> match lines (each blue point's nearest green point), then the alignment. Set the <b>starting guess</b> with the sliders (that's what odometry would give you).</p>
+    <canvas class="sim" id="icp"></canvas>
+    <div class="controls">
+      <button class="btn primary" id="iStep">👣 Step</button>
+      <button class="btn" id="iRun">▶ Run to convergence</button>
+      <button class="btn" id="iReset">↺ Back to the starting guess</button>
+    </div>
+    <div class="controls">
+      <label>start: turn <input type="range" id="iTh" min="-120" max="120" step="1" value="0"> <b class="mono" id="iThV"></b></label>
+      <label>shift x <input type="range" id="iX" min="-2" max="2" step="0.05" value="0"> <b class="mono" id="iXV"></b></label>
+      <label>shift y <input type="range" id="iY" min="-2" max="2" step="0.05" value="0"> <b class="mono" id="iYV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">iteration <b id="iIt">0</b></div>
+      <div class="stat">avg match distance <b id="iD">–</b></div>
+      <div class="stat">true error: position <b id="iPE">–</b></div>
+      <div class="stat">true error: angle <b id="iAE">–</b></div>
+    </div>
+    <div class="verdict" id="iVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> reach a pose error under <b>8 cm and 1.5°</b> within <b>8 iterations</b>. From “no motion” it takes about twice that: give ICP a better starting guess (how did the robot probably move?). Then try a start of 90° or more and watch it get stuck.</p>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the align step with three pairs</span>
+    <p>Old points A: (0, 0), (2, 0), (0, 1). Their matches B: (1, 1), (1, 3), (0, 1). What rotation and shift take A onto B?</p>
+    <ol>
+      <li><b>Centroids</b>: A's is (0.67, 0.33), B's is (0.67, 1.67). Subtract them so both sets are centred.</li>
+      <li><b>Cross-covariance</b>: add up products of centred coordinates: S<sub>xx</sub> = Σ a<sub>x</sub>b<sub>x</sub> = 0.67, S<sub>xy</sub> = Σ a<sub>x</sub>b<sub>y</sub> = 2.67, S<sub>yx</sub> = −0.67, S<sub>yy</sub> = −0.67.</li>
+      <li><b>Rotation</b>: in 2D the SVD has a shortcut, θ = atan2(S<sub>xy</sub> − S<sub>yx</sub>, S<sub>xx</sub> + S<sub>yy</sub>) = atan2(3.33, 0) = <b>90°</b>.</li>
+      <li><b>Shift</b>: t = (centroid of B) − R × (centroid of A) = (0.67, 1.67) − (−0.33, 0.67) = <b>(1, 1)</b>.</li>
+    </ol>
+    <p>Check: rotating (2, 0) by 90° gives (0, 2), plus (1, 1) is (1, 3). ✓ In 3D you need the full SVD of the 3×3 matrix (Arun, Huang &amp; Blostein, <a href="https://doi.org/10.1109/TPAMI.1987.4767965" target="_blank" rel="noopener">TPAMI 1987</a>), but the recipe is the same: centre, multiply, decompose.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    ICP swaps an impossible problem (find the matches <i>and</i> the motion) for two easy ones it alternates between: <b>matches given motion</b> (nearest neighbours) and <b>motion given matches</b> (closed-form SVD). Each round can only lower the error, so it always settles, but only to the nearest valley. A good starting guess is not optional.
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? (and not something simpler)</span>
+    <ol>
+      <li><b>The problem before.</b> Wheel odometry slips on smooth floors and gravel, and an IMU drifts (Lesson 2.5). A lidar sees the world's geometry directly, but two scans are just clouds of points with no labels saying which point is which.</li>
+      <li><b>What people tried.</b> <i>Extract features</i> (corners, line segments) and match those (fragile: smooth walls have no corners, and clutter makes fake ones). <i>Brute-force search</i> over every rotation and shift (exact but slow: 360 angles × 100 × 100 shifts = 3.6 million poses to score per scan pair).</li>
+      <li><b>Why this works.</b> Nearest-neighbour matching is cheap with a k-d tree, and for given matches the best rigid motion has an exact closed form. Alternate them: in the playground, “no motion” → the true 14° turn and 1 m shift in about 20 rounds; the worked example's three pairs give 90° and (1, 1) by hand.</li>
+      <li><b>What it costs, when it fails.</b> It converges to the nearest minimum: start too far off (beyond about 65–70° here) and it locks onto a wrong answer. <b>Outliers</b> (people, cars, points seen in only one scan) drag it off unless you cap the match distance. <b>Featureless</b> places (long corridors, tunnels, open fields) leave a direction unconstrained, so it slides (Lesson 5.6). Moving while scanning distorts the scan (“motion skew”) unless you correct it.</li>
+      <li><b>What came next.</b> <b>Point-to-plane</b> ICP (match to the local surface, converges faster on walls), <b>NDT</b> (match to local Gaussian blobs, Lesson 5.6), <b>feature-based lidar odometry</b> (LOAM: edges and planes), <b>tightly coupled lidar + IMU</b> (LIO-SAM: the IMU de-skews scans and gives the starting guess), and <b>KISS-ICP</b> (point-to-point with adaptive thresholds and a robust kernel). Global methods (scan context, branch-and-bound in Cartographer) find loop closures without any guess.</li>
+    </ol>
+  </div>
+
+  <h2>Outliers: the people in your scan</h2>
+  <p>Real scans contain things the other scan doesn't: a person who walked in, a door that opened, reflections. Those points still get a “nearest neighbour”, usually a wrong one, and they pull the answer. The standard fix is a <b>maximum correspondence distance</b>: ignore any pair farther apart than d. In Open3D that's the <code>max_correspondence_distance</code> argument. Too small, and from a rough start nothing matches; too big, and every outlier votes.</p>
+
+  <div class="predict" id="pr2">
+    <b class="q">🧩 Predict:</b> four people are standing in the new scan only. With no distance limit at all, will the outliers make ICP fail completely, or just make it a bit wrong?
+    <div><button class="btn small" data-open="pr2">Show the answer</button></div>
+    <div class="ans">Just wrong, and that's worse, because it looks fine. In the playground below the unlimited version settles about <b>40 cm</b> off, with a respectable-looking average match distance. Nothing flags it. Capping the distance at around 0.5–1 m brings the error down to a few centimetres.</div>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 2 · Tune the match distance</span>
+    <p class="hint">Same scans, but four people (red) now stand in the new scan. ICP always starts from “no motion”. Pairs longer than the <b>max match distance</b> are ignored (drawn faint). Press <b>▶ Run</b> after changing the slider.</p>
+    <canvas class="sim" id="icp2"></canvas>
+    <div class="controls">
+      <button class="btn primary" id="oRun">▶ Run ICP</button>
+      <label>max match distance <input type="range" id="oMax" min="0" max="24" step="1" value="24"> <b class="mono" id="oMaxV"></b></label>
+      <label><input type="checkbox" id="oPeople" checked> people in the scan</label>
+      <label><input type="checkbox" id="oCoarse"> coarse-to-fine (start at 3 m, shrink to 0.5 m)</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">iterations <b id="oIt">–</b></div>
+      <div class="stat">pairs used <b id="oN">–</b></div>
+      <div class="stat">true error: position <b id="oPE">–</b></div>
+      <div class="stat">true error: angle <b id="oAE">–</b></div>
+    </div>
+    <div class="verdict" id="oVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> with the people in the scan, get under <b>8 cm and 1.5°</b>. The default (no limit) can't. Then find a limit so small that ICP never gets going.</p>
+  </div>
+
+  <h2>From ICP to full systems</h2>
+  <p>A lidar SLAM system is ICP (or a cousin) for odometry, plus a map to match against, plus loop closure and a pose graph (Lesson 5.3). The main families, all verified against their papers and repositories (Nov 2026):</p>
+  <table>
+    <tr><th>System</th><th>Sensors</th><th>Front-end idea</th><th>Status / licence</th></tr>
+    <tr><td><b>LOAM</b> (Zhang &amp; Singh, RSS 2014)</td><td>3D lidar</td><td>Split SLAM in two: fast, rough odometry at a high rate, and fine registration to the map at a rate “an order of magnitude lower”; matches edge and plane points</td><td>Paper; many open re-implementations</td></tr>
+    <tr><td><b>LIO-SAM</b> (Shan et al., IROS 2020)</td><td>3D lidar + IMU (+ GPS)</td><td>Factor graph (GTSAM): IMU pre-integration de-skews scans and gives the initial guess; lidar odometry estimates the IMU bias; loop closures and GPS as factors</td><td>Open source, BSD-3</td></tr>
+    <tr><td><b>KISS-ICP</b> (Vizzo et al., RA-L 2023)</td><td>any 3D lidar</td><td>Point-to-point ICP with adaptive matching threshold, a robust kernel, simple motion compensation and subsampling; few parameters</td><td>Open source, MIT; <code>pip install kiss-icp</code> (odometry only)</td></tr>
+    <tr><td><b>Cartographer</b> (Hess et al., ICRA 2016)</td><td>2D/3D lidar (+ IMU)</td><td>Scans inserted into local submaps; loop closures by fast branch-and-bound scan-to-submap matching; 5 cm maps in real time from a backpack</td><td>Google open source; README says it is <b>no longer actively maintained</b></td></tr>
+    <tr><td><b>slam_toolbox</b> (Macenski &amp; Jambrecic, 2021)</td><td>2D lidar</td><td>Scan matching + pose graph (Ceres by default); mapping, continuing and merging maps, localization mode</td><td>The SLAM library Nav2's docs recommend for ROS 2</td></tr>
+  </table>
+  <p>Cameras need a different front-end: instead of every point, track <b>distinctive features</b>. <b>ORB-SLAM2</b> (Mur-Artal &amp; Tardós, 2017) does monocular, stereo and RGB-D SLAM with ORB features (Lesson 4.1), bundle adjustment (4.7), loop closing with a bag of words (5.3) and relocalization. <b>ORB-SLAM3</b> (Campos et al., 2021) adds tightly integrated visual-inertial SLAM and a <b>multi-map</b> system: when it gets lost it starts a new map and merges it with the old one when it recognizes a place; its paper reports 2 to 5 times better accuracy than previous approaches. Both are GPLv3, which matters for commercial products.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground 3 · Pick the SLAM system</span>
+    <p class="hint">Five robots, five briefs. Pick what a senior robotics engineer would start with. The explanation appears after each answer.</p>
+    <div class="stat-row">
+      <div class="stat">robot <b id="cQ">1 / 5</b></div>
+      <div class="stat">score <b id="cS">0</b></div>
+    </div>
+    <div class="symptom" id="cBrief"></div>
+    <div class="game-opts" id="cOpts"></div>
+    <p class="hint" id="cFb"></p>
+    <div class="controls"><button class="btn primary" id="cNext">Next robot →</button><button class="btn" id="cReset">↺ Start over</button></div>
+    <div class="verdict" id="cVerdict"></div>
+    <p class="hint">🏆 <b>Challenge:</b> 5 out of 5.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>The align step in NumPy (the Phase 5 lab has you write the whole 2D ICP), then <b>Open3D</b> for 3D point clouds (version 0.20 on PyPI as of Nov 2026), <b>KISS-ICP</b> for quick lidar odometry, and <b>slam_toolbox</b> on ROS 2.</p>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+
+<span class="k">def</span> best_fit(P, Q):
+    <span class="s">"""Rotation R and shift t minimizing Σ |R p + t − q|² for matched rows of P and Q (N×2 or N×3)."""</span>
+    cp, cq = P.mean(axis=<span class="n">0</span>), Q.mean(axis=<span class="n">0</span>)
+    U, S, Vt = np.linalg.svd((P - cp).T @ (Q - cq))     <span class="c"># SVD of the cross-covariance</span>
+    R = Vt.T @ U.T
+    <span class="k">if</span> np.linalg.det(R) &lt; <span class="n">0</span>:                             <span class="c"># a reflection sneaked in: flip the last axis</span>
+        Vt[<span class="n">-1</span>] *= <span class="n">-1</span>; R = Vt.T @ U.T
+    <span class="k">return</span> R, cq - R @ cp</code></pre>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np, open3d <span class="k">as</span> o3d
+reg = o3d.pipelines.registration
+source = o3d.io.read_point_cloud(<span class="s">"scan_new.pcd"</span>)
+target = o3d.io.read_point_cloud(<span class="s">"scan_old.pcd"</span>)
+init = np.eye(<span class="n">4</span>)                                        <span class="c"># in practice: the odometry / IMU guess</span>
+result = reg.registration_icp(
+    source, target, <span class="n">0.5</span>, init,                           <span class="c"># max_correspondence_distance = 0.5 m</span>
+    reg.TransformationEstimationPointToPoint(),
+    reg.ICPConvergenceCriteria(max_iteration=<span class="n">50</span>))
+print(result.fitness, result.inlier_rmse)               <span class="c"># share of points matched, and their RMS error</span>
+T = result.transformation                               <span class="c"># 4×4 pose of the new scan in the old scan's frame</span>
+<span class="c"># point-to-plane: target.estimate_normals(), then reg.TransformationEstimationPointToPlane()</span></code></pre>
+<pre><code><span class="c"># KISS-ICP lidar odometry on a folder of scans or a ROS bag</span>
+pip install kiss-icp
+kiss_icp_pipeline --help
+
+<span class="c"># ROS 2: online 2D lidar SLAM with slam_toolbox (then save the map for Nav2)</span>
+ros2 launch slam_toolbox online_sync_launch.py</code></pre>
+    <p class="hint"><code>fitness</code> near 1 with a small <code>inlier_rmse</code> looks good, but Playground 2 showed that a confidently wrong answer can look good too. Always sanity-check against odometry: a 40 cm disagreement in 0.1 s is a red flag.</p>
+  </div>
+
+  <div class="box howco">
+    <span class="label">🚗 How Tesla / Waymo / drones do it</span>
+    <div class="cols">
+      <div><h4>🚕 Waymo</h4><p>Waymo's cars carry lidar and localize against detailed prior maps; a 2016 Waymo post says the map lets the car know where it is “to within 10cm of accuracy”. Matching each live lidar sweep to a prior map is the scan-to-map version of this lesson (Lesson 5.6). Waymo hasn't published which registration method it uses.</p>
+        <p class="src">Sources: <a href="https://waymo.com/blog/2016/12/building-maps-for-self-driving-car/" target="_blank" rel="noopener">Waymo, Dec 2016</a>, <a href="https://waymo.com/blog/2026/08/10ailessons/" target="_blank" rel="noopener">Waymo, Aug 2026</a></p></div>
+      <div><h4>🚘 Tesla</h4><p>Tesla's production cars have no lidar, so lidar ICP isn't part of its driving stack. Tesla hasn't published a visual SLAM system either; its public talks describe networks that turn video from all cameras into the road layout and 3D occupancy (Lessons 6.2, 6.3).</p>
+        <p class="src">Sources: <a href="https://www.tesla.com/AI" target="_blank" rel="noopener">tesla.com/AI</a></p></div>
+      <div><h4>🛸 Drones</h4><p>Lidar is heavy and power-hungry for small drones, so they mostly use cameras + IMU: visual-inertial odometry and SLAM in the ORB-SLAM3 family. Skydio's X10 page describes six custom navigation lenses giving 360° visibility for its vision-based autonomy.</p>
+        <p class="src">Sources: <a href="https://www.skydio.com/x10" target="_blank" rel="noopener">Skydio X10</a>, <a href="https://arxiv.org/abs/2007.11898" target="_blank" rel="noopener">ORB-SLAM3</a></p></div>
+      <div><h4>🤖 Robots</h4><p>Indoor ROS 2 robots: 2D lidar + slam_toolbox, then Nav2 localization on the saved map. Outdoor robots with 3D lidar: LIO-SAM-style lidar-inertial SLAM, or KISS-ICP odometry under a separate back-end.</p>
+        <p class="src">Sources: <a href="https://github.com/SteveMacenski/slam_toolbox" target="_blank" rel="noopener">slam_toolbox</a>, <a href="https://github.com/PRBonn/kiss-icp" target="_blank" rel="noopener">KISS-ICP</a></p></div>
+    </div>
+    <p class="why-diff"><b>Why they differ:</b> lidar gives geometry directly and works in the dark, which suits cars that can carry it and robots that need reliability; ICP-style matching is its natural partner. Cameras are light and cheap, the right trade on a drone, but need feature tracking and an IMU to survive fast motion. Tesla's bet is that learned perception from cameras can replace both the lidar and the prior map.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Point-to-point ICP</td><td>Simplest; works on any shape</td><td>Slow to converge on flat walls; sensitive to sampling</td></tr>
+      <tr><td>Point-to-plane ICP</td><td>Converges in fewer iterations on structured scenes</td><td>Needs surface normals; noisy normals in clutter</td></tr>
+      <tr><td>Small max match distance</td><td>Ignores outliers</td><td>Needs a good starting guess</td></tr>
+      <tr><td>Lidar SLAM (LIO-SAM, slam_toolbox)</td><td>Direct geometry, works in the dark, metric scale</td><td>Sensor cost, weight, power; degenerate in tunnels and fields</td></tr>
+      <tr><td>Visual SLAM (ORB-SLAM3)</td><td>Cheap, light sensors; rich place recognition</td><td>Needs texture and light; mono needs an IMU or stereo for scale; GPLv3</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Walk me through ICP and tell me how it fails.” A strong answer:</p>
+    <ul>
+      <li>Two alternating steps: nearest-neighbour matches (k-d tree), then closed-form alignment (SVD, with the reflection fix).</li>
+      <li>Failure modes: bad initial guess → local minimum; outliers → biased answer (max correspondence distance, robust kernels); <b>degenerate geometry</b> (corridors) → slides along the unconstrained direction; motion skew → de-skew with the IMU.</li>
+      <li>Point-to-plane vs point-to-point; NDT as an alternative; how a system (LIO-SAM, KISS-ICP, slam_toolbox) wraps ICP with an IMU guess, a local map and loop closures.</li>
+      <li>Can pick a system for a given robot and justify it by sensors, compute, environment and licence.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>ICP</b> <span class="tag hist">📜 History · 1992</span> <a href="https://doi.org/10.1109/34.121791" target="_blank" rel="noopener">Besl &amp; McKay, TPAMI</a></div>
+      <p><b>How:</b> register 3D shapes by repeatedly matching closest points and solving for the best rigid motion.</p>
+      <p><b>Why this method:</b> no features or labels needed, and each iteration has an exact solution.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Real-time loop closure from a backpack</b> <span class="tag co">🏢 Google · 2016</span> <a href="https://research.google/pubs/real-time-loop-closure-in-2d-lidar-slam/" target="_blank" rel="noopener">Hess et al., ICRA 2016</a></div>
+      <p><b>How:</b> Cartographer builds submaps from lidar scans and finds loop closures with a branch-and-bound search of scan-to-submap matches, producing 5 cm maps in real time.</p>
+      <p><b>Why this method:</b> branch-and-bound finds the best match over a large search window without a good initial guess, which ICP can't.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>LIO-SAM</b> <span class="tag oss">🧰 Open source</span> <a href="https://arxiv.org/abs/2007.00258" target="_blank" rel="noopener">Shan et al., IROS 2020</a></div>
+      <p><b>How:</b> lidar odometry, IMU pre-integration, GPS and loop closures as factors in one GTSAM factor graph.</p>
+      <p><b>Why this method:</b> the IMU fixes motion skew and gives ICP a great starting guess; the factor graph fuses everything consistently.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>ORB-SLAM3</b> <span class="tag res">🧪 Research · 2021</span> <a href="https://arxiv.org/abs/2007.11898" target="_blank" rel="noopener">Campos et al., T-RO</a></div>
+      <p><b>How:</b> ORB features, visual-inertial MAP estimation, bag-of-words place recognition and a multi-map atlas.</p>
+      <p><b>Why this method:</b> cameras and IMUs are cheap and light; multi-map handling lets it survive losing track and merge maps later.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · Google's SLAM, mapped on foot</span>
+    <p>Cartographer's paper demonstrates real-time mapping and loop closure on a <b>backpack</b> carried through buildings, producing maps at 5 cm resolution with limited onboard computing (<a href="https://research.google/pubs/real-time-loop-closure-in-2d-lidar-slam/" target="_blank" rel="noopener">Google Research</a>). The project later became one of the most popular open-source SLAM systems; as of Nov 2026 its README says it is no longer actively maintained, a good reminder to check a project's pulse before building a product on it.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>ICP produces the odometry and loop-closure edges of the pose graphs in Lesson 5.3, and scan-to-map matching for localization is Lesson 5.6. Visual SLAM reuses features (4.1), RANSAC (4.2), visual odometry (4.6) and bundle adjustment (4.7); the IMU side is Lessons 2.5 and 3.6. Point clouds come from Lesson 2.3. The SVD step: <a href="../../math-course/phase2/6-svd-pca.html">SVD</a> in the Math course; for learned 3D point-cloud processing, see <span class="dlref" data-href="phase4/8-3d-vision.html">the Deep Learning course, Phase 4 (3D vision basics)</span>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://www.open3d.org/docs/release/tutorial/pipelines/icp_registration.html" target="_blank" rel="noopener">Open3D ICP registration tutorial</a>. Point-to-point and point-to-plane, with pictures.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2209.15397" target="_blank" rel="noopener">KISS-ICP: In Defense of Point-to-Point ICP</a>. A readable case for simplicity.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/UZ-SLAMLab/ORB_SLAM3" target="_blank" rel="noopener">ORB-SLAM3 on GitHub</a>. The reference visual-inertial SLAM system.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Two centred point sets give S<sub>xx</sub> = 3, S<sub>yy</sub> = 3, S<sub>xy</sub> = 0, S<sub>yx</sub> = 0. What rotation does the 2D align step return?</div>
+    <div class="opts"><button class="opt" data-ok>0° (no rotation)</button><button class="opt">45°</button><button class="opt">90°</button></div>
+    <div class="explain">θ = atan2(S<sub>xy</sub> − S<sub>yx</sub>, S<sub>xx</sub> + S<sub>yy</sub>) = atan2(0, 6) = <b>0°</b>. The centred coordinates already line up; only a shift remains (difference of the centroids).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your robot's ICP odometry is great in the lab but in a busy station hall it reports the robot drifting sideways while it's standing still. Most likely cause and fix?</div>
+    <div class="opts"><button class="opt">The lidar's range is too long; shorten it</button><button class="opt" data-ok>Moving people are being matched as if they were static walls; cap the match distance, use a robust kernel, or filter dynamic points</button><button class="opt">The SVD is numerically unstable; switch to Euler angles</button></div>
+    <div class="explain">Crowds are outliers that appear in one scan and not the next, or move between scans. Every one gets a nearest neighbour and pulls the answer. A max correspondence distance and robust kernels (as in KISS-ICP) limit their pull; removing points classified as people helps further.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A 250 g indoor drone, no GPS, must map a warehouse. Which setup fits best?</div>
+    <div class="opts"><button class="opt">A spinning 3D lidar with LIO-SAM</button><button class="opt" data-ok>Stereo or fisheye cameras + IMU with visual-inertial SLAM (ORB-SLAM3 style)</button><button class="opt">2D lidar with slam_toolbox</button></div>
+    <div class="explain">A 3D lidar alone can weigh more than the whole drone. Cameras and an IMU weigh grams, work in 3D, and give place recognition for loop closure. slam_toolbox assumes a robot moving on a flat floor with a horizontal 2D lidar.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>ICP: match each point to its nearest neighbour, solve the best rigid motion in closed form (SVD), repeat.</li>
+      <li>2D shortcut: θ = atan2(S<sub>xy</sub> − S<sub>yx</sub>, S<sub>xx</sub> + S<sub>yy</sub>), t = centroid<sub>B</sub> − R centroid<sub>A</sub>.</li>
+      <li>Needs a good starting guess (local minima) and a max match distance (outliers); corridors make it slide.</li>
+      <li>Systems: LOAM (edges/planes), LIO-SAM (lidar + IMU factor graph), KISS-ICP (simple, few parameters), Cartographer (unmaintained), slam_toolbox (ROS 2 default choice), ORB-SLAM2/3 (cameras, GPLv3).</li>
+      <li>Waymo matches lidar to prior maps; drones use cameras + IMU; Tesla hasn't published a SLAM system.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/sim.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = (v, d) => MX.fmt(v, d == null ? 1 : d);
+  document.querySelectorAll("[data-open]").forEach(b => (b.onclick = () => $(b.dataset.open).classList.add("open")));
+
+  // ---------- scans (shared) ----------
+  const ROOM = [0, 0, 12, 8];
+  const OB = [{ type: "rect", x: 8, y: 5, w: 4, h: 3 }, { type: "circle", x: 4, y: 5.5, r: 0.6 }, { type: "rect", x: 2, y: 0, w: 1.2, h: 1.2 }, { type: "rect", x: 9.5, y: 1.2, w: 0.8, h: 0.8 }];
+  const PEOPLE = [{ type: "circle", x: 7.6, y: 4.2, r: 0.3 }, { type: "circle", x: 5.2, y: 4.0, r: 0.3 }, { type: "circle", x: 7.3, y: 2.2, r: 0.3 }, { type: "circle", x: 6.2, y: 5.0, r: 0.3 }];
+  const PA = { x: 5.5, y: 2.8, th: 0 }, PB = { x: 6.3, y: 3.4, th: 0.25 }, TTRUE = [0.8, 0.6, 0.25];
+  function scanPts(pose, rng, extra) {
+    return Sim.lidar(OB.concat(extra || []), pose, { beams: 180, range: 15, noise: 0.01, rng, bounds: ROOM }).filter(b => b.hit).map(b => { const a = b.a - pose.th; return [b.r * Math.cos(a), b.r * Math.sin(a)]; });
+  }
+  const rng = Sim.rng(1), TGT = scanPts(PA, rng), SRC = scanPts(PB, rng), SRCP = scanPts(PB, Sim.rng(2), PEOPLE);
+  const tf = (T, p) => { const c = Math.cos(T[2]), s = Math.sin(T[2]); return [c * p[0] - s * p[1] + T[0], s * p[0] + c * p[1] + T[1]]; };
+  function match(src, tgt, T, maxd) {
+    const pairs = [];
+    for (const p of src) { const q = tf(T, p); let bd = 1e18, bi = -1; for (let i = 0; i < tgt.length; i++) { const d = (tgt[i][0] - q[0]) ** 2 + (tgt[i][1] - q[1]) ** 2; if (d < bd) { bd = d; bi = i; } } pairs.push({ q, t: tgt[bi], d: Math.sqrt(bd), use: Math.sqrt(bd) <= maxd }); }
+    return pairs;
+  }
+  function align(pairs, T) {
+    const P = pairs.filter(p => p.use); if (P.length < 3) return null;
+    let mx = 0, my = 0, nx = 0, ny = 0; P.forEach(({ q, t }) => { mx += q[0]; my += q[1]; nx += t[0]; ny += t[1]; }); const n = P.length; mx /= n; my /= n; nx /= n; ny /= n;
+    let Sxx = 0, Sxy = 0, Syx = 0, Syy = 0; P.forEach(({ q, t }) => { const a = q[0] - mx, b = q[1] - my, c = t[0] - nx, d = t[1] - ny; Sxx += a * c; Sxy += a * d; Syx += b * c; Syy += b * d; });
+    const th = Math.atan2(Sxy - Syx, Sxx + Syy), c = Math.cos(th), s = Math.sin(th), tx = nx - (c * mx - s * my), ty = ny - (s * mx + c * my);
+    return [c * T[0] - s * T[1] + tx, s * T[0] + c * T[1] + ty, Sim.wrap(T[2] + th)];
+  }
+  const errs = T => [Math.hypot(T[0] - TTRUE[0], T[1] - TTRUE[1]), Math.abs(MX.deg(Sim.wrap(T[2] - TTRUE[2])))];
+  function drawScene(w, src, T, pairs, people) {
+    w.clear();
+    w.rect(ROOM[0] - PA.x, ROOM[1] - PA.y, 12, 8, { stroke: "--line", width: 1, dash: [4, 4] });
+    if (pairs) pairs.forEach(p => w.line([p.q, p.t], { color: "--c-un", width: 1, alpha: p.use ? 0.7 : 0.12 }));
+    TGT.forEach(p => w.dot(p, { color: "--c-mp", r: 2.6 }));
+    src.forEach(p => w.dot(tf(T, p), { color: "--c-se", r: 2.6 }));
+    if (people) PEOPLE.forEach(o => { const c = Math.cos(-PA.th); w.circle(o.x - PA.x, o.y - PA.y, 0.3, { stroke: "--c-ag", width: 1.5, alpha: 0.5 }); });
+    w.robot({ x: 0, y: 0, th: 0 }, { color: "--c-mp", r: 0.25 });
+    w.robot({ x: T[0], y: T[1], th: T[2] }, { color: "--c-se", r: 0.25 });
+  }
+
+  // ---------- Playground 1: step-by-step ICP ----------
+  let T1 = null, it1 = 0, pairs1 = null, phase1 = 0, firstOk = null;
+  const start1 = () => [+$("iX").value, +$("iY").value, MX.rad(+$("iTh").value)];
+  const I = new Sim($("icp"), { xRange: [-6.5, 9.5], yRange: [-3.4, 5.6] });
+  I.render(w => { if (!T1) return; drawScene(w, SRC, T1, phase1 === 1 ? pairs1 : null, false); });
+  function stats1(done) {
+    const [pe, ae] = errs(T1);
+    $("iIt").textContent = it1; $("iPE").textContent = fmt(pe * 100, 0) + " cm"; $("iAE").textContent = fmt(ae, 1) + "°";
+    const p = pairs1 || match(SRC, TGT, T1, 1e9); $("iD").textContent = fmt(MX.mean(p.map(q => q.d)) * 100, 0) + " cm";
+    if (firstOk == null && pe < 0.08 && ae < 1.5) firstOk = it1;
+    const startErr = Math.abs(+$("iTh").value - MX.deg(TTRUE[2]));
+    if (firstOk != null) $("iVerdict").innerHTML = firstOk <= 8 ? `<span class="badge-win">✅ Locked on in ${firstOk} iterations</span> <span class="muted">A good starting guess is half the work.</span>` : `<span class="badge-lose">Converged, but it took ${firstOk} iterations</span> <span class="muted">Start closer to the real motion.</span>`;
+    else if (done || it1 > 25) $("iVerdict").innerHTML = `<span class="badge-lose">Stuck ${fmt(pe, 2)} m and ${fmt(ae, 0)}° off: a local minimum</span> <span class="muted">(the start was ${fmt(startErr, 0)}° from the truth)</span>`;
+    else $("iVerdict").innerHTML = "";
+  }
+  function step1() { // two half-steps: show matches, then align
+    if (phase1 === 0) { pairs1 = match(SRC, TGT, T1, 1e9); phase1 = 1; }
+    else { const n = align(pairs1, T1); if (n) T1 = n; it1++; phase1 = 0; pairs1 = null; }
+    stats1(); I.render();
+  }
+  function reset1() { I.stop(); T1 = start1(); it1 = 0; pairs1 = null; phase1 = 0; firstOk = null; $("iRun").textContent = "▶ Run to convergence"; stats1(); I.render(); }
+  $("iStep").onclick = () => { I.stop(); step1(); };
+  $("iRun").onclick = () => {
+    if (I.running) { I.stop(); $("iRun").textContent = "▶ Run to convergence"; return; }
+    $("iRun").textContent = "⏸ Pause"; let t = 0;
+    I.run(dt => { t += dt; if (t < 0.12) return true; t = 0; const old = T1.slice(); step1(); if (phase1 === 0 && Math.hypot(T1[0] - old[0], T1[1] - old[1]) + Math.abs(T1[2] - old[2]) < 1e-5 || it1 >= 60) { $("iRun").textContent = "▶ Run to convergence"; stats1(true); return false; } });
+  };
+  $("iReset").onclick = reset1;
+  ["iTh", "iX", "iY"].forEach(id => ($(id).oninput = () => { $("iThV").textContent = $("iTh").value + "°"; $("iXV").textContent = fmt(+$("iX").value, 2) + " m"; $("iYV").textContent = fmt(+$("iY").value, 2) + " m"; reset1(); }));
+  $("iTh").oninput();
+
+  // ---------- Playground 2: outliers and the match distance ----------
+  const MAXD = [0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 1, 1.25, 1.5, 2, 2.5, 3, 4, 5, 6, 8, 10, 12, 15, 20, Infinity];
+  let T2 = [0, 0, 0], pairs2 = null;
+  const O = new Sim($("icp2"), { xRange: [-6.5, 9.5], yRange: [-3.4, 5.6] });
+  O.render(w => drawScene(w, $("oPeople").checked ? SRCP : SRC, T2, pairs2, $("oPeople").checked));
+  const lab2 = () => { const v = MAXD[+$("oMax").value]; $("oMaxV").textContent = v === Infinity ? "no limit" : fmt(v, 2) + " m"; };
+  $("oMax").oninput = () => { lab2(); T2 = [0, 0, 0]; pairs2 = null; O.render(); ["oIt", "oN", "oPE", "oAE"].forEach(id => ($(id).textContent = "–")); $("oVerdict").innerHTML = ""; };
+  $("oPeople").onchange = $("oMax").oninput; $("oCoarse").onchange = $("oMax").oninput;
+  $("oRun").onclick = () => {
+    const src = $("oPeople").checked ? SRCP : SRC, coarse = $("oCoarse").checked, md = MAXD[+$("oMax").value];
+    T2 = [0, 0, 0]; let k = 0, t = 0;
+    O.run(dt => {
+      t += dt; if (t < 0.06) return true; t = 0;
+      const lim = coarse ? Math.max(0.5, 3 * Math.pow(0.8, k)) : md;
+      pairs2 = match(src, TGT, T2, lim); const n = align(pairs2, T2); k++;
+      const old = T2; if (n) T2 = n;
+      const [pe, ae] = errs(T2);
+      $("oIt").textContent = k; $("oN").textContent = pairs2.filter(p => p.use).length + " / " + pairs2.length; $("oPE").textContent = fmt(pe * 100, 0) + " cm"; $("oAE").textContent = fmt(ae, 1) + "°";
+      const done = !n || k >= 60 || (Math.hypot(T2[0] - old[0], T2[1] - old[1]) + Math.abs(T2[2] - old[2]) < 1e-5 && (!coarse || lim <= 0.5));
+      if (done) {
+        const ok = pe < 0.08 && ae < 1.5;
+        $("oVerdict").innerHTML = !n ? `<span class="badge-lose">Fewer than 3 pairs within the limit: ICP can't even start</span>` : ok ? (src === SRCP ? `<span class="badge-win">✅ ${fmt(pe * 100, 0)} cm and ${fmt(ae, 1)}° with people in the scan</span>` : `<span class="muted">${fmt(pe * 100, 0)} cm: easy without people. Tick them back on.</span>`) : `<span class="badge-lose">${fmt(pe * 100, 0)} cm, ${fmt(ae, 1)}° off</span> <span class="muted">${md === Infinity && !coarse ? "Every outlier is voting." : "Try another limit."}</span>`;
+        return false;
+      }
+    });
+  };
+  lab2(); O.render();
+
+  // ---------- Playground 3: pick the SLAM system ----------
+  const Q = [
+    { b: "🏭 A warehouse robot running ROS 2 and Nav2, with a 2D lidar at shin height and wheel odometry. It needs a floor map once, then localization every day.", o: ["slam_toolbox", "ORB-SLAM3 (monocular)", "LOAM"], a: 0, e: "slam_toolbox is built for exactly this: 2D lidar pose-graph SLAM, a saved map, then localization mode, and it's the SLAM library the Nav2 docs recommend. ORB-SLAM3 needs a camera; LOAM needs a 3D lidar." },
+    { b: "🛸 A 300 g inspection drone flying inside a GPS-denied boiler room, with a stereo camera pair and an IMU.", o: ["LIO-SAM", "ORB-SLAM3 in stereo-inertial mode", "slam_toolbox"], a: 1, e: "Cameras + IMU are what a small drone can carry, and ORB-SLAM3's visual-inertial mode handles fast 3D motion with loop closure. LIO-SAM needs a 3D lidar (too heavy); slam_toolbox assumes a flat floor and a 2D lidar." },
+    { b: "🚜 An outdoor farm robot with a 32-beam 3D spinning lidar, an IMU and RTK GPS, driving bumpy rows.", o: ["LIO-SAM", "ORB-SLAM2 (RGB-D)", "Cartographer 2D"], a: 0, e: "LIO-SAM fuses lidar, IMU pre-integration (which de-skews scans on bumpy ground) and GPS as factors in one graph. RGB-D cameras struggle in sunlight and at range; a 2D map can't represent rows on slopes." },
+    { b: "🔬 You need lidar odometry today, from several different lidar models in a research fleet, with as little parameter tuning as possible.", o: ["Write your own LOAM", "KISS-ICP", "ORB-SLAM3"], a: 1, e: "KISS-ICP's whole point is few parameters that rarely need tuning across sensors: pip install and run. It's odometry only, so add a back-end (e.g. a pose graph) if you need loop closure." },
+    { b: "📱 A handheld RGB-D camera scanning an office room for an AR app prototype (non-commercial research).", o: ["ORB-SLAM2 with RGB-D input", "LIO-SAM", "slam_toolbox"], a: 0, e: "ORB-SLAM2 supports RGB-D directly, with loop closing and relocalization. For a commercial product, remember ORB-SLAM2/3 are GPLv3: check the licence before shipping." },
+  ];
+  let qi = 0, qs = 0, qa = false;
+  function showQ() {
+    const q = Q[qi]; qa = false;
+    $("cQ").textContent = qi + 1 + " / " + Q.length; $("cS").textContent = qs; $("cBrief").textContent = q.b; $("cFb").textContent = "";
+    $("cOpts").innerHTML = q.o.map((o, i) => `<button data-i="${i}">${o}</button>`).join("");
+    $("cOpts").querySelectorAll("button").forEach(b => (b.onclick = () => {
+      if (qa) return; qa = true; const i = +b.dataset.i, ok = i === q.a; if (ok) qs++;
+      b.classList.add(ok ? "right" : "wrong"); if (!ok) $("cOpts").children[q.a].classList.add("right");
+      $("cFb").innerHTML = (ok ? "✅ " : "❌ ") + q.e; $("cS").textContent = qs;
+      if (qi === Q.length - 1) $("cVerdict").innerHTML = qs === Q.length ? `<span class="badge-win">🏆 5 / 5: hire this engineer</span>` : `<span class="badge-lose">${qs} / 5</span> <span class="muted">Match the sensors first, then the environment, then the licence.</span>`;
+    }));
+  }
+  $("cNext").onclick = () => { if (qi < Q.length - 1) { qi++; showQ(); } };
+  $("cReset").onclick = () => { qi = 0; qs = 0; $("cVerdict").innerHTML = ""; showQ(); };
+  showQ();
+})();
+</script>
+</body>
+</html>

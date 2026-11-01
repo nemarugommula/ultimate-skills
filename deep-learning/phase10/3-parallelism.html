@@ -1,0 +1,531 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>10.3 Parallelism: DDP, FSDP/ZeRO, tensor and pipeline · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .membar { position: relative; height: 34px; border-radius: 8px; background: var(--panel); overflow: hidden; margin: 10px 0 4px; border: 1px solid var(--line); }
+  .membar > i { position: absolute; top: 0; bottom: 0; display: block; }
+  .membar .cap { position: absolute; top: -2px; bottom: -2px; width: 3px; background: var(--text); }
+  .memleg { display: flex; flex-wrap: wrap; gap: 12px; font-size: .82rem; color: var(--muted); }
+  .memleg span::before { content: ""; display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 5px; background: var(--sw); }
+  canvas.pipe { width: 100%; height: 250px; display: block; background: var(--bg2); border-radius: 10px; border: 1px solid var(--line); }
+  .tpgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; }
+  .tpcard { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bg2); font-family: var(--mono); font-size: .85rem; }
+  .tpcard h4 { margin: 0 0 4px; font-family: var(--font); font-size: .9rem; }
+  select.btn { padding: 3px 8px; }
+</style>
+</head>
+<body data-lesson="d10-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 10 · Lesson 3</div>
+  <h1>Parallelism: DDP, FSDP/ZeRO, tensor and pipeline</h1>
+  <p class="subtitle">A 7-billion-parameter model doesn't fit on the biggest single GPU you can rent, once you count what training really stores. Here are the four ways to split the work across many GPUs, what each one splits, and what it costs in communication.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Mixed precision with Adam stores <b>16 bytes per parameter</b>: 2 (bf16 <span class="w">weight</span>) + 2 (bf16 <span class="gr">gradient</span>) + 4 (fp32 master) + 8 (Adam's two moments) (Lesson 10.2).</li>
+      <li>Backprop needs the forward pass's <span class="ac">activations</span>, so they're kept in memory until the backward pass uses them (Lesson 1.2).</li>
+      <li>A transformer is a stack of identical blocks, each mostly matmuls (Lesson 6.4; FLOPs vs bandwidth: 10.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Meta pre-trained Llama 3 405B on up to <b>16,384 H100 GPUs</b> at once. Each GPU has 80 GB. Their paper describes splitting the model four different ways at the same time (“4D parallelism”): at the 8K-token stage, 8-way tensor, 16-way pipeline and 128-way data parallelism.</p>
+    <p>Why so complicated? Do the arithmetic for a much smaller 7B model: 7 × 10⁹ parameters × 16 bytes = <b>112 GB</b> before a single activation is stored. It doesn't fit on one 80 GB GPU, and copying it onto 8 GPUs doesn't help either: each copy is still 112 GB.</p>
+    <p><b>So how do you train a model bigger than any one GPU?</b> By the end you'll plan the memory of a 70B training run yourself and know which split to reach for first.</p>
+  </div>
+
+  <h2>Numbers first: where the memory goes</h2>
+  <table>
+    <tr><th>Per parameter (mixed precision + Adam)</th><th>Bytes</th><th>7B model</th><th>70B model</th></tr>
+    <tr><td><span class="w">Weights</span>, bf16 (used in forward and backward)</td><td>2</td><td>14 GB</td><td>140 GB</td></tr>
+    <tr><td><span class="gr">Gradients</span>, bf16</td><td>2</td><td>14 GB</td><td>140 GB</td></tr>
+    <tr><td>Optimizer: fp32 master copy + Adam <i>m</i> + Adam <i>v</i></td><td>4 + 4 + 4 = 12</td><td>84 GB</td><td>840 GB</td></tr>
+    <tr><td><b>Model states total</b></td><td><b>16</b></td><td><b>112 GB</b></td><td><b>1,120 GB</b></td></tr>
+    <tr><td><span class="ac">Activations</span> (one 4,096-token sequence, no checkpointing)</td><td>depends on shape</td><td>≈ 18 GB</td><td>≈ 91 GB</td></tr>
+  </table>
+  <p>The activation numbers use Korthikanti et al.'s count of about <b>34 · s · h bytes per layer</b> for a sequence of s tokens and hidden size h (their formula's attention-score term is left out because FlashAttention doesn't store the scores). For the 7B shape (32 layers, h = 4,096): 34 × 4,096 × 4,096 × 32 ≈ 18 GB.</p>
+  <p>Three things can be split: the <b>data</b> (each GPU sees different examples), the <b>model states</b> (each GPU stores a slice) and the <b>layers' math</b> (each GPU computes part of a layer or some of the layers). Every technique in this lesson is one of those splits plus the communication it forces.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Parallelism trades <b>memory and compute</b> for <b>communication</b>. Data parallelism copies the model and syncs gradients; sharding (ZeRO/FSDP) stops the copies and gathers weights on demand; tensor parallelism splits each matmul and talks inside every layer; pipeline parallelism splits the stack of layers and pays in idle time.
+  </div>
+
+  <h2>1. Data parallelism (DDP): many copies, one average</h2>
+  <p>Give each of N GPUs a full copy of the model and a different slice of the batch. Each computes its own gradients, then all GPUs <b>average</b> their gradients with an operation called <b>all-reduce</b>, so every copy takes exactly the same step and stays identical. PyTorch's <code>DistributedDataParallel</code> (DDP) does this, overlapping the all-reduce with the backward pass in “buckets” so communication hides behind compute.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the cost of one all-reduce</span>
+    <p>7B model, 8 GPUs, bf16 gradients: 14 GB of gradients per GPU. The standard <b>ring all-reduce</b> passes chunks around a ring of GPUs; each GPU sends (and receives) about 2 × (N − 1)/N of the data:</p>
+    <div class="calc">2 × 14 GB × 7/8 = <b>24.5 GB sent per GPU, every step</b></div>
+    <p>At the H100's listed NVLink bandwidth (900 GB/s) that's roughly 30 ms; across a 50 GB/s network link it would be about half a second per step. That's why the GPUs inside one server, wired with NVLink, are so much easier to parallelize over than GPUs in different racks.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">DDP (distributed data parallel)</span></span>
+    <ol>
+      <li><b>The problem before</b> One GPU processes maybe a few thousand tokens per second on a 7B model; a 1-trillion-token run would take decades on one GPU.</li>
+      <li><b>What people tried</b> A single process driving several GPUs (PyTorch's old <code>DataParallel</code>), which bottlenecks on one Python process and one GPU gathering everything; parameter servers that collect gradients centrally.</li>
+      <li><b>Why this works</b> Examples in a batch are independent, so N GPUs can each do 1/N of the batch. Averaging gradients across GPUs gives exactly the gradient of the full batch, so training is mathematically the same as one big GPU. One process per GPU and overlapped bucketed all-reduces keep it near-linear.</li>
+      <li><b>What it costs, when it fails</b> Every GPU stores the <b>whole</b> model state: 112 GB for 7B, so DDP alone can't even start. The all-reduce moves about 2× the gradient size per step. The global batch grows with N, which may need learning-rate changes (Lesson 1.7).</li>
+      <li><b>What refined it</b> Sharding the redundant copies (ZeRO/FSDP, next). Gradient accumulation when the batch must grow without more GPUs.</li>
+    </ol>
+  </div>
+
+  <h2>2. ZeRO and FSDP: stop storing N copies of everything</h2>
+  <p>With DDP, 8 GPUs hold 8 identical copies of the optimizer states, gradients and weights. ZeRO (“Zero Redundancy Optimizer”, Rajbhandari et al., 2019) removes the copies in three stages. Each GPU keeps only its 1/N <b>shard</b> and fetches the rest just in time.</p>
+  <table>
+    <tr><th>Stage</th><th>Shards</th><th>Bytes per parameter per GPU (N GPUs)</th><th>7B on 8 GPUs</th><th>Extra communication vs DDP</th></tr>
+    <tr><td>DDP (ZeRO-0)</td><td>nothing</td><td>16</td><td>112 GB</td><td>–</td></tr>
+    <tr><td>ZeRO-1</td><td>optimizer states</td><td>4 + 12/N</td><td>38.5 GB</td><td>none</td></tr>
+    <tr><td>ZeRO-2</td><td>+ gradients</td><td>2 + 14/N</td><td>26.3 GB</td><td>none</td></tr>
+    <tr><td>ZeRO-3 = FSDP</td><td>+ weights</td><td>16/N</td><td>14 GB</td><td>1.5× (weights are all-gathered for forward and backward)</td></tr>
+  </table>
+  <p class="muted">Model states only. The ZeRO paper's own example: a 7.5B model needs 120 GB per GPU with plain data parallelism and 1.9 GB with all three stages on 64 GPUs.</p>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a book club with one copy of each chapter</span>
+    <p>DDP is eight friends each buying the whole encyclopedia. ZeRO-3 is the club buying one copy and giving each friend a few chapters. When the group reads chapter 12, its owner photocopies it for everyone (all-gather), they read, and the copies are thrown away. More passing of paper, a lot less shelf space.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">ZeRO / FSDP (sharded data parallel)</span></span>
+    <ol>
+      <li><b>The problem before</b> With DDP, memory per GPU doesn't shrink as you add GPUs: 16 bytes per parameter on every one. The ZeRO paper notes that a 1.5B model already needs at least 24 GB of model states, though its bf16 weights are only 3 GB.</li>
+      <li><b>What people tried</b> Model parallelism (splitting layers, below), which needs model code changes; offloading to CPU memory.</li>
+      <li><b>Why this works</b> Each GPU only <i>updates</i> its own shard, so it only needs that shard's optimizer states (stage 1) and reduced gradients (stage 2) for free: the all-reduce becomes a reduce-scatter plus all-gather with the same total volume. Stage 3 also shards the weights and all-gathers each layer just before it's used, then frees it. Memory per GPU becomes 16Ψ/N: add GPUs, fit bigger models.</li>
+      <li><b>What it costs, when it fails</b> Stage 3 moves about 1.5× DDP's data (the paper's 3Ψ vs 2Ψ), and the all-gathers sit on the critical path unless prefetched. Activations are <i>not</i> sharded: they still grow with sequence length and batch (use checkpointing, below). Across slow networks the traffic hurts.</li>
+      <li><b>What refined it</b> PyTorch FSDP (2023) and FSDP2's <code>fully_shard</code>, which shards each parameter on dim 0 as a DTensor; ZeRO-Offload, which puts optimizer states in CPU RAM and trained 13B parameters on one V100; hybrid sharding (shard within a node, replicate across nodes).</li>
+    </ol>
+  </div>
+
+  <h2>3. Tensor parallelism: split every matmul</h2>
+  <p>Sharding still runs each layer on one GPU (with gathered weights). If a single layer is too big or too slow, split the matmul itself. Megatron-LM (Shoeybi et al., 2019) found a neat split for the transformer MLP: cut the first weight matrix by <b>columns</b> and the second by <b>rows</b>. Each GPU then computes its half of the hidden layer independently (the GELU works per column), and the two halves only meet once, in a single all-reduce at the end.</p>
+  <p class="predict">🔮 <b>Predict:</b> if you split a weight matrix by <b>rows</b> across 2 GPUs, does each GPU end up with half of the outputs, or with all outputs but only part of each sum?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Split a matmul across 2 GPUs</span>
+    <p class="hint">The input <span class="x">x</span> = [1, 2, 3, 4] times a 4 × 4 <span class="w">weight</span> W. Choose how W is split and see what each GPU computes and which communication step recombines it.</p>
+    <div class="goals"><span class="goal" id="gCol">🎯 Column split: concatenate</span><span class="goal" id="gRow">🎯 Row split: sum partials</span><span class="goal" id="gMeg">🎯 Megatron MLP: one all-reduce</span></div>
+    <div class="controls"><span class="seg" id="tpSeg"><button data-v="none" class="on">One GPU</button><button data-v="col">Split by columns</button><button data-v="row">Split by rows</button><button data-v="meg">Megatron MLP (column, then row)</button></span></div>
+    <div class="tpgrid" id="tpOut"></div>
+    <p class="hint" id="tpMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the column split gives each GPU two <i>complete</i> outputs (gather them to get all four). The row split gives each GPU all four outputs but only <i>part</i> of each sum: an all-reduce adds them. Megatron chains the two so the nonlinearity happens between them on local data, and only the final row-split result needs one all-reduce, in the forward pass (one more in backward).</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Tensor parallelism (Megatron-style)</span></span>
+    <ol>
+      <li><b>The problem before</b> Sharding stores a slice, but each layer's full weights and activations still pass through one GPU at a time; the activations of one huge layer, or the latency of one huge matmul, can be too much.</li>
+      <li><b>What people tried</b> Hand-partitioned models; general “mesh” frameworks that were hard to use with existing code.</li>
+      <li><b>Why this works</b> Column-then-row splitting needs only one all-reduce per MLP (and per attention block, splitting by heads) per pass, and each GPU holds 1/t of the weights <i>and</i> of the activations (with sequence parallelism). Megatron-LM trained an 8.3B model on 512 GPUs at 76% scaling efficiency with only a few added communication ops in PyTorch.</li>
+      <li><b>What it costs, when it fails</b> The all-reduces happen inside <b>every layer</b>, on the critical path, so tensor parallelism needs very fast links: in practice it stays within one server's NVLink (t ≤ 8). Small per-GPU matmuls also lower arithmetic intensity (Lesson 10.1).</li>
+      <li><b>What refined it</b> Sequence parallelism (shards LayerNorm and dropout activations along the sequence), context parallelism for very long sequences, and combining TP with pipeline and data parallelism (3D, below).</li>
+    </ol>
+  </div>
+
+  <h2>4. Pipeline parallelism: an assembly line of layers</h2>
+  <p>Put layers 1–20 on GPU 1, 21–40 on GPU 2, and so on. Only the activations at the boundaries travel between GPUs, so it works across slower links. The problem: GPU 4 has nothing to do until GPU 1 to 3 finish their part, and during backward the order reverses. That idle time is the <b>pipeline bubble</b>. GPipe (Huang et al., 2018) shrinks it by cutting each batch into M <b>micro-batches</b> that flow through like cars on an assembly line.</p>
+  <p class="predict">🔮 <b>Predict:</b> 4 stages, 1 micro-batch: what fraction of the time is each GPU idle? Then slide the micro-batches up. Does the bubble ever reach 0?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The pipeline bubble</span>
+    <p class="hint">Each row is a GPU (pipeline stage); time runs left to right. Purple blocks are forward passes, pink are backward passes (twice as long), numbers are micro-batch ids, empty cells are idle. Press play to watch the schedule fill in.</p>
+    <div class="goals"><span class="goal" id="gB10">🎯 Bubble under 10%</span><span class="goal" id="g1f1b">🎯 Same bubble, far less memory (1F1B with M ≥ 4 × stages)</span></div>
+    <div class="controls">
+      <span class="seg" id="pSched"><button data-v="gpipe" class="on">GPipe (all forward, then all backward)</button><button data-v="1f1b">1F1B (one forward, one backward)</button></span>
+    </div>
+    <div class="controls">
+      <label>stages p <input type="range" id="pP" min="2" max="8" step="1" value="4"> <b class="mono" id="pPV"></b></label>
+      <label>micro-batches M <input type="range" id="pM" min="1" max="32" step="1" value="1"> <b class="mono" id="pMV"></b></label>
+      <button class="btn primary" id="pPlay">▶ Play</button>
+    </div>
+    <canvas class="pipe" id="pCan"></canvas>
+    <div class="stat-row">
+      <div class="stat">bubble (idle share) <b id="pBub" class="dead">–</b></div>
+      <div class="stat">formula (p − 1)/(M + p − 1) <b id="pForm">–</b></div>
+      <div class="stat">peak micro-batches of activations held by a GPU <b id="pPeak" class="ac">–</b></div>
+    </div>
+    <p class="hint" id="pMsg"></p>
+  </div>
+  <p><b>What you should see:</b> with 4 stages and 1 micro-batch, each GPU is idle <b>75%</b> of the time. With 16 micro-batches the bubble is 16%; you need 27 to get it to 10%. It never reaches zero: filling and draining the line always costs (p − 1) slots. Both schedules have the <i>same</i> bubble, but GPipe holds the activations of all M micro-batches at once, while 1F1B starts backward passes early and never holds more than p. GPipe's paper found the bubble negligible once M ≥ 4 × stages, partly because recomputation overlaps it.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Pipeline parallelism (GPipe, 1F1B)</span></span>
+    <ol>
+      <li><b>The problem before</b> Tensor parallelism needs NVLink-class speed and stops at one server (8 GPUs). A model whose layers need 16+ GPUs' worth of memory must cross slower network links.</li>
+      <li><b>What people tried</b> Naive model parallelism: layers on different GPUs, one batch at a time. With p stages, each GPU is busy only 1/p of the time.</li>
+      <li><b>Why this works</b> Only boundary activations cross GPUs (a few MB per micro-batch), so slow links are fine. Micro-batches keep several stages busy at once; the idle share falls to (p − 1)/(M + p − 1). 1F1B (from PipeDream, 2018) interleaves forward and backward so each stage frees activations early.</li>
+      <li><b>What it costs, when it fails</b> The bubble never vanishes. More micro-batches need a larger global batch. Stages must be balanced (the last stage also computes the loss and output layer; Llama 3's paper calls this out). Debugging a pipeline is notoriously painful.</li>
+      <li><b>What refined it</b> Interleaved schedules (each GPU holds several smaller chunks, shrinking the bubble), zero-bubble schedules, and combining PP with TP and DP.</li>
+    </ol>
+  </div>
+
+  <h2>5. Activation checkpointing: forget, then recompute</h2>
+  <p>All of the above split model states. Activations still grow with layers × sequence length × batch. <b>Activation checkpointing</b> (also called gradient checkpointing or rematerialization) keeps only each layer's <i>input</i> during the forward pass and throws away everything inside. During backward, it reruns that layer's forward to get the activations back, just in time.</p>
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Activation checkpointing</span></span>
+    <ol>
+      <li><b>The problem before</b> A 7B model with one 4,096-token sequence stores about 18 GB of activations; longer sequences or bigger batches grow it linearly. Model-state sharding doesn't touch it.</li>
+      <li><b>What people tried</b> Smaller batches and shorter sequences (worse training), offloading activations to CPU (slow).</li>
+      <li><b>Why this works</b> Chen et al. (2016) showed you can train an n-layer network with O(√n) memory for the cost of one extra forward pass per batch. Per transformer layer, you store just its 2·s·h-byte input instead of ≈ 34·s·h bytes: for our 7B shape, 18 GB becomes under 2 GB.</li>
+      <li><b>What it costs, when it fails</b> Recomputing the forward costs about one extra forward pass. Since backward is about 2× forward, that's roughly 33% more compute. Code with randomness (dropout) must replay the same random numbers, which frameworks handle.</li>
+      <li><b>What refined it</b> Selective recomputation (recompute only the cheap but memory-hungry parts, like attention internals: Korthikanti et al.), FlashAttention (never stores the scores), and offloading checkpoints to CPU.</li>
+    </ol>
+  </div>
+
+  <h2>Put it together: plan a training run</h2>
+  <p class="predict">🔮 <b>Predict:</b> can full training (Adam, 16 bytes per parameter) of a <b>70B</b> model fit on one server of 8 × 80 GB GPUs with every trick turned on? Work it out (16 × 70 ÷ 8) before you touch the planner.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Memory planner</span>
+    <p class="hint">Choose a model, a job, a number of GPUs and how to split. The bar is memory <b>per GPU</b> against an 80 GB H100 (black line); we call it a fit at ≤ 72 GB, leaving 10% headroom for buffers. Sequence length 4,096 tokens, one sequence per GPU at a time. Estimates, not a promise: real frameworks add buffers and fragmentation.</p>
+    <div class="goals"><span class="goal" id="gM7">🎯 Full 7B training on 8 GPUs</span><span class="goal" id="gM70no">🎯 Show 70B full training can't fit on 8 GPUs</span><span class="goal" id="gM70">🎯 Fit a 70B job on 8 × 80 GB</span><span class="goal" id="gM16">🎯 Full 70B training on only 16 GPUs</span></div>
+    <div class="controls">
+      <span class="seg" id="mModel"><button data-v="1.3B">1.3B</button><button data-v="7B" class="on">7B</button><button data-v="13B">13B</button><button data-v="70B">70B</button><button data-v="405B">405B</button></span>
+      <span class="seg" id="mJob"><button data-v="train" class="on">Full training (Adam)</button><button data-v="offload">+ optimizer offload to CPU</button><button data-v="lora">LoRA fine-tune</button><button data-v="infer">Inference only</button></span>
+    </div>
+    <div class="controls">
+      <label>GPUs <select class="btn" id="mN"><option>1</option><option>2</option><option>4</option><option selected>8</option><option>16</option><option>32</option><option>64</option><option>128</option><option>256</option><option>512</option><option>1024</option></select></label>
+      <label>sharding <span class="seg" id="mZero"><button data-v="0" class="on">DDP</button><button data-v="1">ZeRO-1</button><button data-v="2">ZeRO-2</button><button data-v="3">ZeRO-3 / FSDP</button></span></label>
+    </div>
+    <div class="controls">
+      <label>tensor parallel <span class="seg" id="mTp"><button data-v="1" class="on">1</button><button data-v="2">2</button><button data-v="4">4</button><button data-v="8">8</button></span></label>
+      <label>pipeline stages <span class="seg" id="mPp"><button data-v="1" class="on">1</button><button data-v="2">2</button><button data-v="4">4</button><button data-v="8">8</button><button data-v="16">16</button></span></label>
+      <label><input type="checkbox" id="mCk"> activation checkpointing</label>
+    </div>
+    <div class="membar" id="mBar"></div>
+    <div class="memleg"><span style="--sw:var(--c-w)">weights</span><span style="--sw:var(--c-gr)">gradients</span><span style="--sw:var(--c-at)">optimizer states</span><span style="--sw:var(--c-ac)">activations</span><span>| black line = 80 GB; bar scale 0–160 GB</span></div>
+    <div class="stat-row">
+      <div class="stat">per GPU <b id="mTot">–</b></div>
+      <div class="stat">data-parallel copies <b id="mD">–</b></div>
+      <div class="stat">gradient sync per GPU per step <b id="mComm">–</b></div>
+      <div class="stat">CPU RAM for offload <b id="mCpu">–</b></div>
+      <div class="stat">verdict <b id="mVer">–</b></div>
+    </div>
+    <p class="hint" id="mMsg"></p>
+  </div>
+  <p><b>What you should see:</b> 7B with plain DDP needs about <b>130 GB per GPU</b> on any number of GPUs. ZeRO-1 with checkpointing gets it to 40 GB; FSDP with checkpointing to 16 GB. For 70B, even FSDP across 8 GPUs leaves <b>140 GB of model states per GPU</b> (1,120 GB ÷ 8): full training simply can't fit on one 8-GPU server. What does fit on 8 × 80 GB: offloading the optimizer to CPU RAM (840 GB of it), LoRA fine-tuning (frozen 2-byte weights, Lesson 10.4 and <a href="../../ai-engineer/phase7/1-fine-tuning.html">AI Engineer 7.1</a>), or inference (17.5 GB per GPU with 8-way TP). Full 70B training needs at least 16 GPUs: try 8-way TP with 2 pipeline stages, or TP 8 with FSDP.</p>
+
+  <h3>3D parallelism, and which split to use when</h3>
+  <p>Big runs nest the splits by link speed: <b>tensor parallel inside a server</b> (NVLink), <b>pipeline across a few servers</b>, <b>data parallel (often FSDP) across everything</b>. Llama 3 405B at 8K context on 16,384 GPUs: TP 8 × PP 16 × DP 128 = 16,384, plus context parallelism for its 128K-token stage.</p>
+  <table>
+    <tr><th>Situation</th><th>Reach for</th><th>Why</th></tr>
+    <tr><td>Model fits on one GPU, want speed</td><td>DDP</td><td>Simplest, near-linear, no model changes</td></tr>
+    <tr><td>Model states don't fit, good interconnect</td><td>FSDP / ZeRO-3 (+ checkpointing)</td><td>Memory falls as 1/N with almost no code changes</td></tr>
+    <tr><td>Single layers too big or too slow; 8 GPUs with NVLink</td><td>Tensor parallel ≤ 8</td><td>Splits weights and activations; needs fast links</td></tr>
+    <tr><td>Hundreds of GPUs over slower networks</td><td>+ pipeline parallel</td><td>Only boundary activations cross nodes; keep M ≫ stages</td></tr>
+    <tr><td>Very long sequences</td><td>+ context / sequence parallel</td><td>Splits the sequence dimension of activations</td></tr>
+    <tr><td>One GPU, big model, fine-tuning</td><td>LoRA/QLoRA, offload, checkpointing</td><td>Shrink what's trained rather than splitting it</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>DDP and FSDP2 both run with <code>torchrun</code>, one process per GPU. This exact script ran on a laptop CPU with 2 processes and the <code>gloo</code> backend (on GPUs use <code>"nccl"</code> and <code>init_device_mesh("cuda", …)</code>):</p>
+<pre><code><span class="c"># torchrun --nproc_per_node=2 train.py</span>
+<span class="k">import</span> torch, torch.nn <span class="k">as</span> nn, torch.distributed <span class="k">as</span> dist
+<span class="k">from</span> torch.nn.parallel <span class="k">import</span> DistributedDataParallel <span class="k">as</span> DDP
+<span class="k">from</span> torch.distributed.fsdp <span class="k">import</span> fully_shard
+<span class="k">from</span> torch.distributed.device_mesh <span class="k">import</span> init_device_mesh
+
+dist.init_process_group(<span class="s">"gloo"</span>)
+rank, world = dist.get_rank(), dist.get_world_size()
+make = <span class="k">lambda</span>: nn.Sequential(nn.Linear(<span class="n">64</span>, <span class="n">256</span>), nn.ReLU(), nn.Linear(<span class="n">256</span>, <span class="n">1</span>))
+
+<span class="c"># DDP: full copy per rank, gradients all-reduced during backward</span>
+torch.manual_seed(<span class="n">0</span>)
+ddp = DDP(make())
+x = torch.randn(<span class="n">32</span>, <span class="n">64</span>) + rank                  <span class="c"># each rank: a different slice of data</span>
+ddp(x).pow(<span class="n">2</span>).mean().backward()
+print(<span class="s">f"rank {rank}: DDP grad[0,0] = {ddp.module[0].weight.grad[0, 0].item():.6f}"</span>)
+
+<span class="c"># FSDP2: shard each layer, then the root</span>
+mesh = init_device_mesh(<span class="s">"cpu"</span>, (world,))
+torch.manual_seed(<span class="n">0</span>)
+model = make()
+<span class="k">for</span> layer <span class="k">in</span> model:
+    <span class="k">if</span> isinstance(layer, nn.Linear):
+        fully_shard(layer, mesh=mesh)
+fully_shard(model, mesh=mesh)
+w = model[<span class="n">0</span>].weight                               <span class="c"># a DTensor sharded on dim 0</span>
+print(<span class="s">f"rank {rank}: full {tuple(w.shape)}, local shard {tuple(w.to_local().shape)}"</span>)
+model(x).pow(<span class="n">2</span>).mean().backward()
+dist.destroy_process_group()
+
+<span class="c"># Output (torch 2.8, CPU, 2 processes):</span>
+<span class="c"># rank 0: DDP grad[0,0] = 0.004942     rank 1: DDP grad[0,0] = 0.004942   ← identical after all-reduce</span>
+<span class="c"># rank 0: full (256, 64), local shard (128, 64)   ← each rank stores half</span></code></pre>
+    <p>Other knobs: <code>fully_shard(..., mp_policy=MixedPrecisionPolicy(param_dtype=torch.bfloat16, reduce_dtype=torch.float32))</code> for mixed precision; <code>torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)</code> for activation checkpointing. For TP and PP at scale, people use Megatron-LM, DeepSpeed or PyTorch's torchtitan.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Technique</th><th>✅ Splits</th><th>❌ Costs</th></tr>
+      <tr><td>DDP</td><td>Data (compute)</td><td>Full model state on every GPU; one gradient all-reduce per step</td></tr>
+      <tr><td>ZeRO-1/2</td><td>+ optimizer states, gradients</td><td>Nothing extra in volume; more complex checkpoint saving</td></tr>
+      <tr><td>ZeRO-3 / FSDP</td><td>+ weights</td><td>1.5× communication; all-gathers on the critical path</td></tr>
+      <tr><td>Tensor parallel</td><td>Each layer's weights and activations</td><td>All-reduces inside every layer: needs NVLink; smaller matmuls</td></tr>
+      <tr><td>Pipeline parallel</td><td>Layers</td><td>Bubble (p − 1)/(M + p − 1); load balancing; big global batch</td></tr>
+      <tr><td>Activation checkpointing</td><td>Activation memory (≈ 34 → 2 bytes·s·h per layer)</td><td>≈ one extra forward pass (~33% more compute)</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“You need to fine-tune a 70B model on 8 H100s. Walk me through the memory.” A strong answer:</p>
+    <ul>
+      <li>Does the math: 16 bytes/param × 70B = 1,120 GB of model states; ÷ 8 = 140 GB per GPU even with full sharding, so <b>full Adam fine-tuning doesn't fit</b>.</li>
+      <li>Offers options with their costs: CPU optimizer offload (slow, needs ~840 GB RAM), more GPUs, or <b>LoRA/QLoRA</b> (frozen 2-byte or 4-bit weights: 140 GB or ~35 GB total, sharded).</li>
+      <li>Handles activations separately: checkpointing, shorter sequences, FlashAttention; and knows TP stays inside the NVLink domain.</li>
+      <li>Mentions communication: DDP ≈ 2× gradient bytes per step, FSDP ≈ 1.5× that, TP talks every layer.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Sharding the optimizer, gradients and weights</b> <span class="tag co">🏢 Microsoft · 2019</span> <a href="https://arxiv.org/abs/1910.02054" target="_blank" rel="noopener">Rajbhandari et al.: ZeRO</a></div>
+      <p><b>How:</b> three stages of partitioning model states across data-parallel GPUs; the basis of DeepSpeed and of PyTorch FSDP.</p>
+      <p><b>Why this method:</b> memory per GPU falls from 16Ψ to 16Ψ/N at no more than 1.5× the communication; with 1,024 GPUs the paper projects trillion-parameter models.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Splitting transformer layers across GPUs</b> <span class="tag co">🏢 NVIDIA · 2019</span> <a href="https://arxiv.org/abs/1909.08053" target="_blank" rel="noopener">Shoeybi et al.: Megatron-LM</a></div>
+      <p><b>How:</b> column-then-row splits of MLP and attention weights with one all-reduce per block, inside a server.</p>
+      <p><b>Why this method:</b> only a few communication ops added to PyTorch; 8.3B parameters on 512 GPUs at 76% scaling efficiency.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Micro-batch pipelines</b> <span class="tag co">🏢 Google · 2018</span> <a href="https://arxiv.org/abs/1811.06965" target="_blank" rel="noopener">Huang et al.: GPipe</a></div>
+      <p><b>How:</b> splits a network into stages and a batch into M micro-batches, with re-computation of activations.</p>
+      <p><b>Why this method:</b> works over slower links; the paper found the bubble negligible once M ≥ 4 × the number of stages.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>All of it at once</b> <span class="tag co">🏢 Meta · 2024</span> <a href="https://arxiv.org/abs/2407.21783" target="_blank" rel="noopener">The Llama 3 Herd of Models</a></div>
+      <p><b>How:</b> 4D parallelism (tensor, context, pipeline, and FSDP-style data parallelism) on up to 16,384 H100s.</p>
+      <p><b>Why this method:</b> each split goes where its communication fits the hardware: TP within a server's NVLink, PP and DP across the network.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a trillion parameters at 502 petaFLOP/s</span>
+    <p>In 2021, NVIDIA, Stanford and Microsoft combined tensor, pipeline and data parallelism (“PTD-P”) to run training iterations of a <b>1-trillion-parameter</b> model on <b>3,072 GPUs</b> at 502 petaFLOP/s, 52% of the GPUs' theoretical peak (Narayanan et al.). Their interleaved pipeline schedule alone improved throughput by over 10%.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This lesson builds on the 16-bytes-per-parameter count (10.2) and on FLOPs vs bandwidth (10.1): every split is a bet that communication is cheaper than the memory or compute it saves. Batch size and learning-rate scaling: 1.7. Mixture-of-experts adds a fifth split, expert parallelism (6.10); long-context training uses context parallelism (6.11). The same ideas from the distributed-systems side: <a href="../../system-design-course/phase2/4-sharding.html">System Design 2.4 sharding</a>. RL training infrastructure at scale: <a href="../../rl-course/phase8/11-rl-infrastructure.html">RL 8.11</a>. Next, 10.4 makes the model itself smaller.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Book</span> <a href="https://huggingface.co/spaces/nanotron/ultrascale-playbook" target="_blank" rel="noopener">Hugging Face: The Ultra-Scale Playbook</a>. Every parallelism strategy with memory and communication diagrams and real benchmark runs.</li>
+      <li><span class="kind">Tutorial</span> <a href="https://docs.pytorch.org/tutorials/intermediate/FSDP_tutorial.html" target="_blank" rel="noopener">PyTorch: Getting started with FSDP2</a>. <code>fully_shard</code>, prefetching and mixed precision.</li>
+      <li><span class="kind">Guide</span> <a href="https://github.com/stas00/ml-engineering" target="_blank" rel="noopener">Stas Bekman: Machine Learning Engineering Open Book</a>. Field notes from training big models: networks, storage, debugging hangs.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A 13B model trains with mixed-precision Adam (16 bytes/param) and ZeRO-3 across 16 GPUs. Roughly how much model-state memory does each GPU hold?</div>
+    <div class="opts"><button class="opt">208 GB</button><button class="opt" data-ok>13 GB</button><button class="opt">26 GB</button></div>
+    <div class="explain">16 × 13 × 10⁹ = 208 GB in total. ZeRO-3 shards weights, gradients and optimizer states, so each of 16 GPUs holds 208 ÷ 16 = 13 GB. Activations come on top and aren't sharded by ZeRO. (26 GB would be the bf16 weights alone, unsharded.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your 32-GPU job (4 servers of 8) uses 32-way tensor parallelism and runs at a fraction of the expected speed. GPU utilization is low and the network is saturated. What's the likely fix?</div>
+    <div class="opts"><button class="opt">Add more pipeline micro-batches</button><button class="opt" data-ok>Keep tensor parallelism within a server (TP = 8 over NVLink) and use data or pipeline parallelism across servers</button><button class="opt">Turn off activation checkpointing</button></div>
+    <div class="explain">Tensor parallelism all-reduces inside every layer, on the critical path, so it needs NVLink-class bandwidth. Spanning servers sends those all-reduces over the much slower network. Standard practice: TP ≤ 8 inside a node, then PP and/or (sharded) data parallelism across nodes.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A pipeline has 8 stages. With M micro-batches the bubble is (p − 1)/(M + p − 1). How many micro-batches bring it to about 10%?</div>
+    <div class="opts"><button class="opt">8</button><button class="opt" data-ok>63</button><button class="opt">It can be made exactly 0 with enough micro-batches</button></div>
+    <div class="explain">7 / (M + 7) = 0.1 gives M + 7 = 70, so M = 63. With M = 8 the bubble is 7/15 ≈ 47%. It shrinks toward 0 but never reaches it: filling and draining the pipeline always costs p − 1 slots. Interleaved and zero-bubble schedules attack exactly that.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Training memory = model states (16 bytes/param with mixed-precision Adam: 7B → 112 GB) + activations (≈ 34·s·h bytes per layer).</li>
+      <li><b>DDP</b>: full copy per GPU, gradients all-reduced (≈ 2× gradient bytes per step). Scales compute, not memory.</li>
+      <li><b>ZeRO-1/2/3 = FSDP</b>: shard optimizer states, gradients, then weights: 16Ψ/N per GPU for 1.5× communication.</li>
+      <li><b>Tensor parallel</b>: split each matmul (column then row, one all-reduce per block); keep it inside NVLink. <b>Pipeline parallel</b>: split layers; bubble (p − 1)/(M + p − 1); 1F1B holds ≤ p micro-batches.</li>
+      <li><b>Activation checkpointing</b>: store layer inputs, recompute the rest (~33% more compute). Big runs nest TP × PP × DP by link speed.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+  const setup = c => { const d = window.devicePixelRatio || 1, w = c.clientWidth || 600, h = c.clientHeight || 240; c.width = w * d; c.height = h * d; const x = c.getContext("2d"); x.setTransform(d, 0, 0, d, 0, 0); x.clearRect(0, 0, w, h); x.font = "11px " + css("--font"); return { x, w, h }; };
+  const gb = v => (v >= 100 ? v.toFixed(0) : v.toFixed(1)) + " GB";
+
+  /* ---------- 1. tensor-parallel split demo ---------- */
+  const X = [1, 2, 3, 4], W = [[1, 0, 2, 1], [0, 1, 1, 2], [1, 1, 0, 1], [2, 0, 1, 0]];   // W is 4 (in) × 4 (out)
+  const mv = (x, M, rows, cols) => cols.map(j => rows.reduce((s, i) => s + x[i] * M[i][j], 0));
+  const vec = v => "[" + v.join(", ") + "]";
+  function tp(mode) {
+    let html = "", msg = "";
+    const all = [0, 1, 2, 3];
+    if (mode === "none") {
+      html = `<div class="tpcard"><h4>1 GPU</h4>x·W = ${vec(mv(X, W, all, all))}<br><span class="muted">holds all 16 weights</span></div>`;
+      msg = "One GPU holds the whole matrix. Now split it.";
+    } else if (mode === "col") {
+      const a = mv(X, W, all, [0, 1]), b = mv(X, W, all, [2, 3]);
+      html = `<div class="tpcard"><h4>GPU 0: columns 0–1</h4>needs all of x<br>out = ${vec(a)}</div><div class="tpcard"><h4>GPU 1: columns 2–3</h4>needs all of x<br>out = ${vec(b)}</div><div class="tpcard"><h4>All-gather (concatenate)</h4>${vec([...a, ...b])} ✓</div>`;
+      msg = "Column split: each GPU owns some outputs completely. Combine by concatenating (all-gather).";
+      win("gCol", true);
+    } else if (mode === "row") {
+      const a = mv(X, W, [0, 1], all), b = mv(X, W, [2, 3], all);
+      html = `<div class="tpcard"><h4>GPU 0: rows 0–1</h4>uses x[0:2] = [1, 2]<br>partial = ${vec(a)}</div><div class="tpcard"><h4>GPU 1: rows 2–3</h4>uses x[2:4] = [3, 4]<br>partial = ${vec(b)}</div><div class="tpcard"><h4>All-reduce (sum)</h4>${vec(a.map((v, i) => v + b[i]))} ✓</div>`;
+      msg = "Row split: each GPU has every output, but only part of each sum. Combine by adding (all-reduce).";
+      win("gRow", true);
+    } else {
+      // MLP: h = relu(x·A) with A column-split, y = h·B with B row-split. Reuse W as both A and B for a small demo.
+      const relu = v => v.map(z => Math.max(0, z - 6));
+      const h0 = relu(mv(X, W, all, [0, 1])), h1 = relu(mv(X, W, all, [2, 3]));
+      const hFull = [...h0, ...h1];
+      const y0 = mv(hFull, W, [0, 1], all), y1 = mv(hFull, W, [2, 3], all);
+      html = `<div class="tpcard"><h4>GPU 0</h4>h₀ = act(x·A[:, 0:2]) = ${vec(h0)}<br>y₀ = h₀·B[0:2, :] = ${vec(y0)}</div><div class="tpcard"><h4>GPU 1</h4>h₁ = act(x·A[:, 2:4]) = ${vec(h1)}<br>y₁ = h₁·B[2:4, :] = ${vec(y1)}</div><div class="tpcard"><h4>One all-reduce</h4>y = y₀ + y₁ = ${vec(y0.map((v, i) => v + y1[i]))} ✓<br><span class="muted">no communication between the two matmuls</span></div>`;
+      msg = "The column split's outputs are exactly the row split's inputs, so the activation (here max(0, z − 6)) runs locally and the GPUs talk only once.";
+      win("gMeg", true);
+    }
+    $("tpOut").innerHTML = html; $("tpMsg").textContent = msg;
+  }
+  seg("tpSeg", tp); tp("none");
+
+  /* ---------- 2. pipeline schedule (event simulation; F = 1 slot, B = 2 slots) ---------- */
+  let sched = "gpipe", anim = null;
+  function simulate(p, m, kind) {
+    const orders = [];
+    for (let s = 0; s < p; s++) {
+      const o = [];
+      if (kind === "gpipe") { for (let i = 0; i < m; i++) o.push(["F", i]); for (let i = 0; i < m; i++) o.push(["B", i]); }
+      else { const warm = Math.min(p - s - 1, m); let f = 0, b = 0; for (; f < warm; f++) o.push(["F", f]); while (f < m) { o.push(["F", f++]); o.push(["B", b++]); } while (b < m) o.push(["B", b++]); }
+      orders.push(o);
+    }
+    const done = {}, free = Array(p).fill(0), idx = Array(p).fill(0), ops = [];
+    for (let guard = 0; guard < 20000; guard++) {
+      let moved = false;
+      for (let s = 0; s < p; s++) {
+        if (idx[s] >= orders[s].length) continue;
+        const [t, i] = orders[s][idx[s]];
+        const dep = t === "F" ? (s === 0 ? 0 : done["F" + (s - 1) + "_" + i]) : (s === p - 1 ? done["F" + s + "_" + i] : done["B" + (s + 1) + "_" + i]);
+        if (dep === undefined) continue;
+        const start = Math.max(free[s], dep), dur = t === "F" ? 1 : 2;
+        done[t + s + "_" + i] = start + dur; free[s] = start + dur; ops.push({ s, t, i, start, dur }); idx[s]++; moved = true;
+      }
+      if (!moved) break;
+    }
+    const T = Math.max(...free);
+    let peak = 0;
+    for (let s = 0; s < p; s++) { let c = 0; ops.filter(o => o.s === s).sort((a, b) => a.start - b.start).forEach(o => { c += o.t === "F" ? 1 : -1; peak = Math.max(peak, c); }); }
+    return { ops, T, bubble: 1 - (3 * m * p) / (p * T), peak };
+  }
+  function drawPipe(R, p, upTo) {
+    const { x, w, h } = setup($("pCan")), m = { l: 52, r: 8, t: 8, b: 22 }, rowH = Math.min(36, (h - m.t - m.b) / p), cw = (w - m.l - m.r) / R.T;
+    for (let s = 0; s < p; s++) {
+      const y = m.t + s * rowH;
+      x.fillStyle = css("--panel"); x.fillRect(m.l, y + 2, w - m.l - m.r, rowH - 4);
+      x.fillStyle = css("--text"); x.textAlign = "right"; x.fillText("GPU " + (s + 1), m.l - 6, y + rowH / 2 + 4);
+    }
+    R.ops.forEach(o => {
+      if (o.start >= upTo) return;
+      const y = m.t + o.s * rowH, len = Math.min(o.dur, upTo - o.start);
+      x.fillStyle = css(o.t === "F" ? "--c-ac" : "--c-gr");
+      x.fillRect(m.l + o.start * cw + 0.5, y + 3, len * cw - 1, rowH - 6);
+      if (cw * o.dur > 14 && len === o.dur) { x.fillStyle = "#fff"; x.textAlign = "center"; x.fillText(String(o.i + 1), m.l + (o.start + o.dur / 2) * cw, y + rowH / 2 + 4); }
+    });
+    x.fillStyle = css("--muted"); x.textAlign = "left"; x.fillText(`time → (${R.T} slots; forward = 1, backward = 2)`, m.l, h - 6);
+  }
+  function pipe(play) {
+    const p = +$("pP").value, M = +$("pM").value, R = simulate(p, M, sched);
+    $("pPV").textContent = p; $("pMV").textContent = M;
+    $("pBub").textContent = (100 * R.bubble).toFixed(1) + "%";
+    $("pForm").textContent = (100 * (p - 1) / (M + p - 1)).toFixed(1) + "%";
+    $("pPeak").textContent = R.peak + " of " + M;
+    win("gB10", R.bubble < 0.1);
+    win("g1f1b", sched === "1f1b" && M >= 4 * p && R.peak <= p);
+    $("pMsg").textContent = M === 1 ? `One micro-batch: GPU ${p} waits for everyone, then everyone waits for GPU ${p}. Each GPU idles ${(100 * R.bubble).toFixed(0)}% of the time.` :
+      sched === "gpipe" ? `GPipe: every GPU holds activations for all ${M} micro-batches before the first backward. Try 1F1B.` :
+      `1F1B: backward passes start as soon as possible, so no GPU holds more than ${R.peak} micro-batches of activations.`;
+    cancelAnimationFrame(anim);
+    if (!play) { drawPipe(R, p, Infinity); return; }
+    const t0 = performance.now(), dur = 2400;
+    const step = now => { const f = Math.min(1, (now - t0) / dur); drawPipe(R, p, f * R.T); if (f < 1) anim = requestAnimationFrame(step); };
+    anim = requestAnimationFrame(step);
+  }
+  seg("pSched", v => { sched = v; pipe(false); });
+  $("pP").oninput = () => pipe(false); $("pM").oninput = () => pipe(false);
+  $("pPlay").onclick = () => pipe(true);
+  pipe(false);
+
+  /* ---------- 3. memory planner ---------- */
+  const MODELS = { "1.3B": { P: 1.3e9, L: 24, h: 2048 }, "7B": { P: 7e9, L: 32, h: 4096 }, "13B": { P: 13e9, L: 40, h: 5120 }, "70B": { P: 70e9, L: 80, h: 8192 }, "405B": { P: 405e9, L: 126, h: 16384 } };
+  const st = { model: "7B", job: "train", zero: 0, tp: 1, pp: 1 };
+  function plan() {
+    const M = MODELS[st.model], N = +$("mN").value, mp = st.tp * st.pp, D = N / mp, Pl = M.P / mp, s = 4096, ck = $("mCk").checked;
+    if (mp > N) return { bad: `Tensor × pipeline = ${mp} needs at least ${mp} GPUs.` };
+    let w = 0, g = 0, opt = 0, cpu = 0;
+    if (st.job === "train" || st.job === "offload") {
+      w = 2 * Pl; g = 2 * Pl; opt = 12 * Pl;
+      if (st.zero >= 1) opt /= D; if (st.zero >= 2) g /= D; if (st.zero >= 3) w /= D;
+      if (st.job === "offload") { cpu = opt * N; opt = 0; }
+    } else if (st.job === "lora") { w = 2 * Pl / (st.zero >= 3 ? D : 1); opt = 16 * 0.01 * Pl; }   // assumption: adapters ≈ 1% extra params, trained with Adam
+    else w = 2 * Pl;
+    const perLayer = 34 * s * M.h / st.tp;
+    const act = st.job === "infer" ? 0 : ck ? M.L * 2 * s * M.h / st.tp + perLayer : M.L * perLayer;   // 1F1B: first stage holds ≈ L layers' worth
+    const gradBytes = st.job === "lora" ? 2 * 0.01 * Pl : st.job === "infer" ? 0 : 2 * Pl;
+    const comm = D > 1 ? 2 * gradBytes * (D - 1) / D * (st.zero >= 3 ? 1.5 : 1) : 0;
+    const tot = w + g + opt + act;
+    return { N, D, w: w / 1e9, g: g / 1e9, opt: opt / 1e9, act: act / 1e9, tot: tot / 1e9, cpu: cpu / 1e9, comm: comm / 1e9 };
+  }
+  function planner() {
+    const r = plan();
+    if (r.bad) { $("mBar").innerHTML = ""; $("mVer").innerHTML = `<span class="dead">invalid</span>`; $("mMsg").textContent = r.bad; ["mTot", "mD", "mComm", "mCpu"].forEach(i => ($(i).textContent = "–")); return; }
+    const scale = 160, parts = [["w", "--c-w"], ["g", "--c-gr"], ["opt", "--c-at"], ["act", "--c-ac"]];
+    let left = 0, html = "";
+    parts.forEach(([k, c]) => { const wd = Math.min(100 - left, 100 * r[k] / scale); if (wd > 0) html += `<i style="left:${left}%;width:${wd}%;background:var(${c})" title="${k}: ${gb(r[k])}"></i>`; left += wd; });
+    html += `<span class="cap" style="left:${100 * 80 / scale}%"></span>`;
+    $("mBar").innerHTML = html;
+    const fit = r.tot <= 72;
+    $("mTot").textContent = gb(r.tot) + (r.tot > scale ? " (off the bar)" : "");
+    $("mD").textContent = r.D;
+    $("mComm").textContent = r.comm ? gb(r.comm) : "none";
+    $("mCpu").textContent = r.cpu ? gb(r.cpu) + " total" : "–";
+    $("mVer").innerHTML = fit ? `<span class="ev">fits ✓</span>` : r.tot <= 80 ? `<span class="dead">too tight</span>` : `<span class="dead">out of memory</span>`;
+    const ms = r.w + r.g + r.opt;
+    $("mMsg").textContent = st.job === "train" && st.zero === 0 && r.D > 1 ? `Plain DDP: every GPU stores all ${gb(ms)} of model states, however many GPUs you add. Try ZeRO.` :
+      !fit && r.act > ms ? "Activations dominate now. Turn on activation checkpointing or tensor parallelism." :
+      !fit ? "Model states dominate. Shard more (ZeRO-3), add GPUs, or split the model (TP/PP)." :
+      st.job === "offload" ? "Fits on the GPUs, but every step ships gradients to CPU and runs Adam there: much slower." :
+      st.job === "lora" ? "Frozen base weights need no gradients or optimizer states: only the small adapters train." : "Fits with headroom.";
+    const tr = st.job === "train";
+    win("gM7", st.model === "7B" && tr && r.N === 8 && fit);
+    win("gM70no", st.model === "70B" && tr && r.N === 8 && st.zero === 3 && !fit);
+    win("gM70", st.model === "70B" && r.N === 8 && fit);
+    win("gM16", st.model === "70B" && tr && r.N === 16 && fit);
+  }
+  seg("mModel", v => { st.model = v; planner(); });
+  seg("mJob", v => { st.job = v; planner(); });
+  seg("mZero", v => { st.zero = +v; planner(); });
+  seg("mTp", v => { st.tp = +v; planner(); });
+  seg("mPp", v => { st.pp = +v; planner(); });
+  $("mN").onchange = planner; $("mCk").onchange = planner;
+  planner();
+  window.addEventListener("resize", () => pipe(false));
+  window.addEventListener("themechange", () => pipe(false));
+})();
+</script>
+</body>
+</html>

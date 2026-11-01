@@ -1,0 +1,460 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>9.6 Uncertainty, calibration and out-of-distribution data · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.bd { width: 100%; max-width: 340px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 10px; border: 1px solid var(--line); cursor: crosshair; }
+  canvas.rel { width: 100%; max-width: 380px; aspect-ratio: 1 / 1; height: auto; display: block; border-radius: 10px; border: 1px solid var(--line); }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .two { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+  .two .hint { text-align: center; }
+  @media (max-width: 560px) { .two { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-lesson="d9-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 9 · Lesson 6</div>
+  <h1>Uncertainty, calibration and out-of-distribution data</h1>
+  <p class="subtitle">A model that says “90% sure” should be right 90% of the time, and should say “I don't know” when shown something it has never seen. Most deep networks do neither out of the box. Here's how to measure that, fix the first with one number, and catch the second.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Softmax</b> turns logits into probabilities; dividing the logits by a temperature T &gt; 1 flattens them (Lesson 0.6; <a href="../../math-course/phase8/2-softmax.html">math 8.2</a>).</li>
+      <li><b>Cross-entropy / negative log-likelihood (NLL)</b> punishes confident wrong answers hardest (Lesson 1.1; <a href="../../math-course/phase6/3-cross-entropy.html">math 6.3</a>).</li>
+      <li><b>Dropout</b> randomly zeroes units during training (Lesson 2.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2017, Guo, Pleiss, Sun and Weinberger compared a 1998 LeNet with a 2016 110-layer ResNet on CIFAR-100. The ResNet was far more <b>accurate</b>, yet its confidence no longer matched reality: they wrote that “modern neural networks are no longer well-calibrated”. Its expected calibration error was <b>16.53%</b>. Then they divided its logits by <b>one learned number</b>, and the error fell to <b>1.26%</b>, with exactly the same predictions.</p>
+    <p>A year earlier, Hendrycks and Gimpel noted that pure random noise fed into an MNIST digit classifier gets a predicted class probability of <b>91%</b>.</p>
+    <p><b>When should you believe a model's confidence, and how can it tell you “this input is unlike anything I was trained on”?</b> You'll calibrate an overconfident model to under 2% error, then build an ensemble that notices when it's out of its depth.</p>
+  </div>
+
+  <h2>Numbers first: confidence is not correctness</h2>
+  <p>Take 1,000 predictions where a model said “90% sure”. If it's <b>calibrated</b>, about 900 are right. Real deep networks often get 700 right: <b>overconfident</b>. That matters whenever a number drives a decision:</p>
+  <table>
+    <tr><th>Situation</th><th>What goes wrong with miscalibration</th></tr>
+    <tr><td>A triage model sends cases below 80% confidence to a doctor</td><td>If “95%” really means 75%, the riskiest cases skip review</td></tr>
+    <tr><td>A self-driving stack fuses camera and radar by confidence</td><td>The overconfident sensor wins arguments it should lose</td></tr>
+    <tr><td>An LLM pipeline answers only when confident, else retrieves</td><td>It answers wrongly without retrieving</td></tr>
+  </table>
+  <p>Two separate problems hide here. <b>Calibration</b>: on the kind of data you trained on, do confidences match accuracy? <b>Out-of-distribution (OOD) detection</b>: can the model tell that an input is a different kind of data altogether (a cat photo sent to a chest X-ray model)?</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A probability is a promise. <b>Calibration</b> checks the promise on familiar data (reliability diagram, ECE) and fixes it cheaply with <b>temperature scaling</b>. <b>Uncertainty</b> comes in two kinds: noise in the data itself (aleatoric) and the model's own ignorance (epistemic). Epistemic uncertainty is what flags <b>out-of-distribution</b> inputs, and you estimate it by asking several plausible models and seeing if they <b>disagree</b> (ensembles, MC dropout).
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: weather forecasters</span>
+    <p>A good forecaster who says “70% chance of rain” is right on about 70% of those days: calibrated. An overconfident one says 95% every time. Now send the forecaster to a planet they've never studied. A single forecaster happily says “95% sunny”. Ask five forecasters who trained differently: on Earth they agree; on the new planet their guesses scatter. The scatter is the warning.</p>
+  </div>
+
+  <h2>Reliability diagrams and ECE</h2>
+  <p>Sort predictions into bins by confidence (0–10%, 10–20%, …). In each bin, compare the <b>average confidence</b> with the <b>actual accuracy</b>. Plot accuracy against confidence: a calibrated model sits on the diagonal. That's a <b>reliability diagram</b>. Bars below the diagonal mean overconfident.</p>
+  <p><b>Expected calibration error (ECE)</b> boils it down to one number: the average gap |accuracy − confidence| across bins, weighted by how many predictions fall in each.</p>
+  <div class="calc">ECE = Σ<sub>bins</sub> (bin size ÷ N) × | accuracy(bin) − confidence(bin) |</div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: ECE with two bins</span>
+    <p>100 predictions. Bin A: 60 predictions with average confidence <b>0.95</b>, of which 45 are right (accuracy 0.75). Bin B: 40 predictions, average confidence <b>0.60</b>, 22 right (accuracy 0.55).</p>
+    <div class="calc">ECE = 0.60 × |0.75 − 0.95| + 0.40 × |0.55 − 0.60| = 0.60 × 0.20 + 0.40 × 0.05 = 0.12 + 0.02 = <b>0.14</b></div>
+    <p>A 14% calibration error, mostly from the confident bin: “95%” actually means 75%. Overall accuracy is 67%, while the average confidence is 0.81 (0.6 × 0.95 + 0.4 × 0.60). Guo et al. used 15 bins.</p>
+  </div>
+
+  <h2>Temperature scaling: one number fixes a lot</h2>
+  <p>Why are modern nets overconfident? Guo et al. linked it to depth, width, Batch Normalization and less weight decay: training keeps pushing the logits bigger to shrink the NLL even after accuracy stops improving. Their fix: after training, divide all logits by a single temperature T, chosen to minimize NLL on a held-out <b>validation</b> set.</p>
+  <div class="calc">calibrated probabilities = softmax( <span class="y">logits</span> ÷ <span class="w">T</span> ) &nbsp;&nbsp; T &gt; 1 softens overconfidence; T &lt; 1 sharpens underconfidence</div>
+  <p class="predict">🔮 <b>Predict:</b> below are 3,000 simulated predictions from a 10-class model that is 72.6% accurate but 93.5% confident on average. What T makes it calibrated? Will changing T change the accuracy?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Build a reliability diagram, then calibrate it</span>
+    <p class="hint">Simulated classifier (a toy, so we know the truth): labels are drawn from a hidden, perfectly calibrated set of probabilities, and the model reports logits that are too big. Bars = accuracy in each of 15 confidence bins; the diagonal = perfect calibration; <span class="dead">red</span> = the gap. Drag T, or let gradient-free search pick the T with the lowest NLL.</p>
+    <div class="goals"><span class="goal" id="gECE">🎯 Get ECE under 2%</span><span class="goal" id="gUnder">🎯 Calibrate the underconfident model too</span></div>
+    <div class="controls">
+      <span class="seg" id="cModel"><button data-v="over" class="on">Overconfident model</button><button data-v="under">Underconfident model</button></span>
+      <label>temperature <span class="w">T</span> <input type="range" id="cT" min="0.3" max="4" step="0.05" value="1"> <b class="mono" id="cTV"></b></label>
+      <button class="btn primary" id="cFit">🎯 Fit T on validation (min NLL)</button>
+      <button class="btn" id="cOne">↺ T = 1</button>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="rel" id="cCan"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">accuracy <b class="y" id="cAcc">–</b></div>
+          <div class="stat">average confidence <b id="cConf">–</b></div>
+        </div>
+        <div class="stat-row">
+          <div class="stat">ECE <b class="dead" id="cECE">–</b></div>
+          <div class="stat"><span class="ls">NLL</span> <b class="ls" id="cNLL">–</b></div>
+        </div>
+        <canvas class="chart" id="cChart" style="height:170px"></canvas>
+        <p class="hint" id="cMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> at T = 1, bars sit well below the diagonal: average confidence 93.5% against 72.6% accuracy, ECE about <b>21%</b>. Slide T up: confidence falls, accuracy <b>never changes</b> (dividing every logit by the same positive number can't change which one is biggest). Only T between about <b>2.45 and 2.6</b> gets ECE under 2%; the NLL fit finds T ≈ 2.51 (the slider snaps to 2.50: ECE 1.6%). The underconfident model needs T ≈ 0.6 instead. The NLL curve below has one smooth minimum, which is why fitting T takes milliseconds.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Temperature scaling</span></span>
+    <ol>
+      <li><b>The problem before</b> Modern networks are accurate but overconfident: Guo et al. measured ECE of 16.53% for a ResNet-110 on CIFAR-100. Decisions that threshold on confidence inherit the error.</li>
+      <li><b>What people tried</b> Histogram binning, isotonic regression, Bayesian binning (BBQ), and Platt scaling (fit a logistic curve to the scores); vector and matrix scaling (a learned linear map on the logits).</li>
+      <li><b>Why this works</b> Overconfidence in these models is mostly a uniform “logits too big” effect, so one shared T undoes most of it. It's fitted on held-out data by minimizing NLL, a smooth 1D problem (the paper: “by far the fastest” method). Because T &gt; 0 rescales every logit equally, the argmax and therefore accuracy are untouched. On ResNet-110 / CIFAR-100: 16.53% → 1.26% ECE.</li>
+      <li><b>What it costs, when it fails</b> It needs a validation set from the same distribution. One T can't fix a model that's overconfident on some classes and underconfident on others. Most importantly, it calibrates <b>in-distribution</b> only: Ovadia et al. (2019) found that calibration from i.i.d. test data “does not usually translate” to shifted data, and it does nothing for OOD inputs.</li>
+      <li><b>What refined it</b> Per-class or vector scaling, label smoothing and focal loss during training, ensembles (better calibrated under shift), and conformal prediction (prediction <i>sets</i> with a coverage guarantee).</li>
+    </ol>
+  </div>
+
+  <h2>Two kinds of uncertainty</h2>
+  <table>
+    <tr><th></th><th>Aleatoric (“dice”)</th><th>Epistemic (“ignorance”)</th></tr>
+    <tr><td>Source</td><td>noise in the data itself: a blurry photo, two overlapping classes, a coin flip</td><td>the model hasn't seen enough data like this</td></tr>
+    <tr><td>More data helps?</td><td>no: the input really is ambiguous</td><td>yes: it shrinks where data is added</td></tr>
+    <tr><td>Example</td><td>a handwritten digit halfway between 1 and 7</td><td>a chest X-ray model shown a knee X-ray</td></tr>
+    <tr><td>How to estimate</td><td>the model's own predicted spread (softmax entropy, a predicted variance)</td><td><b>disagreement</b> between plausible models (ensembles, MC dropout)</td></tr>
+  </table>
+  <p>A single softmax mixes both and is unreliable for the second: one network has no way to know it's guessing. That's the point of the next two tools.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the same average, different stories</span>
+    <p>Five models predict p(class 1) for two inputs.</p>
+    <table>
+      <tr><th>Input</th><th>Five predictions</th><th>Mean</th><th>Spread (std)</th><th>Reading</th></tr>
+      <tr><td>A blurry, ambiguous photo</td><td>0.50, 0.52, 0.48, 0.49, 0.51</td><td>0.50</td><td>0.014</td><td>they agree it's a coin flip: <b>aleatoric</b></td></tr>
+      <tr><td>Something never seen before</td><td>0.99, 0.02, 0.97, 0.05, 0.47</td><td>0.50</td><td class="dead">0.42</td><td>they wildly disagree: <b>epistemic</b>, probably OOD</td></tr>
+    </table>
+    <p>Same average, so a single “0.50” can't tell these apart. The spread can.</p>
+  </div>
+
+  <h2>Deep ensembles and MC dropout</h2>
+  <p><b>Deep ensembles</b> (Lakshminarayanan, Pritzel and Blundell, 2017): train M copies of the network from different random initializations (and data order), average their predictions, and use their disagreement as uncertainty. The paper recommends <b>M = 5</b>. <b>MC dropout</b> (Gal and Ghahramani, 2016): keep dropout switched on at test time, run T forward passes, and treat the spread as uncertainty, a cheap approximation to a Bayesian network with a single trained model.</p>
+  <p class="predict">🔮 <b>Predict:</b> one network is trained on XOR-shaped data in the middle of the map. Far from the data (the grey ring of test points), will it be unsure? Will five networks trained from different seeds agree with each other out there?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · One confident model versus a disagreeing ensemble</span>
+    <p class="hint">Training data sits inside the square around the centre; grey crosses are <b>out-of-distribution</b> test points on a ring far away. Left: one network's confidence max(p, 1 − p) (bright = sure). Right: how much 5 networks with different seeds disagree (standard deviation of their p). The detector flags an input as OOD if its score is worse than for 95% of normal test points. Click anywhere to see all five opinions.</p>
+    <div class="goals"><span class="goal" id="gTrainE">🎯 Train the ensemble</span><span class="goal" id="gCatch">🎯 Catch ≥ 75% of OOD points while keeping 95% of normal ones</span><span class="goal" id="gProbe">🎯 Find a far point where the single model is ≥ 99% sure but the members disagree</span></div>
+    <div class="controls">
+      <button class="btn primary" id="eTrain">▶ Train 5 networks</button>
+      <label>ensemble size M <input type="range" id="eM" min="1" max="5" step="1" value="5"> <b class="mono" id="eMV"></b></label>
+    </div>
+    <div class="two">
+      <div><canvas class="bd" id="eOne"></canvas><p class="hint">single model: confidence</p></div>
+      <div><canvas class="bd" id="eEns"></canvas><p class="hint">ensemble: disagreement</p></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">OOD caught by max-softmax (1 model) <b id="eS1">–</b></div>
+      <div class="stat">OOD caught by ensemble disagreement <b class="y" id="eSE">–</b></div>
+      <div class="stat">OOD points the single model is ≥ 99% sure about <b class="dead" id="eConf">–</b></div>
+    </div>
+    <div class="stat-row"><div class="stat">clicked point <b class="mono" id="eP">–</b></div><div class="stat">the five members' p(class 1) <b class="mono" id="eMem">–</b></div></div>
+    <p class="hint" id="eMsg"></p>
+  </div>
+  <p><b>What you should see:</b> the single network is bright almost everywhere, including far from the data: it's at least 99% sure about <b>39%</b> of the far-away OOD points, because tanh units saturate and keep extrapolating. Its max-softmax score catches <b>52%</b> of OOD points at a threshold that keeps 95% of normal points. The ensemble's disagreement map is dark over the data (all five agree) and lights up in the empty regions; it catches <b>81%</b>. Lower M to 1, 2, 3 and watch the map and the catch rate change. Not everywhere lights up, though: in some directions all five extrapolate the same way and still agree. Ensembles reduce overconfidence off the data; they don't remove it.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Deep ensembles (and MC dropout)</span></span>
+    <ol>
+      <li><b>The problem before</b> One network gives one confident answer everywhere, including where it has no data (39% of far OOD points at ≥ 99% confidence in your playground). Proper Bayesian neural networks, which keep a distribution over weights, were hard to scale and tune.</li>
+      <li><b>What people tried</b> Variational Bayesian networks (SVI), Laplace approximations, MC dropout as a cheap Bayesian approximation (Gal and Ghahramani: “T stochastic forward passes through the network and averaging the results”).</li>
+      <li><b>Why this works</b> Near the data, every well-trained network is pinned to the same answers, so they agree. Away from it, nothing pins them, and different random starts lead to different guesses: disagreement measures epistemic uncertainty. It needs no change to the model or loss. Ovadia et al.'s large study under dataset shift: “Deep ensembles seem to perform the best across most metrics”, with M = 5 often enough.</li>
+      <li><b>What it costs, when it fails</b> M× the training and inference compute and memory (5 models = 5× the bill). Members can agree on the same wrong extrapolation (you saw dark patches far from the data). MC dropout is cheaper (one model, T passes) but usually less reliable than a real ensemble.</li>
+      <li><b>What refined it</b> Cheaper ensembles (snapshot ensembles from one run, BatchEnsemble, ensembling only the last layers or LoRA adapters), distance-aware single models, and evaluation of uncertainty under shift as standard practice.</li>
+    </ol>
+  </div>
+
+  <h2>Out-of-distribution detection with a score and a threshold</h2>
+  <p>Whatever score you use, OOD detection in production looks the same: compute a score per input, pick a threshold on <b>normal</b> validation data (for example, “keep 95% of normal inputs”), and route anything past the threshold to a fallback: a human, a refusal, a simpler rule.</p>
+  <ul>
+    <li><b>Max softmax probability</b> (Hendrycks and Gimpel, 2016): the baseline. Low top probability → suspicious. Free, and better than nothing, but the 91% confidence on pure noise shows its limit.</li>
+    <li><b>Energy score</b> (Liu et al., 2020): E(x) = −T · log Σ<sub>i</sub> e<sup>logit<sub>i</sub>/T</sup>, computed from the logits before softmax. In words, it looks at how large the logits are overall, which softmax throws away. On a CIFAR-10 WideResNet it cut the false-positive rate (at 95% true-positive rate) by <b>18.03%</b> compared with max softmax.</li>
+    <li><b>Ensemble disagreement</b> or <b>feature-space distance</b> (how far an input's embedding is from the training embeddings).</li>
+  </ul>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">OOD detection with a score threshold</span></span>
+    <ol>
+      <li><b>The problem before</b> A classifier must pick one of its known classes, so it labels a cat photo sent to an X-ray model as some disease, often confidently. Nguyen et al. (2014) generated images “completely unrecognizable to humans” that networks labelled with 99.99% confidence.</li>
+      <li><b>What people tried</b> An extra “other” class (but you can't collect examples of everything that isn't your data), reconstruction error from autoencoders, density models.</li>
+      <li><b>Why this works</b> You don't need examples of every possible OOD input, only of <b>normal</b> ones: set the threshold so 95% of normal validation inputs pass, and anything stranger than that is flagged. Scores that use more information than the top softmax probability (energy, ensemble spread) separate the two groups better: 52% → 81% caught in your playground.</li>
+      <li><b>What it costs, when it fails</b> Every threshold trades false alarms (normal inputs sent to review) against misses. “Near-OOD” inputs (a new disease that looks like a known one) are much harder than far-OOD (a cat). Scores computed from the model can share its blind spots; and adversarial inputs (Lesson 9.5) can be crafted to look normal.</li>
+      <li><b>What refined it</b> Energy-based fine-tuning, outlier exposure (train with a generic pile of “other” data), feature-distance methods, and monitoring the <b>rate</b> of flags over time in production.</li>
+    </ol>
+  </div>
+
+  <h2>Distribution shift in production</h2>
+  <p>Even without single weird inputs, the whole stream of data drifts. Name the kind of shift and you know what to monitor:</p>
+  <table>
+    <tr><th>Shift</th><th>What changes</th><th>Example</th><th>Monitor</th></tr>
+    <tr><td><b>Covariate shift</b></td><td>the inputs p(x); the rule p(y | x) stays</td><td>a hospital buys a new scanner; images get sharper</td><td>input statistics, embedding drift, OOD-flag rate</td></tr>
+    <tr><td><b>Label (prior) shift</b></td><td>how common each class is, p(y)</td><td>flu season: positives go from 5% to 30%</td><td>distribution of predicted classes</td></tr>
+    <tr><td><b>Concept shift</b></td><td>the rule itself, p(y | x)</td><td>what counts as “spam” changes; a new fraud pattern</td><td>accuracy on fresh labels (needs labelling)</td></tr>
+  </table>
+  <p>In practice: log confidences and OOD scores, alert when their averages move, sample flagged and random cases for human labels, and recalibrate or retrain when accuracy on fresh labels drops. LLM-specific monitoring is in <a href="../../ai-engineer/phase8/1-llmops.html">AI Engineer 8.1 (LLMOps)</a>.</p>
+
+  <h2>Side by side</h2>
+  <table>
+    <tr><th>Tool</th><th>Fixes</th><th>Extra cost</th><th>Limits</th></tr>
+    <tr><td>Temperature scaling</td><td>in-distribution calibration</td><td>one number, fitted in milliseconds</td><td>nothing for OOD; breaks under shift</td></tr>
+    <tr><td>MC dropout</td><td>some epistemic uncertainty</td><td>T forward passes</td><td>weaker than ensembles; needs dropout layers</td></tr>
+    <tr><td>Deep ensemble (M = 5)</td><td>calibration under shift, epistemic uncertainty</td><td>5× training and inference</td><td>members can agree on wrong extrapolations</td></tr>
+    <tr><td>Max softmax / energy score</td><td>OOD flagging</td><td>free (one forward pass)</td><td>near-OOD is hard; threshold trade-off</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Calibration and uncertainty need very little code. Libraries help with evaluation: <code>torchmetrics</code> (<code>CalibrationError</code>), <code>netcal</code>, and the PyTorch-OOD and OpenOOD benchmarks. ECE, temperature scaling (fitted with L-BFGS) and MC dropout in plain PyTorch:</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn, torch.nn.functional <span class="k">as</span> F
+
+<span class="k">def</span> ece(probs, labels, n_bins=<span class="n">15</span>):
+    conf, pred = probs.max(<span class="n">1</span>)
+    edges = torch.linspace(<span class="n">0</span>, <span class="n">1</span>, n_bins + <span class="n">1</span>)
+    total = torch.tensor(<span class="n">0.0</span>)
+    <span class="k">for</span> lo, hi <span class="k">in</span> zip(edges[:-<span class="n">1</span>], edges[<span class="n">1</span>:]):
+        inb = (conf &gt; lo) &amp; (conf &lt;= hi)
+        <span class="k">if</span> inb.any():                                   <span class="c"># |accuracy − confidence|, weighted by bin size</span>
+            total += inb.float().mean() * ((pred[inb] == labels[inb]).float().mean() - conf[inb].mean()).abs()
+    <span class="k">return</span> total.item()
+
+<span class="c"># simulated overconfident classifier: true logits z, labels drawn from softmax(z), model reports 2.5·z</span>
+torch.manual_seed(<span class="n">0</span>)
+z = <span class="n">1.2</span> * torch.randn(<span class="n">6000</span>, <span class="n">10</span>); c = torch.randint(<span class="n">0</span>, <span class="n">10</span>, (<span class="n">6000</span>,)); z[torch.arange(<span class="n">6000</span>), c] += <span class="n">4.0</span>
+labels = torch.multinomial(F.softmax(z, <span class="n">1</span>), <span class="n">1</span>).squeeze(<span class="n">1</span>)
+logits = <span class="n">2.5</span> * z
+val, test = slice(<span class="n">0</span>, <span class="n">3000</span>), slice(<span class="n">3000</span>, <span class="n">6000</span>)
+
+log_T = torch.zeros(<span class="n">1</span>, requires_grad=<span class="k">True</span>)             <span class="c"># T = exp(log_T) stays positive</span>
+opt = torch.optim.LBFGS([log_T], lr=<span class="n">0.1</span>, max_iter=<span class="n">100</span>)
+<span class="k">def</span> closure():
+    opt.zero_grad()
+    loss = F.cross_entropy(logits[val] / log_T.exp(), labels[val])   <span class="c"># fit T on the VALIDATION split</span>
+    loss.backward()
+    <span class="k">return</span> loss.detach()
+opt.step(closure)
+T = log_T.exp().item()
+
+<span class="k">for</span> name, t <span class="k">in</span> [(<span class="s">"before (T = 1)"</span>, <span class="n">1.0</span>), (<span class="s">f"after  (T = {T:.2f})"</span>, T)]:
+    p = F.softmax(logits[test] / t, <span class="n">1</span>)
+    acc = (p.argmax(<span class="n">1</span>) == labels[test]).float().mean().item()
+    print(<span class="s">f"{name}: accuracy {acc:.3f}  mean confidence {p.max(1).values.mean():.3f}  ECE {100 * ece(p, labels[test]):.1f}%"</span>)
+
+<span class="c"># MC dropout: keep dropout ON at test time and look at the spread of predictions</span>
+torch.manual_seed(<span class="n">0</span>)
+X = torch.rand(<span class="n">400</span>, <span class="n">1</span>) * <span class="n">2</span> - <span class="n">1</span>; y = torch.sin(<span class="n">3</span> * X) + <span class="n">0.1</span> * torch.randn_like(X)   <span class="c"># data only in [−1, 1]</span>
+net = nn.Sequential(nn.Linear(<span class="n">1</span>, <span class="n">64</span>), nn.ReLU(), nn.Dropout(<span class="n">0.2</span>), nn.Linear(<span class="n">64</span>, <span class="n">64</span>), nn.ReLU(), nn.Dropout(<span class="n">0.2</span>), nn.Linear(<span class="n">64</span>, <span class="n">1</span>))
+o = torch.optim.Adam(net.parameters(), lr=<span class="n">1e-2</span>)
+<span class="k">for</span> _ <span class="k">in</span> range(<span class="n">1500</span>):
+    o.zero_grad(); F.mse_loss(net(X), y).backward(); o.step()
+net.train()                                              <span class="c"># dropout stays active</span>
+<span class="k">with</span> torch.no_grad():
+    <span class="k">for</span> x0 <span class="k">in</span> [<span class="n">0.0</span>, <span class="n">3.0</span>]:
+        samples = torch.stack([net(torch.tensor([[x0]])) <span class="k">for</span> _ <span class="k">in</span> range(<span class="n">100</span>)])
+        print(<span class="s">f"x = {x0}: MC-dropout std of 100 predictions = {samples.std().item():.3f}"</span>)
+
+<span class="c"># What we got on a laptop CPU (torch 2.8):</span>
+<span class="c"># before (T = 1): accuracy 0.728  mean confidence 0.938  ECE 21.0%</span>
+<span class="c"># after  (T = 2.49): accuracy 0.728  mean confidence 0.734  ECE 2.1%</span>
+<span class="c"># x = 0.0: MC-dropout std of 100 predictions = 0.061</span>
+<span class="c"># x = 3.0: MC-dropout std of 100 predictions = 0.541</span></code></pre>
+    <p class="hint">Fit T on a validation split, report ECE on a separate test split, and refit whenever the model or the data changes. MC dropout's spread is 9× larger at x = 3, far outside the training range [−1, 1]: epistemic uncertainty showing up.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Temperature scaling</td><td>Near-free, keeps accuracy, big ECE gains</td><td>Only in-distribution; needs a validation set; one global knob</td></tr>
+      <tr><td>Deep ensemble</td><td>Best calibration under shift; disagreement flags OOD</td><td>M× compute and memory at training and serving</td></tr>
+      <tr><td>MC dropout</td><td>Uncertainty from one model</td><td>T× inference; weaker estimates</td></tr>
+      <tr><td>Strict OOD threshold</td><td>Fewer silent failures</td><td>More false alarms and human review load</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your model says 95% on cases it gets wrong, and sometimes it sees inputs from a new hospital. What do you do?” A strong answer:</p>
+    <ul>
+      <li>Measure: reliability diagram and ECE on held-out data; fix with temperature scaling fitted on validation NLL (accuracy unchanged).</li>
+      <li>Separate aleatoric from epistemic uncertainty; use a deep ensemble (M = 5) or MC dropout for epistemic uncertainty.</li>
+      <li>OOD: a score (max softmax baseline, energy score, ensemble disagreement), a threshold set on normal data (e.g. keep 95%), and a fallback path.</li>
+      <li>Production: name the shift (covariate, label, concept), monitor score distributions and flag rates, label samples, recalibrate or retrain.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The calibration wake-up call</b> <span class="tag res">🧪 Research · 2017</span> <a href="https://arxiv.org/abs/1706.04599" target="_blank" rel="noopener">Guo, Pleiss, Sun &amp; Weinberger: On Calibration of Modern Neural Networks</a></div>
+      <p><b>How:</b> reliability diagrams and ECE (15 bins) across vision and NLP models; compared binning methods, Platt, vector, matrix and temperature scaling.</p>
+      <p><b>Why this method:</b> temperature scaling, one parameter, was the simplest and often the best: ResNet-110 on CIFAR-100 went from 16.53% to 1.26% ECE.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Ensembles for uncertainty</b> <span class="tag res">🧪 DeepMind · 2017</span> <a href="https://arxiv.org/abs/1612.01474" target="_blank" rel="noopener">Lakshminarayanan, Pritzel &amp; Blundell: Simple and Scalable Predictive Uncertainty Estimation using Deep Ensembles</a></div>
+      <p><b>How:</b> M independently initialized networks trained with a proper scoring rule, averaged; M = 5 recommended.</p>
+      <p><b>Why this method:</b> a non-Bayesian method that's simple, parallel and needs no tuning, and it beat approximate Bayesian methods on uncertainty quality.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Uncertainty under dataset shift</b> <span class="tag res">🧪 Google · 2019</span> <a href="https://arxiv.org/abs/1906.02530" target="_blank" rel="noopener">Ovadia et al.: Can You Trust Your Model's Uncertainty?</a></div>
+      <p><b>How:</b> benchmarked temperature scaling, MC dropout, ensembles, variational methods and more as images and text were progressively corrupted or shifted.</p>
+      <p><b>Why this method:</b> found that uncertainty quality degrades with shift for every method, that i.i.d. calibration doesn't transfer, and that deep ensembles held up best.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>OOD from the logits</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/2010.03759" target="_blank" rel="noopener">Liu, Wang, Owens &amp; Li: Energy-based Out-of-distribution Detection</a></div>
+      <p><b>How:</b> score each input by its energy, −T·logsumexp(logits/T), instead of the top softmax probability; optionally fine-tune to widen the gap.</p>
+      <p><b>Why this method:</b> a drop-in replacement for the baseline that uses the logits' scale; it reduced FPR at 95% TPR by 18.03% on CIFAR-10.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 99.99% sure it's a lion</span>
+    <p>Nguyen, Yosinski and Clune (2014) used an evolutionary algorithm to create images that look like TV static or abstract stripes. State-of-the-art networks labelled them as specific objects with <b>99.99%</b> confidence, “labeling with certainty that white noise static is a lion”. That paper is why “the softmax is not a confidence you can trust off-distribution” became folk wisdom.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Temperature is the same knob as in softmax outputs (0.6) and contrastive learning (9.1); NLL is cross-entropy (1.1, <a href="../../math-course/phase6/3-cross-entropy.html">math 6.3</a>); calibration as a metric appears in <a href="../../math-course/phase5/6b-metrics.html">math 5.6b</a>. Dropout is 2.4; ensembles echo bagging (<a href="../../machine-learning/phase4/2-random-forests.html">ML: random forests</a>). Adversarial inputs (9.5) are a hostile kind of OOD; saliency audits (9.4) catch spurious features that cause failures under shift. Production monitoring and evals for LLMs: <a href="../../ai-engineer/phase8/1-llmops.html">AI Engineer 8.1</a>, <a href="../../ai-engineer/phase5/1-why-evals.html">5.1</a>. Next: the recap puts all of Phase 9 together in one trustworthy medical model.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1706.04599" target="_blank" rel="noopener">On Calibration of Modern Neural Networks</a>. Short, clear, with the reliability diagrams you just built.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1906.02530" target="_blank" rel="noopener">Can You Trust Your Model's Uncertainty?</a>. The large benchmark of uncertainty methods under shift.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1610.02136" target="_blank" rel="noopener">Hendrycks &amp; Gimpel: A Baseline for Detecting Misclassified and Out-of-Distribution Examples</a>. The max-softmax baseline every OOD paper compares against.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 200 predictions fall into two confidence bins. Bin 1: 150 predictions, average confidence 0.90, accuracy 0.80. Bin 2: 50 predictions, average confidence 0.50, accuracy 0.50. What's the ECE?</div>
+    <div class="opts"><button class="opt" data-ok>0.075</button><button class="opt">0.10</button><button class="opt">0.05</button></div>
+    <div class="explain">ECE = (150/200) × |0.80 − 0.90| + (50/200) × |0.50 − 0.50| = 0.75 × 0.10 + 0.25 × 0 = 0.075, a 7.5% calibration error, all from the confident bin.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After temperature scaling with T = 2.3 fitted on validation data, a colleague says “accuracy went down because the model is less confident now”. Are they right?</div>
+    <div class="opts"><button class="opt">Yes: lower confidence means fewer correct predictions</button><button class="opt" data-ok>No: dividing every logit by the same T &gt; 0 keeps the largest logit largest, so every predicted class, and the accuracy, is unchanged; only the probabilities move</button><button class="opt">Only if T is greater than 2</button></div>
+    <div class="explain">Temperature scaling is monotonic per input: logits/T keeps their order. The argmax doesn't change, so neither does accuracy. What changes is how confident each prediction claims to be, which is exactly what ECE and NLL measure.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A calibrated chest X-ray classifier (ECE 1.5% on the test set) is deployed at a new hospital whose scanner produces different-looking images. Confidence stays high but accuracy drops. What's the best first step?</div>
+    <div class="opts"><button class="opt">Nothing: the model is calibrated, so its confidence can be trusted</button><button class="opt">Lower the temperature to make it more decisive</button><button class="opt" data-ok>Treat it as covariate shift: monitor OOD scores (ensemble disagreement or energy) and route flagged scans to radiologists; collect labels from the new site, then recalibrate or fine-tune</button></div>
+    <div class="explain">Calibration measured on in-distribution data does not survive a shift (Ovadia et al.). The new scanner changed p(x): covariate shift. Detect it with an OOD score and a threshold set on the original data, keep humans in the loop for flagged cases, and adapt the model with labelled data from the new hospital.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Calibrated = “p% confident” is right p% of the time. Check with a reliability diagram; summarize with ECE.</li>
+      <li>Modern nets are overconfident (ResNet-110 on CIFAR-100: ECE 16.53%). Temperature scaling, one T fitted on validation NLL, fixed it to 1.26% without changing accuracy.</li>
+      <li>Aleatoric uncertainty = noisy data; epistemic = the model's ignorance. Ensembles (M = 5) and MC dropout estimate epistemic uncertainty by disagreement.</li>
+      <li>OOD detection = a score (max softmax, energy, ensemble spread) + a threshold set on normal data + a fallback. Single softmax is overconfident off-distribution (91% on noise, 99.99% on static).</li>
+      <li>Shifts: covariate (inputs), label (class mix), concept (the rule). Monitor scores and flag rates; calibration doesn't survive shift.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const css = n => getComputedStyle(document.documentElement).getPropertyValue(n).trim();
+
+  /* ---------- 1. reliability diagram ---------- */
+  function makeSet(k, N = 3000, seed = 4) { // labels drawn from softmax(z): z is calibrated; the model reports k·z
+    const r = NN.rng(seed), out = [];
+    for (let i = 0; i < N; i++) {
+      const c = r.int(10), z = Array.from({ length: 10 }, (_, j) => 1.2 * r.n() + (j === c ? 4 : 0));
+      const m = Math.max(...z), e = z.map(v => Math.exp(v - m)), s = e.reduce((a, b) => a + b, 0);
+      let u = r.u() * s, y = 0; while (u > e[y]) { u -= e[y]; y++; } y = Math.min(y, 9);
+      out.push({ logits: z.map(v => k * v), y });
+    }
+    return out;
+  }
+  const SETS = { over: makeSet(2.5), under: makeSet(0.6) };
+  let model = "over";
+  const soft = (z, T) => { const m = Math.max(...z), e = z.map(v => Math.exp((v - m) / T)), s = e.reduce((a, b) => a + b, 0); return e.map(v => v / s); };
+  function evalT(set, T, B = 15) {
+    const bins = Array.from({ length: B }, () => ({ n: 0, c: 0, a: 0 })); let nll = 0, acc = 0;
+    set.forEach(s => { const p = soft(s.logits, T); let k = 0; for (let j = 1; j < 10; j++) if (p[j] > p[k]) k = j; const b = Math.min(B - 1, Math.floor(p[k] * B)); bins[b].n++; bins[b].c += p[k]; bins[b].a += k === s.y ? 1 : 0; nll -= Math.log(Math.max(1e-12, p[s.y])); acc += k === s.y ? 1 : 0; });
+    const ece = bins.reduce((t, b) => t + (b.n ? (b.n / set.length) * Math.abs(b.a / b.n - b.c / b.n) : 0), 0);
+    return { ece, nll: nll / set.length, acc: acc / set.length, conf: bins.reduce((t, b) => t + b.c, 0) / set.length, bins };
+  }
+  const NLLC = {}; ["over", "under"].forEach(k => { NLLC[k] = []; for (let T = 0.3; T <= 4.0001; T += 0.1) NLLC[k].push([+T.toFixed(2), evalT(SETS[k], T).nll]); });
+  function drawC() {
+    const T = +$("cT").value, E = evalT(SETS[model], T), { ctx, w, h } = NN.fit($("cCan")), pad = 34, W = w - pad - 10, H = h - pad - 10;
+    const X = v => pad + v * W, Y = v => 10 + (1 - v) * H;
+    ctx.clearRect(0, 0, w, h); ctx.fillStyle = css("--bg2"); ctx.fillRect(0, 0, w, h);
+    ctx.strokeStyle = css("--line"); ctx.lineWidth = 1; ctx.strokeRect(X(0), Y(1), W, H);
+    E.bins.forEach((b, i) => { if (!b.n) return; const lo = i / 15, hi = (i + 1) / 15, acc = b.a / b.n, conf = b.c / b.n;
+      ctx.fillStyle = css("--c-y"); ctx.globalAlpha = 0.75; ctx.fillRect(X(lo) + 1, Y(acc), X(hi) - X(lo) - 2, Y(0) - Y(acc));
+      ctx.globalAlpha = 0.55; ctx.fillStyle = css("--c-dead"); const top = Math.max(acc, conf), bot = Math.min(acc, conf); ctx.fillRect(X(lo) + 1, Y(top), X(hi) - X(lo) - 2, Y(bot) - Y(top)); ctx.globalAlpha = 1; });
+    ctx.strokeStyle = css("--text"); ctx.setLineDash([5, 4]); ctx.beginPath(); ctx.moveTo(X(0), Y(0)); ctx.lineTo(X(1), Y(1)); ctx.stroke(); ctx.setLineDash([]);
+    ctx.fillStyle = css("--muted"); ctx.font = "11px " + css("--font"); ctx.textAlign = "center"; ctx.fillText("confidence →", X(0.5), h - 8);
+    [0, 0.5, 1].forEach(v => { ctx.fillText(v.toFixed(1), X(v), Y(0) + 12); }); ctx.save(); ctx.translate(11, Y(0.5)); ctx.rotate(-Math.PI / 2); ctx.fillText("accuracy in the bin", 0, 0); ctx.restore();
+    $("cTV").textContent = T.toFixed(2); $("cAcc").textContent = (100 * E.acc).toFixed(1) + "%"; $("cConf").textContent = (100 * E.conf).toFixed(1) + "%";
+    $("cECE").innerHTML = `<span class="${E.ece < 0.02 ? "y" : "dead"}">${(100 * E.ece).toFixed(1)}%</span>`; $("cNLL").textContent = E.nll.toFixed(3);
+    Plot.line($("cChart"), { series: [{ label: "NLL vs T", color: css("--c-ls"), data: NLLC[model], width: 2.5 }, { label: "your T", color: css("--text"), data: [[T, NLLC[model].reduce((m, p) => Math.min(m, p[1]), 9) - 0.05], [T, NLLC[model].reduce((m, p) => Math.max(m, p[1]), 0)]], width: 1, dash: [4, 4] }], xLabel: "temperature T", yMin: 0.8, yMax: Math.min(3, NLLC[model].reduce((m, p) => Math.max(m, p[1]), 0)) });
+    if (E.ece < 0.02) win(model === "over" ? "gECE" : "gUnder", true);
+    $("cMsg").textContent = E.ece < 0.02 ? "Calibrated: bars hug the diagonal. Accuracy didn't move at all." : E.conf > E.acc ? "Overconfident: confidence above accuracy (bars below the diagonal). Raise T." : "Underconfident: accuracy above confidence (bars above the diagonal). Lower T.";
+  }
+  $("cT").oninput = drawC;
+  $("cOne").onclick = () => { $("cT").value = 1; drawC(); };
+  $("cFit").onclick = () => { let a = 0.2, b = 5; for (let i = 0; i < 40; i++) { const c = b - (b - a) / 1.618, d = a + (b - a) / 1.618; if (evalT(SETS[model], c).nll < evalT(SETS[model], d).nll) b = d; else a = c; } $("cT").value = ((a + b) / 2).toFixed(2); drawC(); $("cMsg").textContent += ` (fitted T = ${((a + b) / 2).toFixed(3)})`; };
+  seg("cModel", v => { model = v; $("cT").value = 1; drawC(); });
+  drawC();
+
+  /* ---------- 2. ensemble OOD ---------- */
+  const DATA = NN.data.xor(200), TEST = NN.data.xor(200, { seed: 78 }), R = 3;
+  const OOD = (() => { const r = NN.rng(31); return Array.from({ length: 200 }, () => { const a = 2 * Math.PI * r.u(), rad = 1.8 + 1.0 * r.u(); return [rad * Math.cos(a), rad * Math.sin(a)]; }); })();
+  let nets = [], probe = null;
+  const M = () => +$("eM").value;
+  const ps = x => nets.slice(0, M()).map(n => n.predict(x)[0]);
+  const conf1 = x => { const p = nets[0].predict(x)[0]; return Math.max(p, 1 - p); };
+  const spread = x => { const v = ps(x), m = v.reduce((a, b) => a + b, 0) / v.length; return Math.sqrt(v.reduce((a, b) => a + (b - m) ** 2, 0) / v.length); };
+  const caught = (score, high) => { const s = TEST.map(t => score(t.x)).sort((a, b) => a - b), thr = high ? s[Math.floor(0.95 * s.length)] : s[Math.floor(0.05 * s.length)]; return OOD.filter(x => (high ? score(x) > thr : score(x) < thr)).length / OOD.length; };
+  function heatMap(cv, f, lo, hi, color) {
+    const { ctx, w, h } = NN.fit(cv), res = 60;
+    for (let i = 0; i < res; i++) for (let j = 0; j < res; j++) { const x = -R + 2 * R * (i + 0.5) / res, y = R - 2 * R * (j + 0.5) / res; ctx.fillStyle = NN.cmap.seq((f(x, y) - lo) / (hi - lo), color); ctx.fillRect(i * w / res, j * h / res, w / res + 1, h / res + 1); }
+    const P = (x, y) => [(x + R) / (2 * R) * w, (R - y) / (2 * R) * h];
+    DATA.forEach(s => { const [px, py] = P(...s.x); ctx.beginPath(); ctx.arc(px, py, 2.2, 0, 7); ctx.fillStyle = s.y ? "#2f80ed" : "#e17055"; ctx.fill(); });
+    ctx.strokeStyle = css("--muted"); ctx.lineWidth = 1.2; OOD.forEach(([x, y]) => { const [px, py] = P(x, y); ctx.beginPath(); ctx.moveTo(px - 2.5, py - 2.5); ctx.lineTo(px + 2.5, py + 2.5); ctx.moveTo(px - 2.5, py + 2.5); ctx.lineTo(px + 2.5, py - 2.5); ctx.stroke(); });
+    if (probe) { const [px, py] = P(...probe); ctx.beginPath(); ctx.arc(px, py, 7, 0, 7); ctx.lineWidth = 2.5; ctx.strokeStyle = css("--text"); ctx.stroke(); }
+  }
+  function eDraw() {
+    $("eMV").textContent = M();
+    if (!nets.length) { ["eOne", "eEns"].forEach(id => { const { ctx, w, h } = NN.fit($(id)); ctx.fillStyle = css("--panel"); ctx.fillRect(0, 0, w, h); ctx.fillStyle = css("--muted"); ctx.font = "13px " + css("--font"); ctx.textAlign = "center"; ctx.fillText("press ▶ Train 5 networks", w / 2, h / 2); }); return; }
+    heatMap($("eOne"), (x, y) => conf1([x, y]), 0.5, 1, "--c-y");
+    if (nets.length >= M()) heatMap($("eEns"), (x, y) => spread([x, y]), 0, 0.25, "--c-dead");
+    if (nets.length < 5) return;
+    const s1 = caught(conf1, false), sE = M() > 1 ? caught(spread, true) : null, sure = OOD.filter(x => conf1(x) >= 0.99).length / OOD.length;
+    $("eS1").textContent = (100 * s1).toFixed(0) + "%"; $("eSE").textContent = sE == null ? "needs M ≥ 2" : (100 * sE).toFixed(0) + "%"; $("eConf").textContent = (100 * sure).toFixed(0) + "%";
+    if (sE != null && sE >= 0.75) win("gCatch", true);
+    if (probe) { const v = ps(probe), one = nets[0].predict(probe)[0]; $("eP").textContent = `(${probe[0].toFixed(1)}, ${probe[1].toFixed(1)})`; $("eMem").textContent = v.map(p => p.toFixed(2)).join("  ");
+      const far = Math.max(Math.abs(probe[0]), Math.abs(probe[1])) > 1.4, sd = spread(probe);
+      if (far && Math.max(one, 1 - one) >= 0.99 && sd >= 0.2 && M() >= 2) win("gProbe", true);
+      $("eMsg").textContent = !far ? "Near the data: the members should agree." : sd >= 0.2 ? "Far from the data and the members disagree: epistemic uncertainty, flag it." : "Far from the data, yet the members agree. Ensembles miss some directions."; }
+  }
+  $("eTrain").onclick = () => {
+    nets = []; $("eTrain").disabled = true; let k = 0;
+    const L = NN.loop(() => { const n = new NN.MLP({ sizes: [2, 16, 16, 1], act: "tanh", out: "sigmoid", init: "xavier", initScale: 2, seed: k + 1 }); for (let t = 0; t < 300; t++) n.train(DATA, { lr: 0.01, opt: "adam" }); nets.push(n); k++; $("eTrain").textContent = `Training ${k} / 5…`; eDraw(); if (k >= 5) return false; },
+      { onStop: () => { $("eTrain").textContent = "▶ Train 5 networks"; $("eTrain").disabled = false; win("gTrainE", true); eDraw(); } });
+    L.start();
+  };
+  $("eM").oninput = eDraw;
+  [$("eOne"), $("eEns")].forEach(cv => cv.addEventListener("pointerdown", e => { if (nets.length < 5) return; const r = cv.getBoundingClientRect(); probe = [-R + 2 * R * (e.clientX - r.left) / r.width, R - 2 * R * (e.clientY - r.top) / r.height]; eDraw(); }));
+  eDraw();
+})();
+</script>
+</body>
+</html>

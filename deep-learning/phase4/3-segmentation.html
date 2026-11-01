@@ -1,0 +1,459 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.3 Segmentation: FCN, U-Net, Mask R-CNN, panoptic · Deep Learning</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧠</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  canvas.px { width: 100%; max-width: 360px; aspect-ratio: 1 / 1; height: auto; display: block; margin: 0 auto; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; touch-action: none; image-rendering: pixelated; }
+  canvas.small { max-width: 160px; }
+  .goals { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .legend-row { display: flex; flex-wrap: wrap; gap: 12px; font-size: .82rem; color: var(--muted); margin: 4px 0; }
+  .legend-row i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; vertical-align: -2px; margin-right: 4px; }
+  svg.unet { width: 100%; max-width: 640px; display: block; margin: 0 auto; }
+  svg.unet text { font: 600 11px var(--font); fill: var(--text); }
+</style>
+</head>
+<body data-lesson="d4-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 3</div>
+  <h1>Segmentation: FCN, U-Net, Mask R-CNN, panoptic</h1>
+  <p class="subtitle">Boxes say roughly where. Segmentation says exactly which pixels. The trouble is that CNNs throw away resolution to understand an image; this lesson is about how to get it back, how to score it, and how to tell two touching objects apart.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Convolution, stride and pooling shrink a feature map (Lessons 3.2 and 3.3): a 224 × 224 image becomes a 7 × 7 grid of rich <span class="ac">features</span> in a classifier.</li>
+      <li>IoU, masks vs boxes and mAP (Lesson 4.1); Faster R-CNN's region proposals (Lesson 4.2).</li>
+      <li>Cross-entropy is a per-example loss (Lesson 1.1); here every <b>pixel</b> is an example.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook: 30 training images</span>
+    <p>In 2015, Olaf Ronneberger and colleagues trained a network on the ISBI challenge for segmenting neuron membranes in electron-microscope images. The training set: <b>30 images</b> of 512 × 512 pixels. ImageNet classifiers had trained on 1.28 million.</p>
+    <p>Their network beat the previous best method, then, applied to light-microscopy cell videos, won the ISBI cell tracking challenge 2015 “by a large margin”. It segments a 512 × 512 image in under a second. They called it <b>U-Net</b>, and a decade later it's still the backbone of medical image segmentation (the self-configuring nnU-Net) and the denoiser inside many diffusion image generators (Lesson 7.4).</p>
+    <p><b>How can 30 images be enough, and what does the “U” have to do with it?</b></p>
+  </div>
+
+  <h2>Numbers first: segmentation is classification, 262,144 times</h2>
+  <p>Semantic segmentation gives every pixel a class. A 512 × 512 image with 21 classes needs 512 × 512 × 21 = <b>5.5 million</b> scores, one class distribution per pixel. The loss is just cross-entropy, averaged over all 262,144 pixels.</p>
+  <p>The catch: a classification CNN deliberately <b>throws resolution away</b>. Five stride-2 steps take 224 × 224 down to 7 × 7: each output cell summarizes a 32 × 32 patch. Great for “is there a cat?”, useless for “which exact pixels are cat?”. Every segmentation architecture is an answer to one question: <b>how do you get the resolution back without losing the understanding?</b></p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Fully convolutional networks (FCN, 2014)</span></span>
+    <ol>
+      <li><b>The problem before</b> Classifiers end in fully connected layers that need a fixed input size and output one vector. Early neural segmentation classified each pixel from a patch around it: one network run per pixel, very slow, with little context.</li>
+      <li><b>What people tried</b> Patch-wise classifiers, superpixels plus hand-made features, CRF post-processing.</li>
+      <li><b>Why this works</b> Long, Shelhamer and Darrell replaced the fully connected layers with convolutions, so the network takes any image size and outputs a coarse <b>map</b> of class scores in one pass; learned upsampling (transposed convolution) brings it back to full size. They also fused the coarse deep map with finer maps from earlier layers. Result: 62.2% mean IU on PASCAL VOC 2012 (20% relative better) at one third of a second per image, while reusing ImageNet classifiers.</li>
+      <li><b>What it costs, when it fails</b> Upsampling a 32×-downsampled map gives blobby edges; thin parts (legs, poles) vanish. The fusion with fine layers was shallow (just adding maps at 3 scales).</li>
+      <li><b>What refined it</b> Full encoder–decoders with skips at every scale (U-Net, next), and dilated convolution that avoids downsampling in the first place (DeepLab, below).</li>
+    </ol>
+  </div>
+
+  <h2>U-Net: a deep “what” plus a shallow “where”</h2>
+  <p>U-Net has a <b>contracting path</b> (the encoder: convolutions and pooling, getting smaller and smarter) and a symmetric <b>expanding path</b> (the decoder: upsampling back to full size). The key move: at every scale, the decoder <b>concatenates</b> the encoder's feature map of the same size, a “skip connection” (the paper's diagram labels them “copy and crop”).</p>
+  <svg class="unet" viewBox="0 0 640 220" role="img" aria-label="U-Net: an encoder going down, a decoder going up, and horizontal skip connections between them">
+    <g id="unetG"></g>
+  </svg>
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the general and the scout</span>
+    <p>The deep layers are a general looking at a blurry satellite map: they know <i>what</i> is going on (“the cell is roughly here, that blob is debris”) but not the exact edges. The shallow layers are a scout on the ground: they see every edge sharply, but can't tell a cell from debris. The decoder is the meeting where the general points (“trace this one”) and the scout draws the exact border. Without the scout, the border is blurry. Without the general, you trace everything bright.</p>
+  </div>
+  <p class="predict">🔮 <b>Predict:</b> with the bottleneck at 1/8 resolution and no skips, what happens to the cell's thin 2-pixel arm? And if you use <b>only</b> the shallow features, what happens to the debris?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Skips on, skips off</span>
+    <p class="hint">A toy, not a trained network: a 48 × 48 microscope-style image with one <b>cell</b> (the target, with a thin arm) and a bright piece of <b>debris</b>. The “decoder” mask is the target's coarse map at the bottleneck resolution, upsampled. The “skip” is the raw high-resolution image (sharp but noisy, and blind to what's what). The slider blends them; the mask is where the blend is above 0.5.</p>
+    <div class="goals"><span class="goal" id="gArm">🎯 Lose the arm (no skips)</span><span class="goal" id="gDebris">🎯 Segment the debris by mistake</span><span class="goal" id="g95">🎯 mIoU ≥ 0.95 at 1/8 resolution</span></div>
+    <div class="controls">
+      <span class="seg" id="uF"><button data-v="2">bottleneck 1/2</button><button data-v="4">1/4</button><button data-v="8" class="on">1/8</button><button data-v="16">1/16</button></span>
+      <label>skip weight α <input type="range" id="uA" min="0" max="1" step="0.05" value="0"> <b class="mono" id="uAV"></b></label>
+    </div>
+    <div class="pg-cols">
+      <div><canvas class="px" id="uC"></canvas>
+        <div class="legend-row"><span><i style="background:var(--c-y)"></i>correct object pixels</span><span><i style="background:var(--c-dead)"></i>false positive</span><span><i style="background:var(--c-x)"></i>missed</span></div></div>
+      <div>
+        <p class="hint">What the bottleneck sees (the coarse “what” map):</p>
+        <canvas class="px small" id="uCoarse"></canvas>
+        <div class="stat-row">
+          <div class="stat">mIoU <b id="uM" class="y">–</b></div>
+          <div class="stat">object IoU <b id="uFg">–</b></div>
+          <div class="stat">arm pixels kept <b id="uArm">–</b></div>
+          <div class="stat">debris pixels <b id="uDeb" class="dead">–</b></div>
+        </div>
+        <p class="hint" id="uMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> at 1/8 with no skips (α = 0), the mask is a smooth blob: mIoU 0.84 and <b>all</b> of the thin arm is gone. At 1/16 it collapses to 0.53. Skips only (α = 1) traces every bright pixel, debris and noise included: 0.85. The blend in the middle gets the best of both: at α = 0.5, mIoU reaches <b>0.97</b>, arm included, no debris. Real U-Nets learn this combination with convolutions instead of a fixed α.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">U-Net's skip connections (Ronneberger et al., 2015)</span></span>
+    <ol>
+      <li><b>The problem before</b> FCN's decoder upsampled a map 32× smaller than the image: the 1/16 case in your playground, where a 2-pixel arm can't survive. Biomedical images need exact borders (touching cells, thin membranes), and there were only dozens of labelled images.</li>
+      <li><b>What people tried</b> Sliding-window patch classifiers (the previous ISBI winner), FCN's 3-scale fusion, CRF post-processing to sharpen edges.</li>
+      <li><b>Why this works</b> The decoder gets two inputs at every scale: upsampled deep features (what) and the encoder's same-size features (where). Concatenation keeps both and lets convolutions learn how to combine them, so borders come from the high-resolution path and decisions from the deep path. It's fully convolutional, so every pixel of every image is a training example, and heavy augmentation (the paper stresses elastic deformations) multiplies 30 images into many. Skips also give gradients a short path to the early layers.</li>
+      <li><b>What it costs, when it fails</b> Memory: you keep every encoder feature map until the decoder uses it, at full resolution. Its context is limited to its receptive field, so it can confuse look-alike structures far apart. Plain U-Net is semantic only: two touching cells of the same class merge unless you add tricks (the paper weighted the border pixels between cells).</li>
+      <li><b>What refined it</b> 3D U-Nets for CT and MRI volumes, nnU-Net (2018) that configures itself to each dataset, attention and transformer encoders; U-Nets also became the denoiser in diffusion models (Lesson 7.4). Residual connections (Lesson 2.2) are the same idea inside a block.</li>
+    </ol>
+  </div>
+
+  <h2>Dilated (atrous) convolution: see wider without shrinking</h2>
+  <p>DeepLab took the opposite route: instead of shrinking and recovering, <b>shrink less</b>. A dilated (French: <i>à trous</i>, “with holes”) 3 × 3 convolution with rate 2 places its 9 weights 2 pixels apart, so it covers a 5 × 5 area; rate 4 covers 9 × 9; still 9 weights each.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: field of view for free</span>
+    <table>
+      <tr><th>Layer (3 × 3 kernel)</th><th>Weights per channel pair</th><th>Area covered</th><th>Output size on 64 × 64 (padding = rate)</th></tr>
+      <tr><td>normal (rate 1)</td><td>9</td><td>3 × 3</td><td>64 × 64</td></tr>
+      <tr><td>dilated, rate 2</td><td>9</td><td>5 × 5</td><td>64 × 64</td></tr>
+      <tr><td>dilated, rate 4</td><td>9</td><td>9 × 9</td><td>64 × 64</td></tr>
+      <tr><td>normal 9 × 9</td><td>81</td><td>9 × 9</td><td>64 × 64</td></tr>
+      <tr><td>stride-2 conv then upsample</td><td>9</td><td>3 × 3 (of a half-size map)</td><td>32 × 32 → blurry 64 × 64</td></tr>
+    </table>
+    <p>Stack rates 1, 2, 4: each output pixel sees a 15 × 15 window (3 + 4 + 8 = 15) using 27 weights per channel pair and no downsampling. In PyTorch: <code>nn.Conv2d(c, c, 3, padding=2, dilation=2)</code>.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Atrous convolution and ASPP (DeepLab, 2016)</span></span>
+    <ol>
+      <li><b>The problem before</b> Pooling and striding give large receptive fields but cost resolution; the decoder then has to guess the details back.</li>
+      <li><b>What people tried</b> Bigger kernels (81 weights for 9 × 9 instead of 9), upsampling decoders (FCN), CRF post-processing.</li>
+      <li><b>Why this works</b> Spacing the kernel out enlarges the field of view “without increasing the number of parameters or the amount of computation” (DeepLab's words). Keep the last stages at 1/8 resolution with dilation and the network sees whole objects while keeping 4× more detail than a 1/32 map. ASPP (atrous spatial pyramid pooling) runs several rates in parallel to catch small and large objects at once. DeepLab reached 79.7% mIoU on PASCAL VOC 2012 test.</li>
+      <li><b>What it costs, when it fails</b> High-resolution feature maps in deep layers are expensive in memory and compute. Large rates on small maps sample mostly padding; repeated equal rates create a “gridding” pattern where some pixels are never looked at.</li>
+      <li><b>What refined it</b> DeepLabv3+ added a light decoder (dilation plus skips); transformer segmenters get global context from attention instead (Mask2Former, SAM in Lesson 4.4).</li>
+    </ol>
+  </div>
+
+  <h2>Scoring a mask: accuracy lies, IoU and Dice don't</h2>
+  <p><b>Pixel accuracy</b> = correct pixels ÷ all pixels. <b>mIoU</b> (mean IoU) computes IoU per class over the whole image (pixels both predicted and true ÷ pixels either predicted or true), then averages over classes. <b>Dice</b> = 2 × overlap ÷ (predicted pixels + true pixels), a close cousin: Dice = 2·IoU ÷ (1 + IoU).</p>
+  <p class="predict">🔮 <b>Predict:</b> a 32 × 32 scan contains a 3 × 3 tumor (0.9% of pixels). A model that predicts “healthy” everywhere gets what pixel accuracy? What Dice?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The 99% accurate model that finds nothing</span>
+    <p class="hint">Paint your predicted mask: click and drag on the scan (click a painted pixel to erase). The <span class="y">green outline</span> is the true tumor. Losses use probabilities 0.95 for painted and 0.05 for unpainted pixels.</p>
+    <div class="goals"><span class="goal" id="gLie">🎯 Accuracy above 99% with Dice 0</span><span class="goal" id="gBlob">🎯 Find the tumor but score Dice under 0.3</span><span class="goal" id="gDice">🎯 Dice ≥ 0.8</span></div>
+    <div class="controls"><button class="btn" id="dNone">Predict all healthy</button><button class="btn" id="dBlob">Predict a big blob</button><button class="btn" id="dClear">↺ Clear</button></div>
+    <div class="pg-cols">
+      <div><canvas class="px" id="dC"></canvas></div>
+      <div>
+        <div class="stat-row">
+          <div class="stat">pixel accuracy <b id="dAcc">–</b></div>
+          <div class="stat">Dice <b id="dDice" class="y">–</b></div>
+          <div class="stat">tumor IoU <b id="dIou">–</b></div>
+        </div>
+        <div class="stat-row">
+          <div class="stat"><span class="ls">cross-entropy loss</span> <b id="dCe" class="ls">–</b></div>
+          <div class="stat"><span class="ls">Dice loss</span> 1 − Dice <b id="dDl" class="ls">–</b></div>
+        </div>
+        <p class="hint" id="dMsg"></p>
+      </div>
+    </div>
+  </div>
+  <p><b>What you should see:</b> “all healthy” scores <b>99.1%</b> accuracy (1,015 of 1,024 pixels) with Dice <b>0</b>: it found nothing. A big 9 × 9 blob over the tumor finds every tumor pixel but has Dice 0.2. Painting the 3 × 3 exactly gives Dice 1. Now compare the losses: from “all healthy” to “perfect”, average cross-entropy only drops from 0.077 to 0.051, because the 9 tumor pixels are under 1% of the average. Dice loss drops from 1 to 0: it only cares about the object.</p>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Dice loss for small objects</span></span>
+    <ol>
+      <li><b>The problem before</b> Per-pixel cross-entropy is an average over all pixels. When the object is 0.9% of the image, ignoring it entirely costs little (0.077 vs 0.051 in the playground), so networks learn to predict background, and pixel accuracy happily reports 99%.</li>
+      <li><b>What people tried</b> Class-weighted cross-entropy (multiply tumor pixels' loss by ~100), cropping around objects, oversampling images with objects.</li>
+      <li><b>Why this works</b> Dice loss = 1 − 2·overlap ÷ (predicted + true), computed with probabilities so it's differentiable (the “soft” Dice of V-Net, 2016). It's a ratio <b>about the object only</b>: background pixels that are correctly empty never enter it, so the object's size doesn't matter. Missing a 9-pixel tumor costs the full loss of 1.</li>
+      <li><b>What it costs, when it fails</b> Noisy gradients when the object is tiny or absent (an empty image makes Dice 0/0: add a small ε); it doesn't care about calibrated probabilities. Most systems therefore combine it with cross-entropy or focal loss: nnU-Net uses Dice + cross-entropy, SAM trains masks with focal + Dice.</li>
+      <li><b>What refined it</b> Tversky and focal-Tversky losses (weight false negatives more), boundary losses, and the Lovász loss that optimizes IoU directly.</li>
+    </ol>
+  </div>
+
+  <h2>Instance segmentation: Mask R-CNN</h2>
+  <p>Semantic segmentation paints two touching people the same color. <b>Instance</b> segmentation separates them. <b>Mask R-CNN</b> (2017) does it with a small addition to Faster R-CNN (Lesson 4.2): for each detected box, a tiny FCN predicts a <b>28 × 28 mask</b> of the object inside that box, then the mask is resized to the box. Detection decides <i>which objects</i>; the mask head only decides <i>which pixels in this box</i>.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: why rounding hurts masks (RoIAlign)</span>
+    <p>A box starts at x = 13.7 pixels. On a stride-16 feature map that's cell 13.7 ÷ 16 = 0.856. Fast R-CNN's RoI pooling <b>rounds</b> it to cell 1, which is pixel 16: a shift of <b>2.3 pixels</b>. For a 40-pixel-wide object that's 6% of its width, and the mask is now drawn 2.3 pixels off. For classification it doesn't matter; for masks it does.</p>
+    <p>Mask R-CNN's <b>RoIAlign</b> keeps 0.856 and samples the feature map there with bilinear interpolation: “no quantization is performed on any coordinates” (the paper's words). It's in torchvision as <code>torchvision.ops.roi_align</code>.</p>
+  </div>
+
+  <div class="box why">
+    <span class="label">🤔 Why this? <span class="what">Mask R-CNN's mask head</span></span>
+    <ol>
+      <li><b>The problem before</b> Semantic segmentation can't count or separate touching objects; detection gives boxes with background inside. Earlier instance methods segmented first and then classified, or chained many stages, and were slow and complex.</li>
+      <li><b>What people tried</b> Proposing segments then classifying them (DeepMask-style), per-pixel softmax over “instance channels”.</li>
+      <li><b>Why this works</b> Reuse a strong detector and add a parallel branch: per region, a small FCN outputs one 28 × 28 mask <b>per class</b> with a per-pixel sigmoid, and the classification branch picks which mask to use. The paper calls this decoupling mask and class prediction: masks don't compete across classes, so the mask head just answers “object or not, pixel by pixel”. Together with RoIAlign's exact sampling, it showed top results in all three COCO tracks (masks, boxes, keypoints), beating every single-model entry including the COCO 2016 winners, at 5 fps and only a small overhead over Faster R-CNN.</li>
+      <li><b>What it costs, when it fails</b> 28 × 28 masks are coarse for big objects with fine detail (hair, fences); masks are limited to inside the predicted box, so a bad box means a bad mask; two-stage speed.</li>
+      <li><b>What refined it</b> Real-time instance segmentation in YOLO models (YOLOv8 to YOLO26 “-seg”), query-based Mask2Former (2021) that handles semantic, instance and panoptic with one architecture, and promptable SAM (Lesson 4.4).</li>
+    </ol>
+  </div>
+
+  <h2>Panoptic segmentation: everything, once</h2>
+  <p>Kirillov et al. (2018) proposed <b>panoptic segmentation</b>: every pixel gets a class, and pixels of countable <b>things</b> (people, cars) also get an instance ID, while amorphous <b>stuff</b> (sky, road, grass) gets only a class. No overlaps allowed: one answer per pixel. They also proposed one metric for it, <b>panoptic quality</b> (PQ): match predicted and true segments (IoU &gt; 0.5 makes the match unique), then</p>
+  <div class="calc">PQ = Σ IoU of matched pairs ÷ (TP + ½ FP + ½ FN) = (average IoU of matches, “SQ”) × (TP ÷ (TP + ½ FP + ½ FN), “RQ”)</div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: PQ by hand</span>
+    <p>A street photo has 5 cars. Your model matches 3 of them with IoUs 0.9, 0.8 and 0.7, predicts 1 car that isn't there (FP) and misses 2 (FN).</p>
+    <div class="calc">PQ = (0.9 + 0.8 + 0.7) ÷ (3 + 0.5 + 1) = 2.4 ÷ 4.5 = <b>0.533</b>   ·   SQ = 2.4 ÷ 3 = 0.80, RQ = 3 ÷ 4.5 = 0.667, and 0.80 × 0.667 = 0.533 ✓</div>
+    <p>SQ says your masks are good when they exist; RQ says you're finding and not hallucinating enough of them. Like COCO's mAP, one number, two diagnoses.</p>
+  </div>
+
+  <table>
+    <tr><th></th><th>Semantic</th><th>Instance</th><th>Panoptic</th></tr>
+    <tr><td>Output</td><td>class per pixel</td><td>mask + class per object</td><td>class per pixel + ID per thing</td></tr>
+    <tr><td>Counts objects?</td><td>no</td><td>yes (things only)</td><td>yes</td></tr>
+    <tr><td>Stuff (sky, road)?</td><td>yes</td><td>no</td><td>yes</td></tr>
+    <tr><td>Metric</td><td>mIoU</td><td>mask AP</td><td>PQ</td></tr>
+    <tr><td>Classic models</td><td>FCN, U-Net, DeepLab</td><td>Mask R-CNN, YOLO-seg</td><td>Panoptic FPN, Mask2Former</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>torchvision has DeepLabv3, FCN and Mask R-CNN; Hugging Face has Mask2Former and SegFormer; Ultralytics has YOLO segmentation models; MONAI and nnU-Net are the medical standards. A tiny U-Net with two skip connections and a Dice loss, run on CPU:</p>
+<pre><code><span class="k">import</span> torch, torch.nn <span class="k">as</span> nn, torch.nn.functional <span class="k">as</span> F
+<span class="k">from</span> torchvision.models.segmentation <span class="k">import</span> deeplabv3_resnet50
+
+torch.manual_seed(<span class="n">0</span>)
+
+<span class="k">class</span> TinyUNet(nn.Module):
+    <span class="s">"""Encoder halves the size twice; decoder doubles it back and concatenates the skip features."""</span>
+    <span class="k">def</span> __init__(self, c=<span class="n">16</span>, n_classes=<span class="n">2</span>):
+        super().__init__()
+        block = <span class="k">lambda</span> i, o: nn.Sequential(nn.Conv2d(i, o, <span class="n">3</span>, padding=<span class="n">1</span>), nn.ReLU(), nn.Conv2d(o, o, <span class="n">3</span>, padding=<span class="n">1</span>), nn.ReLU())
+        self.enc1, self.enc2, self.mid = block(<span class="n">3</span>, c), block(c, <span class="n">2</span> * c), block(<span class="n">2</span> * c, <span class="n">4</span> * c)
+        self.up2, self.dec2 = nn.ConvTranspose2d(<span class="n">4</span> * c, <span class="n">2</span> * c, <span class="n">2</span>, stride=<span class="n">2</span>), block(<span class="n">4</span> * c, <span class="n">2</span> * c)
+        self.up1, self.dec1 = nn.ConvTranspose2d(<span class="n">2</span> * c, c, <span class="n">2</span>, stride=<span class="n">2</span>), block(<span class="n">2</span> * c, c)
+        self.head = nn.Conv2d(c, n_classes, <span class="n">1</span>)                  <span class="c"># one score per class per pixel</span>
+    <span class="k">def</span> forward(self, x):
+        e1 = self.enc1(x)                                       <span class="c"># full resolution: edges, fine detail</span>
+        e2 = self.enc2(F.max_pool2d(e1, <span class="n">2</span>))                     <span class="c"># 1/2</span>
+        m = self.mid(F.max_pool2d(e2, <span class="n">2</span>))                       <span class="c"># 1/4: context, "what"</span>
+        d2 = self.dec2(torch.cat([self.up2(m), e2], dim=<span class="n">1</span>))     <span class="c"># skip connection 1</span>
+        d1 = self.dec1(torch.cat([self.up1(d2), e1], dim=<span class="n">1</span>))    <span class="c"># skip connection 2</span>
+        <span class="k">return</span> self.head(d1)
+
+<span class="k">def</span> dice_loss(logits, target, eps=<span class="n">1.0</span>):
+    p = logits.softmax(<span class="n">1</span>)[:, <span class="n">1</span>]                                 <span class="c"># probability of "object" per pixel</span>
+    inter = (p * target).sum()
+    <span class="k">return</span> <span class="n">1</span> - (<span class="n">2</span> * inter + eps) / (p.sum() + target.sum() + eps)
+
+x = torch.rand(<span class="n">2</span>, <span class="n">3</span>, <span class="n">64</span>, <span class="n">64</span>)
+net = TinyUNet()
+out = net(x)
+print(out.shape, <span class="s">f"{sum(p.numel() for p in net.parameters()):,} parameters"</span>)
+target = torch.zeros(<span class="n">2</span>, <span class="n">64</span>, <span class="n">64</span>); target[:, <span class="n">30</span>:<span class="n">33</span>, <span class="n">30</span>:<span class="n">33</span>] = <span class="n">1</span>   <span class="c"># a tiny 3x3 object</span>
+print(<span class="s">"CE"</span>, F.cross_entropy(out, target.long()).item(), <span class="s">"Dice loss"</span>, dice_loss(out, target).item())
+
+seg = deeplabv3_resnet50(weights=<span class="k">None</span>, weights_backbone=<span class="k">None</span>, num_classes=<span class="n">3</span>).eval()   <span class="c"># no download</span>
+<span class="k">with</span> torch.no_grad():
+    print(seg(torch.rand(<span class="n">1</span>, <span class="n">3</span>, <span class="n">256</span>, <span class="n">256</span>))[<span class="s">"out"</span>].shape)
+
+<span class="c"># What we got (torch 2.8, torchvision 0.23, CPU):</span>
+<span class="c"># torch.Size([2, 2, 64, 64]) 117,058 parameters</span>
+<span class="c"># CE 0.7972108125686646 Dice loss 0.9954031109809875</span>
+<span class="c"># torch.Size([1, 3, 256, 256])</span></code></pre>
+    <p class="hint">The untrained net's cross-entropy (0.80) looks like an ordinary start; its Dice loss (0.995) says plainly that it has found none of the tiny object. Lab 4 trains a version of this net. Gotcha: <code>F.cross_entropy</code> wants logits of shape (N, C, H, W) and integer targets (N, H, W), not one-hot.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Encoder–decoder with skips (U-Net)</td><td>Sharp borders, works with little data, simple</td><td>Memory for stored feature maps; semantic only</td></tr>
+      <tr><td>Dilated convolution (DeepLab)</td><td>Big context without losing resolution or adding weights</td><td>Expensive high-res deep layers; gridding</td></tr>
+      <tr><td>Mask R-CNN</td><td>Instances, masks and boxes in one model</td><td>28 × 28 masks, two-stage speed, masks tied to boxes</td></tr>
+      <tr><td>Dice loss</td><td>Ignores how much background there is</td><td>Noisy for tiny or absent objects; pair with CE</td></tr>
+      <tr><td>Pixel accuracy as a metric</td><td>Easy to explain</td><td>Lies on imbalanced images; report mIoU or Dice</td></tr>
+    </table>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Design a model to segment tumors in CT scans. Labels are scarce.” A strong answer:</p>
+    <ul>
+      <li>U-Net (2D slices or 3D volumes), ideally via nnU-Net; skips for exact borders; strong augmentation (flips, elastic deformation, intensity changes); pretrained encoders where possible.</li>
+      <li>Loss: Dice + cross-entropy (or focal), because tumors are tiny; metric: Dice per case and per tumor, not pixel accuracy.</li>
+      <li>Knows semantic vs instance vs panoptic, and when to use Mask R-CNN or a promptable model like SAM to speed up labelling (Lesson 4.4).</li>
+      <li>Mentions validation by patient (not by slice) to avoid leakage, and checking errors with clinicians.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Medical segmentation that configures itself</b> <span class="tag oss">🧰 Open source · 2018</span> <a href="https://github.com/MIC-DKFZ/nnUNet" target="_blank" rel="noopener">nnU-Net (Isensee et al.)</a></div>
+      <p><b>How:</b> plain 2D and 3D U-Nets whose preprocessing, architecture and training are set automatically from the dataset's properties.</p>
+      <p><b>Why this method:</b> the authors argue the U-Net already works and the details matter more than new blocks; at submission it had the highest mean Dice in phase 1 of the Medical Segmentation Decathlon, with no manual tuning between its ten tasks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The original U-Net</b> <span class="tag hist">📜 History · 2015</span> <a href="https://arxiv.org/abs/1505.04597" target="_blank" rel="noopener">Ronneberger, Fischer &amp; Brox: U-Net</a></div>
+      <p><b>How:</b> contracting and expanding paths with copy-and-crop skips; elastic-deformation augmentation; trained end to end from very few images.</p>
+      <p><b>Why this method:</b> biomedical labels are expensive, so the network had to use every pixel and every augmentation; it won the ISBI 2015 cell tracking challenge in its categories.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Street scenes for self-driving research</b> <span class="tag res">🧪 Research · 2016</span> <a href="https://www.cityscapes-dataset.com/" target="_blank" rel="noopener">Cordts et al.: The Cityscapes Dataset</a></div>
+      <p><b>How:</b> stereo video from 50 cities; 5,000 images with fine pixel-level labels and 20,000 with coarse ones, for semantic and instance segmentation.</p>
+      <p><b>Why this method:</b> driving needs every pixel of road, sidewalk and person; Cityscapes became a standard mIoU and PQ benchmark (more in the <a href="../../autonomous-systems/index.html">Autonomous Systems course</a>).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Instance segmentation in real time</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.ultralytics.com/tasks/segment/" target="_blank" rel="noopener">Ultralytics: instance segmentation task</a></div>
+      <p><b>How:</b> YOLO models with a mask branch output a box, class and mask per object in one pass (YOLO26 also adds semantic-segmentation models).</p>
+      <p><b>Why this method:</b> masks at detector speed for robotics, measuring areas, and cutting out objects in video.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the output is smaller than the input</span>
+    <p>In the original U-Net diagram, a <b>572 × 572</b> input tile produces a <b>388 × 388</b> segmentation map: the paper used unpadded convolutions, so every layer nibbles a pixel off each border, and the skips have to “copy and crop”. To segment a big image they tiled it with overlapping tiles and mirrored the borders. Today almost everyone uses padding and gets the same size out as in, but the “U” in the diagram is still literally the shape of the network.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Downsampling and receptive fields: Lesson 3.3; transposed convolution is convolution's “reverse” (<a href="../../math-course/phase8/3b-convolution.html">math 8.3b</a>). Mask R-CNN extends Faster R-CNN (4.2); its masks are scored with the mask version of mAP (4.1). Skip connections echo residuals (2.2). Next, 4.4: SAM segments anything from a click. Later: U-Nets as diffusion denoisers (7.4). Applied segmentation for robots and cars: the <a href="../../autonomous-systems/index.html">Autonomous Systems course</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Book</span> <a href="https://d2l.ai/chapter_computer-vision/fcn.html" target="_blank" rel="noopener">Dive into Deep Learning: Fully convolutional networks</a>. Transposed convolution and FCN with code.</li>
+      <li><span class="kind">Project</span> <a href="https://lmb.informatik.uni-freiburg.de/people/ronneber/u-net/" target="_blank" rel="noopener">U-Net project page (Freiburg)</a>. The original paper, a video, and the famous figure.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1801.00868" target="_blank" rel="noopener">Panoptic Segmentation (2018)</a>. Short and readable; defines PQ and compares to human annotators.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A segmentation model gets IoU 0.90 on “road”, 0.70 on “car” and 0.20 on “bicycle”. What's its mIoU over these three classes?</div>
+    <div class="opts"><button class="opt" data-ok>0.60</button><button class="opt">0.90, the best class</button><button class="opt">It depends on how many pixels each class has</button></div>
+    <div class="explain">mIoU is the plain average of per-class IoUs: (0.90 + 0.70 + 0.20) ÷ 3 = <b>0.60</b>. That's deliberate: every class counts equally however few pixels it has, so a model can't hide a terrible bicycle class behind a huge road class (which pixel accuracy would do).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your lane-marking segmenter outputs smooth blobs: thin lane lines are missing or smeared, though it clearly knows where the road is. The model is an encoder that downsamples 32× followed by a single upsampling layer. What's the best fix?</div>
+    <div class="opts"><button class="opt">Train longer with a higher learning rate</button><button class="opt" data-ok>Add a decoder with skip connections from the high-resolution encoder layers (U-Net style), or keep more resolution with dilated convolutions</button><button class="opt">Switch the loss to mean squared error</button></div>
+    <div class="explain">Thin structures can't survive a 32× bottleneck and a single upsampling step: exactly the 1/16 case in the playground. The deep layers know “road”, the shallow ones know the exact edges; skips (or dilation, which avoids shrinking) give the decoder both.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A polyp segmentation model trained with plain cross-entropy reports 98.5% pixel accuracy, but doctors say it misses most small polyps. What should you change first?</div>
+    <div class="opts"><button class="opt">Nothing: 98.5% is excellent</button><button class="opt">Increase the image resolution only</button><button class="opt" data-ok>Report Dice/IoU per polyp, and train with Dice + cross-entropy (or focal) so small objects dominate the loss instead of background</button></div>
+    <div class="explain">Polyps are a small share of each image, so “background everywhere” already scores high accuracy and low cross-entropy. Dice ignores how much background exists and charges the full loss for a missed object; combining it with CE keeps training stable.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Semantic segmentation = cross-entropy at every pixel. The hard part is recovering the resolution a CNN throws away.</li>
+      <li>FCN: convolutions only, coarse map, learned upsampling. U-Net: decoder + skip connections at every scale (deep “what” + shallow “where”); trains from very few images.</li>
+      <li>Dilated (atrous) convolution widens the field of view with the same 9 weights and no downsampling (DeepLab, ASPP).</li>
+      <li>Pixel accuracy lies on small objects (99.1% while finding nothing). Use mIoU, Dice; train with Dice + CE or focal.</li>
+      <li>Mask R-CNN = Faster R-CNN + RoIAlign + a 28 × 28 per-class mask head. Panoptic = class per pixel + ID per thing, scored by PQ = SQ × RQ.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/nn.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const css = v => getComputedStyle(document.documentElement).getPropertyValue(v).trim();
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); };
+  const win = (id, ok) => { if (ok) $(id).classList.add("won"); };
+  const fit = c => { const d = window.devicePixelRatio || 1, w = c.clientWidth || 300, h = c.clientHeight || 300;
+    if (c.width !== Math.round(w * d)) { c.width = Math.round(w * d); c.height = Math.round(h * d); }
+    const x = c.getContext("2d"); x.setTransform(d, 0, 0, d, 0, 0); x.clearRect(0, 0, w, h); return { x, w, h }; };
+
+  /* ---------- U-Net diagram ---------- */
+  (() => {
+    const g = $("unetG"), NS = "http://www.w3.org/2000/svg", el = (t, a) => { const e = document.createElementNS(NS, t); Object.entries(a).forEach(([k, v]) => e.setAttribute(k, v)); g.appendChild(e); return e; };
+    const lv = [{ y: 20, h: 60, w: 18, lab: "64×64" }, { y: 90, h: 40, w: 26, lab: "32×32" }, { y: 140, h: 26, w: 34, lab: "16×16" }, { y: 176, h: 16, w: 44, lab: "8×8" }];
+    lv.forEach((L, i) => {
+      const xe = 40 + i * 70, xd = 600 - i * 70 - L.w;
+      el("rect", { x: xe, y: L.y, width: L.w, height: L.h, rx: 3, fill: "var(--c-ac)", opacity: 0.75 });
+      el("text", { x: xe - 4, y: L.y + L.h + 12 }).textContent = L.lab;
+      if (i < 3) {
+        el("rect", { x: xd, y: L.y, width: L.w, height: L.h, rx: 3, fill: "var(--c-ac)", opacity: 0.45 });
+        el("rect", { x: xd - L.w, y: L.y, width: L.w, height: L.h, rx: 3, fill: "var(--c-x)", opacity: 0.45 });
+        el("line", { x1: xe + L.w + 4, y1: L.y + L.h / 2, x2: xd - L.w - 4, y2: L.y + L.h / 2, stroke: "var(--c-x)", "stroke-width": 2, "stroke-dasharray": "6 4" });
+        el("text", { x: (xe + xd) / 2 - 40, y: L.y + L.h / 2 - 5 }).textContent = i === 0 ? "skip: copy (concatenate)" : "skip";
+        const nx = 40 + (i + 1) * 70, ny = lv[i + 1].y;
+        el("line", { x1: xe + L.w / 2, y1: L.y + L.h, x2: nx + lv[i + 1].w / 2, y2: ny, stroke: "var(--muted)", "stroke-width": 1.5 });
+        const ndx = 600 - (i + 1) * 70 - lv[i + 1].w;
+        const fromX = i === 2 ? 40 + 3 * 70 + lv[3].w : ndx + lv[i + 1].w / 2, fromY = i === 2 ? lv[3].y + lv[3].h / 2 : ny;   // the deepest decoder step starts at the bottleneck
+        el("line", { x1: fromX, y1: fromY, x2: xd - L.w / 2, y2: L.y + L.h, stroke: "var(--c-y)", "stroke-width": 1.5 });
+      }
+    });
+    el("text", { x: 20, y: 12 }).textContent = "encoder: pool ↓ (what)";
+    el("text", { x: 470, y: 12 }).textContent = "decoder: upsample ↑ (where)";
+    el("text", { x: 285, y: 205 }).textContent = "bottleneck";
+  })();
+
+  /* ---------- 1. skips on/off toy ---------- */
+  const N = 48, R = NN.rng(7), T = [], I = [], DEB = [], ARM = [];
+  for (let y = 0; y < N; y++) { T.push([]); I.push([]); DEB.push([]); ARM.push([]); for (let x = 0; x < N; x++) {
+    const dx = x - 18, dy = y - 24, ang = Math.atan2(dy, dx), rad = 9 + 2.5 * Math.sin(3 * ang);
+    let t = Math.hypot(dx, dy) <= rad ? 1 : 0;
+    const arm = x >= 26 && x <= 41 && y >= 23 && y <= 24 && !t; if (arm) t = 1;
+    const d = Math.hypot(x - 38, y - 10) <= 5 ? 1 : 0;
+    T[y].push(t); DEB[y].push(d); ARM[y].push(arm ? 1 : 0);
+    I[y].push(Math.min(1, Math.max(0, 0.15 + 0.7 * (t || d) + 0.15 * R.n()))); } }
+  const coarse = F => { const n = N / F, P = []; for (let i = 0; i < n; i++) { P.push([]); for (let j = 0; j < n; j++) { let s = 0; for (let a = 0; a < F; a++) for (let b = 0; b < F; b++) s += T[i * F + a][j * F + b]; P[i].push(s / F / F); } } return P; };
+  const up = (P, F) => { const n = N / F, U = []; for (let y = 0; y < N; y++) { U.push([]); for (let x = 0; x < N; x++) {
+    const fy = (y + 0.5) / F - 0.5, fx = (x + 0.5) / F - 0.5, y0 = Math.max(0, Math.min(n - 1, Math.floor(fy))), x0 = Math.max(0, Math.min(n - 1, Math.floor(fx))), y1 = Math.min(n - 1, y0 + 1), x1 = Math.min(n - 1, x0 + 1);
+    const wy = Math.max(0, Math.min(1, fy - y0)), wx = Math.max(0, Math.min(1, fx - x0));
+    U[y].push((1 - wy) * ((1 - wx) * P[y0][x0] + wx * P[y0][x1]) + wy * ((1 - wx) * P[y1][x0] + wx * P[y1][x1])); } } return U; };
+  let UF = 8;
+  function drawU() {
+    const a = +$("uA").value, P = coarse(UF), U = up(P, UF);
+    $("uAV").textContent = a.toFixed(2);
+    const M = U.map((r, y) => r.map((p, x) => ((1 - a) * p + a * I[y][x]) > 0.5 ? 1 : 0));
+    let i1 = 0, u1 = 0, i0 = 0, u0 = 0, arm = 0, armT = 0, deb = 0;
+    const { x, w } = fit($("uC")), k = w / N, good = css("--c-y"), bad = css("--c-dead"), miss = css("--c-x");
+    for (let yy = 0; yy < N; yy++) for (let xx = 0; xx < N; xx++) {
+      const p = M[yy][xx], t = T[yy][xx], v = Math.round(255 * I[yy][xx]);
+      if (p && t) i1++; if (p || t) u1++; if (!p && !t) i0++; if (!p || !t) u0++;
+      if (ARM[yy][xx]) { armT++; if (p) arm++; } if (DEB[yy][xx] && p) deb++;
+      x.fillStyle = `rgb(${v},${v},${v})`; x.fillRect(xx * k, yy * k, k + 0.5, k + 0.5);
+      const col = p && t ? good : p ? bad : t ? miss : null;
+      if (col) { x.globalAlpha = 0.6; x.fillStyle = col; x.fillRect(xx * k, yy * k, k + 0.5, k + 0.5); x.globalAlpha = 1; }
+    }
+    NN.heat($("uCoarse"), P, { lo: 0, hi: 1, cmap: "seq", color: "--c-ac", gap: 0 });
+    const m = (i1 / u1 + i0 / u0) / 2;
+    $("uM").textContent = m.toFixed(3); $("uFg").textContent = (i1 / u1).toFixed(2); $("uArm").textContent = `${arm} / ${armT}`; $("uDeb").textContent = deb;
+    win("gArm", a === 0 && arm === 0); win("gDebris", deb > 0); win("g95", UF === 8 && m >= 0.95);
+    $("uMsg").textContent = deb > 0 ? "Too much skip: the high-resolution path can't tell debris from the cell, so it traces anything bright (and noise)." :
+      arm === 0 ? "The coarse map is too blurry to hold a 2-pixel arm: the decoder alone draws a smooth blob." :
+      m >= 0.95 ? "Deep path decides what; skip path draws exact borders. That's the U-Net idea." : "";
+  }
+  seg("uF", v => { UF = +v; drawU(); });
+  $("uA").oninput = drawU;
+  drawU();
+
+  /* ---------- 2. Dice vs accuracy ---------- */
+  const D = 32, TUM = [[14, 14], [14, 15], [14, 16], [15, 14], [15, 15], [15, 16], [16, 14], [16, 15], [16, 16]];
+  const isT = (r, c) => r >= 14 && r <= 16 && c >= 14 && c <= 16;
+  let pred = Array.from({ length: D }, () => Array(D).fill(0)), paintVal = 1;
+  const r2 = NN.rng(3), BG = Array.from({ length: D }, (_, r) => Array.from({ length: D }, (_, c) => 0.25 + 0.12 * r2.n() + (isT(r, c) ? 0.35 : 0) + 0.15 * Math.exp(-((r - 10) ** 2 + (c - 22) ** 2) / 40)));
+  function drawD(msg) {
+    const { x, w } = fit($("dC")), k = w / D;
+    let tp = 0, fp = 0, fn = 0, tn = 0, ce = 0;
+    for (let r = 0; r < D; r++) for (let c = 0; c < D; c++) {
+      const v = Math.round(255 * Math.max(0, Math.min(1, BG[r][c]))); x.fillStyle = `rgb(${v},${v},${v})`; x.fillRect(c * k, r * k, k + 0.5, k + 0.5);
+      const p = pred[r][c], t = isT(r, c) ? 1 : 0;
+      if (p && t) tp++; else if (p) fp++; else if (t) fn++; else tn++;
+      const q = p ? 0.95 : 0.05; ce += t ? -Math.log(q) : -Math.log(1 - q);
+      if (p) { x.globalAlpha = 0.65; x.fillStyle = t ? css("--c-y") : css("--c-dead"); x.fillRect(c * k, r * k, k + 0.5, k + 0.5); x.globalAlpha = 1; }
+    }
+    x.strokeStyle = css("--c-y"); x.lineWidth = 2.5; x.strokeRect(14 * k, 14 * k, 3 * k, 3 * k);
+    const acc = (tp + tn) / (D * D), dice = 2 * tp / (2 * tp + fp + fn), iou = tp / (tp + fp + fn);
+    $("dAcc").textContent = (100 * acc).toFixed(1) + "%"; $("dDice").textContent = dice.toFixed(2); $("dIou").textContent = iou.toFixed(2);
+    $("dCe").textContent = (ce / (D * D)).toFixed(3); $("dDl").textContent = (1 - dice).toFixed(2);
+    win("gLie", acc > 0.99 && dice === 0); win("gBlob", tp === 9 && dice < 0.3); win("gDice", dice >= 0.8);
+    $("dMsg").textContent = msg || (acc > 0.99 && dice === 0 ? "99% accurate, and it found nothing. This is why segmentation reports Dice or IoU." : dice >= 0.8 ? "Found it, tightly." : "");
+  }
+  NN.onCells($("dC"), D, D, (r, c, e) => { if (e.type === "pointerdown") paintVal = pred[r][c] ? 0 : 1; pred[r][c] = paintVal; drawD(); });
+  $("dNone").onclick = () => { pred = pred.map(row => row.map(() => 0)); drawD("All healthy: 1,015 of 1,024 pixels are right, so accuracy is 99.1%. Dice: 0."); };
+  $("dBlob").onclick = () => { pred = pred.map((row, r) => row.map((_, c) => (r >= 11 && r <= 19 && c >= 11 && c <= 19 ? 1 : 0))); drawD("A 9 × 9 blob: every tumor pixel found, plus 72 healthy ones. Dice = 2·9 ÷ (81 + 9) = 0.2."); };
+  $("dClear").onclick = () => { pred = pred.map(row => row.map(() => 0)); drawD(); };
+  drawD();
+})();
+</script>
+</body>
+</html>
