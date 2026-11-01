@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.3 Chunking strategies · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .c0 { background: color-mix(in srgb, var(--c-in) 22%, transparent); }
+  .c1 { background: color-mix(in srgb, var(--c-tl) 24%, transparent); }
+  .c2 { background: color-mix(in srgb, var(--c-cx) 22%, transparent); }
+  .c3 { background: color-mix(in srgb, var(--c-md) 22%, transparent); }
+  .ovl { background: color-mix(in srgb, var(--c-tk) 45%, transparent); }
+  .got { outline: 2px solid var(--c-cx); outline-offset: 1px; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .doc h5 { margin: 6px 0 2px; font-size: .95rem; }
+</style>
+</head>
+<body data-lesson="a3-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 3</div>
+  <h1>Chunking strategies: the decision that makes or breaks RAG</h1>
+  <p class="subtitle">Before a document can be searched, it's cut into pieces. Cut badly and the right answer is never found, however good your model is.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Embeddings</b> turn a piece of text into a vector, and similar meanings land close together (Lesson 2.1).</li>
+      <li><b>RAG</b> = retrieve the most relevant pieces of your documents, put them in the prompt, then generate (Lesson 3.1).</li>
+      <li><b>Tokens</b>: about 4 characters of English each; you pay for every token you send (Lesson 0.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Anthropic's retrieval team describes a chunk from a financial filing that says: <i>“The company's revenue grew by 3% over the previous quarter.”</i> Someone asks about ACME Corp's revenue growth in Q2 2023. That chunk holds the answer, but on its own it never says <b>which company</b> or <b>which quarter</b>, so search struggles to find it and the model can't trust it.</p>
+    <p>Their fix was to change how chunks are made: put a short line of document context in front of each one before indexing it. Together with keyword search and reranking, that cut failed retrievals from <b>5.7% to 1.9%</b>. No new model needed, just better pieces.</p>
+  </div>
+
+  <h2>Numbers first: why we cut at all</h2>
+  <p>Your company handbook is 50 pages: about <b>25,000 tokens</b>. Why not send the whole thing with every question?</p>
+  <table>
+    <tr><th></th><th>Send the whole handbook</th><th>Send the 5 best 500-token chunks</th></tr>
+    <tr><td>Input tokens per question</td><td class="tk">25,000</td><td class="tk">2,500</td></tr>
+    <tr><td>Cost at $3 per million input tokens</td><td>$0.075</td><td>$0.0075 (10× cheaper)</td></tr>
+    <tr><td>At 100,000 questions a day</td><td class="rk">$7,500 a day</td><td>$750 a day</td></tr>
+    <tr><td>And when the docs grow to 5,000 pages?</td><td class="rk">Doesn't fit in any context window</td><td>Still 2,500 tokens</td></tr>
+  </table>
+  <p class="muted">Prices are illustrative; check your provider's pricing page. Small, stable knowledge bases are the exception: Anthropic's own advice is that under about 200,000 tokens you can often skip retrieval and put everything in the prompt, especially with prompt caching (Lesson 1.4).</p>
+  <p>So we split documents into <b>chunks</b>, embed each chunk, and at question time retrieve only the few that match. The catch: the answer has to be <b>inside</b> a chunk that gets retrieved, and that chunk has to make sense <b>on its own</b>.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A chunk is the unit your system can find and the unit the model can read. Good chunks are <b>small enough to match a question precisely</b>, but <b>big and self-contained enough to answer it</b>. Every chunking strategy is a different way to balance those two.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: cutting a cookbook into index cards</span>
+    <p>You're turning a cookbook into index cards so you can grab the right one fast. Cut every 100 words, and one card ends mid-recipe: “…then bake for 40 minutes.” Bake <i>what</i>? Cut one card per recipe, and each card is complete, though a long recipe makes a bulky card. Write the recipe's name at the top of every card, and even a small card makes sense on its own. Those three choices are fixed-size chunking, structure-aware chunking, and contextual chunking.</p>
+  </div>
+
+  <h2>The strategies</h2>
+  <table>
+    <tr><th>Strategy</th><th>How it cuts</th><th>Good for</th><th>Watch out for</th></tr>
+    <tr><td><b>Fixed-size</b> (+ overlap)</td><td>Every N tokens or characters, optionally repeating the last M at the start of the next chunk.</td><td>A quick baseline; uniform text.</td><td>Cuts mid-sentence; the pronoun problem (“this window…”).</td></tr>
+    <tr><td><b>Sentence-based</b></td><td>Packs whole sentences until the size limit.</td><td>Prose, FAQs, support articles.</td><td>Facts that span two sentences can still be split.</td></tr>
+    <tr><td><b>Recursive</b></td><td>Tries the biggest natural break first (blank line), then line, then sentence, then word, until pieces fit.</td><td>The usual default (LangChain's <code>RecursiveCharacterTextSplitter</code>).</td><td>Needs a sensible size; defaults may be poor.</td></tr>
+    <tr><td><b>Structure-aware</b></td><td>Splits on the document's own structure: Markdown headers, HTML sections, PDF pages, code functions.</td><td>Docs with headings, manuals, code, slides.</td><td>Sections can be huge; combine with a size cap.</td></tr>
+    <tr><td><b>Semantic</b></td><td>Embeds each sentence and cuts where the meaning shifts (similarity between neighbours drops).</td><td>Long unstructured text that changes topic.</td><td>Embedding cost at indexing time; threshold tuning.</td></tr>
+    <tr><td><b>Contextual</b></td><td>Any of the above, then adds a short description (doc title, section, or an LLM-written summary line) to each chunk before embedding.</td><td>Chunks that depend on context: filings, contracts, handbooks.</td><td>An LLM call per chunk at indexing time (cheap with caching).</td></tr>
+    <tr><td><b>Late chunking</b></td><td>Embeds the whole document with a long-context embedding model first, then pools the token vectors per chunk, so each chunk “remembers” its surroundings.</td><td>When chunks rely on earlier context.</td><td>Needs a long-context embedding model that exposes token vectors.</td></tr>
+  </table>
+  <p>Two more you'll meet in Lesson 4.2: <b>small-to-big</b> (search small chunks, but hand the model the bigger parent section) and <b>proposition</b> chunking (rewrite text into standalone facts).</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what overlap costs</span>
+    <p>A 10,000-token document, chunk size 500 tokens.</p>
+    <ul>
+      <li>No overlap: 10,000 ÷ 500 = <b>20 chunks</b>.</li>
+      <li>Overlap 100 tokens: each new chunk starts 400 tokens after the last. Chunks = ⌈(10,000 − 500) ÷ 400⌉ + 1 = ⌈23.75⌉ + 1 = <b>25 chunks</b>.</li>
+      <li>That's 25% more chunks to embed and store, and some search results will be near-duplicates of each other.</li>
+    </ul>
+    <p>Overlap buys you a safety margin when a fact straddles a cut. It isn't free, and it isn't magic: if the chunks are tiny, overlap just makes more tiny chunks.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Chunk it, then ask it</span>
+    <p class="hint">A small customer handbook. Pick a strategy and size; the colored stripes are the chunks (gold = text that appears in two chunks because of overlap). Pick a question: the chunks retrieved for it get a green outline, and we check whether they actually contain the answer. Start with the defaults (tiny fixed chunks) and question 1, then try to fix it.</p>
+    <div class="controls">
+      <span class="seg" id="meth"><button data-v="fixed" class="on">Fixed-size</button><button data-v="sentence">Sentences</button><button data-v="recursive">Recursive</button><button data-v="paragraph">By section</button></span>
+    </div>
+    <div class="controls">
+      <label>chunk size <input type="range" id="sz" min="10" max="120" step="5" value="20"> <b class="mono" id="szv"></b></label>
+      <label>overlap <input type="range" id="ov" min="0" max="20" step="1" value="0"> <b class="mono" id="ovv"></b></label>
+      <label>top-k <input type="range" id="kk" min="1" max="4" step="1" value="2"> <b class="mono" id="kkv"></b></label>
+      <label><input type="checkbox" id="ctx"> add section context to each chunk</label>
+    </div>
+    <div class="controls">
+      <label>question <select id="qq" class="btn small"></select></label>
+    </div>
+    <div class="doc" id="doc"></div>
+    <div class="verdict" id="verdict"></div>
+    <div id="hits"></div>
+    <div class="stat-row">
+      <div class="stat">chunks <b id="nC">–</b></div>
+      <div class="stat">avg chunk <b id="aT">–</b></div>
+      <div class="stat">tokens sent to the model <b id="sT">–</b></div>
+      <div class="stat">questions answerable <b id="score">–</b></div>
+    </div>
+    <p class="hint">Search here uses this course's tiny offline embedding (it knows synonyms like “money back” ≈ “refund”). Real embedding models are far better, but they fail in exactly the same ways when the answer isn't inside one retrievable chunk.</p>
+  </div>
+  <p>What you should see: tiny fixed chunks split “Refunds are available within 30 days” from “This window extends to 60 days for members of the Plus program”. Retrieval finds the 30-day sentence, so the model would confidently answer <b>30 days</b>: wrong for Plus members. Turn on section context and more questions start working, because every chunk now says what it's about. Switch to recursive at around 50 tokens, or by section, and the facts stay together.</p>
+
+  <h2>Chunk size is a trade-off you can measure</h2>
+  <p>Small chunks match a question precisely but may not hold the whole answer. Big chunks hold the answer but dilute the match, and every retrieved chunk costs tokens. The only honest way to pick is to measure on your own questions.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Sweep the chunk size</span>
+    <p class="hint">Uses the strategy, overlap, top-k and context settings from the playground above, and tries every chunk size on all 8 handbook questions. Green = share of questions whose retrieved chunks contain the answer. Gold = tokens sent to the model per question.</p>
+    <div class="controls"><button class="btn primary" id="sweep">▶ Sweep sizes 10 → 120 tokens</button></div>
+    <canvas class="chart" id="sw" style="height:230px"></canvas>
+    <p class="hint" id="swmsg"></p>
+  </div>
+  <p>On real corpora the curve has the same shape. NVIDIA's 2025 tests found the best size varied by dataset (1,024 tokens for one financial benchmark, 512 for another), with extreme sizes like 128 and 2,048 tokens generally doing worse. Lesson 5.4 shows how to build the retrieval eval that draws this curve for your data.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>LangChain</b> text splitters (<code>RecursiveCharacterTextSplitter</code>, <code>MarkdownHeaderTextSplitter</code>), <b>LlamaIndex</b> node parsers (<code>SentenceSplitter</code>, <code>SemanticSplitterNodeParser</code>), document parsers like <b>Unstructured</b> or <b>Docling</b> that keep headings and tables (Lesson 3.2), and Chonkie for fast standalone chunking.</p>
+<pre><code><span class="k">from</span> langchain_text_splitters <span class="k">import</span> RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=<span class="n">1200</span>,        <span class="c"># measured in characters by default (~300 tokens)</span>
+    chunk_overlap=<span class="n">150</span>,
+    separators=[<span class="s">"\n\n"</span>, <span class="s">"\n"</span>, <span class="s">". "</span>, <span class="s">" "</span>, <span class="s">""</span>],  <span class="c"># biggest break first</span>
+)
+chunks = splitter.split_text(handbook_text)
+
+<span class="c"># Contextual chunking: prefix each chunk with where it came from before embedding</span>
+records = [{
+    <span class="s">"text"</span>: chunk,                                       <span class="c"># what the model will read</span>
+    <span class="s">"embed_text"</span>: <span class="s">f"{doc_title} › {section_of(chunk)}\n{chunk}"</span>,  <span class="c"># what gets embedded</span>
+    <span class="s">"metadata"</span>: {<span class="s">"doc_id"</span>: doc_id, <span class="s">"section"</span>: section_of(chunk)},
+} <span class="k">for</span> chunk <span class="k">in</span> chunks]</code></pre>
+    <p class="hint">Anthropic's version asks an LLM for a one- or two-sentence context per chunk (usually 50–100 tokens) and uses prompt caching so the whole document is only processed once; they estimate about $1.02 per million document tokens, paid once at indexing time.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Smaller chunks</td><td>Precise matches, fewer tokens per answer</td><td>Answers split across chunks; context lost</td></tr>
+      <tr><td>Bigger chunks</td><td>Self-contained answers</td><td>Blurry embeddings (many topics in one vector), more tokens, more noise for the model</td></tr>
+      <tr><td>Overlap</td><td>Safety margin at boundaries</td><td>More chunks and near-duplicate results</td></tr>
+      <tr><td>Structure-aware</td><td>Chunks match how humans wrote the doc</td><td>Needs a parser that keeps structure; uneven sizes</td></tr>
+      <tr><td>Contextual / late chunking</td><td>Each chunk understandable on its own</td><td>Extra indexing compute; re-index when you change it</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Recursive splitting at 300–800 tokens with ~10–15% overlap, split on headings if you have them, and keep the title and section in metadata. Build a 30-question eval set the same day, so every later change is measured instead of guessed.</p></div>
+      <div><h4>At scale</h4><p>Per-source pipelines (contracts by clause, code by function, slides by page, tickets by thread), contextual chunks, small-to-big retrieval, and chunk configs versioned and A/B-tested against a retrieval eval. Changing the chunker means re-embedding everything, so it's planned like a database migration.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you chunk these documents?” A senior answer:</p>
+    <ul>
+      <li>Starts from the <b>documents and the questions</b>: structure, length, tables, how self-contained the facts are.</li>
+      <li>Names a baseline (recursive, a size range, a little overlap) and <b>why</b>, plus structure-aware splitting where structure exists.</li>
+      <li>Mentions the <b>context problem</b> (pronouns, missing entity names) and a fix (headers in chunks, contextual retrieval, small-to-big).</li>
+      <li>Says how they'd <b>measure</b> it: recall@k on a labelled question set, then end-to-end answer quality (Lessons 5.1 and 5.4).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Context added to every chunk</b> <span class="tag co">🏢 Anthropic · 2024</span> <a href="https://www.anthropic.com/research/contextual-retrieval" target="_blank" rel="noopener">Introducing Contextual Retrieval</a></div>
+      <p><b>How:</b> before embedding, an LLM writes a short context for each chunk (which document, which section, what it's about), and the context is added to both the embedding and the BM25 keyword index.</p>
+      <p><b>Why this method:</b> top-20 retrieval failures fell 35% with contextual embeddings (5.7% → 3.7%), 49% adding contextual BM25 (→ 2.9%) and 67% with reranking (→ 1.9%), without changing the embedding model.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Measuring chunkers instead of guessing</b> <span class="tag co">🏢 Chroma · 2024</span> <a href="https://www.trychroma.com/research/evaluating-chunking" target="_blank" rel="noopener">Evaluating Chunking Strategies for Retrieval</a></div>
+      <p><b>How:</b> compared popular chunkers and settings on the same retrieval benchmark, scoring recall and precision of the retrieved tokens.</p>
+      <p><b>Why this method:</b> the choice of strategy changed recall by up to 9%; some popular defaults performed relatively poorly, while a well-tuned recursive splitter often did well.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Page-level chunks for PDFs</b> <span class="tag co">🏢 NVIDIA · 2025</span> <a href="https://developer.nvidia.com/blog/finding-the-best-chunking-strategy-for-accurate-ai-responses/" target="_blank" rel="noopener">Finding the Best Chunking Strategy for Accurate AI Responses</a></div>
+      <p><b>How:</b> tested token-based, section-based and page-level chunking across several datasets, measuring end-to-end answer accuracy.</p>
+      <p><b>Why this method:</b> page-level chunking had the highest average accuracy (0.648) and the most consistent results, and the best token size differed by dataset, which is why you measure on your own data.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Embed first, chunk later</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2409.04701" target="_blank" rel="noopener">Late Chunking (Jina AI)</a></div>
+      <p><b>How:</b> run the whole document through a long-context embedding model, then average the token vectors inside each chunk's span to get that chunk's embedding.</p>
+      <p><b>Why this method:</b> each chunk's vector is computed with the rest of the document in view, so “it” and “this window” still carry their meaning, without an extra LLM call per chunk.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the default nobody chose</span>
+    <p>Many RAG prototypes run on whatever chunk size the tutorial used. Chroma's study found exactly that kind of untuned default among the weaker configurations it tested. One of the cheapest wins in AI engineering is simply measuring two or three chunk sizes on 50 real questions.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Chunks are what you embed (Lesson 2.1) and store in a vector database (2.3); retrieval and reranking choose among them (3.4); the generator reads them (3.5). Lesson 4.2 builds smarter indexes on top (parent–child, hierarchical summaries), and Lesson 5.4 measures all of it. The math of why one vector can't hold many topics well is in the Math for AI course: <a href="../../math-course/phase1/5-embeddings.html">embeddings as geometry</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://www.anthropic.com/research/contextual-retrieval" target="_blank" rel="noopener">Anthropic: Contextual Retrieval</a>. The context-per-chunk method, its prompt, cost and results.</li>
+      <li><span class="kind">Research</span> <a href="https://www.trychroma.com/research/evaluating-chunking" target="_blank" rel="noopener">Chroma: Evaluating Chunking Strategies</a>. How to evaluate chunkers at the token level.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.langchain.com/oss/python/integrations/splitters/index" target="_blank" rel="noopener">LangChain text splitters</a>. Every splitter type with examples.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A 6,000-token document, chunk size 400, overlap 100. Roughly how many chunks?</div>
+    <div class="opts"><button class="opt">15</button><button class="opt" data-ok>20</button><button class="opt">60</button></div>
+    <div class="explain">Each chunk starts 300 tokens after the previous one: ⌈(6,000 − 400) ÷ 300⌉ + 1 = ⌈18.7⌉ + 1 = <b>20</b>, versus 15 with no overlap.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Retrieval keeps returning “This window extends to 60 days for members” for refund questions, but your model ignores it or misreads it. What's the most direct fix?</div>
+    <div class="opts"><button class="opt">Switch to a bigger LLM</button><button class="opt" data-ok>Make chunks self-contained: keep the sentence with the one it refers to, and add the section title or a context line to each chunk</button><button class="opt">Lower the temperature</button></div>
+    <div class="explain">The chunk depends on the sentence before it (“this window” = the refund window). Structure-aware or recursive splitting keeps them together; contextual chunking adds “Refunds:” to the chunk so it stands alone.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You're indexing a codebase and a Markdown docs site. Which chunking is the best starting point?</div>
+    <div class="opts"><button class="opt">Fixed 200-character chunks for both</button><button class="opt">One chunk per file</button><button class="opt" data-ok>Structure-aware: code split by function or class, docs split by headings, each with a size cap</button></div>
+    <div class="explain">Both sources have structure that matches how people ask questions (“what does parse_config do?”, “how do I install?”). Splitting along it keeps units whole; a size cap stops giant functions or sections.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>The answer must live inside a chunk that gets retrieved, and that chunk must make sense on its own.</li>
+      <li>Start with recursive or structure-aware splitting, a few hundred tokens, a little overlap; keep titles and sections as metadata.</li>
+      <li>Fix context loss with section headers, contextual retrieval or late chunking; fix size with small-to-big (4.2).</li>
+      <li>Chunk size is a trade-off between precision, completeness and tokens: measure it on your own questions.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const DOC = `# Acme Gear customer handbook
+
+## Refunds
+Refunds are available within 30 days of delivery. This window extends to 60 days for members of the Plus program. Refunds go back to the original payment method within 5 business days.
+
+## Shipping
+Standard shipping takes 3 to 5 business days. Express shipping arrives the next business day if you order before 2 pm. Tracking links are emailed as soon as the parcel leaves the warehouse.
+
+## Warranty
+Every jacket has a two-year warranty against defects. The warranty does not cover damage from normal wear. To make a claim, send a photo of the defect to support.
+
+## Plus membership
+Plus costs 49 dollars per year. It includes free express shipping on every order. Members also get early access to sales.
+
+## Account and login
+If you are locked out, use the Forgot password link on the sign in page. The reset link expires after 30 minutes. For security, we never ask for your password by email.`;
+  // [question, facts that must appear in the retrieved text, a tempting wrong fact]
+  const QS = [
+    ["How long do Plus members have to ask for a refund?", ["60 days"], "30 days"],
+    ["How much does the Plus membership cost?", ["49 dollars"], null],
+    ["When does the password reset link expire?", ["30 minutes"], null],
+    ["Does the warranty cover normal wear?", ["does not cover"], "two-year warranty"],
+    ["How fast is express shipping?", ["next business day"], "3 to 5 business days"],
+    ["How long until my refund money is back?", ["5 business days"], "30 days"],
+    ["Do Plus members pay for express shipping?", ["free express shipping"], null],
+    ["How do I make a warranty claim?", ["photo"], null],
+  ];
+  const heads = [...DOC.matchAll(/^#+ (.*)$/gm)].map(m => [m.index, m[1]]);
+  const section = pos => { let h = ""; heads.forEach(([i, t]) => { if (i <= pos) h = t; }); return h; };
+  const esc = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  let method = "fixed";
+  const segBtns = [...$("meth").querySelectorAll("button")];
+  segBtns.forEach(b => (b.onclick = () => { segBtns.forEach(x => x.classList.toggle("on", x === b)); method = b.dataset.v; render(); }));
+  $("qq").innerHTML = QS.map((q, i) => `<option value="${i}">${i + 1}. ${q[0]}</option>`).join("");
+
+  function build(o) {
+    const ch = AI.chunk(DOC, { method: o.method, size: o.size, overlap: o.overlap })
+      .filter(c => !/^#\s[^\n]*$/.test(c.text.trim())); // drop a chunk that is only the document title
+    const vecs = ch.map(c => AI.embed((o.ctx ? `Acme Gear handbook, section ${section(c.start + 2)}. ` : "") + c.text));
+    return { ch, vecs };
+  }
+  function ask(idx, q, k) {
+    const qv = AI.embed(q[0]);
+    const top = idx.vecs.map((v, i) => ({ i, s: AI.cosine(qv, v) })).sort((a, b) => b.s - a.s).slice(0, k);
+    const txt = top.map(t => idx.ch[t.i].text).join(" ");
+    return { top, ok: q[1].every(f => txt.includes(f)), trap: q[2] && txt.includes(q[2]) };
+  }
+  const opts = () => ({ method, size: +$("sz").value, overlap: Math.min(+$("ov").value, +$("sz").value - 5), ctx: $("ctx").checked, k: +$("kk").value });
+
+  function render() {
+    const o = opts();
+    $("szv").textContent = method === "paragraph" ? "(not used)" : o.size + " tokens";
+    $("ovv").textContent = o.overlap + " tokens"; $("kkv").textContent = o.k;
+    const idx = build(o), q = QS[+$("qq").value], r = ask(idx, q, o.k);
+    const got = new Set(r.top.map(t => t.i));
+    // paint the document: split at every chunk boundary, color by chunk, gold where chunks overlap
+    const cuts = new Set([0, DOC.length]);
+    idx.ch.forEach(c => { cuts.add(c.start); cuts.add(c.end); });
+    const pts = [...cuts].sort((a, b) => a - b);
+    let html = "";
+    for (let p = 0; p < pts.length - 1; p++) {
+      const s = pts[p], e = pts[p + 1], cover = idx.ch.map((c, i) => [c, i]).filter(([c]) => c.start <= s && c.end >= e);
+      const txt = esc(DOC.slice(s, e)).replace(/^## (.*)$/gm, "<b>$1</b>").replace(/^# (.*)$/gm, "<b>$1</b>").replace(/\n/g, "<br>");
+      if (!cover.length) { html += `<span class="muted">${txt}</span>`; continue; }
+      const cls = cover.length > 1 ? "ovl" : "c" + (cover[0][1] % 4);
+      html += `<span class="chunk ${cls}${cover.some(([, i]) => got.has(i)) ? " got" : ""}">${txt}</span>`;
+    }
+    $("doc").innerHTML = html;
+    $("verdict").innerHTML = r.ok
+      ? `<span class="ev">✅ The retrieved chunks contain the answer (${q[1].join(", ")}). The model can answer correctly.</span>`
+      : r.trap ? `<span class="rk">❌ The answer isn't in the retrieved chunks, but “${q[2]}” is. The model would likely answer confidently and wrongly.</span>`
+      : `<span class="rk">❌ The answer isn't in the retrieved chunks. At best the model says it doesn't know.</span>`;
+    $("hits").innerHTML = r.top.map((t, n) => `<div class="hit${q[1].some(f => idx.ch[t.i].text.includes(f)) ? "" : " miss"}"><span class="sc">#${n + 1} · similarity ${t.s.toFixed(2)}</span>${o.ctx ? `<span class="muted">[section ${esc(section(idx.ch[t.i].start + 2))}]</span> ` : ""}${esc(idx.ch[t.i].text.replace(/#+ /g, "").trim())}</div>`).join("");
+    const avg = idx.ch.reduce((s, c) => s + AI.countTokens(c.text), 0) / idx.ch.length;
+    $("nC").textContent = idx.ch.length;
+    $("aT").textContent = Math.round(avg) + " tokens";
+    $("sT").textContent = Math.round(r.top.reduce((s, t) => s + AI.countTokens(idx.ch[t.i].text), 0)) + " tokens";
+    $("score").textContent = QS.filter(qq => ask(idx, qq, o.k).ok).length + " / " + QS.length;
+  }
+  ["sz", "ov", "kk", "qq"].forEach(id => ($(id).oninput = render));
+  $("ctx").onchange = render;
+  render();
+
+  $("sweep").onclick = () => {
+    const o = opts(), acc = [], tok = [];
+    for (let size = 10; size <= 120; size += 5) {
+      const idx = build({ ...o, size, overlap: Math.min(o.overlap, size - 5) });
+      let ok = 0, t = 0;
+      QS.forEach(q => { const r = ask(idx, q, o.k); ok += r.ok; t += r.top.reduce((s, x) => s + AI.countTokens(idx.ch[x.i].text), 0); });
+      acc.push([size, 100 * ok / QS.length]); tok.push([size, t / QS.length]);
+    }
+    const maxT = Math.max(...tok.map(p => p[1]));
+    Plot.line($("sw"), {
+      series: [
+        { label: "answerable %", color: MX.css("--c-cx"), data: acc, width: 3 },
+        { label: `tokens per question (scaled, max ${Math.round(maxT)})`, color: MX.css("--c-tk"), data: tok.map(([x, y]) => [x, 100 * y / maxT]), dash: [6, 4] },
+      ], xLabel: "chunk size (tokens)", yMin: 0, yMax: 100,
+    });
+    const best = acc.reduce((b, p) => (p[1] > b[1] ? p : b), [0, -1]);
+    $("swmsg").textContent = method === "paragraph"
+      ? "By-section chunking ignores the size slider, so the line is flat: here every section is already a small, self-contained chunk."
+      : `With ${method} chunking, the smallest size that answers the most questions here is ${best[0]} tokens (${Math.round(best[1])}%). Past that, you mostly pay for more tokens.`;
+  };
+  $("sweep").onclick();
+})();
+</script>
+</body>
+</html>

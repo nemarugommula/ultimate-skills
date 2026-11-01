@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.2 Indexes &amp; query performance (B-trees, LSM trees) · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .controls select { font: inherit; font-size: .88rem; padding: 3px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); }
+  .sqlline { font-family: var(--mono); font-size: .9rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 8px 0; overflow-x: auto; }
+</style>
+</head>
+<body data-lesson="s2-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 2</div>
+  <h1>Indexes &amp; query performance (B-trees, LSM trees)</h1>
+  <p class="subtitle">An index turns “read every row” into “walk down a small tree”. It's the cheapest, biggest performance win in most systems, and every index you add makes every write a little more expensive.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Memory is far faster than SSD, and SSD far faster than spinning disk (Lesson 0.3).</li>
+      <li>Tables, rows and the access-patterns-first mindset (Lesson 2.1).</li>
+      <li><b>p99</b> = the latency 99% of requests beat (Lesson 0.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2016 Uber explained why it moved core data from Postgres to MySQL. One reason was <b>write amplification</b>: one logical change turning into many physical writes. In Postgres as Uber described it, a table had <b>12 indexes</b>, and an update to a field covered by just one of them still had to be written into <b>all 12</b>, because the new version of the row lived at a new physical address. Every extra write also travelled over replication to other servers.</p>
+    <p>Indexes are why your queries take a millisecond instead of a second. They're also a bill you pay on every write. This lesson is about getting the first without being surprised by the second.</p>
+  </div>
+
+  <h2>Numbers first: find one user among 10 million</h2>
+  <p><code>SELECT * FROM users WHERE email = 'ana@example.com'</code> on a table of <b>10,000,000 rows</b>. Typical numbers: about <b>100 rows</b> fit in one 8 KB page (Postgres stores tables and indexes in pages of usually 8 kB), and a B-tree page holds about <b>300 keys</b>.</p>
+  <table>
+    <tr><th></th><th>No index: full table scan</th><th>B-tree index on <code>email</code></th></tr>
+    <tr><td>Rows compared</td><td class="er">10,000,000</td><td class="ca">about 3 × 300 (one page per level)</td></tr>
+    <tr><td>Pages read</td><td>10,000,000 ÷ 100 = <b>100,000</b> (800 MB)</td><td>3 tree levels + 1 table page = <b>4</b></td></tr>
+    <tr><td>Time, typical SSD</td><td>800 MB at ~1 GB/s ≈ <b>0.8 s</b></td><td>4 × ~0.1 ms ≈ <b>0.4 ms</b> (less if cached in memory)</td></tr>
+  </table>
+  <p>About <b>2,000× faster</b>, and the gap grows with the table. A tree with 300 keys per page needs only 3 levels for 27 million rows (300³) and 4 levels for 8.1 billion (300⁴).</p>
+  <div class="eq">
+    pages read ≈ ⌈ log<sub>f</sub>(<span class="db">N</span>) ⌉ + 1 &nbsp;&nbsp; vs &nbsp;&nbsp; <span class="db">N</span> ÷ rows per page
+    <span class="say">“With an index, the pages you read grow with the logarithm of the row count, base f (the keys per page). Without one, they grow with the row count itself.”</span>
+  </div>
+  <div class="legend"><span class="db">N: rows in the table</span><span class="ca">f: fanout, keys per index page (hundreds)</span></div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    An index is a <b>second copy of some columns, kept sorted</b>, with a pointer back to each row. Sorting is what lets the database jump straight to the right place. Keeping that copy sorted is the cost you pay on every insert, update and delete.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the index at the back of a book</span>
+    <p>To find “replication” in a 600-page book you don't read every page. You flip to the index, find the word in alphabetical order, and jump to page 213. A phone book sorted by <b>(last name, first name)</b> is a composite index: great for “Smith, Ana”, useless for “everyone named Ana”. And every time the author adds a page, someone has to update the index too.</p>
+  </div>
+
+  <h2>How a B-tree finds a row</h2>
+  <p>A <b>B-tree</b> (balanced tree) is the default index in Postgres, MySQL and most relational databases. The root page holds a few hundred keys that split the key space into ranges. Each range points to a child page that splits it further, down to the <b>leaf</b> pages, which hold every key with a pointer to its row. The tree stays balanced: every leaf is the same distance from the root.</p>
+
+  <div class="playground" id="pg-scan">
+    <span class="label">🎮 Playground · Scan vs index</span>
+    <p class="hint">Pick a table size and a query, then press <b>Run query</b> to watch the database work. The planner (the part of the database that picks a strategy) uses the index only when it helps.</p>
+    <svg id="bt"></svg>
+    <div class="controls">
+      <label>rows <input type="range" id="s-n" min="3" max="9" step="1" value="7"> <b class="mono" id="s-nv"></b></label>
+      <label>keys per index page <input type="range" id="s-f" min="50" max="500" step="50" value="300"> <b class="mono" id="s-fv"></b></label>
+      <label><input type="checkbox" id="s-idx" checked> index on <code>email</code> exists</label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="s-q"><button id="s-q-eq" data-v="eq" class="on">email = ?</button><button id="s-q-fn" data-v="fn">lower(email) = ?</button><button id="s-q-lo" data-v="lo">country = 'US' (40% of rows)</button></span>
+      <button class="btn primary" id="s-run">▶ Run query</button>
+    </div>
+    <div class="sqlline" id="s-sql"></div>
+    <div class="stat-row">
+      <div class="stat">plan <b id="s-plan">–</b></div>
+      <div class="stat">rows examined <b id="s-rows">–</b></div>
+      <div class="stat">pages read <b id="s-pages">–</b></div>
+      <div class="stat">time (typical SSD) <b id="s-time">–</b></div>
+    </div>
+    <canvas class="chart" id="s-chart" style="height:200px"></canvas>
+    <p class="hint" id="s-msg"></p>
+  </div>
+  <p>Things to try: slide from a thousand rows to a billion. The scan line climbs 1,000,000×, the index line barely moves. Now pick <code>lower(email)</code>: the index is sorted by <code>email</code>, not by <code>lower(email)</code>, so the database can't use it (the fix is an <b>expression index</b> on <code>lower(email)</code>). Finally pick <code>country = 'US'</code>: 40% of rows match, so jumping around the table 4 million times is slower than reading it straight through, and the planner rightly scans.</p>
+
+  <h2>Composite indexes: column order matters</h2>
+  <p>A <b>composite index</b> covers several columns, like <code>(user_id, status, created_at)</code>. It's sorted by the first column, then by the second within each first value, and so on, exactly like a phone book.</p>
+  <p>The rule from the Postgres docs: the index is most efficient with conditions on the <b>leading (leftmost) columns</b>. Equality conditions on leading columns, plus at most one range condition on the next column, narrow the part of the index that's read. This is the <b>leftmost-prefix rule</b>.</p>
+
+  <div class="playground" id="pg-prefix">
+    <span class="label">🎮 Playground · The leftmost-prefix tester</span>
+    <p class="hint">An <code>orders</code> table with <b>50 million rows</b>: 1 million users, 5 statuses, two years of dates. Build an index by choosing the column order, tick the query's conditions, and see how much of the table the database has to touch.</p>
+    <div class="controls">
+      <span class="hint">Index on (</span>
+      <select id="p-1"><option>user_id</option><option>status</option><option>created_at</option></select>,
+      <select id="p-2"><option>status</option><option>user_id</option><option>created_at</option><option value="">—</option></select>,
+      <select id="p-3"><option>created_at</option><option>user_id</option><option>status</option><option value="">—</option></select>
+      <span class="hint">)</span>
+      <label><input type="checkbox" id="p-inc"> <code>INCLUDE (total)</code></label>
+    </div>
+    <div class="controls">
+      <span class="hint">WHERE</span>
+      <label><input type="checkbox" id="p-u" checked> <code>user_id = 42</code></label>
+      <label><input type="checkbox" id="p-s"> <code>status = 'paid'</code></label>
+      <label><input type="checkbox" id="p-c" checked> <code>created_at &gt; now() - 7 days</code></label>
+      <button class="btn" id="p-best">Best order for this query</button>
+    </div>
+    <div class="sqlline" id="p-sql"></div>
+    <div class="stat-row">
+      <div class="stat">index narrows on <b id="p-used">–</b></div>
+      <div class="stat">index entries read <b id="p-read">–</b></div>
+      <div class="stat">table rows fetched <b id="p-heap">–</b></div>
+      <div class="stat">rows returned <b id="p-ret">–</b></div>
+    </div>
+    <p class="hint" id="p-msg"></p>
+  </div>
+  <p>Things to try: with <code>(user_id, status, created_at)</code>, query only <code>user_id</code> and <code>created_at</code>. The index narrows on <code>user_id</code>, then stops at <code>status</code> (no condition on it), so <code>created_at</code> is checked row by row. Press <b>Best order</b>: <code>(user_id, created_at)</code> narrows on both. Now put <code>created_at</code> first: a range on the first column means reading every order from the last week, about 480,000 entries, to find one user's handful. Tick <code>INCLUDE (total)</code> to make a <b>covering index</b> for <code>SELECT total</code>: the database answers from the index alone and fetches zero table rows (an <b>index-only scan</b>).</p>
+  <p class="muted">Postgres 18 added a “skip scan” that can sometimes use an index whose first column has no condition, when that column has few distinct values. Treat it as a bonus, not a design rule.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what do indexes cost on writes?</span>
+    <p>An <code>events</code> table takes <b>2,000 inserts per second</b> and has <b>5 indexes</b>.</p>
+    <ul>
+      <li>Each insert writes the row once, plus one entry into each index: 1 + 5 = <b>6 structures</b> touched.</li>
+      <li>Per second: 2,000 × 6 = <b>12,000</b> sorted inserts, each into a different place in a different tree. Those trees also need memory to stay fast.</li>
+      <li>Dropping two indexes nobody queries (Postgres tracks this: <code>idx_scan = 0</code> in <code>pg_stat_user_indexes</code>) cuts that to 2,000 × 4 = <b>8,000</b>, a third less work.</li>
+    </ul>
+    <p>Rule of thumb: index the columns your hot queries filter, join and sort on. Every other index is a cost with no benefit.</p>
+  </div>
+
+  <h2>When writes dominate: LSM trees</h2>
+  <p>B-trees update pages <b>in place</b>: an insert finds its leaf and rewrites that page. With heavy random writes, that's a lot of scattered I/O. <b>LSM trees</b> (log-structured merge trees) flip it around. They're used by Cassandra, ScyllaDB, RocksDB, LevelDB and HBase:</p>
+  <ol>
+    <li>Append the write to a <b>write-ahead log</b> (WAL, Cassandra calls it the commit log) on disk, so it survives a crash.</li>
+    <li>Insert it into the <b>memtable</b>, a sorted structure in memory.</li>
+    <li>When the memtable is full, write it out in one sequential pass as an immutable, sorted file: an <b>SSTable</b> (sorted string table).</li>
+    <li>In the background, <b>compaction</b> merges SSTables, dropping overwritten and deleted values.</li>
+  </ol>
+  <p>Writes become cheap and sequential. The price: data is rewritten several times by compaction (write amplification again), and a read may have to check several SSTables. A <b>Bloom filter</b> per SSTable (a tiny structure that answers “definitely not here” or “maybe here”) lets reads skip most files.</p>
+  <table>
+    <tr><th></th><th>B-tree</th><th>LSM tree</th></tr>
+    <tr><td>Write path</td><td>Find the page, update in place</td><td>Append to log + memtable; flush sequential files</td></tr>
+    <tr><td>Reads</td><td>One tree walk, very predictable</td><td>Memtable + possibly several SSTables (Bloom filters help)</td></tr>
+    <tr><td>Background work</td><td>Light (vacuum in Postgres)</td><td>Compaction, which competes for disk with live traffic</td></tr>
+    <tr><td>Typical home</td><td>Postgres, MySQL InnoDB</td><td>Cassandra, ScyllaDB, RocksDB, HBase</td></tr>
+  </table>
+
+  <div class="playground" id="pg-lsm">
+    <span class="label">🎮 Playground · Inside an LSM tree</span>
+    <p class="hint">Keys are random numbers. The memtable flushes to a new SSTable when full; when 4 SSTables pile up at level 0, compaction merges them into one sorted level-1 file. Turn compaction off to see what “falling behind on compactions” does to reads.</p>
+    <div class="controls">
+      <label>memtable size <input type="range" id="l-m" min="500" max="4000" step="500" value="1000"> <b class="mono" id="l-mv"></b></label>
+      <label><input type="checkbox" id="l-comp" checked> compaction on</label>
+      <label><input type="checkbox" id="l-bloom" checked> Bloom filters</label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="l-write">Write 2,000 keys</button>
+      <button class="btn" id="l-many">Write 20,000 keys</button>
+      <button class="btn" id="l-reset">Reset</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">keys written <b id="l-n">0</b></div>
+      <div class="stat">SSTables on disk <b id="l-t">0</b></div>
+      <div class="stat">write amplification <b id="l-wa">–</b></div>
+      <div class="stat">SSTables checked per read <b id="l-rp">–</b></div>
+    </div>
+    <canvas class="chart" id="l-chart" style="height:190px"></canvas>
+    <p class="hint" id="l-msg"></p>
+  </div>
+  <p>With compaction on, the file count stays at 4 or fewer and a read for an existing key checks about one file, but every key gets written to disk about 4 times (log, flush, merges). Turn compaction off and write 20,000 keys: write amplification halves to about 2×, files pile up to 19, and with Bloom filters also off an average read checks about 14 of them. Bloom filters rescue most of that, which is why LSM stores use them. Discord's Cassandra cluster suffered from exactly this: it was “prone to falling behind on compactions”.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>EXPLAIN ANALYZE</b> runs a query and prints the plan the database chose with real timings. It's the first thing to run on a slow query. In MySQL, <code>EXPLAIN</code> / <code>EXPLAIN ANALYZE</code>; in MongoDB, <code>.explain("executionStats")</code>. Output below is illustrative; your numbers will differ.</p>
+<pre><code><span class="k">EXPLAIN ANALYZE SELECT</span> * <span class="k">FROM</span> users <span class="k">WHERE</span> email = <span class="s">'ana@example.com'</span>;
+<span class="c">--  Seq Scan on users  (actual time=0.03..812.55 rows=1 loops=1)</span>
+<span class="c">--    Filter: (email = 'ana@example.com')</span>
+<span class="c">--    Rows Removed by Filter: 9999999          &lt;- read everything to find one row</span>
+
+<span class="k">CREATE INDEX CONCURRENTLY</span> users_email_idx <span class="k">ON</span> users (email);  <span class="c">-- doesn't block writes while building</span>
+
+<span class="c">--  Index Scan using users_email_idx on users  (actual time=0.04..0.04 rows=1 loops=1)</span>
+<span class="c">--    Index Cond: (email = 'ana@example.com')</span>
+
+<span class="k">CREATE INDEX</span> users_email_lower <span class="k">ON</span> users (lower(email));          <span class="c">-- expression index</span>
+<span class="k">CREATE INDEX</span> orders_user_created <span class="k">ON</span> orders (user_id, created_at) <span class="k">INCLUDE</span> (total); <span class="c">-- covering</span>
+
+<span class="c">-- indexes that are never used: candidates to drop</span>
+<span class="k">SELECT</span> indexrelname, idx_scan <span class="k">FROM</span> pg_stat_user_indexes <span class="k">WHERE</span> idx_scan = <span class="n">0</span>;</code></pre>
+    <p><b>Why CONCURRENTLY:</b> a normal <code>CREATE INDEX</code> locks out writes (not reads) until it's done, which on a big table can mean minutes of failed writes. With <code>CONCURRENTLY</code>, Postgres scans the table twice and waits for running transactions, so it takes longer but the app keeps writing. LSM stores to know: <b>RocksDB</b> (an embedded library), <b>Cassandra/ScyllaDB</b> (<code>nodetool compactionstats</code> shows compaction backlog).</p>
+    <p class="hint">Try it locally: start Postgres with <code>docker run -e POSTGRES_PASSWORD=dev -p 5432:5432 postgres</code>, fill a table with <code>INSERT INTO t SELECT g, md5(g::text) FROM generate_series(1, 1000000) g;</code> and compare <code>EXPLAIN ANALYZE</code> before and after <code>CREATE INDEX</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>✅ Add an index when…</th><th>❌ Think twice when…</th></tr>
+      <tr><td>A hot query filters, joins or sorts on the column</td><td>The column has few distinct values and queries match a big share of rows (a boolean, a status with 3 values on its own)</td></tr>
+      <tr><td>The query returns a small fraction of the table</td><td>The table is tiny (a few thousand rows): a scan is already fast</td></tr>
+      <tr><td>Reads far outnumber writes</td><td>The table is write-heavy and nobody reads by that column</td></tr>
+      <tr><td>A composite or covering index can serve a top query entirely</td><td>You'd be adding the 10th index “just in case”: each one slows writes and needs memory</td></tr>
+    </table>
+    <p><b>B-tree or LSM?</b> Read-heavy with complex queries: B-tree (the relational default). Massive write rates of simple key-based data: LSM. Most teams don't choose this directly; they choose the database, and it comes with one.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Most early “the database is slow” problems are one missing index. Turn on slow-query logging (<code>log_min_duration_statement</code> in Postgres), run <code>EXPLAIN ANALYZE</code> on the worst offenders, add the index <code>CONCURRENTLY</code>. That's often a bigger win than any cache (Lesson 1.3).</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Index changes go through review like code: estimated build time, write cost, memory. Online schema-change tools build indexes on huge tables without locking. Write-heavy services choose LSM-based stores and tune compaction; teams watch compaction backlog and p99 read latency (Lesson 6.3).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>When you draw a database in a design, say which <b>indexes</b> it has and why. A senior answer covers:</p>
+    <ul>
+      <li>The <b>key and indexes for each hot query</b>, including composite column order (equality columns first, then the range or sort column).</li>
+      <li>The <b>write cost</b>: how many indexes per table, and whether the write rate can afford them.</li>
+      <li>For write-heavy data, why an <b>LSM-based store</b> fits, and what compaction costs.</li>
+    </ul>
+    <p>Common follow-ups: “Your query has <code>ORDER BY created_at DESC LIMIT 20</code>, which index serves it?” “How would you add an index to a 2 TB table without downtime?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>When the index stops fitting in RAM</b> <span class="tag co">🏢 Discord · 2017</span> <a href="https://discord.com/blog/how-discord-stores-billions-of-messages" target="_blank" rel="noopener">How Discord Stores Billions of Messages</a></div>
+      <p><b>How:</b> messages lived in MongoDB with one compound index on <code>channel_id</code> and <code>created_at</code>. Around 100 million stored messages, the data and the index no longer fit in RAM and latency became unpredictable.</p>
+      <p><b>Why this method:</b> the compound index matched the query perfectly (“messages in this channel, by time”). What broke was size: an index has to live mostly in memory to be fast. That pushed Discord toward a store that spreads data across machines.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The write cost of indexes</b> <span class="tag co">🏢 Uber · 2016</span> <a href="https://www.uber.com/blog/postgres-to-mysql-migration/" target="_blank" rel="noopener">Why Uber Engineering Switched from Postgres to MySQL</a></div>
+      <p><b>How:</b> the post walks through how Postgres stored rows and indexes at the time: indexes pointed at a row's physical location, so a new row version meant new entries in every index, which then flowed into replication as well.</p>
+      <p><b>Why this method:</b> for Uber's update-heavy tables with many indexes, that amplification mattered more than Postgres's other strengths. It's a good read on why storage internals change architecture decisions.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>An LSM engine as a library</b> <span class="tag oss">🧰 Open source · Meta</span> <a href="https://github.com/facebook/rocksdb/wiki/RocksDB-Overview" target="_blank" rel="noopener">RocksDB Overview</a></div>
+      <p><b>How:</b> RocksDB's three building blocks are the memtable, SST files and the log file (WAL). A full memtable is flushed to a sorted SST file; multi-threaded compaction removes overwritten and deleted keys. It started as a fork of LevelDB.</p>
+      <p><b>Why this method:</b> embedding a fast write-optimized engine lets other databases reuse it instead of writing their own storage layer.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The LSM write path, documented</b> <span class="tag oss">🧰 Open source · Apache Cassandra</span> <a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/storage-engine.html" target="_blank" rel="noopener">Cassandra storage engine</a></div>
+      <p><b>How:</b> each write goes to the commit log, then the memtable, which is flushed to immutable SSTables; compaction merges them. The docs say plainly that every write is rewritten multiple times, which they call write amplification.</p>
+      <p><b>Why this method:</b> turning random writes into sequential ones is what lets Cassandra accept very high write rates per node.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Indexes that don't block writes</b> <span class="tag oss">🧰 Open source · PostgreSQL</span> <a href="https://www.postgresql.org/docs/current/sql-createindex.html" target="_blank" rel="noopener">CREATE INDEX (Postgres docs)</a></div>
+      <p><b>How:</b> <code>CONCURRENTLY</code> builds an index without locks that block inserts, updates and deletes, at the cost of two table scans and more total time.</p>
+      <p><b>Why this method:</b> on a live production table, a slower build that keeps the app writing beats a fast build that causes an outage.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · four levels for eight billion rows</span>
+    <p>With about 300 keys per page, a B-tree 4 levels deep can index 300⁴ ≈ <b>8.1 billion</b> rows, and the top levels are small enough to stay in memory. So finding one row among billions usually costs one or two actual disk reads. That's why indexed lookups feel instant on enormous tables, until the index itself no longer fits in RAM.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Indexes are a kind of cache you never have to invalidate yourself (Lesson 1.3). When one machine can't hold the index any more, you <b>shard</b> (Lesson 2.4), and each shard keeps its own smaller index. Search engines are built on a different index, the <b>inverted index</b>, and vector databases on <b>approximate nearest-neighbour indexes</b> (Lesson 2.7). Prometheus's storage engine (Lesson 6.3) uses the same write-ahead-log-plus-immutable-blocks idea as an LSM tree.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://www.postgresql.org/docs/current/using-explain.html" target="_blank" rel="noopener">Postgres: Using EXPLAIN</a>. How to read a plan, from the people who wrote the planner.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.postgresql.org/docs/current/indexes-multicolumn.html" target="_blank" rel="noopener">Postgres: Multicolumn indexes</a>. The exact leftmost-prefix rule, and skip scan.</li>
+      <li><span class="kind">Book</span> <a href="https://dataintensive.net/" target="_blank" rel="noopener">Designing Data-Intensive Applications</a>. Chapter 3 builds B-trees and LSM trees from scratch.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A table has 1 billion rows and its B-tree index holds about 500 keys per page. Roughly how many pages does one lookup by key read?</div>
+    <div class="opts"><button class="opt" data-ok>About 4 or 5</button><button class="opt">About 30</button><button class="opt">About 2,000</button></div>
+    <div class="explain">log₅₀₀(1,000,000,000) ≈ 3.3, so the tree is 4 levels deep, plus one page for the row itself: <b>about 5</b>. The top levels are usually cached, so only one or two of those are real disk reads.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You have an index on <code>(user_id, created_at)</code>. Which query can't use it to narrow the search?</div>
+    <div class="opts"><button class="opt">WHERE user_id = 7</button><button class="opt">WHERE user_id = 7 AND created_at &gt; '2025-01-01'</button><button class="opt" data-ok>WHERE created_at &gt; '2025-01-01'</button></div>
+    <div class="explain">The index is sorted by <code>user_id</code> first. Without a condition on the leading column, the dates you want are scattered across every user's section of the index (leftmost-prefix rule). If this query matters, add a separate index on <code>created_at</code>.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. An ingestion table takes 30,000 inserts per second and has 9 indexes. Inserts are slow. What's the best first step?</div>
+    <div class="opts"><button class="opt">Add a Redis cache in front of it</button><button class="opt" data-ok>Find and drop indexes no query uses, then reconsider the rest</button><button class="opt">Add a tenth index on the timestamp</button></div>
+    <div class="explain">Each insert writes the row plus 9 index entries. Indexes with <code>idx_scan = 0</code> are pure cost. A cache helps reads, not writes. If the write rate keeps growing, an LSM-based store or sharding (Lesson 2.4) is the next step.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>An index is a sorted copy of columns: lookups cost about log<sub>f</sub>(N) pages instead of N ÷ rows-per-page.</li>
+      <li>Composite indexes follow the leftmost-prefix rule: equality columns first, then one range or sort column. Covering indexes (<code>INCLUDE</code>) skip the table entirely.</li>
+      <li>Every index costs every write. Drop unused ones; build new ones with <code>CREATE INDEX CONCURRENTLY</code>; check plans with <code>EXPLAIN ANALYZE</code>.</li>
+      <li>LSM trees (memtable → SSTables → compaction) make writes cheap and sequential, at the price of compaction work and multi-file reads.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const big = v => v >= 1e9 ? (v / 1e9).toFixed(1) + "B" : v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "k" : String(Math.round(v * 10) / 10);
+  const ms = t => t >= 1000 ? (t / 1000).toFixed(1) + " s" : t >= 1 ? t.toFixed(1) + " ms" : (t * 1000).toFixed(0) + " µs";
+
+  // ---------- playground 1: scan vs index ----------
+  const F = new Flow($("bt"), { width: 720, height: 230 });
+  F.node("q", { x: 60, y: 60, w: 90, label: "Query", sub: "", kind: "cl" })
+   .node("root", { x: 210, y: 60, w: 100, label: "root page", sub: "index", kind: "ca" })
+   .node("br", { x: 350, y: 60, w: 100, label: "branch", sub: "index", kind: "ca" })
+   .node("leaf", { x: 490, y: 60, w: 100, label: "leaf", sub: "key → row", kind: "ca" });
+  const PAGES = ["t1", "t2", "t3", "t4", "t5", "t6"];
+  PAGES.forEach((id, i) => F.node(id, { x: 120 + i * 106, y: 175, w: 88, h: 42, label: "table p" + (i + 1), sub: "", kind: "db" }));
+  F.edge("q", "root").edge("root", "br").edge("br", "leaf").edge("leaf", "t5", { dashed: true }).edge("q", "t1");
+  for (let i = 0; i < 5; i++) F.edge(PAGES[i], PAGES[i + 1]);
+  F.render();
+  const getQ = seg("s-q", () => scan());
+  const ROWS_PER_PAGE = 100, SEQ_BPS = 1e9, RAND_MS = 0.1;
+  function plan() {
+    const N = Math.pow(10, +$("s-n").value), f = +$("s-f").value, q = getQ(), idx = $("s-idx").checked;
+    const levels = Math.max(1, Math.ceil(Math.log(N) / Math.log(f) - 1e-9));
+    const scanPages = Math.ceil(N / ROWS_PER_PAGE), scanMs = scanPages * 8192 / SEQ_BPS * 1000;
+    let p;
+    if (q === "eq" && idx) p = { plan: "Index Scan", rows: levels * f, pages: levels + 1, t: (levels + 1) * RAND_MS, why: `Walk ${levels} index levels, then fetch 1 table page.` };
+    else if (q === "lo" && idx) {
+      const match = 0.4 * N, idxMs = match * RAND_MS;
+      p = { plan: "Seq Scan", rows: N, pages: scanPages, t: scanMs, why: `Using the index would mean ${big(match)} random page reads (≈ ${ms(idxMs)}). Reading the table straight through (≈ ${ms(scanMs)}) is cheaper, so the planner scans.` };
+    } else p = { plan: "Seq Scan", rows: N, pages: scanPages, t: scanMs, why: q === "fn" && idx ? "The index is sorted by email, not lower(email), so it can't help. Fix: CREATE INDEX ON users (lower(email))." : "No usable index: every row is read and checked." };
+    return Object.assign(p, { N, f, levels, scanPages, q, idx });
+  }
+  const SQL = { eq: "SELECT * FROM users WHERE email = 'ana@example.com';", fn: "SELECT * FROM users WHERE lower(email) = 'ana@example.com';", lo: "SELECT * FROM users WHERE country = 'US';" };
+  function scan() {
+    const p = plan();
+    $("s-nv").textContent = big(p.N); $("s-fv").textContent = p.f;
+    $("s-sql").textContent = SQL[p.q];
+    $("s-plan").textContent = p.plan; $("s-rows").textContent = big(p.rows); $("s-pages").textContent = big(p.pages); $("s-time").textContent = ms(p.t);
+    $("s-msg").textContent = p.why;
+    const usesIdx = p.plan === "Index Scan";
+    ["root", "br", "leaf"].forEach(id => F.set(id, { down: false, hot: false, sub: usesIdx ? (id === "leaf" ? "key → row" : "index") : "not used" }));
+    F.set("root", { sub: usesIdx ? p.levels + " levels" : "not used" });
+    PAGES.forEach(id => F.set(id, { sub: "", hot: false }));
+    F.set("q", { sub: p.plan });
+    const xs = [], sc = [], ix = [];
+    for (let e = 3; e <= 9; e += 0.25) { const n = Math.pow(10, e); xs.push(e); sc.push([e, Math.log10(Math.ceil(n / ROWS_PER_PAGE))]); ix.push([e, Math.log10(Math.max(1, Math.ceil(Math.log(n) / Math.log(p.f) - 1e-9)) + 1)]); }
+    const cur = Math.log10(p.N);
+    Plot.line($("s-chart"), {
+      series: [
+        { label: "full scan", color: MX.css("--c-er"), data: sc },
+        { label: "B-tree index", color: MX.css("--c-ca"), data: ix },
+        { label: "you are here", color: MX.css("--c-lt"), data: [[cur, Math.log10(p.pages)]], dots: true },
+      ], xMin: 3, xMax: 9, yMin: 0, yMax: 8, xLabel: "rows in table (log₁₀: 6 = 1 million)", yLabel: "pages read (log₁₀)",
+    });
+  }
+  let running = false;
+  $("s-run").onclick = async () => {
+    if (running) return; running = true;
+    const p = plan();
+    if (p.plan === "Index Scan") {
+      F.set("root", { hot: true }); await F.packet(["q", "root"], { color: "--c-ca", dur: 350 });
+      F.set("br", { hot: true }); await F.packet(["root", "br"], { color: "--c-ca", dur: 300 });
+      F.set("leaf", { hot: true }); await F.packet(["br", "leaf"], { color: "--c-ca", dur: 300 });
+      F.set("t5", { hot: true, sub: "1 row ✓" }); await F.packet(["leaf", "t5"], { color: "--c-db", dur: 350 });
+    } else {
+      await F.packet(["q", "t1"], { color: "--c-er", dur: 300 });
+      for (let i = 0; i < PAGES.length; i++) {
+        F.set(PAGES[i], { hot: true, sub: big(p.N / 6) + " rows" });
+        if (i < PAGES.length - 1) await F.packet([PAGES[i], PAGES[i + 1]], { color: "--c-er", dur: 260 });
+      }
+    }
+    running = false;
+  };
+  ["s-n", "s-f"].forEach(id => ($(id).oninput = scan));
+  $("s-idx").onchange = scan;
+  scan();
+
+  // ---------- playground 2: leftmost prefix ----------
+  const N2 = 50e6, SEL = { user_id: 1 / 1e6, status: 1 / 5, created_at: 7 / 730 };
+  const KIND = { user_id: "eq", status: "eq", created_at: "range" };
+  const COND = { user_id: "p-u", status: "p-s", created_at: "p-c" };
+  const TXT = { user_id: "user_id = 42", status: "status = 'paid'", created_at: "created_at > now() - interval '7 days'" };
+  function cols() {
+    const out = [];
+    ["p-1", "p-2", "p-3"].forEach(id => { const v = $(id).value; if (v && !out.includes(v)) out.push(v); });
+    return out;
+  }
+  const fmtRows = v => v < 1 ? "≈ " + (v < 0.1 ? "0" : v.toFixed(1)) : big(v);
+  function prefix() {
+    const idx = cols(), on = Object.keys(COND).filter(c => $(COND[c]).checked);
+    const used = [];
+    for (const c of idx) {
+      if (!on.includes(c)) break;
+      used.push(c);
+      if (KIND[c] === "range") break;
+    }
+    const narrowed = used.reduce((a, c) => a * SEL[c], 1);
+    const ret = on.reduce((a, c) => a * SEL[c], 1) * N2;
+    const read = used.length ? N2 * narrowed : N2;
+    // conditions on index columns not used for narrowing can still be checked inside the index before visiting the table
+    const inIdx = on.filter(c => idx.includes(c));
+    const afterIdx = used.length ? N2 * inIdx.reduce((a, c) => a * SEL[c], 1) : N2;
+    const covering = $("p-inc").checked && on.every(c => idx.includes(c));
+    const heap = !used.length ? N2 : covering ? 0 : afterIdx;
+    $("p-sql").textContent = (covering ? "SELECT total" : "SELECT *") + " FROM orders" + (on.length ? " WHERE " + on.map(c => TXT[c]).join(" AND ") : "") + ";   -- index (" + idx.join(", ") + ")" + ($("p-inc").checked ? " INCLUDE (total)" : "");
+    $("p-used").textContent = used.length ? used.join(" → ") : "nothing (full scan)";
+    $("p-read").textContent = used.length ? fmtRows(read) : "0 (scan instead)";
+    $("p-heap").textContent = fmtRows(heap) + (covering && used.length ? " (index-only)" : "");
+    $("p-ret").textContent = fmtRows(ret);
+    const skipped = on.filter(c => !used.includes(c));
+    $("p-msg").textContent = !on.length ? "No conditions: every row is returned, an index can't help." :
+      !used.length ? `The first index column (${idx[0]}) has no condition, so the index can't narrow anything: 50M rows scanned.` :
+      read > 1000 * Math.max(1, ret) ? `Wasteful: ${fmtRows(read)} index entries read to return ${fmtRows(ret)} rows. ${skipped.length ? skipped.join(" and ") + " can't narrow the search from where it sits in the index." : ""} Try “Best order”.` :
+      `Efficient: the index narrows on ${used.join(" and ")}${skipped.length ? ", then checks " + skipped.join(" and ") + " as a filter" : ""}.`;
+  }
+  $("p-best").onclick = () => {
+    const on = Object.keys(COND).filter(c => $(COND[c]).checked);
+    const eq = on.filter(c => KIND[c] === "eq").sort((a, b) => SEL[a] - SEL[b]), rg = on.filter(c => KIND[c] === "range");
+    const order = [...eq, ...rg];
+    const rest = ["user_id", "status", "created_at"].filter(c => !order.includes(c));
+    const sel = ["p-1", "p-2", "p-3"];
+    sel.forEach((id, i) => { $(id).value = order[i] || (i === 0 ? rest[0] : ""); });
+    prefix();
+  };
+  ["p-1", "p-2", "p-3"].forEach(id => ($(id).onchange = prefix));
+  ["p-u", "p-s", "p-c", "p-inc"].forEach(id => ($(id).onchange = prefix));
+  prefix();
+
+  // ---------- playground 3: LSM tree ----------
+  const KEYSPACE = 200000;
+  let L, rng;
+  const reset = () => { L = { mem: new Set(), l0: [], l1: null, user: 0, disk: 0, hist: [], keys: [] }; rng = MX.seeded(11); };
+  function flush() {
+    if (!L.mem.size) return;
+    L.l0.push(new Set(L.mem)); L.disk += L.mem.size; L.mem.clear();
+    if ($("l-comp").checked && L.l0.length >= 4) {
+      const merged = new Set(L.l1 || []);
+      L.l0.forEach(t => t.forEach(k => merged.add(k)));
+      L.disk += merged.size; L.l1 = merged; L.l0 = [];
+    }
+  }
+  function probes() {
+    const bloom = $("l-bloom").checked, r = MX.seeded(5);
+    const tables = [...L.l0.slice().reverse(), ...(L.l1 ? [L.l1] : [])];
+    let tot = 0; const T = 2000;
+    for (let i = 0; i < T; i++) {
+      const k = i % 2 ? L.keys[Math.floor(r() * L.keys.length)] : KEYSPACE + Math.floor(r() * KEYSPACE); // half existing keys, half missing
+      if (L.mem.has(k)) continue;
+      for (const t of tables) {
+        const has = t.has(k);
+        if (!bloom || has || r() < 0.01) tot++;
+        if (has) break;
+      }
+    }
+    return tot / T;
+  }
+  function write(n) {
+    const cap = +$("l-m").value;
+    for (let i = 0; i < n; i++) {
+      const k = Math.floor(rng() * KEYSPACE); L.mem.add(k); L.keys.push(k); L.user++;
+      if (L.mem.size >= cap) flush();
+      if (L.user % 1000 === 0) L.hist.push([L.user / 1000, L.l0.length + (L.l1 ? 1 : 0), (L.disk + L.user) / L.user]);
+    }
+    paintL();
+  }
+  function paintL() {
+    $("l-mv").textContent = big(+$("l-m").value) + " keys";
+    const files = L.l0.length + (L.l1 ? 1 : 0), wa = L.user ? (L.disk + L.user) / L.user : 0, rp = L.user ? probes() : 0;
+    $("l-n").textContent = big(L.user); $("l-t").textContent = files + (L.l1 ? ` (L0: ${L.l0.length}, L1: 1)` : ` (L0: ${L.l0.length})`);
+    $("l-wa").textContent = L.user ? wa.toFixed(1) + "×" : "–";
+    $("l-rp").textContent = L.user ? rp.toFixed(2) : "–";
+    Plot.line($("l-chart"), {
+      series: [
+        { label: "SSTables on disk", color: MX.css("--c-db"), data: L.hist.map(h => [h[0], h[1]]) },
+        { label: "write amplification (× bytes written)", color: MX.css("--c-lt"), data: L.hist.map(h => [h[0], h[2]]), dash: [6, 4] },
+      ], xLabel: "thousands of keys written", yMin: 0, yMax: Math.max(6, ...L.hist.map(h => h[1] + 1)),
+    });
+    $("l-msg").textContent = !L.user ? "Press Write to start. Each write goes to the log (counted once) and the memtable." :
+      !$("l-comp").checked && files > 8 ? `${files} files and no compaction: a read for a missing key would check all ${files} without Bloom filters. This is read amplification.` :
+      `Every key was written to disk about ${wa.toFixed(1)} times (log + flush + compaction merges). Half the test reads ask for keys that exist, half for missing ones; on average each read checks ${rp.toFixed(2)} SSTables.`;
+  }
+  $("l-write").onclick = () => write(2000);
+  $("l-many").onclick = () => write(20000);
+  $("l-reset").onclick = () => { reset(); paintL(); };
+  $("l-m").oninput = paintL;
+  ["l-comp", "l-bloom"].forEach(id => ($(id).onchange = paintL));
+  reset(); paintL();
+})();
+</script>
+</body>
+</html>

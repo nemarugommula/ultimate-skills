@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.8 Design a notification system · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+</style>
+</head>
+<body data-lesson="s7-8" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 8</div>
+  <h1>Design a notification system</h1>
+  <p class="subtitle">One service that every team calls to reach users by push, email or SMS: reliably, in the right order of urgency, and without annoying people into turning notifications off. At scale, the hard part is as much “don't send” as “send”.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Queues and Kafka</b>: producers drop work, workers pick it up at their own pace (Lessons 3.1 and 3.2).</li>
+      <li><b>Retries, backoff and idempotency</b>: retry safely without doing the work twice (Lesson 3.3); <b>circuit breakers</b> stop calling a dead dependency (Lesson 4.4).</li>
+      <li><b>Rate limiting</b> with token buckets (Lesson 1.5), and <b>fan-out</b> from one event to many recipients (Lesson 7.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2018 LinkedIn described why it built <b>Air Traffic Controller</b> (ATC), a single platform every LinkedIn notification goes through. Repetitive, excessive and low-quality notifications, the post says, made members file complaints, <b>disable notifications</b>, and use the app less.</p>
+    <p>ATC was designed around what LinkedIn calls the <b>“5 Rights”</b>: the right message, to the right member, through the right channel, at the right time, with the right frequency. By the end of this lesson you'll be able to build a pipeline that does all five, and survives a provider outage while doing it.</p>
+  </div>
+
+  <h2>Step 1 · Clarify the requirements</h2>
+  <p>Questions a senior candidate asks:</p>
+  <ul>
+    <li><b>Which channels?</b> Mobile push (Apple's <b>APNs</b>, Apple Push Notification service, and Google's <b>FCM</b>, Firebase Cloud Messaging), email, SMS, and an in-app inbox.</li>
+    <li><b>What kinds of messages?</b> Very different urgencies: a login code (seconds matter), a chat message (seconds), “someone liked your post” (minutes are fine), a weekly newsletter (hours are fine).</li>
+    <li><b>Who triggers them?</b> Other services, through an API or events. Also bulk campaigns to millions.</li>
+    <li><b>User control?</b> Per-category, per-channel opt-outs, quiet hours in the user's time zone, unsubscribe links (legally required for marketing email in many countries).</li>
+    <li><b>Guarantees?</b> At least once for important messages; never the same notification twice in a row on screen.</li>
+  </ul>
+  <table>
+    <tr><th>Functional</th><th>Non-functional</th></tr>
+    <tr><td>Send a notification to a user on one or more channels</td><td>Login codes delivered in seconds even during a marketing blast</td></tr>
+    <tr><td>Templates with localisation and personalisation</td><td>No duplicates on screen; no loss of important messages</td></tr>
+    <tr><td>Respect preferences, quiet hours, frequency caps</td><td>Survive a provider outage (failover)</td></tr>
+    <tr><td>Bulk sends to millions; digests</td><td>Track delivery, opens, failures; clean up dead device tokens</td></tr>
+  </table>
+
+  <h2>Step 2 · Numbers first</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: average, burst, and storage</span>
+    <ul>
+      <li><b>Average:</b> 200 million users × 5 notifications a day = 1 billion a day ÷ 86,400 s ≈ <b>11,600 per second</b>.</li>
+      <li><b>Burst:</b> breaking news to 50 million users, all within 5 minutes: 50,000,000 ÷ 300 s ≈ <b class="er">167,000 per second</b>, about 14× the average. Bursts, not averages, size this system.</li>
+      <li><b>Device tokens</b> (the address APNs/FCM gives each app install): 200 M users × 1.5 devices × about 200 bytes ≈ <b>60 GB</b>. Fits in a sharded key-value store.</li>
+      <li><b>Notification log</b> (for dedupe, inbox and analytics): 1 billion × 500 bytes = <b class="db">500 GB a day</b>; 90 days of retention ≈ 45 TB.</li>
+      <li><b>Payload limit:</b> an APNs notification body can be at most <b>4 KB</b>. You send a short message and an id, never the whole document.</li>
+    </ul>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Treat every notification as a request that must pass <b>gates</b> before it may be sent: <b>dedupe</b>, <b>preferences</b>, <b>quiet hours</b>, <b>frequency caps</b>, <b>aggregation</b>. Then route what survives into <b>separate queues by priority</b>, and send with <b>retries and failover</b>. Most of the value is in the gates.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a good personal assistant</span>
+    <p>A bad assistant interrupts you for every email. A good one knows that a call from your child's school goes straight through, that ten “someone liked your post” messages become one note at lunch, that you're not to be disturbed at 3 a.m., and that if your phone is off, a text is better than nothing. The notification service is that assistant, for 200 million people at once.</p>
+  </div>
+
+  <h2>Step 3 · API and data model</h2>
+<pre><code>POST /v1/notifications
+Idempotency-Key: comment_99812-to-u_42          <span class="c"># same event, same user → sent at most once</span>
+{ "user_id": "u_42", "category": "social.comment", "priority": "normal",
+  "template": "comment_on_post", "data": { "actor": "Asha", "post_id": "p_7" },
+  "channels": ["push", "inbox"], "collapse_key": "post:p_7" }
+  → 202 Accepted { "notification_id": "n_5512", "status": "QUEUED" }
+
+POST /v1/campaigns   { "segment": "country=IN AND active_30d", "template": "festival_offer", "send_window": "18:00-21:00 local" }
+PUT  /v1/users/u_42/preferences   { "social.comment": { "push": true, "email": false }, "quiet_hours": "22:00-07:00", "tz": "Asia/Kolkata" }</code></pre>
+  <table>
+    <tr><th>Data</th><th>Store</th><th>Why</th></tr>
+    <tr><td>Preferences, quiet hours, time zone</td><td><span class="db">Key-value</span> by user id + a <span class="ca">cache</span></td><td>Read on every send: must be fast</td></tr>
+    <tr><td>Device tokens: (user_id, platform, token, last_seen)</td><td><span class="db">Key-value</span> by user id</td><td>Delete a token when APNs answers 410 (no longer active) or FCM says unregistered</td></tr>
+    <tr><td>Templates (per language, per channel)</td><td><span class="db">SQL</span>, versioned + cached</td><td>Edited by product teams; rarely changes</td></tr>
+    <tr><td>Sent log / dedupe keys / per-user counters</td><td><span class="ca">Redis</span> with TTLs + <span class="db">wide-column</span> log</td><td>Dedupe and caps need fast “have I sent this recently?”</td></tr>
+    <tr><td>In-app inbox</td><td><span class="db">Wide-column</span> (Cassandra-style) by user id, newest first</td><td>The durable copy: push can be dropped, the inbox can't</td></tr>
+  </table>
+
+  <h2>Step 4 · High-level design</h2>
+  <p>Producers call the <b class="sv">notification service</b>. It runs the gates, renders the template, and puts the message on a <b class="nw">priority queue</b>. <b class="sv">Channel workers</b> send through <b class="nw">providers</b> (APNs, FCM, an email service, an SMS gateway) and record the result.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Priority queues and provider failover</span>
+    <p class="hint">60 seconds of traffic with workers that can send 2,000 messages a second (an assumption). Every second: 30 login codes (SMS), 600 chat pushes and 100 marketing pushes. At t = 5 s a campaign drops <b>60,000</b> marketing messages. Start with <b>one FIFO queue</b> and see the login codes stuck behind the campaign; switch to <b>priority queues</b>. <b>p95</b> means the time that 95% of messages beat. Then add the <b>💥 SMS provider outage</b> (t = 20–35 s) and fix it with <b>retries</b> and <b>failover</b>.</p>
+    <svg id="nflow"></svg>
+    <div class="controls">
+      <span class="seg" id="qmode"><button id="qmode-fifo" data-v="fifo" class="on">One FIFO queue</button><button id="qmode-prio" data-v="prio">Priority queues</button></span>
+      <label><input type="checkbox" id="outage"> 💥 SMS provider A down (t = 20–35 s)</label>
+      <label><input type="checkbox" id="retries"> retries with backoff</label>
+      <label><input type="checkbox" id="failover"> failover to provider B</label>
+      <button class="btn primary" id="nRun">▶ Run 60 s</button>
+    </div>
+    <canvas class="chart" id="nDepth" style="height:190px"></canvas>
+    <canvas class="chart" id="nLat" style="height:170px"></canvas>
+    <div class="stat-row">
+      <div class="stat">login codes p95 latency <b id="nOtp95">–</b></div>
+      <div class="stat">login codes lost <b id="nOtpLost">–</b></div>
+      <div class="stat">chat p95 latency <b id="nChat95">–</b></div>
+      <div class="stat">campaign finished at <b id="nMktDone">–</b></div>
+    </div>
+    <p class="hint" id="nMsg"></p>
+  </div>
+
+  <h2>Step 5 · Deep dives</h2>
+  <h3>Deep dive 1: priorities and fan-out</h3>
+  <p>One queue for everything means a 60,000-message campaign sits in front of a login code. Fix: <b>separate queues (or Kafka topics) per priority</b>, with workers that always drain the higher ones first, or with dedicated worker pools per priority so the low one can never starve the high one. LinkedIn's ATC post mentions exactly this: high-priority Kafka topics for member messages.</p>
+  <p><b>Fan-out</b> for a campaign or breaking news: don't build 50 million messages in one request. A campaign job pages through the audience (say 1,000 users per page), enqueues one batch job per page, and batch workers expand each into individual sends. Spread the send over a window (and over time zones) so providers and your own servers see a ramp, not a wall. Providers rate-limit you too: plan for per-provider token buckets (Lesson 1.5).</p>
+
+  <h3>Deep dive 2: reliability: retries, dedupe, failover</h3>
+  <ul>
+    <li><b>At-least-once + dedupe:</b> a worker that crashes after sending but before acknowledging the queue will send again. So every notification carries a <b>dedupe key</b> (event id + user id); before sending, <code>SET dedupe:{key} 1 NX EX 86400</code> in Redis. If it already exists, skip.</li>
+    <li><b>Retry with exponential backoff + jitter</b> for timeouts and 5xx answers; don't retry 4xx errors like a bad token. After N tries, move the message to a <b>DLQ</b> (dead-letter queue) for inspection.</li>
+    <li><b>Failover:</b> for channels where it matters (SMS codes, transactional email), integrate <b>two providers</b>. A circuit breaker (Lesson 4.4) on provider A opens after a burst of failures, and traffic switches to B.</li>
+    <li><b>Token hygiene:</b> APNs returns <code>410</code> when a device token is no longer active. Delete it, or you'll keep paying to send into the void.</li>
+    <li><b>Push isn't storage:</b> if a phone is offline, APNs keeps only one notification per app (usually the latest). The in-app inbox is the durable record; push is just the doorbell.</li>
+  </ul>
+
+  <h3>Deep dive 3: not annoying people</h3>
+  <p>Every gate below reduces sends. That's the point.</p>
+  <table>
+    <tr><th>Gate</th><th>What it does</th><th>Typical implementation</th></tr>
+    <tr><td><b>Preferences</b></td><td>Drop if the user opted out of this category on this channel</td><td>Cached lookup per send</td></tr>
+    <tr><td><b>Quiet hours</b></td><td>Hold non-urgent sends until the morning, in the user's time zone</td><td>Delay queue keyed by release time</td></tr>
+    <tr><td><b>Frequency cap</b></td><td>At most N pushes per user per hour/day</td><td>A per-user token bucket (Lesson 1.5) in Redis</td></tr>
+    <tr><td><b>Aggregation / digest</b></td><td>“Asha and 41 others liked your post” instead of 42 pushes</td><td>Hold a short window per (user, topic), then send one summary</td></tr>
+    <tr><td><b>Collapse</b></td><td>A newer push replaces an older one on screen</td><td><code>apns-collapse-id</code> / FCM collapse key</td></tr>
+    <tr><td><b>Channel choice</b></td><td>Push if the app is active, email if not, SMS only for critical</td><td>Rules + per-user engagement signals</td></tr>
+  </table>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · One push per like, or a digest?</span>
+    <p class="hint">Your post goes viral at 21:30. Over the next hours, hundreds of likes and comments arrive (fast at first, then trailing off). Choose how to notify: one push per event, a collapsed push at most once per window, or a morning digest. Turn on <b>quiet hours</b> (23:00–07:00) and watch night-time pushes disappear. The goal: few pushes, few at night, but no one waiting a day to hear something they care about.</p>
+    <div class="controls">
+      <span class="seg" id="dmode"><button id="dmode-each" data-v="each" class="on">One per event</button><button id="dmode-window" data-v="window">Collapse per window</button><button id="dmode-digest" data-v="digest">Morning digest (08:00)</button></span>
+      <label>window <input type="range" id="dwin" min="0" max="4" step="1" value="2"> <b class="mono" id="dwinV"></b></label>
+      <label><input type="checkbox" id="quiet"> 🌙 quiet hours 23:00–07:00</label>
+      <button class="btn primary" id="dRun">▶ Simulate the night</button>
+    </div>
+    <canvas class="chart" id="dChart" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">events <b id="dEv">–</b></div>
+      <div class="stat">pushes sent <b id="dPush">–</b></div>
+      <div class="stat">most pushes in one hour <b id="dMax">–</b></div>
+      <div class="stat">pushes at night <b id="dNight">–</b></div>
+      <div class="stat">median wait to hear <b id="dDelay">–</b></div>
+    </div>
+    <p class="hint" id="dMsg"></p>
+  </div>
+
+  <h2>Step 6 · Bottlenecks and the scaling path</h2>
+  <table>
+    <tr><th>Stage</th><th>What you run</th><th>What breaks next</th></tr>
+    <tr><td><b>v1 · startup</b></td><td>Call FCM (it also sends to iOS via APNs), an email API (SES, SendGrid, Postmark) and an SMS API (Twilio) from a background job queue; one preferences table; idempotency keys</td><td>Login codes delayed behind a big send; duplicates after worker crashes</td></tr>
+    <tr><td><b>v2 · growing</b></td><td>A notification service owned by one team: priority queues, dedupe in Redis, templates, quiet hours, caps, an inbox, a second SMS/email provider with failover, delivery analytics</td><td>Campaign fan-out to tens of millions; per-provider rate limits</td></tr>
+    <tr><td><b>v3 · 100M users</b></td><td>Kafka topics per priority, partitioned by user id so one user's state lives on one worker (as LinkedIn's ATC does), relevance models deciding what is worth sending and when, persistent connections for in-app delivery, multi-region</td><td>Notification quality: engagement, opt-out and uninstall rates become the main metrics</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Providers: <b>APNs</b>, <b>FCM</b>, <b>Amazon SNS</b> / <b>SES</b>, <b>SendGrid</b>, <b>Twilio</b>; all-in-one notification platforms like <b>OneSignal</b>, <b>Knock</b> or the open-source <b>Novu</b>; queues: <b>Kafka</b>, <b>SQS</b>, <b>RabbitMQ</b>; <b>Redis</b> for dedupe and caps. Sending one push through APNs over HTTP/2, with a collapse id:</p>
+<pre><code>curl --http2 https://api.push.apple.com/3/device/$DEVICE_TOKEN \
+  -H "authorization: bearer $APNS_JWT" \
+  -H "apns-topic: com.example.app" -H "apns-push-type: alert" \
+  -H "apns-priority: 10" \                          <span class="c"># 10 = send now; 5 = may be batched to save battery</span>
+  -H "apns-collapse-id: post:p_7" \                 <span class="c"># newer pushes for this post replace older ones</span>
+  -d '{"aps":{"alert":{"title":"New comments","body":"Asha and 41 others commented"}}}'</code></pre>
+<pre><code><span class="c"># FCM HTTP v1: same idea for Android (and iOS through FCM)</span>
+POST https://fcm.googleapis.com/v1/projects/my-app/messages:send
+{ "message": { "token": "…", "notification": { "title": "Your code", "body": "482913" },
+               "android": { "priority": "high" } } }
+
+<span class="c"># dedupe + per-user cap in Redis</span>
+SET dedupe:comment_99812:u_42 1 NX EX 86400        <span class="c"># nil reply → already sent, skip</span>
+INCR cap:u_42:2026103121 ; EXPIRE cap:u_42:2026103121 3600   <span class="c"># &gt; 4 this hour → hold for digest</span></code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 6379:6379 redis</code> and run the <code>SET … NX EX</code> line twice in <code>redis-cli</code>: the second returns nil. That one line is the dedupe gate.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Decision</th><th>Option A</th><th>Option B</th></tr>
+      <tr><td>Delivery guarantee</td><td><b>At-least-once + dedupe</b>: nothing important lost; needs a dedupe store</td><td><b>At-most-once</b>: simpler, fine for low-value pushes; some are silently lost</td></tr>
+      <tr><td>Batching</td><td><b>Immediate</b>: fastest; noisy, more opt-outs</td><td><b>Aggregate / digest</b>: calmer, fewer sends; later, and harder to explain</td></tr>
+      <tr><td>Providers</td><td><b>One per channel</b>: simple contracts and debugging</td><td><b>Two with failover</b>: survives outages; templates and tracking twice</td></tr>
+      <tr><td>Build vs buy</td><td><b>Buy</b> (OneSignal, Knock, Braze): fast, rich dashboards</td><td><b>Build</b>: full control over gates and relevance; a team to run it</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Use FCM + an email API + Twilio from a job queue, or a hosted platform. Do three things from day one: a separate high-priority queue for login codes and receipts, an idempotency/dedupe key on every send, and a preferences table with an unsubscribe link. Those are painful to add later.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>A central notification platform every team must use, so one place enforces caps and quiet hours across all products. Stream processing per user (LinkedIn's ATC runs on Samza with RocksDB state), machine-learning-ranked relevance and send-time optimisation, multiple providers per channel, and opt-out rate as a company-level health metric.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <ul>
+      <li>Size for <b>bursts</b>, not averages, and say how campaign fan-out is spread out.</li>
+      <li><b>Priority separation</b> so critical messages never wait behind bulk ones.</li>
+      <li><b>At-least-once + dedupe keys</b>, retries with backoff, a DLQ, provider <b>failover</b>, token cleanup.</li>
+      <li>The user-protection gates: <b>preferences, quiet hours in local time, frequency caps, aggregation</b>.</li>
+      <li>An <b>inbox</b> as the durable copy; push as best-effort.</li>
+    </ul>
+    <p><b>Common mistakes:</b> one queue for everything; calling providers synchronously from the producer's request; no dedupe; ignoring time zones; “exactly-once push” (impossible across APNs/FCM). <b>Likely follow-ups:</b> “How do you send to 50 million users in 5 minutes?”, “The SMS provider is down; what happens to login codes?”, “How do you stop a buggy producer from spamming every user?” (per-producer quotas, a global kill switch), “How would you measure whether a notification was worth sending?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>One platform for every notification</b> <span class="tag co">🏢 LinkedIn · 2018</span> <a href="https://engineering.linkedin.com/blog/2018/03/air-traffic-controller--member-first-notifications-at-linkedin" target="_blank" rel="noopener">Air Traffic Controller: Member-First Notifications at LinkedIn</a></div>
+      <p><b>How:</b> ATC, built on Samza with RocksDB state, routes all notifications for a member to the same task, then applies channel selection, aggregation (e.g. grouping invitation reminders into one email), delivery-time optimisation (not while the member is sleeping) and high-priority Kafka topics for messages.</p>
+      <p><b>Why this method:</b> excessive, repetitive notifications drove complaints and opt-outs; one platform can see everything a member is about to receive and decide as a whole.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Near-real-time fan-out</b> <span class="tag co">🏢 LinkedIn · 2018</span> <a href="https://engineering.linkedin.com/blog/2018/05/concourse--generating-personalized-content-notifications-in-near" target="_blank" rel="noopener">Concourse: Generating Personalized Content Notifications in Near-Real-Time</a></div>
+      <p><b>How:</b> replaced batch jobs that ran a few times a day with a streaming pipeline: content events flow through Kafka, partitioned by the member who created the content, and are fanned out to candidate recipients.</p>
+      <p><b>Why this method:</b> the batch version could notify people hours late, when the content was no longer relevant.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The push gateway's rules</b> <span class="tag prod">🏭 In production · Apple</span> <a href="https://developer.apple.com/documentation/usernotifications/sending-notification-requests-to-apns" target="_blank" rel="noopener">Sending notification requests to APNs</a></div>
+      <p><b>How:</b> an HTTP/2 POST per notification, payloads up to 4 KB, <code>apns-priority</code> 10 (immediate) vs 5 or 1 (may be grouped and delivered in bursts), <code>apns-collapse-id</code>, and an expiration after which APNs stops retrying.</p>
+      <p><b>Why this method:</b> the OS, not your server, decides how to spend the phone's battery; priorities and collapse ids are how you cooperate with it.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Normal vs high priority on Android</b> <span class="tag prod">🏭 In production · Google</span> <a href="https://firebase.google.com/docs/cloud-messaging/customize-messages/setting-message-priority" target="_blank" rel="noopener">FCM: setting message priority</a></div>
+      <p><b>How:</b> FCM attempts to deliver high-priority messages immediately, even when the device is in Doze mode (Android's deep-sleep state), and are meant for time-sensitive, user-visible content; normal ones may be delayed while the app is in the background.</p>
+      <p><b>Why this method:</b> if every app sent everything as urgent, phones would never sleep; your priority queue should map onto the platform's.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A WebSocket proxy for live delivery</b> <span class="tag co">🏢 Netflix · 2024</span> <a href="https://netflixtechblog.com/pushy-to-the-limit-evolving-netflixs-websocket-proxy-for-the-future-b468bc0ff658" target="_blank" rel="noopener">Pushy to the Limit</a></div>
+      <p><b>How:</b> Pushy holds hundreds of millions of concurrent WebSocket connections and delivers hundreds of thousands of messages per second to Netflix apps.</p>
+      <p><b>Why this method:</b> for apps that are open, a persistent connection you control is faster and richer than going through APNs/FCM.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · APNs keeps only one</span>
+    <p>If a phone is offline and you send it ten notifications for the same app, Apple's documentation says APNs stores <b>only one</b> (in most cases the latest) and delivers it when the device comes back. The other nine are gone. That's why serious apps keep an in-app inbox or sync on open: push is a doorbell, not a mailbox.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This design is queues and Kafka (Lessons 3.1, 3.2), idempotent retries (Lesson 3.3), circuit breakers (Lesson 4.4) and token buckets (Lesson 1.5) assembled into one service. Fan-out is the news-feed problem again (Lesson 7.3); in-app delivery reuses chat's persistent connections (Lesson 7.4). Payments (Lesson 7.7) and ride sharing (Lesson 7.6) are its biggest customers. In AI products, the same gates decide when an agent should interrupt a human, and when to batch its updates into a summary.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://engineering.linkedin.com/blog/2018/03/air-traffic-controller--member-first-notifications-at-linkedin" target="_blank" rel="noopener">LinkedIn: Air Traffic Controller</a>. The “5 Rights”, aggregation and delivery-time optimisation in a real system.</li>
+      <li><span class="kind">Docs</span> <a href="https://firebase.google.com/docs/cloud-messaging/send/v1-api" target="_blank" rel="noopener">FCM: send messages with the HTTP v1 API</a>. The request format and targeting options.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/novuhq/novu" target="_blank" rel="noopener">Novu on GitHub</a>. An open-source notification platform: read how it models workflows, digests and providers.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A product team wants to notify 20 million users within 10 minutes. What send rate must the pipeline (and its providers) sustain?</div>
+    <div class="opts"><button class="opt">About 3,300 per second</button><button class="opt" data-ok>About 33,000 per second</button><button class="opt">About 330,000 per second</button></div>
+    <div class="explain">20,000,000 ÷ 600 s ≈ <b>33,300 per second</b>, roughly 3× this lesson's daily average. Check the providers' rate limits too, and spread the send over time zones if “within 10 minutes” isn't really required.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Every time marketing launches a campaign, users complain their login codes arrive minutes late. What's the best fix?</div>
+    <div class="opts"><button class="opt">Add more workers to the single queue</button><button class="opt" data-ok>Separate queues (or worker pools) by priority so login codes never wait behind bulk sends</button><button class="opt">Send campaigns only at night</button></div>
+    <div class="explain">More workers shrink the delay but a big enough campaign always wins. Priority separation makes the guarantee structural: bulk work only uses capacity that critical work doesn't need. Night-only campaigns break quiet hours for half the planet.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A worker crashes after calling APNs but before acknowledging the queue message. The message is redelivered. How do you avoid a duplicate push?</div>
+    <div class="opts"><button class="opt">Switch the queue to exactly-once delivery</button><button class="opt">Never retry push notifications</button><button class="opt" data-ok>Check-and-set a dedupe key (event id + user id) before sending, e.g. Redis <code>SET … NX EX</code></button></div>
+    <div class="explain">Queues are at-least-once; “exactly once” end to end is achieved by making the effect idempotent (Lesson 3.3). The dedupe key turns the second attempt into a no-op. Never retrying would lose important messages instead.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>1 billion notifications a day is ~11.6k/s, but a breaking-news burst can be 167k/s: size for bursts and spread fan-out.</li>
+      <li>Every send passes gates: dedupe, preferences, quiet hours, caps, aggregation. Fewer, better notifications keep users opted in.</li>
+      <li>Separate queues by priority; retry with backoff, dead-letter what keeps failing, fail over between providers.</li>
+      <li>Push is best-effort (APNs keeps one per app when offline); the inbox is the durable copy.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const pct = (arr, p) => { if (!arr.length) return 0; const s = arr.slice().sort((a, b) => a - b); return s[Math.min(s.length - 1, Math.floor(p * s.length))]; };
+
+  // ---------- pipeline flow ----------
+  const F = new Flow($("nflow"), { width: 720, height: 250 });
+  F.node("prod", { x: 70, y: 125, label: "Producers", sub: "auth, chat, mkt", kind: "cl" })
+   .node("svc", { x: 215, y: 125, label: "Notif service", sub: "gates + templates", kind: "sv", w: 120 })
+   .node("qc", { x: 380, y: 45, label: "critical queue", sub: "", kind: "nw", w: 120 })
+   .node("qh", { x: 380, y: 125, label: "high queue", sub: "", kind: "nw", w: 120 })
+   .node("ql", { x: 380, y: 205, label: "low queue", sub: "", kind: "nw", w: 120 })
+   .node("wk", { x: 530, y: 125, label: "Workers", sub: "2,000/s", kind: "sv", w: 100 })
+   .node("smsA", { x: 665, y: 45, label: "SMS A", sub: "", kind: "lt", w: 90 })
+   .node("smsB", { x: 665, y: 125, label: "SMS B", sub: "standby", kind: "lt", w: 90 })
+   .node("push", { x: 665, y: 205, label: "APNs/FCM", sub: "", kind: "lt", w: 90 })
+   .edge("prod", "svc").edge("svc", "qc").edge("svc", "qh").edge("svc", "ql")
+   .edge("qc", "wk").edge("qh", "wk").edge("ql", "wk").edge("wk", "smsA").edge("wk", "smsB", { dashed: true }).edge("wk", "push").render();
+
+  // ---------- pipeline simulation ----------
+  const T = 60, DT = 0.1, CAP = 2000, RATE = { c: 30, h: 600, l: 100 }, BLAST_T = 5, BLAST_N = 60000, OUT0 = 20, OUT1 = 35;
+  class Q { constructor() { this.a = []; this.h = 0; } push(x) { this.a.push(x); } shift() { return this.h < this.a.length ? this.a[this.h++] : null; } get size() { return this.a.length - this.h; } }
+  const getQ = seg("qmode", () => run());
+  function run() {
+    const prio = getQ() === "prio", outage = $("outage").checked, retries = $("retries").checked, failover = $("failover").checked;
+    const qs = prio ? { c: new Q(), h: new Q(), l: new Q() } : null, fifo = new Q(), pending = [];
+    const lat = { c: [], h: [] }, lost = { c: 0 }, byCreate = new Array(T * 2).fill(0), depth = { c: [], h: [], l: [] };
+    let mktDone = null, mktSent = 0, mktTotal = 0, carry = { c: 0, h: 0, l: 0 };
+    const enq = m => (prio ? qs[m.k] : fifo).push(m);
+    const aDown = t => outage && t >= OUT0 && t < OUT1;
+    const breakerOpen = t => failover && outage && t >= OUT0 + 2 && t < OUT1 + 2; // opens after 2 s of errors, closes after a healthy probe
+    for (let step = 0; step < T / DT; step++) {
+      const t = step * DT;
+      // arrivals
+      for (const k of ["c", "h", "l"]) { carry[k] += RATE[k] * DT; while (carry[k] >= 1) { enq({ k, t0: t, tries: 0 }); carry[k]--; if (k === "l") mktTotal++; } }
+      if (Math.abs(t - BLAST_T) < DT / 2) for (let i = 0; i < BLAST_N; i++) { enq({ k: "l", t0: t, tries: 0 }); mktTotal++; }
+      // retries that are due go back into their queue
+      for (let i = pending.length - 1; i >= 0; i--) if (pending[i].at <= t) { enq(pending[i].m); pending.splice(i, 1); }
+      // send
+      let budget = CAP * DT;
+      while (budget >= 1) {
+        let m = null;
+        if (prio) m = qs.c.shift() || qs.h.shift() || qs.l.shift(); else m = fifo.shift();
+        if (!m) break;
+        budget--;
+        if (m.k === "c" && aDown(t) && !breakerOpen(t)) {
+          m.tries++;
+          if (retries && m.tries < 6) pending.push({ m, at: t + Math.pow(2, m.tries) * (0.75 + 0.5 * ((m.t0 * 7919) % 1)) });
+          else lost.c++;
+          continue;
+        }
+        const l = t + DT - m.t0;
+        if (m.k === "c") { lat.c.push(l); const b = Math.floor(m.t0 * 2); byCreate[b] = Math.max(byCreate[b], l); }
+        else if (m.k === "h") lat.h.push(l);
+        else { mktSent++; if (mktSent === mktTotal && mktDone == null && t > BLAST_T) mktDone = t; }
+      }
+      if (Math.round(t * 10) % 5 === 0) {
+        const d = prio ? { c: qs.c.size, h: qs.h.size, l: qs.l.size } : { c: 0, h: 0, l: fifo.size };
+        depth.c.push([t, d.c]); depth.h.push([t, d.h]); depth.l.push([t, d.l]);
+      }
+    }
+    lost.c += pending.filter(p => p.m.k === "c").length; // still waiting at the end: count as not delivered in time
+    Plot.line($("nDepth"), { series: prio ? [
+        { label: "low queue (marketing)", color: MX.css("--c-nw"), data: depth.l, fill: true },
+        { label: "high queue (chat)", color: MX.css("--c-sv"), data: depth.h },
+        { label: "critical queue (codes)", color: MX.css("--c-er"), data: depth.c } ] :
+      [{ label: "the one FIFO queue (everything)", color: MX.css("--c-nw"), data: depth.l, fill: true }],
+      xMin: 0, xMax: T, yMin: 0, xLabel: "seconds", yLabel: "messages waiting" });
+    Plot.line($("nLat"), { series: [{ label: "wait for a login code requested at time t (s)", color: MX.css("--c-er"), data: byCreate.map((v, i) => [i / 2, v]), fill: true }],
+      xMin: 0, xMax: T, yMin: 0, xLabel: "seconds", yLabel: "seconds", hlines: [{ y: 10, label: "10 s (assumed user patience)", color: MX.css("--c-lt") }] });
+    const p95c = pct(lat.c, 0.95), p95h = pct(lat.h, 0.95);
+    $("nOtp95").textContent = p95c.toFixed(1) + " s"; $("nOtp95").style.color = p95c > 10 ? MX.css("--c-er") : "";
+    $("nOtpLost").textContent = lost.c; $("nOtpLost").style.color = lost.c ? MX.css("--c-er") : "";
+    $("nChat95").textContent = p95h.toFixed(1) + " s";
+    $("nMktDone").textContent = mktDone == null ? "not by 60 s" : "t = " + mktDone.toFixed(0) + " s";
+    F.set("qc", { sub: prio ? "served first" : "(shared FIFO)" }).set("ql", { sub: prio ? "leftover capacity" : "60k blast" })
+     .set("smsA", { down: outage, sub: outage ? "down 20–35 s" : "ok" })
+     .set("smsB", { sub: failover ? (outage ? "took over" : "standby") : "not set up", hot: failover && outage })
+     .edgeStyle("wk", "smsB", { dashed: !(failover && outage), color: failover && outage ? "--c-db" : "--line" });
+    $("nMsg").textContent = !prio && p95c > 10 ? `💥 Login codes waited up to ${p95c.toFixed(0)} s (p95) behind 60,000 marketing messages in the same queue. Switch to priority queues.` :
+      lost.c && !retries ? `💥 ${lost.c} login codes were lost during the SMS outage: no retries, so a failed send is gone. Turn on retries, then failover.` :
+      lost.c ? `${lost.c} login codes still failed or were still waiting at the end. Add failover so they don't depend on provider A recovering.` :
+      outage && !failover && retries ? `No codes lost, but retries waited out the outage: p95 ${p95c.toFixed(1)} s. Failover to provider B turns that into a couple of seconds.` :
+      `✅ Login codes p95 ${p95c.toFixed(1)} s, none lost. The campaign still finished (${mktDone == null ? "late" : "by t = " + mktDone.toFixed(0) + " s"}), using only spare capacity.`;
+  }
+  ["outage", "retries", "failover"].forEach(id => ($(id).onchange = run));
+  $("nRun").onclick = async () => { run(); await Promise.all([F.packet(["prod", "svc", "qc", "wk", $("outage").checked && $("failover").checked ? "smsB" : "smsA"], { color: "--c-er", dur: 900 }), F.packet(["prod", "svc", "ql", "wk", "push"], { color: "--c-nw", dur: 1200 })]); };
+  run();
+
+  // ---------- digest simulation ----------
+  const WINS = [5, 15, 30, 60, 120];
+  const events = (() => { const rng = MX.seeded(21), ev = []; for (let i = 0; i < 420; i++) { const t = 21.5 + -Math.log(1 - rng()) * 1.1; if (t < 34) ev.push(t); } return ev.sort((a, b) => a - b); })();
+  const isNight = h => { const x = ((h % 24) + 24) % 24; return x >= 23 || x < 7; };
+  const getD = seg("dmode", () => digest());
+  function digest() {
+    const mode = getD(), W = WINS[+$("dwin").value] / 60, quiet = $("quiet").checked;
+    $("dwinV").textContent = WINS[+$("dwin").value] + " min";
+    const pushes = [], delays = [];
+    if (mode === "each") {
+      let held = [];
+      events.forEach(t => {
+        if (quiet && isNight(t)) held.push(t);
+        else { pushes.push(t); delays.push(0); }
+      });
+      if (held.length) { const rel = 31; pushes.push(rel); // one summary at 07:00
+        held.forEach(h => delays.push(rel - h)); pushes.sort((a, b) => a - b); }
+    } else if (mode === "window") {
+      let last = -1e9, pend = [];
+      for (let m = 21.5; m <= 34; m += 1 / 60) {
+        while (events.length && pend.length + delays.length < events.length && events[pend.length + delays.length] <= m) pend.push(events[pend.length + delays.length]);
+        if (pend.length && m - last >= W - 1e-9 && !(quiet && isNight(m))) { pushes.push(m); pend.forEach(e => delays.push(m - e)); pend = []; last = m; }
+      }
+    } else {
+      events.forEach(t => { if (t <= 32) delays.push(32 - t); });
+      pushes.push(32);
+    }
+    const perHour = {}; pushes.forEach(p => { const h = Math.floor(p); perHour[h] = (perHour[h] || 0) + 1; });
+    const maxHour = Math.max(0, ...Object.values(perHour)), night = pushes.filter(isNight).length;
+    const med = pct(delays, 0.5) * 60;
+    const cum = (arr) => { const out = [[21.5, 0]]; arr.forEach((t, i) => out.push([t, i + 1])); out.push([34, arr.length]); return out; };
+    Plot.line($("dChart"), { series: [
+      { label: "likes & comments so far", color: MX.css("--c-cl"), data: cum(events) },
+      { label: "pushes sent so far", color: MX.css(pushes.length > 50 ? "--c-er" : "--c-db"), data: cum(pushes), fill: true, dots: pushes.length < 40 } ],
+      xMin: 21.5, xMax: 34, yMin: 0, xLabel: "hour (21 = 9 pm, 24 = midnight, 31 = 7 am)", yLabel: "count" });
+    $("dEv").textContent = events.length; $("dPush").textContent = pushes.length; $("dMax").textContent = maxHour;
+    $("dNight").textContent = night; $("dNight").style.color = night ? MX.css("--c-er") : "";
+    $("dDelay").textContent = med < 1 ? "instant" : med < 90 ? Math.round(med) + " min" : (med / 60).toFixed(1) + " h";
+    $("dPush").style.color = pushes.length > 50 ? MX.css("--c-er") : "";
+    $("dMsg").textContent = mode === "each" ? `${pushes.length} pushes, up to ${maxHour} in one hour${night ? ", " + night + " of them at night" : ""}. This is how users end up disabling notifications.` :
+      mode === "digest" ? `One calm push at 8:00, but the median like waited ${(med / 60).toFixed(1)} hours. Fine for a weekly summary, too slow for a comment someone is waiting on.` :
+      `${pushes.length} pushes (each one “Asha and N others…”), at most ${maxHour} per hour${night ? ", " + night + " at night: turn on quiet hours" : ""}. Median wait ${Math.round(med)} min. A good middle ground.`;
+  }
+  $("dwin").oninput = digest; $("quiet").onchange = digest; $("dRun").onclick = digest;
+  digest();
+})();
+</script>
+</body>
+</html>

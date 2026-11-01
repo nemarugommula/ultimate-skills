@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.4 Hybrid search · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .txt { flex: 1 1 260px; font: inherit; padding: 6px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg2); color: var(--text); }
+  .three { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .three h4 { margin: 4px 0; }
+  .hit.ok { border-left-color: var(--c-ev); outline: 2px solid var(--c-ev); }
+  .hit.none { opacity: .55; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  td.okc { background: color-mix(in srgb, var(--c-ev) 18%, transparent); }
+  table.fuse td, table.fuse th { font-size: .88rem; }
+</style>
+</head>
+<body data-lesson="a2-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 4</div>
+  <h1>Hybrid search: BM25 + dense, fusion & sparse vectors</h1>
+  <p class="subtitle">Embeddings understand meaning but blur exact strings. Keyword search nails exact strings but misses paraphrases. Run both, fuse the rankings, and you get the strengths of each for a few extra milliseconds.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Dense retrieval</b>: embed the query and documents, return the nearest vectors (Lessons 2.1 and 2.2).</li>
+      <li>Embeddings blur exact numbers and codes, and can't see words they never learned (2.1).</li>
+      <li>Vector databases can store several kinds of vectors and run filters (2.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Anthropic's retrieval team gives the example of a support user searching for <b>“Error code TS-999”</b>. An embedding model may return general content about error codes and miss the one document that mentions TS-999 exactly. Old-fashioned keyword search finds it instantly.</p>
+    <p>In their tests, adding keyword search (BM25) to their improved embeddings cut top-20 retrieval failures from <b>3.7% to 2.9%</b>, on top of the gains from better chunks. The 30-year-old algorithm still pulls its weight next to the neural one.</p>
+  </div>
+
+  <h2>Numbers first: who wins which query</h2>
+  <table>
+    <tr><th>Query</th><th>Dense (embeddings)</th><th>Keyword (BM25)</th></tr>
+    <tr><td>“error E-4013”, “SKU 88-1234-B”, “invoice INV-20931”</td><td class="rk">Blurs codes: finds “some error doc”</td><td class="ev">Exact match on the rare token</td></tr>
+    <tr><td>“Zephyr X2”, a rare surname, internal project name</td><td class="rk">Unknown words have weak meaning</td><td class="ev">Rare words score highest</td></tr>
+    <tr><td>“how do I get my money back?” (doc says “refund”)</td><td class="ev">Same meaning, different words</td><td class="rk">No shared words → no match</td></tr>
+    <tr><td>Long conceptual question</td><td class="ev">Captures intent</td><td>Partial word matches, noisy</td></tr>
+  </table>
+  <p>This isn't just folklore. The BEIR benchmark (Thakur et al., 2021) tested retrievers on 18 datasets they weren't trained for and found <b>BM25 a robust baseline</b> that many neural retrievers failed to beat out of their home domain. When Microsoft released E5 in 2022, it was the first embedding model to outperform BM25 on BEIR zero-shot without labelled data. Plain sentence: <b>dense and keyword search fail on different queries</b>, so combining them covers both.</p>
+
+  <svg id="pipe" aria-label="The query goes to both a BM25 index and a vector index; their ranked lists are fused, optionally reranked, then sent to the LLM"></svg>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Run <b>two retrievers in parallel</b>, one that matches words exactly (BM25 or a sparse vector) and one that matches meaning (dense embeddings), then <b>fuse their ranked lists</b>. Fusion by rank (RRF) needs almost no tuning and no score calibration, which is why it's the usual starting point.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: two detectives</span>
+    <p>One detective reads every file for the exact licence plate “KX-4013”; she never misses an exact clue but doesn't understand that “the getaway car” means the same thing. The other understands the story and connects “getaway car” with “fled in a vehicle”, but shrugs at plate numbers. You don't pick one. You ask both for their top suspects and trust the names that appear high on <b>both</b> lists most.</p>
+  </div>
+
+  <h2>BM25 in one formula</h2>
+  <p><b>BM25</b> (“Best Matching 25”, from the Okapi system at City University London in the 1990s, built on the probabilistic retrieval work of Stephen Robertson, Karen Spärck Jones and others) scores a document for a query by adding up, for each query word:</p>
+  <div class="calc">score = Σ IDF(word) × tf × (k₁ + 1) ÷ ( tf + k₁ × (1 − b + b × doclen ÷ avglen) )</div>
+  <ul>
+    <li><b>IDF</b>, inverse document frequency: rare words count much more than common ones. IDF = ln(1 + (N − n + 0.5) ÷ (n + 0.5)) for a word in n of N documents.</li>
+    <li><b>tf</b>, term frequency: more mentions help, but with diminishing returns (k₁, usually 1.2 to 2.0).</li>
+    <li><b>b</b> (usually 0.75): long documents get a penalty, so a word in a short title counts more than the same word buried in a manual.</li>
+  </ul>
+  <p>It needs no training, runs on an <b>inverted index</b> (word → list of documents) and is microseconds fast. Its weakness is the flip side: no words in common, no match.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: why “4013” beats “error”</span>
+    <p>1,000 support articles. “error” appears in 300 of them; “4013” appears in 1. With k₁ = 1.5:</p>
+    <ul>
+      <li>IDF(“error”) = ln(1 + 700.5 ÷ 300.5) = ln(3.33) = <b>1.20</b>.</li>
+      <li>IDF(“4013”) = ln(1 + 999.5 ÷ 1.5) = ln(667.3) = <b>6.50</b>: 5.4× more weight than “error”.</li>
+      <li>Term frequency saturates: for an average-length document, 1 mention scores 1.0, 2 mentions 1.43, 5 mentions 1.92, 10 mentions only 2.17. Stuffing a word ten times barely helps.</li>
+    </ul>
+    <p>So for the query “error 4013”, the one article containing 4013 wins clearly. A dense model, which turns “4013” into a few generic number-ish sub-word tokens (Lesson 0.2), has no such sharp signal.</p>
+  </div>
+
+  <h2>Fusing the two lists</h2>
+  <p>BM25 scores (0 to maybe 20) and cosine similarities (0.2 to 0.9) live on different scales, so you can't just add them. Two common fixes:</p>
+  <ul>
+    <li><b>RRF, reciprocal rank fusion</b> (Cormack, Clarke and Büttcher, 2009): ignore scores, use ranks. Each document gets <b>Σ 1 ÷ (k + rank)</b> over the lists it appears in, with k = 60. In the paper, k = 60 was fixed during a pilot study, and RRF beat the best single system and established fusion methods (Condorcet, CombMNZ) by 4 to 5% on average.</li>
+    <li><b>Weighted score fusion</b> (also called convex combination): normalize each list's scores to 0–1, then combine as <b>α × dense + (1 − α) × keyword</b>. Weaviate's <code>alpha</code> works this way (1 = pure vector, 0 = pure keyword). It can beat RRF when tuned on your data, but the weight is one more thing to tune and to drift.</li>
+  </ul>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: RRF by hand (k = 60)</span>
+    <ul>
+      <li>Doc A: rank 1 in dense, absent from BM25: 1/61 = <b>0.0164</b>.</li>
+      <li>Doc B: rank 3 in dense, rank 1 in BM25: 1/63 + 1/61 = <b>0.0323</b>.</li>
+      <li>Doc C: rank 2 in dense, rank 4 in BM25: 1/62 + 1/64 = <b>0.0318</b>.</li>
+    </ul>
+    <p>Fused order: B, C, A. Being decent on <b>both</b> lists beats being first on one. The large k flattens the curve, so one list can't dominate with a single top hit.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Dense vs BM25 vs hybrid</span>
+    <p class="hint">A 12-article help centre. Pick a query (the correct article is outlined in green) or type your own, and compare the three result lists. Then read the scoreboard: which method finds the right article in its top 3 across all five test queries?</p>
+    <div class="controls">
+      <span class="seg" id="qs"><button id="q0" class="on">E-4013</button><button id="q1">money back</button><button id="q2">Zephyr X2 won't charge</button><button id="q3">parcel late</button><button id="q4">payment declined</button></span>
+    </div>
+    <div class="controls"><input class="txt" id="qtext" aria-label="search query"></div>
+    <div class="three">
+      <div><h4 class="md">Dense (toy embedding)</h4><div id="rDense"></div></div>
+      <div><h4 class="tl">BM25 (keywords)</h4><div id="rBm"></div></div>
+      <div><h4 class="ev">Hybrid (RRF, k = 60)</h4><div id="rHy"></div></div>
+    </div>
+    <div class="verdict" id="hyMsg"></div>
+    <div class="stat-row">
+      <div class="stat">dense: right article in top 3 <b id="scD">–</b></div>
+      <div class="stat">BM25 <b id="scB">–</b></div>
+      <div class="stat">hybrid <b id="scH">–</b></div>
+    </div>
+    <p class="hint">Dense search here uses the course's toy embedding, which, like real models, knows meanings (refund ≈ money back, sign in ≈ login) but blurs codes: we make it treat every token containing a digit (E-4013, X2) as the same generic “code”, a caricature of how real models smear numbers and IDs. BM25 is a real BM25 over the 12 articles. Hybrid is AI.rrf over both rankings.</p>
+  </div>
+  <p>What you should see: on “E-4013” dense returns any error article (or worse, an unrelated one) while BM25 nails it; on “money back” BM25 finds nothing because no article says “money”; hybrid gets the right article into the top 3 every time. Try your own: “X1 bluetooth”, “E-5001”, “I can't sign in”.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Fusion calculator</span>
+    <p class="hint">The same query's two rankings, fused two ways. Slide RRF's k and the weighted-fusion α and watch the order change. α = 1 is pure dense, α = 0 pure BM25. Green row = the correct article.</p>
+    <div class="controls">
+      <label>RRF k <input type="range" id="rrfk" min="1" max="100" step="1" value="60"> <b class="mono" id="rrfkv"></b></label>
+      <label>weighted α (dense share) <input type="range" id="alpha" min="0" max="1" step="0.05" value="0.5"> <b class="mono" id="alphav"></b></label>
+    </div>
+    <table class="fuse" id="fuse"></table>
+    <div class="verdict" id="fuseMsg"></div>
+    <p class="hint">Weighted fusion min-max normalizes each list's scores over all 12 articles first. With RRF, small k lets a single first place dominate; large k rewards appearing on both lists.</p>
+  </div>
+
+  <h2>Sparse learned vectors: BM25 that knows synonyms</h2>
+  <p>A <b>sparse vector</b> has one slot per vocabulary word (tens of thousands), almost all zero: BM25 is in effect one. <b>SPLADE</b> (Formal et al., 2021) has a language model produce those word weights instead, and <b>expand</b> the text with related words it doesn't contain: an article about “refunds” also gets weight on “money”, “return” and “reimburse”. The result keeps exact-term matching and the speed of an inverted index while picking up some synonyms. SPLADE v2 reported more than 9% better NDCG@10 (a ranking-quality score) on TREC DL 2019 than the first version, and state-of-the-art results on BEIR at the time.</p>
+  <p>Many engines store sparse vectors natively: Qdrant and Pinecone (sparse + dense in one query), pgvector's <code>sparsevec</code>, Elasticsearch's sparse fields. The trade-off: you run another model at index and query time.</p>
+
+  <h2>When hybrid helps (and when it doesn't)</h2>
+  <table>
+    <tr><th>Helps a lot</th><th>Helps a little or not at all</th></tr>
+    <tr><td>Codes, IDs, SKUs, error numbers, version strings, names, jargon, acronyms; short keyword-style queries; multilingual mixes with product names; out-of-domain data</td><td>Purely conversational questions over clean prose; a strong domain-tuned embedding model; corpora where words and meaning line up anyway</td></tr>
+  </table>
+  <p>Costs: a second index (an inverted index is small), a second query (parallel, a few ms), and the same text-processing choices as any search engine (tokenizing, stemming, languages). Measure it: run your eval set with dense only, BM25 only and hybrid, and keep hybrid only if it earns its place. Usually it does, and a <b>reranker</b> on the fused top 50 adds more (Lesson 3.4).</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Native hybrid: <b>Elasticsearch / OpenSearch</b> (BM25 + kNN + the <code>rrf</code> retriever), <b>Weaviate</b> (<code>hybrid</code> with <code>alpha</code>), <b>Qdrant</b> (prefetch dense + sparse, fuse with RRF or DBSF), <b>Pinecone</b> (sparse-dense), <b>pgvector</b> with Postgres full-text search. DIY: <code>rank_bm25</code> or <code>bm25s</code> in Python plus your embeddings and a 5-line RRF.</p>
+<pre><code><span class="c"># DIY hybrid: BM25 + embeddings + reciprocal rank fusion</span>
+<span class="k">from</span> rank_bm25 <span class="k">import</span> BM25Okapi
+<span class="k">import</span> numpy <span class="k">as</span> np
+
+bm25 = BM25Okapi([d.lower().split() <span class="k">for</span> d <span class="k">in</span> docs])        <span class="c"># use a real tokenizer in production</span>
+def hybrid(query, q_vec, doc_vecs, k=<span class="n">60</span>, top=<span class="n">10</span>):
+    kw = np.argsort(-bm25.get_scores(query.lower().split()))[:<span class="n">50</span>]
+    dense = np.argsort(-(doc_vecs @ q_vec))[:<span class="n">50</span>]             <span class="c"># normalized vectors: dot = cosine</span>
+    score = {}
+    <span class="k">for</span> ranking <span class="k">in</span> (kw, dense):
+        <span class="k">for</span> rank, i <span class="k">in</span> enumerate(ranking):
+            score[i] = score.get(i, <span class="n">0</span>) + <span class="n">1</span> / (k + rank + <span class="n">1</span>)
+    <span class="k">return</span> sorted(score, key=score.get, reverse=<span class="k">True</span>)[:top]
+
+<span class="c"># Qdrant: dense + sparse in one request, fused server-side</span>
+<span class="k">from</span> qdrant_client <span class="k">import</span> models
+hits = client.query_points(collection_name=<span class="s">"docs"</span>, limit=<span class="n">10</span>,
+    prefetch=[
+        models.Prefetch(query=models.SparseVector(indices=sparse.indices, values=sparse.values), using=<span class="s">"sparse"</span>, limit=<span class="n">50</span>),
+        models.Prefetch(query=dense_vec, using=<span class="s">"dense"</span>, limit=<span class="n">50</span>),
+    ],
+    query=models.RrfQuery(rrf=models.Rrf(k=<span class="n">60</span>))).points     <span class="c"># or models.FusionQuery(fusion=models.Fusion.DBSF)</span></code></pre>
+<pre><code><span class="c">// Elasticsearch: the rrf retriever (rank_constant defaults to 60)</span>
+{ <span class="s">"retriever"</span>: { <span class="s">"rrf"</span>: { <span class="s">"retrievers"</span>: [
+    { <span class="s">"standard"</span>: { <span class="s">"query"</span>: { <span class="s">"match"</span>: { <span class="s">"body"</span>: <span class="s">"error E-4013"</span> } } } },
+    { <span class="s">"knn"</span>: { <span class="s">"field"</span>: <span class="s">"embedding"</span>, <span class="s">"query_vector"</span>: [<span class="n">0.12</span>, <span class="n">-0.4</span>, <span class="s">"..."</span>], <span class="s">"k"</span>: <span class="n">50</span>, <span class="s">"num_candidates"</span>: <span class="n">200</span> } }
+] } } }</code></pre>
+    <p class="hint">Check your engine's RRF constant: defaults differ between products (Elasticsearch's is 60). Weaviate's Python client: <code>collection.query.hybrid(query="food", alpha=0.25, limit=3)</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Dense only</td><td>One index; great on paraphrases</td><td>Misses codes, names, rare jargon</td></tr>
+      <tr><td>BM25 only</td><td>Cheap, exact, explainable, no model</td><td>Misses synonyms and paraphrases</td></tr>
+      <tr><td>Hybrid with RRF</td><td>Robust, no score calibration, almost no tuning</td><td>Two retrievers; ignores how confident each one was</td></tr>
+      <tr><td>Weighted score fusion</td><td>Can beat RRF when tuned</td><td>Needs normalization and a tuned α that drifts with data</td></tr>
+      <tr><td>Learned sparse (SPLADE)</td><td>Exact matching plus expansion</td><td>Another model to run; vocabulary limits</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Turn on your database's built-in hybrid (or add Postgres full-text search next to pgvector) with RRF defaults. Add five ID-style and five paraphrase queries to your eval set so you can see each retriever's blind spot.</p></div>
+      <div><h4>At scale</h4><p>Several retrievers (BM25 with field boosts, dense, learned sparse, sometimes per language), fused and then reranked by a cross-encoder, with weights learned from click logs and A/B tested. Query routing sends obvious ID lookups straight to exact match.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Users say search can't find tickets by their ticket number, but understands questions fine. What do you do?” A senior answer:</p>
+    <ul>
+      <li>Diagnoses it: embeddings blur <b>exact tokens</b> like IDs; this is a retrieval-method gap, not a model-size problem.</li>
+      <li>Adds <b>BM25 (or sparse vectors) in parallel</b> and fuses with <b>RRF</b>; maybe routes regex-shaped queries (“TCK-\d+”) straight to an exact lookup.</li>
+      <li>Explains the fusion choice (RRF vs weighted α) and why scores can't be added raw.</li>
+      <li>Proves it with an eval slice per query type (IDs, paraphrases, names) and watches that paraphrase quality doesn't drop.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Contextual embeddings + contextual BM25</b> <span class="tag co">🏢 Anthropic · 2024</span> <a href="https://www.anthropic.com/research/contextual-retrieval" target="_blank" rel="noopener">Introducing Contextual Retrieval</a></div>
+      <p><b>How:</b> each chunk, prefixed with a short generated context, is indexed both as an embedding and in a BM25 index; results are combined, then reranked.</p>
+      <p><b>Why this method:</b> embeddings miss exact matches like “TS-999”; adding BM25 took failures from 3.7% to 2.9%, and reranking to 1.9% (from a 5.7% baseline).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Rank fusion that needs no tuning</b> <span class="tag res">🧪 Research · 2009</span> <a href="https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf" target="_blank" rel="noopener">Reciprocal Rank Fusion (Cormack et al., SIGIR)</a></div>
+      <p><b>How:</b> score each document by Σ 1/(60 + rank) across rankings.</p>
+      <p><b>Why this method:</b> it consistently beat the individual systems and the standard fusion methods, using only ranks, so it works for retrievers whose scores aren't comparable. It's now built into Elasticsearch, OpenSearch, Qdrant, Weaviate and others.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>BM25 is hard to beat out of domain</b> <span class="tag res">🧪 Research · 2021</span> <a href="https://arxiv.org/abs/2104.08663" target="_blank" rel="noopener">BEIR benchmark</a></div>
+      <p><b>How:</b> 10 retrieval systems (lexical, sparse, dense, late-interaction, rerankers) evaluated zero-shot on 18 datasets.</p>
+      <p><b>Why this method:</b> testing outside the training domain exposed that dense retrievers often underperform BM25 there, which is the evidence behind keeping BM25 in the loop.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Learned sparse retrieval</b> <span class="tag res">🧪 Research · 2021</span> <a href="https://arxiv.org/abs/2107.05720" target="_blank" rel="noopener">SPLADE (Formal et al.)</a></div>
+      <p><b>How:</b> a model outputs sparse, expanded term weights with a sparsity penalty, served from an ordinary inverted index.</p>
+      <p><b>Why this method:</b> keeps the exact matching and efficiency of bag-of-words search while learning which related terms to add.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the magic 60</span>
+    <p>The k = 60 you'll find in so many hybrid search systems comes from one line in a short 2009 paper: the authors fixed it during a pilot investigation and found it near-optimal. Elasticsearch's <code>rank_constant</code> still defaults to 60 today.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Hybrid retrieval feeds the reranker (Lesson 3.4) and the generator (3.5); contextual chunks (3.3) improve both halves. Query rewriting (4.1) helps when neither retriever understands the user, and ColBERT-style late interaction (4.2) is a third way between dense and sparse. Inverted indexes are covered in the System Design course's <a href="../../system-design-course/phase2/7-specialized-stores.html">search and specialized stores</a> lesson.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://qdrant.tech/documentation/concepts/hybrid-queries/" target="_blank" rel="noopener">Qdrant: Hybrid and multi-stage queries</a>. Prefetch, RRF, DBSF and reranking stages.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.weaviate.io/weaviate/search/hybrid" target="_blank" rel="noopener">Weaviate: Hybrid search</a>. Alpha, fusion methods and examples.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.elastic.co/docs/reference/elasticsearch/rest-apis/retrievers/rrf-retriever" target="_blank" rel="noopener">Elasticsearch: RRF retriever</a>. Fusing BM25 and kNN in one request.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. With RRF (k = 60), doc X is ranked 2nd by dense and 2nd by BM25; doc Y is ranked 1st by dense and absent from BM25. Which ranks higher?</div>
+    <div class="opts"><button class="opt">Y, because it's first somewhere</button><button class="opt" data-ok>X: 2/62 ≈ 0.0323 beats 1/61 ≈ 0.0164</button><button class="opt">They tie</button></div>
+    <div class="explain">X: 1/62 + 1/62 = 0.0323. Y: 1/61 = 0.0164. Appearing high on both lists roughly doubles your score, which is exactly the behaviour you want from fusion.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You fuse by adding raw BM25 scores (0 to 25) to cosine similarities (0.3 to 0.9). What goes wrong?</div>
+    <div class="opts"><button class="opt" data-ok>BM25's bigger numbers dominate, so it's effectively keyword-only</button><button class="opt">Nothing; both measure relevance</button><button class="opt">Cosine dominates because it's bounded</button></div>
+    <div class="explain">Scores on different scales can't be added directly. Normalize (min-max or distribution-based, like Qdrant's DBSF) and weight them, or use rank-based RRF, which ignores the scales entirely.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A legal search tool must find clauses by exact citation (“§ 4.2(b)”) and by meaning (“can the landlord end the lease early?”). Best design?</div>
+    <div class="opts"><button class="opt">A bigger embedding model</button><button class="opt">BM25 only, with synonyms added by hand</button><button class="opt" data-ok>Hybrid: BM25 (or sparse) for citations and exact terms, dense for meaning, fused with RRF and then reranked</button></div>
+    <div class="explain">Citations are exact tokens that embeddings blur; “end the lease early” vs “early termination” needs meaning. Hybrid covers both; a reranker then orders the fused shortlist with full attention to the query.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Dense search wins on paraphrases; BM25 wins on exact codes, IDs, names and rare words. They fail differently.</li>
+      <li>BM25 = rare words weigh more (IDF), repeated words saturate (k₁), long docs are penalized (b).</li>
+      <li>Fuse with RRF (Σ 1/(60 + rank)) by default; weighted score fusion needs normalization and tuning.</li>
+      <li>Learned sparse vectors (SPLADE) add expansion to exact matching.</li>
+      <li>Measure hybrid on query slices (IDs vs paraphrases), then add a reranker on top.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  const F = new Flow($("pipe"), { width: 720, height: 170 });
+  F.node("q", { x: 70, y: 85, w: 110, h: 46, label: "Query", sub: "“error E-4013”", kind: "cl" })
+   .node("bm", { x: 255, y: 40, w: 140, h: 46, label: "BM25 index", sub: "exact words", kind: "sv" })
+   .node("vx", { x: 255, y: 130, w: 140, h: 46, label: "Vector index", sub: "meaning", kind: "db" })
+   .node("f", { x: 445, y: 85, w: 120, h: 46, label: "Fuse (RRF)", sub: "Σ 1/(60+rank)", kind: "ca" })
+   .node("llm", { x: 625, y: 85, w: 130, h: 46, label: "Rerank → LLM", sub: "Lesson 3.4", kind: "nw" })
+   .edge("q", "bm").edge("q", "vx").edge("bm", "f").edge("vx", "f").edge("f", "llm").render();
+
+  const DOCS = [
+    "Error E-4012: the card payment was declined by the bank. Ask the customer to try another card.",
+    "Error E-4013: the payment request timed out. Wait a minute and retry.",
+    "Error E-5001: sync failed because the device is offline.",
+    "Refund policy: return any item within 30 days for a full refund.",
+    "Zephyr X2 headphones: if the battery will not charge, hold the power button for 10 seconds to reset.",
+    "Zephyr X1 setup: pair the headphones with your phone over Bluetooth.",
+    "Charging problems on any device: try a different cable and charger.",
+    "Forgot your password? Use the reset link on the sign in page.",
+    "Shipping times: standard delivery takes 3 to 5 business days.",
+    "Troubleshooting crashes: update the app and clear its cache.",
+    "Cancel your subscription at any time from Settings, then Billing.",
+    "Invoices and receipts are emailed after every payment.",
+  ];
+  const QS = [["E-4013", 1], ["how do I get my money back", 3], ["Zephyr X2 battery won't charge", 4], ["parcel late", 8], ["payment declined", 0]];
+  const blur = t => t.replace(/[\w-]*\d[\w-]*/g, " code ");
+  const DV = DOCS.map(d => AI.embed(blur(d)));
+  function rank(q) {
+    const qv = AI.embed(blur(q));
+    const dense = DOCS.map((_, i) => ({ i, s: AI.cosine(qv, DV[i]) })).sort((a, b) => b.s - a.s);
+    const bm = AI.bm25(DOCS, q).map((s, i) => ({ i, s })).sort((a, b) => b.s - a.s);
+    const hy = AI.rrf([dense.map(r => r.i), bm.filter(r => r.s > 0).map(r => r.i)], 60);
+    return { dense, bm, hy };
+  }
+  let cur = 0;
+  const title = i => esc(DOCS[i].split(":")[0]);
+  const row = (i, s, ok, none) => `<div class="hit${ok ? " ok" : ""}${none ? " none" : ""}"><span class="sc">${s}</span><b>${title(i)}</b><br><span class="muted">${(t => esc(t.length > 70 ? t.slice(0, 68) + "…" : t))(DOCS[i].split(":").slice(1).join(":").trim())}</span></div>`;
+  function search() {
+    const q = $("qtext").value, R = rank(q), want = cur >= 0 ? QS[cur][1] : -1;
+    $("rDense").innerHTML = R.dense.slice(0, 3).map(r => row(r.i, "cos " + r.s.toFixed(2), r.i === want, r.s <= 0.01)).join("");
+    const bmPos = R.bm.filter(r => r.s > 0);
+    $("rBm").innerHTML = bmPos.length ? bmPos.slice(0, 3).map(r => row(r.i, "BM25 " + r.s.toFixed(2), r.i === want)).join("") : `<div class="hit miss">No article shares a word with this query.</div>`;
+    $("rHy").innerHTML = R.hy.slice(0, 3).map(r => row(r.i, "RRF " + r.score.toFixed(4), r.i === want)).join("");
+    if (want >= 0) {
+      const inTop = list => list.slice(0, 3).some(r => r.i === want);
+      const d = inTop(R.dense), b = inTop(bmPos), h = inTop(R.hy);
+      $("hyMsg").innerHTML = `Right article (“${title(want)}”) in top 3 → dense ${d ? "✅" : "❌"} · BM25 ${b ? "✅" : "❌"} · hybrid ${h ? "✅" : "❌"}` +
+        (!d && b ? `<br><span class="rk">Dense blurred the exact code or name; keywords caught it.</span>` : !b && d ? `<br><span class="rk">No shared words, so BM25 is blind; the embedding caught the meaning.</span>` : "");
+    } else $("hyMsg").textContent = "Your own query: no answer key, so judge the lists yourself.";
+    fuse(R, want);
+  }
+  function score() {
+    const tot = { d: 0, b: 0, h: 0 };
+    QS.forEach(([q, want]) => {
+      const R = rank(q), inTop = list => list.slice(0, 3).some(r => r.i === want);
+      tot.d += inTop(R.dense); tot.b += inTop(R.bm.filter(r => r.s > 0)); tot.h += inTop(R.hy);
+    });
+    $("scD").textContent = tot.d + " / 5"; $("scB").textContent = tot.b + " / 5"; $("scH").textContent = tot.h + " / 5";
+  }
+  function fuse(R, want) {
+    const k = +$("rrfk").value, a = +$("alpha").value;
+    $("rrfkv").textContent = k; $("alphav").textContent = a.toFixed(2);
+    const dr = new Map(R.dense.map((r, n) => [r.i, n + 1])), bpos = R.bm.filter(r => r.s > 0), br = new Map(bpos.map((r, n) => [r.i, n + 1]));
+    const norm = list => { const v = list.map(r => r.s), lo = Math.min(...v), hi = Math.max(...v); return new Map(list.map(r => [r.i, hi > lo ? (r.s - lo) / (hi - lo) : 0])); };
+    const dn = norm(R.dense), bn = norm(R.bm);
+    const rows = DOCS.map((_, i) => ({
+      i, dR: dr.get(i), bR: br.get(i),
+      rrf: (dr.has(i) ? 1 / (k + dr.get(i)) : 0) + (br.has(i) ? 1 / (k + br.get(i)) : 0),
+      w: a * dn.get(i) + (1 - a) * bn.get(i),
+    }));
+    const byR = rows.slice().sort((x, y) => y.rrf - x.rrf), byW = rows.slice().sort((x, y) => y.w - x.w);
+    const rposR = new Map(byR.map((r, n) => [r.i, n + 1])), rposW = new Map(byW.map((r, n) => [r.i, n + 1]));
+    $("fuse").innerHTML = `<tr><th>Article</th><th>dense rank</th><th>BM25 rank</th><th>RRF score → rank</th><th>weighted score → rank</th></tr>` +
+      byR.slice(0, 6).map(r => `<tr><td class="${r.i === want ? "okc" : ""}">${title(r.i)}</td><td>${r.dR}</td><td>${r.bR || "–"}</td><td>${r.rrf.toFixed(4)} → #${rposR.get(r.i)}</td><td>${r.w.toFixed(2)} → #${rposW.get(r.i)}</td></tr>`).join("");
+    if (want >= 0) $("fuseMsg").innerHTML = `Correct article: RRF puts it at <b>#${rposR.get(want)}</b>, weighted fusion (α = ${a.toFixed(2)}) at <b>#${rposW.get(want)}</b>.` +
+      (a >= 0.95 ? " α ≈ 1 is just dense search again." : a <= 0.05 ? " α ≈ 0 is just BM25 again." : "");
+    else $("fuseMsg").textContent = "";
+  }
+  const btns = [...$("qs").querySelectorAll("button")];
+  btns.forEach((b, n) => (b.onclick = () => { btns.forEach(x => x.classList.toggle("on", x === b)); cur = n; $("qtext").value = QS[n][0]; search(); }));
+  $("qtext").oninput = () => { cur = QS.findIndex(q => q[0] === $("qtext").value); btns.forEach((x, n) => x.classList.toggle("on", n === cur)); search(); };
+  ["rrfk", "alpha"].forEach(id => ($(id).oninput = () => search()));
+  score(); btns[0].onclick();
+})();
+</script>
+</body>
+</html>

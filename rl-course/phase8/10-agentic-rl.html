@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.10 Multi-turn RL: when the LLM acts in a world · RL from Zero</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .traj{display:grid;gap:5px;margin:10px 0}
+  .seg{border-radius:10px;padding:8px 10px;font-family:var(--mono);font-size:.8rem;border:2px solid var(--line);background:var(--bg2);white-space:pre-wrap}
+  .seg .tag{font-family:var(--font);font-weight:800;font-size:.72rem;text-transform:uppercase;letter-spacing:.05em;margin-right:6px}
+  .seg.train{border-color:var(--c-policy);background:color-mix(in srgb,var(--c-policy) 10%,var(--bg2))}
+  .seg.masked{opacity:.55;border-style:dashed}
+  .seg .rw{float:right;font-family:var(--font);font-weight:800;color:var(--c-reward)}
+</style>
+<style>.seg.newseg{animation:segin .6s}@keyframes segin{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}</style>
+</head>
+<body data-lesson="p8-10" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8B · Lesson 10</div>
+  <h1>Multi-turn RL: when the LLM acts in a world</h1>
+  <p class="subtitle">From "write one answer" to "click, type, run, read, repeat until the job is done". RL for agents is RL in the full sense again: long episodes, a real environment, partial views and delayed rewards.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>RLVR</b>: reward = a program's check, e.g. tests pass (Lesson 8.2).</li>
+      <li><b>GRPO</b>: compare a group of attempts at the same task (Lesson 8.3).</li>
+      <li><b>Partial observability</b>: the agent can't see the whole state at once (Lesson 2.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In January 2025, OpenAI showed <b>CUA</b> (Computer-Using Agent): a model that looks at screenshots and moves a mouse and keyboard, built by combining GPT-4o's vision with reasoning trained through <b>reinforcement learning</b>. On OSWorld (real desktop tasks like "rename these files" or "make this spreadsheet chart") it succeeded <b>38.1%</b> of the time. Humans manage <b>72.4%</b>. The gap is what this lesson is about: acting in a world, step after step, is much harder than writing one good answer.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    An agent's episode is many <b>turns</b>: think → call a tool (run a command, edit a file, search) → read the result → think again… → finish. The environment is a real sandbox, and the reward usually arrives only at the end (tests pass, task done). This is the token MDP of 7.1 turned into a long, <b>partially observable</b> MDP (Lesson 2.1): the agent can't see the whole repository or machine at once, only what's in its context window.
+  </div>
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: an intern with a laptop</span>
+    <p>You give an intern a bug ticket and a laptop. For an hour they look around, run commands, read error messages, try fixes and run the tests, then say "done". You only check whether the tests pass at the end. To get better, they must figure out which of their many actions made the difference. That's agentic RL.</p>
+  </div>
+
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Anatomy of one agent trajectory</span>
+    <div class="controls">
+      <label><input type="checkbox" id="mask" checked> show the loss mask (which tokens get trained)</label>
+      <label>reward: <select id="rw" class="btn small"><option value="outcome">outcome only (tests at the end)</option><option value="turn">plus turn-level checks</option></select></label>
+      <button class="btn primary" id="replay">▶ Replay turn by turn</button>
+    </div>
+    <div class="traj" id="traj"></div>
+    <p class="hint" id="msg"></p>
+  </div>
+  <ul>
+    <li><b>Mask the environment's tokens.</b> Tool outputs (file contents, error messages) weren't chosen by the model, so they aren't actions. Training on them would teach the model to "predict the terminal", not to act. Only the agent's own tokens get policy-gradient updates. Why is this new? In single-turn RL the task prompt also isn't trained, but it sits neatly <i>before</i> the answer, so "train only the response" handles it for free. In multi-turn RL the environment's text lands in the <i>middle</i> of the agent's turns, so it has to be masked out explicitly. It stays in the context (the agent still reads it); it just gets no gradient.</li>
+    <li><b>Credit assignment is brutal</b>: one reward after 50 tool calls and maybe 30,000 tokens. Which call mattered? Turn-level checks (did the edit apply? did a new test start passing?) and checklist rewards (8.9) add denser signal, at the risk of being gamed.</li>
+  </ul>
+
+  <h2>Memory: the agent's belief state</h2>
+  <p>An agent never sees the whole world: not the whole repository, not the whole website, not what's behind the next click. In Lesson 2.1's terms it lives in a <b>POMDP</b> (a partially observable MDP), and the right thing to act on is a <b>belief state</b>: its best summary of everything it has seen so far. For an LLM agent, the belief state is simply <b>what's in its context window</b>, plus any notes or memory files it chooses to write. When the context fills up, the agent must decide what to keep, and RL can train that decision too (self-summarization, Lesson 8.14).</p>
+
+  <h2>What makes agentic RL hard</h2>
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
+    <div class="card"><div class="emoji">🐢</div><h4>Slow, expensive rollouts</h4><p>Each step runs real code in a container. One episode can take minutes. Infrastructure is half the work (8.11).</p></div>
+    <div class="card"><div class="emoji">🏗️</div><h4>Building environments</h4><p>Thousands of reproducible tasks with reliable checks: code sandboxes, terminals, browsers, whole desktops. Building good "RL environments" became a big industry effort in 2025–26 (coding: 8.13, scaling: 8.14, search: 8.15).</p></div>
+    <div class="card"><div class="emoji">🧠</div><h4>Context limits</h4><p>Long trajectories overflow the context window. Agents must summarize, take notes and manage memory, which is partial observability again.</p></div>
+    <div class="card"><div class="emoji">🎣</div><h4>Hacking</h4><p>Editing tests, hard-coding outputs, finding leaked solutions (8.6). Environments must be hardened.</p></div>
+  </div>
+
+  <details class="mathbox">
+    <summary><span class="pill">Math refresher</span> Token-level vs turn-level advantages</summary>
+    <div class="inner"><p>GRPO-style training gives every agent token in a trajectory the same advantage (episode reward minus the group mean). Turn-level methods estimate an advantage per turn (each tool call is an "action"), using turn rewards or a value estimate per turn. That's GAE-style credit (5.5): each turn gets credit for how much it changed the odds of success, rather than every token getting the same score.</p></div>
+  </details>
+
+  <div class="box watch">
+    <span class="label">📺 Watch</span>
+    <ul>
+      <li><a href="https://www.youtube.com/watch?v=8JAqLnTaZu4" target="_blank" rel="noopener">Stanford CS329A Self-Improving AI Agents, Part 8: Agentic evaluations and long-horizon tasks</a>.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🌍 Where it's used</span>
+    <div class="use">
+      <div class="use-head"><b>Tool use learned by RL</b> <span class="tag prod">🏭 In production · 2025</span> <a href="https://openai.com/index/introducing-o3-and-o4-mini/" target="_blank" rel="noopener">OpenAI o3 and o4-mini</a></div>
+      <p><b>How:</b> <span class="s">state</span> = conversation + tool results so far · <span class="a">action</span> = think, call a tool (search, Python, image tools) or answer · the <span class="r">reward</span> design isn't public.</p>
+      <p><b>Why this method:</b> OpenAI's stated aim was to teach <i>when</i> to use a tool, not just how. That's a decision with delayed payoff, exactly what RL learns and examples alone don't.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Masking the environment's tokens</b> <span class="tag res">🧪 Research · 2025</span> <a href="https://arxiv.org/abs/2504.11536" target="_blank" rel="noopener">ReTool (ByteDance Seed)</a></div>
+      <p><b>How:</b> <span class="s">state</span> = math problem + reasoning + interpreter outputs · <span class="a">action</span> = text or code run in a sandbox · <span class="r">reward</span> = final answer correct. Interpreter output is masked from the loss.</p>
+      <p><b>Why this method:</b> the policy didn't write those tokens, so they get no gradient. With the tool, the 32B model reached 67% on AIME in 400 steps vs 40% after 1,080 text-only steps.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A learned belief state</b> <span class="tag res">🧪 Research · 2025</span> <a href="https://arxiv.org/abs/2506.15841" target="_blank" rel="noopener">MEM1 (MIT, NUS)</a></div>
+      <p><b>How:</b> each turn the agent rewrites a short internal <span class="s">state</span> (its notes) and older turns are deleted · <span class="r">reward</span> = task answered correctly, with nothing rewarding memory size.</p>
+      <p><b>Why this method:</b> memory stays constant however long the task runs. On a 16-question task, the 7B agent scored 3.5× higher with 3.7× less memory than a 14B model reading everything.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact</span>
+    <p>The think → act → observe loop in the playground has a name: <b>ReAct</b> (Yao et al., 2022). It started as a <i>prompting</i> trick, with no RL at all: just show the model one or two examples of interleaving thoughts with tool calls. On two interactive benchmarks (ALFWorld and WebShop) it beat imitation- and RL-trained agents of the time. Agentic RL takes that same loop and trains the model to run it well.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 Close to home</span>
+    <p>The coding agent that built this course works the same way: read files, run commands, edit, test, repeat. Public evidence suggests agents like it improve substantially through RL in sandboxed software environments with test-based rewards: the techniques of this lesson, with the safeguards of 8.6. (Closed labs don't publish their full recipes; Lesson 8.13 covers the open ones.)</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2503.09516" target="_blank" rel="noopener">Search-R1 (Jin et al., 2025)</a>: Multi-turn RL with a tool, and retrieved-token masking.</li>
+      <li><span class="kind">Blog</span> <a href="https://openai.com/index/computer-using-agent/" target="_blank" rel="noopener">OpenAI: Computer-Using Agent</a>: An RL-trained agent that operates a desktop from screenshots.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2210.03629" target="_blank" rel="noopener">ReAct (Yao et al., 2022)</a>: The think → act → observe loop.</li>
+      <li><span class="kind">Blog</span> <a href="https://aweers.de/blog/2026/rl-for-llms/" target="_blank" rel="noopener">A. Weers: State of RL for reasoning LLMs</a>: Agentic RL in the context of the field.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself ✅</h2>
+  <div class="quiz"><div class="qtext">1. Why mask tool-output tokens from the policy-gradient loss?</div>
+    <div class="opts"><button class="opt">To save memory</button><button class="opt" data-ok>They come from the environment, not the agent, so they aren't actions to reinforce</button><button class="opt">They're always wrong</button></div>
+    <div class="explain">Only the agent's choices (its thoughts, tool calls and final answer) should be trained.</div></div>
+  <div class="quiz"><div class="qtext">2. What's the typical reward for a SWE agent?</div>
+    <div class="opts"><button class="opt">Human ratings of each command</button><button class="opt" data-ok>Whether the repository's (hidden) tests pass at the end</button><button class="opt">Number of files edited</button></div>
+    <div class="explain">A verifiable outcome reward (RLVR) for a long, multi-turn episode.</div></div>
+  <div class="quiz"><div class="qtext">3. Agentic RL compared with single-turn reasoning RL…</div>
+    <div class="opts"><button class="opt">has shorter episodes</button><button class="opt" data-ok>has much longer episodes, real environment dynamics, expensive rollouts and harder credit assignment</button><button class="opt">needs no verifier</button></div>
+    <div class="explain">It's closer to classic RL (Phases 2–6), with an LLM as the policy.</div></div>
+
+  <div class="box tldr"><span class="label">📝 TL;DR</span><ul>
+    <li>Agent episode = many turns of think → tool call → observation, ending with an outcome reward.</li>
+    <li>Mask environment tokens (they land mid-episode, unlike the prompt). Credit assignment over long horizons is the core difficulty.</li>
+    <li>It's a POMDP: the context window (plus notes) is the agent's belief state.</li>
+    <li>Building environments, slow rollouts, context limits and hacking are the practical challenges. Computer-use, coding and search agents are this same loop with different tools (8.13–8.15).</li>
+  </ul></div>
+</main>
+<script src="../assets/course.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const SEG = [
+    ["task", "Fix the bug: parse_date('2024-02-30') should raise ValueError.", false, null],
+    ["think", "I should find where parse_date lives and look at how it validates days.", true, null],
+    ["tool call", "$ grep -rn \"def parse_date\" src/", true, null],
+    ["observation", "src/utils/dates.py:14: def parse_date(s):", false, null],
+    ["tool call", "$ sed -n 10,30p src/utils/dates.py", true, null],
+    ["observation", "...  day = int(parts[2])\n     if day > 31: raise ValueError ...", false, null],
+    ["think", "It only checks day > 31. Use calendar.monthrange to validate days per month.", true, "+0.2 (located the right function)"],
+    ["tool call", "edit src/utils/dates.py: use calendar.monthrange(year, month)[1]", true, "+0.2 (edit applied cleanly)"],
+    ["tool call", "$ pytest tests/test_dates.py -q", true, null],
+    ["observation", "12 passed in 0.31s", false, null],
+    ["final", "Fixed: parse_date now validates days per month using calendar.monthrange.", true, null],
+  ];
+  let limit = SEG.length, rtimer = null;
+  function draw() {
+    const showMask = $("mask").checked, turn = $("rw").value === "turn";
+    let trained = 0, total = 0;
+    $("traj").innerHTML = SEG.slice(0, limit).map(([tag, txt, train, tr], i) => {
+      const len = txt.length; total += len; if (train) trained += len;
+      const cls = showMask ? (train ? "train" : "masked") : "";
+      const rw = i === SEG.length - 1 ? '<span class="rw">reward +1 ✅ (hidden tests pass)</span>' : turn && tr ? `<span class="rw">${tr}</span>` : "";
+      return `<div class="seg ${cls} ${i === limit - 1 && rtimer ? "newseg" : ""}"><span class="tag">${tag}</span>${rw}${txt.replace(/</g, "&lt;")}</div>`;
+    }).join("");
+    $("msg").textContent = showMask ? `Purple = agent tokens that get policy-gradient updates (~${Math.round(100 * trained / total)}% here). Dashed = task text and environment output, which are masked out of the loss.` : "Turn on the loss mask to see which parts are trained.";
+  }
+  $("mask").onchange = $("rw").onchange = draw; draw();
+  const WHO = { task: "The task arrives (not the agent's words: masked).", think: "The agent thinks (its own tokens: trained).", "tool call": "The agent calls a tool (its own tokens: trained).", observation: "The environment answers (not chosen by the agent: masked).", final: "The agent declares it's done. Only now do the hidden tests run and give the reward." };
+  $("replay").onclick = () => {
+    clearInterval(rtimer); limit = 0; $("mask").checked = true;
+    rtimer = setInterval(() => {
+      limit++; draw();
+      const [tag] = SEG[limit - 1];
+      $("msg").textContent = `Turn ${limit}/${SEG.length}: ${WHO[tag]}`;
+      if (limit >= SEG.length) { clearInterval(rtimer); rtimer = null; setTimeout(() => { if (!rtimer) draw(); }, 2500); }
+    }, 1100);
+  };
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.2 Kafka & event streaming · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .btn.tog.on { background: var(--c-er); border-color: var(--c-er); color: #fff; }
+  .logrow { display: flex; gap: 3px; flex-wrap: wrap; margin: 6px 0; font-family: var(--mono); font-size: .8rem; align-items: center; }
+  .logrow .cell { border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; background: var(--bg2); }
+  .logrow .cell.bad { border-color: var(--c-er); color: var(--c-er); font-weight: 700; }
+  .logrow .who { min-width: 92px; color: var(--muted); }
+</style>
+</head>
+<body data-lesson="s3-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 2</div>
+  <h1>Kafka & event streaming</h1>
+  <p class="subtitle">A queue that never forgets: Kafka stores events in an ordered, replicated log that many readers can replay at their own pace. It's how big companies move data between hundreds of systems in real time.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Queues</b> decouple producers and consumers; acks + redelivery give at-least-once delivery (Lesson 3.1).</li>
+      <li><b>Replication</b>: keeping copies of data on several machines, with a leader taking writes (Lesson 2.3).</li>
+      <li><b>Sharding</b>: splitting data by a key so many machines share the load (Lesson 2.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2019 LinkedIn reported running <b>over 100 Kafka clusters</b> with <b>more than 4,000 brokers</b> (Kafka servers), serving 100,000 topics and 7 million partitions. Together they handled <b>more than 7 trillion messages per day</b>. That's about 81 million messages every second, on average.</p>
+    <p>Kafka was born at LinkedIn to answer one question: how do you get every change, click and event to every system that needs it, without wiring hundreds of systems to each other?</p>
+  </div>
+
+  <h2>Numbers first: a log you can replay</h2>
+  <p>A classic queue deletes a message once it's acked. Kafka doesn't. It appends every event to a <b class="nw">log</b> and keeps it for a set time (the broker default is 168 hours, 7 days). Each reader remembers how far it has read. That small change unlocks a lot:</p>
+  <table>
+    <tr><th></th><th>Queue (SQS, RabbitMQ)</th><th>Log (Kafka)</th></tr>
+    <tr><td>After a consumer acks</td><td>Message deleted</td><td>Event stays until retention expires</td></tr>
+    <tr><td>Ten teams want the data</td><td>Ten copies, one queue each</td><td>One copy; ten consumer groups read it independently</td></tr>
+    <tr><td>Bug found in yesterday's processing</td><td>Data is gone</td><td>Rewind and reprocess from yesterday</td></tr>
+    <tr><td>Ordering</td><td>Usually best-effort</td><td>Guaranteed within a partition</td></tr>
+    <tr><td>Per-message tricks</td><td>Per-message ack, delay, DLQ, priority</td><td>Reads in order; one stuck message blocks its partition</td></tr>
+  </table>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A <b class="nw">log</b> is an append-only, ordered list of records. Writers only add to the end; readers keep a bookmark called an <b>offset</b> (“I've read up to record 1,204”). Because the log is the record of <i>what happened</i>, any number of systems can build their own view of the data by reading it, now or replaying it later.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a ship's logbook, photocopied</span>
+    <p>The captain writes every event in the logbook, in order, and never tears out pages. The navigator, the cook and the insurance company each keep their own bookmark and read at their own speed. The cook reads only yesterday's pages; the insurer reads the whole thing once a month. If the cook loses track, she flips back. And because the book is split into several volumes (one per deck), several clerks can write at once: that's <b>partitions</b>.</p>
+  </div>
+
+  <h2>The pieces of Kafka</h2>
+  <table>
+    <tr><th>Term</th><th>Plain meaning</th></tr>
+    <tr><td><b>Broker</b></td><td>One Kafka server. A cluster has several (3 is a typical minimum).</td></tr>
+    <tr><td><b>Topic</b></td><td>A named stream of events, like <code>orders</code> or <code>page-views</code>.</td></tr>
+    <tr><td><b>Partition</b></td><td>A topic is split into partitions, each its own ordered log on some broker. Partitions are the unit of parallelism.</td></tr>
+    <tr><td><b>Key</b></td><td>Optional field on each event (e.g. user ID). Events with the same key go to the same partition, so they stay in order.</td></tr>
+    <tr><td><b>Offset</b></td><td>An event's position in its partition: 0, 1, 2, … Consumers commit offsets to remember progress.</td></tr>
+    <tr><td><b>Consumer group</b></td><td>A set of consumers sharing the work. Each partition is read by exactly one member of the group.</td></tr>
+    <tr><td><b>Lag</b></td><td>How far behind a group is: latest offset minus committed offset. The number to alert on.</td></tr>
+    <tr><td><b>Retention</b></td><td>How long events are kept (time or size), or <b>compaction</b>: keep only the latest event per key.</td></tr>
+  </table>
+
+  <h2>Partitions: how Kafka scales</h2>
+  <p>One partition is read by one consumer in a group. So the number of partitions is the <b>ceiling on parallelism</b>: a topic with 6 partitions can use at most 6 consumers in one group. A 7th sits idle.</p>
+  <div class="eq">
+    partition = hash(<span class="cl">key</span>) mod <span class="nw">number of partitions</span>
+    <span class="say">“Hash the key and take the remainder.” Same key, same partition, same order, as long as the number of partitions doesn't change.</span>
+  </div>
+  <div class="legend"><span class="cl">key: e.g. user ID or order ID</span><span class="nw">partitions: fixed when you create the topic (can grow, but keys then move)</span></div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: sizing a clickstream topic</span>
+    <p>Your app emits <b>50,000 events per second</b> at peak, about <b>1 KB</b> each. One consumer instance can process about <b>5,000 events per second</b> (it writes to a database).</p>
+    <ul>
+      <li>Throughput: 50,000 × 1 KB = <b>50 MB/s</b>. Per day: 50 MB/s × 86,400 s = <b>4.32 TB</b>.</li>
+      <li>Replication factor 3 (three copies): 4.32 × 3 = <b>12.96 TB of disk per day</b>. With 7-day retention: about <b>91 TB</b> across the cluster.</li>
+      <li>Consumers: 50,000 ÷ 5,000 = <b>10</b> at peak, so you need <b>at least 10 partitions</b>. Pick more (say 24) so you can grow without changing the count, because adding partitions later moves keys.</li>
+    </ul>
+    <p>If consumers fall behind by 900,000 events and have 2,000 events/s of spare capacity, catching up takes 900,000 ÷ 2,000 = <b>450 s</b>. Lag is the early-warning signal.</p>
+  </div>
+
+  <div class="playground" id="pg1">
+    <span class="label">🎮 Playground · Partitions, consumer groups & lag</span>
+    <p class="hint">Live: one tick = one second. A producer writes to a topic; each consumer in the group can process 2,000 events/s, split across its partitions. Add and remove consumers and watch Kafka <b>rebalance</b> (reassign partitions; everyone pauses briefly). <b>Crash</b> a consumer and watch its partitions go unread until the group notices (session timeout, default 45 s).</p>
+    <svg id="kf"></svg>
+    <div class="controls">
+      <label>partitions <input type="range" id="np" min="1" max="12" step="1" value="6"> <b class="mono" id="npv"></b></label>
+      <label>produce rate <input type="range" id="rt" min="1000" max="20000" step="500" value="5000"> <b class="mono" id="rtv"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="addc">➕ Add consumer</button>
+      <button class="btn" id="rmc">➖ Remove consumer (graceful)</button>
+      <button class="btn" id="crc">💥 Crash a consumer</button>
+      <button class="btn tog" id="hot">🔥 Hot key (50% of events)</button>
+      <button class="btn" id="kpause">⏸ Pause</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">consumers <b id="kc">–</b></div>
+      <div class="stat">idle <b id="ki">–</b></div>
+      <div class="stat">total lag <b id="kl">–</b></div>
+      <div class="stat">seconds behind <b id="ks">–</b></div>
+      <div class="stat">rebalances <b id="kr">0</b></div>
+    </div>
+    <canvas class="chart" id="kc2" style="height:200px"></canvas>
+    <p class="hint" id="kmsg"></p>
+  </div>
+  <p>Things to try: with 2 consumers the group can do 4,000/s against 5,000/s produced, so lag climbs. Add a third and watch it fall. Add consumers until you have more than 6: the extras are idle. Turn on the hot key: one partition gets half of all events and its single consumer can't keep up, no matter how many consumers you add. That's why you pick keys that spread evenly.</p>
+
+  <h2>Ordering: per partition, by key</h2>
+  <p>Kafka guarantees that a consumer reads one partition's events in exactly the order they were written. It makes <b>no promise across partitions</b>. So if “deposit $100” and “withdraw $80” for the same account land in different partitions, a faster consumer may apply the withdrawal first.</p>
+  <p>The fix is to give both events the same key (the account ID). Same key → same partition → same order.</p>
+
+  <div class="playground" id="pg2">
+    <span class="label">🎮 Playground · Keys keep order</span>
+    <p class="hint">Four users each send 5 events that must be applied in order (1, 2, 3, 4, 5). Three partitions, each read by its own consumer; consumer 3 is slow. Compare keying by user ID with no key (events spread round-robin). Then add a fourth partition and see which users' keys move.</p>
+    <svg id="of"></svg>
+    <div class="controls">
+      <span class="seg" id="omode"><button id="okey" data-v="key" class="on">key = user ID</button><button id="onokey" data-v="none">no key (round-robin)</button></span>
+      <span class="seg" id="oparts"><button id="op3" data-v="3" class="on">3 partitions</button><button id="op4" data-v="4">4 partitions</button></span>
+      <button class="btn primary" id="osend">▶ Send 20 events</button>
+    </div>
+    <div id="oapplied"></div>
+    <div class="stat-row">
+      <div class="stat">applied out of order <b id="oo">–</b></div>
+      <div class="stat">users whose partition moved (3 → 4) <b id="om">–</b></div>
+    </div>
+    <p class="hint" id="omsg"></p>
+  </div>
+
+  <h2>Durability: replicas and the in-sync set</h2>
+  <p>Each partition has a <b>leader</b> replica (takes reads and writes) and <b>followers</b> that copy it on other brokers. A common production setting is <b>replication factor 3</b>: three copies. Followers that are caught up form the <b>ISR</b> (in-sync replicas). An event counts as <b>committed</b> once every replica in the ISR has it, and consumers only ever see committed events.</p>
+  <table>
+    <tr><th>Producer setting</th><th>Waits for</th><th>If the leader dies right after</th></tr>
+    <tr><td><code>acks=0</code></td><td>Nothing</td><td class="er">Event may be lost; producer never knows</td></tr>
+    <tr><td><code>acks=1</code></td><td>The leader's own write</td><td class="er">Lost if followers hadn't copied it yet</td></tr>
+    <tr><td><code>acks=all</code> + <code>min.insync.replicas=2</code></td><td>Every in-sync replica, and at least 2 of them</td><td class="db">Safe: another replica has it and becomes leader</td></tr>
+  </table>
+  <p>With 3 replicas and <code>min.insync.replicas=2</code>, you can lose one broker and keep accepting writes without losing acknowledged data. Lose two and writes are refused (an error, not silent loss). Current Kafka producers default to <code>acks=all</code> with idempotence turned on, so retries don't write duplicates (more in Lesson 3.3).</p>
+
+  <h2>Change data capture: the database as a stream</h2>
+  <p>Every database already keeps a log of its changes (Postgres's write-ahead log, MySQL's binlog). <b>Change data capture</b> (CDC) tools like <b>Debezium</b> read that log and publish every committed row change to Kafka, in commit order. Now the search index, the cache, the warehouse and the recommendation service can all stay in sync with the database, without the app writing to each of them (the dangerous “dual write”, Lesson 3.5). Make the log itself your source of truth and you get event sourcing and CQRS (Lesson 3.2b).</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Apache Kafka</b> (self-run; since 4.0 it runs without ZooKeeper), managed versions like <b>Confluent Cloud</b>, <b>Amazon MSK</b> and <b>Aiven</b>, Kafka-compatible engines like <b>Redpanda</b>, and similar logs: <b>AWS Kinesis</b>, <b>Google Pub/Sub</b>, <b>Apache Pulsar</b>. <b>Debezium</b> and <b>Kafka Connect</b> for CDC and connectors. The Kafka CLI from the official quickstart:</p>
+<pre><code>bin/kafka-topics.sh --create --topic orders --partitions <span class="n">6</span> --replication-factor <span class="n">3</span> \
+    --bootstrap-server localhost:9092
+bin/kafka-console-producer.sh --topic orders --bootstrap-server localhost:9092 \
+    --property parse.key=true --property key.separator=:      <span class="c"># type  user42:{"total":30}</span>
+bin/kafka-console-consumer.sh --topic orders --from-beginning --bootstrap-server localhost:9092
+bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --describe --group billing
+<span class="c"># TOPIC  PARTITION  CURRENT-OFFSET  LOG-END-OFFSET  LAG  ...   &lt;- LAG is what you alert on</span></code></pre>
+    <p>A Python consumer with <code>confluent-kafka</code>, committing only after the work is done (at-least-once):</p>
+<pre><code><span class="k">from</span> confluent_kafka <span class="k">import</span> Consumer
+c = Consumer({<span class="s">"bootstrap.servers"</span>: <span class="s">"localhost:9092"</span>, <span class="s">"group.id"</span>: <span class="s">"billing"</span>,
+              <span class="s">"auto.offset.reset"</span>: <span class="s">"earliest"</span>, <span class="s">"enable.auto.commit"</span>: <span class="k">False</span>})
+c.subscribe([<span class="s">"orders"</span>])
+<span class="k">while</span> <span class="k">True</span>:
+    msg = c.poll(<span class="n">1.0</span>)
+    <span class="k">if</span> msg <span class="k">is</span> <span class="k">None</span> <span class="k">or</span> msg.error():
+        <span class="k">continue</span>
+    charge(msg.key(), msg.value())     <span class="c"># must be idempotent: a crash here means a redelivery</span>
+    c.commit(message=msg)              <span class="c"># move the bookmark forward</span></code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 9092:9092 apache/kafka:4.0.2</code> starts a single broker (the image from the Kafka quickstart). Then run the CLI commands above from the Kafka download.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs: Kafka or a plain queue?</span>
+    <table>
+      <tr><th>✅ Reach for Kafka when…</th><th>❌ A queue is better when…</th></tr>
+      <tr><td>Many independent consumers need the same events</td><td>You just need background jobs done once</td></tr>
+      <tr><td>You need replay: rebuild a search index, fix a bug, backfill a new service</td><td>You need per-message retries, delays or priorities</td></tr>
+      <tr><td>Throughput is high (tens of thousands of events per second and up)</td><td>Volume is low and you don't want to run a cluster</td></tr>
+      <tr><td>Per-key ordering matters (all events for one account in order)</td><td>One slow or poison message mustn't block others behind it</td></tr>
+    </table>
+    <p class="hint">Costs: partitions to plan, consumer lag to watch, rebalances that pause consumption, and operational weight (brokers, disks, upgrades). Managed Kafka removes most of the last one, for a price.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>You probably don't need Kafka yet. A queue plus Postgres goes a long way. When you do (analytics events, CDC into a warehouse, several consumers), use a managed service, a handful of topics, 6–12 partitions each, keys by entity ID, and alerts on consumer lag.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Kafka becomes the company's central nervous system: hundreds of clusters, schema registries so producers can't break consumers, CDC from every database, tiered storage for long retention, mirroring between regions, and platform teams who own it. LinkedIn runs custom patches for its scale.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>When you put Kafka in a design, a senior answer covers:</p>
+    <ul>
+      <li><b>Topic and key choice</b>: what's the key, does it spread evenly, and what ordering does it guarantee?</li>
+      <li><b>Partition count</b> from throughput math, with headroom (adding partitions later moves keys).</li>
+      <li><b>Delivery</b>: commit offsets after processing (at-least-once) + idempotent consumers.</li>
+      <li><b>Durability</b>: replication factor 3, <code>acks=all</code>, <code>min.insync.replicas=2</code>.</li>
+      <li><b>Operations</b>: lag alerts, retention vs disk cost, what a rebalance does to latency.</li>
+    </ul>
+    <p class="hint">Common follow-ups: “How do you keep a user's events in order?” “What happens when a consumer dies?” “Kafka or SQS here, and why?” “How would you replay last Tuesday?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The log as the company's data backbone</b> <span class="tag co">🏢 LinkedIn · 2019</span> <a href="https://engineering.linkedin.com/blog/2019/apache-kafka-trillion-messages" target="_blank" rel="noopener">How LinkedIn customizes Apache Kafka for 7 trillion messages per day</a></div>
+      <p><b>How:</b> 100+ clusters and 4,000+ brokers carry activity tracking, messaging and metrics. Some clusters have over 140 brokers and a million replicas, which pushed LinkedIn to patch controller and broker startup performance.</p>
+      <p><b>Why this method:</b> one shared log lets every team publish once and lets any number of systems consume, instead of point-to-point pipelines between every pair.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Every article ever, in one log</b> <span class="tag co">🏢 The New York Times · 2017</span> <a href="https://www.confluent.io/blog/publishing-apache-kafka-new-york-times/" target="_blank" rel="noopener">Publishing with Apache Kafka at The New York Times</a></div>
+      <p><b>How:</b> the “Monolog” topic holds every published asset, totally ordered by publication time. Search indexes and other services are built by reading it from the beginning.</p>
+      <p><b>Why this method:</b> to change a search schema you build a new index from the log and throw the old one away, instead of a risky migration.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The essay that explained it</b> <span class="tag hist">📜 History · 2013</span> <a href="https://web.archive.org/web/20260612105408/https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying" target="_blank" rel="noopener">Jay Kreps: The Log (LinkedIn Engineering, archived)</a></div>
+      <p><b>How:</b> Kreps defines a log as “an append-only, totally-ordered sequence of records ordered by time” and shows how databases, replication and data integration are all built on one.</p>
+      <p><b>Why this method:</b> if every system consumes the same ordered log, they all end up consistent with each other, which is far simpler than syncing pairs of systems.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Change data capture from the database log</b> <span class="tag oss">🧰 Open source</span> <a href="https://debezium.io/documentation/reference/stable/architecture.html" target="_blank" rel="noopener">Debezium architecture</a></div>
+      <p><b>How:</b> connectors run in Kafka Connect; the MySQL connector reads the binlog and the PostgreSQL connector reads a logical replication stream, then send row changes to Kafka topics.</p>
+      <p><b>Why this method:</b> the database's own log already has every committed change, in order, so nothing in the application has to remember to publish.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Ordering, retention and replicas</b> <span class="tag oss">🧰 Open source</span> <a href="https://kafka.apache.org/40/getting-started/introduction/" target="_blank" rel="noopener">Apache Kafka: introduction</a></div>
+      <p><b>How:</b> events with the same key go to the same partition, and any consumer reads a partition in the order written; events aren't deleted after consumption; a replication factor of 3 is a common production setting.</p>
+      <p><b>Why this method:</b> per-partition ordering is cheap to guarantee and enough for most needs (order per user or per account), while partitions still scale out.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 170 years in one partition</span>
+    <p>The New York Times' Monolog contains every asset published since 1851, and it's a <b>single-partition</b> topic, on purpose: one partition means one total order, so a consumer always sees an asset before anything that references it. It fits on one disk because, as the team put it, it's all text written by humans.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Kafka is a queue (Lesson 3.1) that's also a replicated log (Lesson 2.3) sharded by key (Lesson 2.4). Its consumers need idempotency (Lesson 3.3). Kafka's brokers elect a controller with Raft since KRaft replaced ZooKeeper (Lesson 3.4). CDC + Kafka powers the transactional outbox (Lesson 3.5) and stream processing with Flink (Lesson 3.6). In AI systems, CDC streams keep vector stores and feature stores fresh as source data changes.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://web.archive.org/web/20260612105408/https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying" target="_blank" rel="noopener">The Log: What every software engineer should know</a>. The classic essay on why logs unify data systems (archived copy; the original link is gone).</li>
+      <li><span class="kind">Docs</span> <a href="https://kafka.apache.org/40/design/design/" target="_blank" rel="noopener">Kafka design</a>. Why Kafka uses the disk and page cache, how ISRs work, and the delivery semantics section.</li>
+      <li><span class="kind">Docs</span> <a href="https://debezium.io/documentation/reference/stable/architecture.html" target="_blank" rel="noopener">Debezium</a>. How CDC connectors read database logs into Kafka.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A topic gets 30,000 events per second. Each consumer handles 4,000 per second. What's the minimum number of partitions so one consumer group can keep up?</div>
+    <div class="opts"><button class="opt">4</button><button class="opt" data-ok>8</button><button class="opt">30</button></div>
+    <div class="explain">30,000 ÷ 4,000 = 7.5, so you need <b>8</b> consumers, and since each partition is read by only one consumer in a group, at least 8 partitions. You'd choose more (12 or 16) for growth, since adding partitions later moves keys between partitions.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A bank streams account events through Kafka with no key. Sometimes a withdrawal is applied before the deposit that funded it. What's the fix?</div>
+    <div class="opts"><button class="opt">Add more partitions so events move faster</button><button class="opt" data-ok>Use the account ID as the key, so an account's events share one partition and stay in order</button><button class="opt">Increase the replication factor to 5</button></div>
+    <div class="explain">Kafka only orders events <i>within</i> a partition. With no key, an account's events spread over partitions read by consumers at different speeds. Keying by account ID sends them all to one partition, read in order by one consumer.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your topic has 6 partitions. Lag is growing, so you scale the consumer group from 6 to 12 instances. What happens?</div>
+    <div class="opts"><button class="opt">Throughput doubles</button><button class="opt" data-ok>Nothing improves: 6 consumers get one partition each and 6 sit idle</button><button class="opt">Kafka splits each partition in two automatically</button></div>
+    <div class="explain">Partitions are the ceiling on parallelism within a group. To go past 6 consumers, add partitions (and accept that keys move) or make each consumer faster, for example by batching database writes.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Kafka is a replicated, partitioned, append-only log. Events stay for the retention period; consumers track offsets and can replay.</li>
+      <li>Partitions = parallelism. One consumer per partition per group; extra consumers idle.</li>
+      <li>Ordering is per partition: key by the entity whose events must stay in order, and pick keys that spread evenly.</li>
+      <li>Durability: replication factor 3, <code>acks=all</code>, <code>min.insync.replicas=2</code>. Watch consumer lag.</li>
+      <li>CDC (Debezium) turns a database's own log into a stream, so other systems stay in sync without dual writes.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const k = n => n >= 1000 ? (n / 1000).toFixed(n >= 10000 ? 0 : 1) + "k" : String(Math.round(n));
+  const fmt = n => Math.round(n).toLocaleString("en-US");
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- consumer group simulator ----------
+  const CAP = 2000, REB = 3, SESSION = 45;
+  let P = 6, lag = new Array(P).fill(0), t = 0, nextId = 3, rebalances = 0, pausedUntil = 0, running = true;
+  let consumers = [{ id: 1, alive: true }, { id: 2, alive: true }];  // group members
+  let assign = {}, F, hist = [];
+  function rebalance(count) {
+    assign = {};
+    const m = consumers.length;
+    consumers.forEach(c => (assign[c.id] = []));
+    // range-style: contiguous chunks, like Kafka's default RangeAssignor
+    const per = Math.floor(P / Math.max(1, m)), extra = P % Math.max(1, m);
+    let p = 0;
+    consumers.forEach((c, i) => { const n = per + (i < extra ? 1 : 0); for (let j = 0; j < n; j++) assign[c.id].push(p++); });
+    if (count) { rebalances++; pausedUntil = t + REB; }
+    draw();
+  }
+  function draw() {
+    const rows = Math.max(P, consumers.length, 2), H = rows * 40 + 40;
+    F = new Flow($("kf"), { width: 720, height: H });
+    F.node("prod", { x: 70, y: H / 2, label: "📤 Producer", sub: k(+$("rt").value) + "/s", kind: "sv" });
+    for (let p = 0; p < P; p++) F.node("p" + p, { x: 290, y: 20 + (p + 0.5) * (H - 40) / P, w: 150, h: 28, label: `P${p} · lag 0`, kind: "nw" });
+    consumers.forEach((c, i) => {
+      const parts = assign[c.id] || [];
+      F.node("c" + c.id, { x: 580, y: 20 + (i + 0.5) * (H - 40) / Math.max(1, consumers.length), w: 170, h: 38, label: `Consumer ${c.id}`, sub: parts.length ? "P" + parts.join(",P") : "idle", kind: "sv", down: !c.alive });
+      parts.forEach(p => F.edge("p" + p, "c" + c.id));
+    });
+    for (let p = 0; p < P; p++) F.edge("prod", "p" + p, { noArrow: true });
+    F.render();
+  }
+  function tick() {
+    if (!running) return;
+    t++;
+    const R = +$("rt").value, hot = $("hot").classList.contains("on");
+    for (let p = 0; p < P; p++) lag[p] += hot ? (p === 0 ? R * 0.5 : 0) + R * 0.5 / P : R / P;
+    // a crashed consumer is removed only when its session times out
+    consumers.filter(c => !c.alive && t - c.crashedAt >= SESSION).forEach(c => { consumers = consumers.filter(x => x !== c); rebalance(true); });
+    if (t >= pausedUntil) {
+      consumers.forEach(c => {
+        if (!c.alive) return;
+        let parts = (assign[c.id] || []).slice(), budget = CAP;
+        while (parts.length && budget > 0.5) {           // share capacity fairly, give leftovers to busier partitions
+          const share = budget / parts.length;
+          parts.forEach(p => { const d = Math.min(lag[p], share); lag[p] -= d; budget -= d; });
+          parts = parts.filter(p => lag[p] > 0.5);
+        }
+      });
+    }
+    const total = lag.reduce((a, b) => a + b, 0);
+    hist.push([t, total]); if (hist.length > 120) hist.shift();
+    paint(total, R);
+  }
+  function paint(total, R) {
+    for (let p = 0; p < P; p++) F.set("p" + p, { label: `P${p} · lag ${k(lag[p])}`, load: Math.min(1, lag[p] / 30000) });
+    F.set("prod", { sub: k(R) + "/s" });
+    const live = consumers.filter(c => c.alive).length;
+    const idle = consumers.filter(c => (assign[c.id] || []).length === 0).length;
+    $("kc").textContent = live + (live < consumers.length ? " (+1 dead)" : "");
+    $("ki").textContent = idle; $("kl").textContent = fmt(total); $("ks").textContent = (total / R).toFixed(1) + " s";
+    $("kr").textContent = rebalances;
+    Plot.line($("kc2"), { series: [{ label: "total consumer lag (events)", color: MX.css("--c-nw"), data: hist.length ? hist : [[0, 0]], fill: true }], xLabel: "seconds", yMin: 0, yMax: Math.max(10000, ...hist.map(h => h[1])) * 1.1 });
+    const hot = $("hot").classList.contains("on"), capacity = live * CAP;
+    const dead = consumers.find(c => !c.alive);
+    $("kmsg").textContent = t < pausedUntil ? "⏸ Rebalancing: the whole group stops reading while partitions are reassigned."
+      : dead ? `Consumer ${dead.id} crashed. Its partitions are unread until the session timeout: ${Math.max(0, SESSION - (t - dead.crashedAt))} s left.`
+      : idle ? `${idle} consumer(s) idle: there are only ${P} partitions to share. More consumers can't help; more partitions (or faster consumers) can.`
+      : hot && lag[0] > 2 * CAP ? "The hot partition P0 gets half of all events, but only one consumer can read it. Adding consumers won't help; a better key would."
+      : capacity < R ? `Group capacity ${fmt(capacity)}/s is below ${fmt(R)}/s produced, so lag grows by about ${fmt(R - capacity)} every second. Add consumers.`
+      : total > 1000 ? "Enough capacity: the group is catching up on its backlog." : "Keeping up: lag is near zero.";
+  }
+  function resizeParts() {
+    P = +$("np").value; $("npv").textContent = P;
+    const old = lag; lag = new Array(P).fill(0);
+    old.forEach((v, i) => (lag[i % P] += v));      // keep the backlog; keys now map differently
+    rebalance(true);
+  }
+  $("np").oninput = resizeParts;
+  $("rt").oninput = () => { $("rtv").textContent = fmt(+$("rt").value) + "/s"; };
+  $("addc").onclick = () => { if (consumers.length >= 12) return; consumers.push({ id: nextId++, alive: true }); rebalance(true); };
+  $("rmc").onclick = () => { const c = consumers.slice().reverse().find(x => x.alive); if (!c || consumers.length <= 1) return; consumers = consumers.filter(x => x !== c); rebalance(true); };
+  $("crc").onclick = () => { const c = consumers.find(x => x.alive && (assign[x.id] || []).length); if (!c || consumers.some(x => !x.alive)) return; c.alive = false; c.crashedAt = t; F.set("c" + c.id, { down: true, sub: "💥 crashed (group doesn't know yet)" }); };
+  $("hot").onclick = () => $("hot").classList.toggle("on");
+  $("kpause").onclick = () => { running = !running; $("kpause").textContent = running ? "⏸ Pause" : "▶ Resume"; };
+  $("npv").textContent = P; $("rtv").textContent = "5,000/s";
+  rebalance(false);
+  paint(0, 5000);
+  setInterval(tick, 300);
+
+  // ---------- ordering playground ----------
+  const USERS = ["Ann", "Bob", "Cat", "Dan"], UCOL = ["--c-cl", "--c-sv", "--c-db", "--c-lt"];
+  const SPEED = [90, 140, 380, 120];     // ms per event for consumers 1..4 (consumer 3 is slow)
+  const hash = s => { let h = (5 * 2654435761) >>> 0; for (const ch of s) { h = Math.imul(h ^ ch.charCodeAt(0), 16777619) >>> 0; h ^= h >>> 13; } return h >>> 0; };  // a toy stand-in for Kafka's key hash
+  let O, busy = false;
+  const getMode = seg("omode", () => drawO());
+  const getParts = seg("oparts", () => drawO());
+  function drawO() {
+    const n = +getParts();
+    O = new Flow($("of"), { width: 720, height: 60 + n * 50 });
+    const H = 60 + n * 50;
+    O.node("pr", { x: 80, y: H / 2, label: "👥 4 users", sub: "20 events", kind: "cl" });
+    for (let p = 0; p < n; p++) {
+      O.node("p" + p, { x: 330, y: 30 + p * 50 + 25, w: 140, h: 36, label: `Partition ${p}`, kind: "nw" });
+      O.node("c" + p, { x: 590, y: 30 + p * 50 + 25, w: 170, h: 36, label: `Consumer ${p + 1}`, sub: p === 2 ? "slow" : "", kind: "sv" });
+      O.edge("pr", "p" + p).edge("p" + p, "c" + p);
+    }
+    O.render();
+    const moved = USERS.filter(u => hash(u) % 3 !== hash(u) % 4);
+    $("om").textContent = moved.length + " of 4 (" + moved.join(", ") + ")";
+  }
+  function plan() {
+    const n = +getParts(), mode = getMode(), rng = MX.seeded(11);
+    const next = [1, 1, 1, 1], evs = [];
+    while (evs.length < 20) { const u = Math.floor(rng() * 4); if (next[u] <= 5) evs.push({ u, seq: next[u]++ }); }
+    const free = new Array(n).fill(0);
+    evs.forEach((e, i) => {
+      e.p = mode === "key" ? hash(USERS[e.u]) % n : i % n;
+      const arrive = i * 40, svc = SPEED[e.p] * (0.7 + 0.6 * rng());
+      e.done = Math.max(free[e.p], arrive) + svc; free[e.p] = e.done; e.i = i;
+    });
+    return evs;
+  }
+  function showApplied(evs, upto) {
+    const applied = evs.slice().sort((a, b) => a.done - b.done).slice(0, upto);
+    let bad = 0, html = "";
+    USERS.forEach((u, ui) => {
+      let last = 0; const cells = [];
+      applied.filter(e => e.u === ui).forEach(e => { const ok = e.seq === last + 1; if (!ok) bad++; last = Math.max(last, e.seq); cells.push(`<span class="cell${ok ? "" : " bad"}">${e.seq}${ok ? "" : " ✗"}</span>`); });
+      html += `<div class="logrow"><span class="who" style="color:${MX.css(UCOL[ui])}">${u}'s account:</span>${cells.join("")}</div>`;
+    });
+    $("oapplied").innerHTML = html;
+    $("oo").textContent = bad;
+    return bad;
+  }
+  $("osend").onclick = async () => {
+    if (busy) return; busy = true;
+    drawO();
+    const evs = plan();
+    $("oapplied").innerHTML = ""; $("oo").textContent = "…";
+    const sends = evs.map(e => O.packet(["pr", "p" + e.p], { color: UCOL[e.u], dur: 300 }));
+    await Promise.all(sends.slice(0, 1));
+    const sorted = evs.slice().sort((a, b) => a.done - b.done);
+    for (let i = 0; i < sorted.length; i++) {
+      const e = sorted[i];
+      await O.packet(["p" + e.p, "c" + e.p], { color: UCOL[e.u], dur: 140 });
+      showApplied(evs, i + 1);
+    }
+    const bad = showApplied(evs, evs.length);
+    $("omsg").textContent = getMode() === "key"
+      ? `All of each user's events went to one partition and were applied in order: ${bad} out of order. Consumer 3 being slow only delays its users; it never reorders them.`
+      : `${bad} events were applied out of order. Round-robin spread each user's events over partitions, and the slow consumer let later events overtake earlier ones.`;
+    if (getParts() === "4" && getMode() === "key") $("omsg").textContent += " Note: with 4 partitions some users now hash to a different partition; during that switch their old and new events could be read out of order.";
+    busy = false;
+  };
+  drawO();
+})();
+</script>
+</body>
+</html>

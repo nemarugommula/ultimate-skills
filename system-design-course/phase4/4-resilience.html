@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.4 Resilience: timeouts, retries, circuit breakers, bulkheads · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .states { display: flex; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+  .states span { padding: 4px 12px; border-radius: 999px; border: 2px solid var(--line); font-weight: 700; font-size: .85rem; }
+  .states span.on.closed { border-color: var(--c-db); color: var(--c-db); }
+  .states span.on.open { border-color: var(--c-er); color: var(--c-er); }
+  .states span.on.half { border-color: var(--c-lt); color: var(--c-lt); }
+</style>
+</head>
+<body data-lesson="s4-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 4</div>
+  <h1>Resilience: timeouts, retries, circuit breakers, bulkheads</h1>
+  <p class="subtitle">In a system of many services, something is always slow or broken. These patterns stop one sick dependency from taking everything else down with it.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Thread pool</b>: a server handles each request on a worker from a fixed pool; when all are busy, new requests wait or fail.</li>
+      <li><b>Idempotency</b>: an operation that's safe to repeat, so a retry can't charge a card twice (Lesson 3.3).</li>
+      <li><b>Sync calls put services on your critical path</b>, and meshes can retry for you (Lesson 4.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On December 7, 2021, at 7:30 AM PST, an automated scaling activity inside AWS's US-EAST-1 region triggered unexpected behavior from a large number of internal clients. The resulting surge of connections overwhelmed the network devices between AWS's internal network and its main network.</p>
+    <p>The delays caused errors, and the errors caused <b>even more connection attempts and retries</b>, which kept the devices congested. AWS's summary describes all network devices fully recovering at 2:22 PM PST, almost seven hours later. Retries are meant to help. Without limits, they are how a small problem becomes a big one.</p>
+  </div>
+
+  <h2>Numbers first: how one slow service eats your threads</h2>
+  <p>Service A has <b>200 worker threads</b> and gets <b>500 requests per second</b>. Every request calls B (10 ms). One in five also calls C (normally 20 ms). How many threads are busy? Use <b>Little's law</b>: things in the system = arrival rate × time each one stays.</p>
+  <div class="eq">
+    <span class="sv">threads busy</span> = <span class="cl">requests per second</span> × <span class="lt">seconds each request holds a thread</span>
+    <span class="say">“If 100 requests arrive every second and each one keeps a thread for 5 seconds, 500 threads are busy at any moment.”</span>
+  </div>
+  <table>
+    <tr><th>Situation</th><th>Threads busy</th><th>Result</th></tr>
+    <tr><td>Normal</td><td>500 × 0.010 + 100 × 0.020 = <b>7</b></td><td class="db">Plenty of room (7 of 200)</td></tr>
+    <tr><td>C slows to 5 s, no timeout</td><td>100 × 5 = <b>500</b> needed</td><td class="er">Pool full in about 2 s. Then <b>most</b> requests fail, even the 80% that never touch C</td></tr>
+    <tr><td>C slow, 500 ms timeout</td><td>100 × 0.5 + 5 = <b>55</b></td><td class="db">A survives; requests needing C get a fallback</td></tr>
+    <tr><td>C slow, 1 s timeout + 2 retries</td><td>100 × 3 × 1 + 5 = <b>305</b> needed</td><td class="er">Retries brought the outage back, and C gets 3× the load</td></tr>
+  </table>
+  <p>That's a <b>cascading failure</b>: a failure that spreads because each failing part pushes more load onto the next. Google's SRE (site reliability engineering) book defines it as a failure that grows over time through positive feedback.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Every call to another service needs a <b>limit</b>: a limit on <b>time</b> (timeout), on <b>attempts</b> (retry budget), on <b>concurrency</b> (bulkhead), and on <b>calling something that's already down</b> (circuit breaker). Unlimited waiting is how one slow dependency becomes your outage.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the ship, the fuse box and the phone queue</span>
+    <p>A <b>bulkhead</b> is the wall between compartments of a ship: one flooded compartment doesn't sink the ship. A <b>circuit breaker</b> is the one in your fuse box: when a device shorts, it cuts the power right away instead of letting the wires overheat, and you try flipping it back later. A <b>timeout</b> is hanging up after 2 minutes on hold. A <b>retry with backoff and jitter</b> is calling back later, but not all at the same second as everyone else who got cut off.</p>
+  </div>
+
+  <h2>The toolkit</h2>
+  <table>
+    <tr><th>Pattern</th><th>What it does</th><th>Typical setting</th></tr>
+    <tr><td><b>Timeout</b></td><td>Stop waiting after T. Pick T from the dependency's latency: Amazon picks an acceptable false-timeout rate (say 0.1%) and uses that percentile (p99.9).</td><td>Slightly above the callee's p99.9</td></tr>
+    <tr><td><b>Deadline propagation</b></td><td>Pass “you have 300 ms left” down the chain so nobody works on an answer the caller already gave up on (gRPC, the RPC framework from Lesson 4.3, does this with deadlines).</td><td>Whole-request budget</td></tr>
+    <tr><td><b>Retry with backoff + jitter</b></td><td>Retry transient errors, waiting longer each time (backoff) with randomness (jitter) so clients don't retry in sync.</td><td>2–3 attempts, only for idempotent calls, at <b>one</b> layer</td></tr>
+    <tr><td><b>Retry budget</b></td><td>Cap retries as a share of traffic. Google: at most 3 attempts per request, and a client retries only while retries are under 10% of its requests.</td><td>~10% extra load at most</td></tr>
+    <tr><td><b>Circuit breaker</b></td><td>When failures pass a threshold, stop calling for a cooldown and fail fast; then let a few trial calls through.</td><td>Resilience4j's defaults: 50% failure rate over 100 calls, 60 s open</td></tr>
+    <tr><td><b>Bulkhead</b></td><td>Give each dependency its own small pool of threads or connections, so one can't use them all.</td><td>Sized by Little's law plus headroom</td></tr>
+    <tr><td><b>Fallback</b></td><td>When a call fails, return something useful: a cached value, a default, a simpler feature.</td><td>“Popular items” instead of personal recommendations</td></tr>
+    <tr><td><b>Load shedding</b></td><td>When overloaded, reject some requests early and cheaply (HTTP 503 or 429) so the rest succeed.</td><td>Drop low-priority traffic first</td></tr>
+    <tr><td><b>Backpressure</b></td><td>Tell the sender to slow down: bounded queues, flow control, consumers pulling at their own pace.</td><td>Bounded queue, not an infinite one</td></tr>
+  </table>
+
+  <h3>The circuit breaker's three states</h3>
+  <ul>
+    <li><b class="db">Closed</b> (normal): calls go through; the breaker counts failures over a sliding window of recent calls.</li>
+    <li><b class="er">Open</b>: the failure rate crossed the threshold. Calls fail <b>immediately</b> (or use a fallback) without touching the sick service. This gives it room to recover and keeps your threads free.</li>
+    <li><b class="lt">Half-open</b>: after the cooldown, a few trial calls go through. If they succeed, back to closed; if not, open again.</li>
+  </ul>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · A circuit breaker vs a flaky dependency</span>
+    <p class="hint">Your service sends 50 calls per second to a dependency. At t = 10 s it goes down: every call hangs until a 1-second timeout. Set how long the outage lasts and tune the breaker. Without a breaker, every call during the outage waits a full second and the sick service keeps getting hammered.</p>
+    <div class="controls">
+      <label>outage length <input type="range" id="cbL" min="5" max="40" step="1" value="20"> <b class="mono" id="cbLv"></b></label>
+      <label>failure threshold <input type="range" id="cbT" min="20" max="90" step="5" value="50"> <b class="mono" id="cbTv"></b></label>
+      <label>window (calls) <input type="range" id="cbW" min="10" max="100" step="10" value="20"> <b class="mono" id="cbWv"></b></label>
+      <label>cooldown <input type="range" id="cbC" min="1" max="30" step="1" value="5"> <b class="mono" id="cbCv"></b></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="cbMode"><button id="cbOn" data-v="on" class="on">Breaker on</button><button id="cbOff" data-v="off">No breaker</button></span>
+      <button class="btn primary" id="cbRun">▶ Run 60 seconds</button>
+    </div>
+    <div class="states"><span class="closed" id="stC">CLOSED</span><span class="open" id="stO">OPEN</span><span class="half" id="stH">HALF-OPEN</span></div>
+    <div class="stat-row">
+      <div class="stat">calls sent to sick service <b id="cbSent">–</b></div>
+      <div class="stat">avg wait during outage <b id="cbWait">–</b></div>
+      <div class="stat">threads stuck (peak) <b id="cbThr">–</b></div>
+      <div class="stat">times it tripped <b id="cbTrips">–</b></div>
+      <div class="stat">back to normal after recovery <b id="cbRec">–</b></div>
+    </div>
+    <canvas class="chart" id="cbc" style="height:220px"></canvas>
+    <p class="hint" id="cbmsg"></p>
+  </div>
+  <p>Things to try: with the breaker on, the sick service gets a small trickle of trial calls instead of the full stream, and callers wait about a millisecond instead of a second. Now make the cooldown 30 s: the breaker stays open long after the dependency recovers, so you serve fallbacks for nothing. A 1 s cooldown sends more trial calls into the outage. Tuning is a trade-off between protecting the dependency and recovering quickly.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: retries multiply</span>
+    <p>A user request goes through <b>5 layers</b> of services, ending at a database. Each layer tries each call up to <b>3 times</b>. The database starts failing.</p>
+    <ul>
+      <li>Layer 5 tries the database 3 times per call from layer 4. Layer 4 tries layer 5 three times. And so on up.</li>
+      <li>Worst case: 3 × 3 × 3 × 3 × 3 = 3<sup>5</sup> = <b>243 database calls</b> for one user request. AWS's Builders' Library uses this exact example.</li>
+      <li>With Google's per-client budget (retries allowed only while they're under 10% of requests), the growth is capped near <b>1.1×</b> instead.</li>
+    </ul>
+    <p>The fix is structural: retry at <b>one</b> layer (usually the edge or the mesh), give every client a retry budget, and back off with jitter: wait a random time between 0 and min(cap, base × 2<sup>attempt</sup>).</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Cascading failure</span>
+    <p class="hint">Service A: 200 threads, 500 requests/s. All requests call B (10 ms); 20% also call C. At t = 5 s, C becomes slow. Run it with no protection and watch A die, including the requests that never needed C. Then add a timeout, a bulkhead (a separate limit on concurrent C calls), and retries.</p>
+    <svg id="caf"></svg>
+    <div class="controls">
+      <label>C's latency when sick <input type="range" id="caS" min="200" max="10000" step="100" value="5000"> <b class="mono" id="caSv"></b></label>
+      <label>timeout <input type="range" id="caT" min="0" max="10" step="1" value="0"> <b class="mono" id="caTv"></b></label>
+      <label>retries <input type="range" id="caR" min="0" max="3" step="1" value="0"> <b class="mono" id="caRv"></b></label>
+      <label>bulkhead for C <input type="range" id="caB" min="0" max="5" step="1" value="0"> <b class="mono" id="caBv"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn" id="caNone">No protection</button>
+      <button class="btn" id="caFix">Timeout + bulkhead</button>
+      <button class="btn" id="caRetry">Timeout + 2 retries</button>
+      <button class="btn primary" id="caRun">▶ Run 20 seconds</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">after C slows: requests not needing C, OK <b id="caOkB">–</b></div>
+      <div class="stat">requests needing C, OK or fallback <b id="caOkC">–</b></div>
+      <div class="stat">peak threads busy <b id="caPeak">–</b></div>
+      <div class="stat">load on C <b id="caLoad">–</b></div>
+    </div>
+    <canvas class="chart" id="cac" style="height:220px"></canvas>
+    <p class="hint" id="camsg"></p>
+  </div>
+  <p>With no protection, A's 200 threads fill with requests stuck on C within about 2 seconds, and from then on A rejects most requests, whatever they need: a slow C has become a broken A. A timeout alone saves A here. A bulkhead protects A even with no timeout, because C can never hold more than its share of threads. And “Timeout + 2 retries” shows the trap from the hook: each retry holds the thread for another full timeout, and C, already struggling, gets three times the calls.</p>
+
+  <div class="box incident">
+    <span class="label">🔥 Real outage · AWS US-EAST-1, December 7, 2021</span>
+    <p><b>What happened:</b> an automated scaling activity triggered a surge of connection activity from many clients on AWS's internal network. Network devices between the internal and main networks became congested; the resulting delays and errors led to <b>more connection attempts and retries</b>, which kept them congested. Internal monitoring was also affected, which slowed diagnosis.</p>
+    <p><b>Impact:</b> several AWS services were impaired for hours; for example, the Route 53 API was impaired from 7:30 AM to 2:30 PM PST (existing DNS answers kept working).</p>
+    <p><b>Lesson:</b> clients that retry without backoff, jitter and budgets turn a capacity problem into a feedback loop. The <a href="https://aws.amazon.com/message/12721/" target="_blank" rel="noopener">AWS summary</a> lists the scaling activity as disabled and further protections added.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Libraries:</b> Resilience4j (Java; the recommended successor to Netflix Hystrix), Polly (.NET), <code>tenacity</code> (Python retries), <code>cockatiel</code> (Node). <b>In the proxy or mesh:</b> Envoy and Istio have timeouts, retries, outlier detection and circuit-breaking limits built in (Lesson 4.3). <b>Testing:</b> fault injection (Istio can inject delays and errors), and chaos experiments (Lesson 8.4).</p>
+<pre><code><span class="c"># application.yml: Resilience4j in Spring Boot</span>
+resilience4j.circuitbreaker:
+  instances:
+    payments:
+      slidingWindowSize: <span class="n">20</span>                 <span class="c"># judge the last 20 calls</span>
+      minimumNumberOfCalls: <span class="n">20</span>
+      failureRateThreshold: <span class="n">50</span>              <span class="c"># open at 50% failures</span>
+      waitDurationInOpenState: 10s          <span class="c"># cooldown before half-open</span>
+      permittedNumberOfCallsInHalfOpenState: <span class="n">3</span>
+resilience4j.bulkhead:
+  instances:
+    payments:
+      maxConcurrentCalls: <span class="n">30</span>                <span class="c"># payments can never hold more than 30 threads</span>
+resilience4j.retry:
+  instances:
+    payments:
+      maxAttempts: <span class="n">3</span>
+      waitDuration: 100ms
+      enableExponentialBackoff: <span class="k">true</span>
+      exponentialBackoffMultiplier: <span class="n">2</span></code></pre>
+<pre><code><span class="c"># Python: exponential backoff with "full jitter"</span>
+<span class="k">import</span> random, time
+<span class="k">def</span> call_with_retries(fn, attempts=<span class="n">3</span>, base=<span class="n">0.1</span>, cap=<span class="n">2.0</span>):
+    <span class="k">for</span> i <span class="k">in</span> range(attempts):
+        <span class="k">try</span>:
+            <span class="k">return</span> fn(timeout=<span class="n">0.5</span>)                 <span class="c"># always a timeout</span>
+        <span class="k">except</span> TransientError:
+            <span class="k">if</span> i == attempts - <span class="n">1</span>: <span class="k">raise</span>
+            time.sleep(random.uniform(<span class="n">0</span>, min(cap, base * <span class="n">2</span> ** i)))  <span class="c"># spread retries out</span></code></pre>
+    <p class="hint">Try it cheaply: run any small HTTP service, then add <code>tc qdisc add dev eth0 root netem delay 2000ms</code> inside its container (Linux) or use Toxiproxy (<code>docker run -p 8474:8474 ghcr.io/shopify/toxiproxy</code>) to inject latency, and watch whether your caller's timeouts actually fire.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Pattern</th><th>✅ Protects you from</th><th>❌ Costs and pitfalls</th></tr>
+      <tr><td>Short timeouts</td><td>Threads stuck on slow calls</td><td>Too short = false failures when the callee is merely a bit slow</td></tr>
+      <tr><td>Retries</td><td>Random, brief failures</td><td>Multiply load during overload; unsafe for non-idempotent calls</td></tr>
+      <tr><td>Circuit breaker</td><td>Hammering a dead service; slow failures</td><td>Mis-tuned, it trips on blips or stays open too long; per-instance breakers see only part of the picture</td></tr>
+      <tr><td>Bulkhead</td><td>One dependency taking every thread</td><td>Pools too small reject good traffic; more pools to size and monitor</td></tr>
+      <tr><td>Fallbacks</td><td>Users seeing errors</td><td>A fallback that's never tested may fail exactly when needed; stale data must be acceptable</td></tr>
+      <tr><td>Load shedding</td><td>Total collapse under overload</td><td>Some users get errors on purpose; needs priorities</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>The cheap 80%: a timeout on <b>every</b> outbound call (HTTP clients often default to none or to minutes), retries only at one layer with jittered backoff, and idempotency keys on payment calls. Add a fallback for the one feature that can degrade (recommendations, avatars).</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Resilience is platform policy: deadlines propagated through every RPC, retry budgets in the client library or mesh, breakers and outlier detection in the proxy, load shedding by request priority, and regular fault-injection and chaos tests (Lesson 8.4) to prove the fallbacks work.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“What happens when this service is slow?” is one of the most common follow-ups. A senior answer:</p>
+    <ul>
+      <li>Names a <b>timeout</b> with a number and where it comes from (the callee's p99.9), and a whole-request <b>deadline</b>.</li>
+      <li>Says <b>where</b> retries happen (one layer), how many, with <b>backoff + jitter</b>, and that the call is <b>idempotent</b>.</li>
+      <li>Adds a <b>circuit breaker</b> and a <b>bulkhead</b> for risky dependencies, and a <b>fallback</b> the product team agreed to.</li>
+      <li>Explains <b>load shedding</b>: under overload we reject low-priority work early so the rest succeeds.</li>
+    </ul>
+    <p class="hint">Common follow-ups: “Your retry made it worse. Why?” · “How do you pick the timeout value?” · “What does the user see when the breaker is open?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Circuit breakers and bulkheads as a library</b> <span class="tag co">🏢 Netflix · open source</span> <a href="https://github.com/Netflix/Hystrix" target="_blank" rel="noopener">Netflix Hystrix</a></div>
+      <p><b>How:</b> Hystrix wrapped calls to dependencies with timeouts, isolated thread pools (bulkheads), circuit breakers and fallbacks. It is now in maintenance mode (final version 1.5.18); Netflix recommends Resilience4j for new projects.</p>
+      <p><b>Why this method:</b> with hundreds of dependencies, some are always failing; isolating each one kept a single failure from consuming the whole service.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Timeouts, retries and jitter</b> <span class="tag co">🏢 Amazon · Builders' Library</span> <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">Timeouts, retries, and backoff with jitter</a></div>
+      <p><b>How:</b> Amazon sets timeouts from the downstream service's latency percentile matching an acceptable false-timeout rate, retries at a single layer, and limits retries locally with a token bucket (added to the AWS SDK, Amazon's client libraries, in 2016). The jitter math is in Marc Brooker's 2015 post <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">Exponential Backoff and Jitter</a>.</p>
+      <p><b>Why this method:</b> retries at every layer multiply (3<sup>5</sup> = 243×), and synchronized retries arrive as waves; budgets and jitter break both.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Retry budgets and load shedding</b> <span class="tag co">🏢 Google · SRE book</span> <a href="https://sre.google/sre-book/addressing-cascading-failures/" target="_blank" rel="noopener">Addressing Cascading Failures</a></div>
+      <p><b>How:</b> limit retries per request, use a server-wide retry budget, shed load, and degrade gracefully. The companion chapter <a href="https://sre.google/sre-book/handling-overload/" target="_blank" rel="noopener">Handling Overload</a> describes at most 3 attempts per request and a 10% per-client retry ratio, which keeps growth near 1.1×.</p>
+      <p><b>Why this method:</b> cascading failures are feedback loops; every pattern here cuts the loop somewhere.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The circuit-breaker state machine</b> <span class="tag oss">🧰 Open source · Resilience4j</span> <a href="https://resilience4j.readme.io/docs/circuitbreaker" target="_blank" rel="noopener">Resilience4j CircuitBreaker</a></div>
+      <p><b>How:</b> a finite state machine with CLOSED, OPEN and HALF_OPEN states over a count-based or time-based sliding window. Defaults: 50% failure threshold, window of 100 calls, 60 s wait in open.</p>
+      <p><b>Why this method:</b> a sliding window reacts to recent behavior only, so one bad minute last hour doesn't keep the breaker open.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the pattern came from a book about production</span>
+    <p>Martin Fowler credits Michael Nygard's book <i>Release It!</i> with popularizing the circuit breaker in software (<a href="https://martinfowler.com/bliki/CircuitBreaker.html" target="_blank" rel="noopener">CircuitBreaker</a>, 2014). And when Netflix retired Hystrix, it said its focus had shifted to <b>adaptive</b> approaches, like concurrency limits that react to real-time performance instead of hand-tuned thresholds.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Retries are only safe with idempotency (Lesson 3.3). Rate limiting (Lesson 1.5) is load shedding at the front door. Queues give backpressure a place to live (Lesson 3.1). Meshes configure these patterns centrally (Lesson 4.3). Alerting on breaker trips and timeouts is Lesson 6.4, and proving all of this works is chaos engineering (Lesson 8.4). For AI systems the same applies to model APIs: set timeouts, retry rate-limit errors with jittered backoff, and fall back to a smaller model when the big one is slow.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">AWS: Timeouts, retries, and backoff with jitter</a>. How Amazon actually picks timeout values.</li>
+      <li><span class="kind">Book</span> <a href="https://sre.google/sre-book/addressing-cascading-failures/" target="_blank" rel="noopener">Google SRE: Addressing Cascading Failures</a>. Free chapter with real failure stories and fixes.</li>
+      <li><span class="kind">Blog</span> <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">Exponential Backoff and Jitter</a>. Simulations of why jitter beats plain backoff.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A service gets 200 requests/s that call a dependency, and the dependency now takes 3 s per call. With no timeout, how many threads are tied up waiting on it?</div>
+    <div class="opts"><button class="opt">67</button><button class="opt">200</button><button class="opt" data-ok>600</button></div>
+    <div class="explain">Little's law: 200 requests/s × 3 s = <b>600</b> threads. A 200-thread pool would be exhausted in a second. A 300 ms timeout would cut it to 60.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A recommendations service is timing out under heavy load. Every caller retries 3 times immediately. What's the best change?</div>
+    <div class="opts"><button class="opt">Increase retries to 5 so more calls eventually succeed</button><button class="opt" data-ok>Add a circuit breaker with a fallback (popular items), and cap retries with backoff, jitter and a budget</button><button class="opt">Remove the timeout so calls never fail</button></div>
+    <div class="explain">The failures come from overload, so retries add load to the thing that's drowning. A breaker stops the flood and a fallback keeps the page useful; budgets and jitter limit and spread the remaining retries. Removing the timeout would freeze the callers' threads.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Image thumbnails and checkout both run in one service. A thumbnail library starts hanging and checkout requests begin failing. Which pattern most directly prevents this?</div>
+    <div class="opts"><button class="opt" data-ok>A bulkhead: a separate, limited pool for thumbnail work</button><button class="opt">Retries on checkout</button><button class="opt">A bigger shared thread pool</button></div>
+    <div class="explain">The hang consumes shared threads. A bulkhead caps how many threads thumbnails can hold, so checkout keeps its own. A bigger pool only delays exhaustion; retries add load.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Little's law: threads busy = rate × time held. A slow dependency with no timeout exhausts your pool and takes down unrelated requests.</li>
+      <li>Every call gets a timeout (from the callee's p99.9) and a deadline; retries happen at one layer, with backoff, jitter and a budget, only for idempotent calls.</li>
+      <li>Circuit breakers (closed → open → half-open) fail fast and give sick services room; bulkheads cap what one dependency can consume.</li>
+      <li>Plan the degraded experience: fallbacks, load shedding, backpressure.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- circuit breaker ----------
+  const getCb = seg("cbMode", () => cbRun());
+  const showState = s => { $("stC").classList.toggle("on", s === "closed"); $("stO").classList.toggle("on", s === "open"); $("stH").classList.toggle("on", s === "half"); };
+  function cbRun() {
+    const L = +$("cbL").value, thr = +$("cbT").value / 100, W = +$("cbW").value, cool = +$("cbC").value, on = getCb() === "on";
+    $("cbLv").textContent = L + " s"; $("cbTv").textContent = Math.round(thr * 100) + "%"; $("cbWv").textContent = W; $("cbCv").textContent = cool + " s";
+    const RATE = 50, DT = 0.1, PER = RATE * DT, T0 = 10, T1 = 10 + L, TIMEOUT = 1, END = 60, TRIAL = 3;
+    const rng = MX.seeded(5);
+    let state = "closed", win = [], openedAt = 0, trialLeft = 0, trialOk = 0, trips = 0, recoveredClosedAt = null;
+    let sentOut = 0, waitSum = 0, waitN = 0, peakThr = 0;
+    const inflight = []; // end times of calls holding a thread
+    const sentS = [], failS = [], openS = [];
+    let secSent = 0, secFail = 0, secOpen = 0;
+    for (let k = 0; k < END / DT; k++) {
+      const t = k * DT, sick = t >= T0 && t < T1;
+      while (inflight.length && inflight[0] <= t) inflight.shift();
+      if (on && state === "open" && t >= openedAt + cool) { state = "half"; trialLeft = TRIAL; trialOk = 0; }
+      for (let i = 0; i < PER; i++) {
+        let send = !on || state === "closed" || (state === "half" && trialLeft > 0);
+        if (state === "half" && send) trialLeft--;
+        if (!send) { if (sick) { waitSum += 0.001; waitN++; } continue; } // fast fail / fallback
+        secSent++;
+        if (sick) sentOut++;
+        const fail = sick || rng() < 0.02, dur = sick ? TIMEOUT : 0.02;
+        if (sick) { waitSum += dur; waitN++; }
+        inflight.push(t + dur); inflight.sort((a, b) => a - b);
+        if (fail) secFail++;
+        if (!on) continue;
+        if (state === "half") {
+          if (fail) { state = "open"; openedAt = t; trips++; }
+          else if (++trialOk >= TRIAL) { state = "closed"; win = []; if (t >= T1 && recoveredClosedAt == null) recoveredClosedAt = t; }
+        } else if (state === "closed") {
+          win.push(fail ? 1 : 0); if (win.length > W) win.shift();
+          if (win.length >= W && win.reduce((s, v) => s + v, 0) / W >= thr) { state = "open"; openedAt = t; trips++; }
+        }
+      }
+      if (state === "open") secOpen++;
+      peakThr = Math.max(peakThr, inflight.length);
+      if ((k + 1) % 10 === 0) { sentS.push([t, 100 * secSent / RATE]); failS.push([t, 100 * secFail / RATE]); openS.push([t, secOpen ? 100 : 0]); secSent = secFail = secOpen = 0; }
+    }
+    if (!on) recoveredClosedAt = T1;
+    $("cbSent").textContent = sentOut.toLocaleString() + (on ? "" : " (all of them)");
+    $("cbWait").textContent = waitN ? (1000 * waitSum / waitN).toFixed(0) + " ms" : "–";
+    $("cbThr").textContent = peakThr;
+    $("cbTrips").textContent = on ? trips : "–";
+    $("cbRec").textContent = on ? (recoveredClosedAt != null ? "+" + (recoveredClosedAt - T1).toFixed(1) + " s" : "still open") : "n/a (no breaker)";
+    showState(on ? state : "closed");
+    Plot.line($("cbc"), {
+      series: [
+        { label: "breaker open", color: MX.css("--c-nw"), data: openS, fill: true, width: 0.5 },
+        { label: "% of calls sent to dependency", color: MX.css("--c-sv"), data: sentS },
+        { label: "% of calls failing", color: MX.css("--c-er"), data: failS, dash: [5, 4] }
+      ],
+      xMin: 0, xMax: 60, yMin: 0, yMax: 105, xLabel: "seconds (outage from 10 s)", yLabel: "%"
+    });
+    $("cbmsg").textContent = !on ? `No breaker: ${sentOut.toLocaleString()} calls went into the outage and each held a thread for 1 s (about ${RATE} threads stuck at once).` :
+      recoveredClosedAt != null && recoveredClosedAt - T1 > 10 ? `Protected, but slow to recover: the dependency was healthy again for ${(recoveredClosedAt - T1).toFixed(0)} s before the breaker closed. Try a shorter cooldown.` :
+      `The breaker cut calls into the outage from ${(RATE * L).toLocaleString()} to ${sentOut}, and callers failed fast (about 1 ms) instead of waiting 1 s.`;
+  }
+  ["cbL", "cbT", "cbW", "cbC"].forEach(id => ($(id).oninput = cbRun));
+  $("cbRun").onclick = cbRun;
+  cbRun();
+
+  // ---------- cascading failure ----------
+  const TOS = [0, 100, 200, 300, 500, 750, 1000, 1500, 2000, 3000, 5000], BHS = [0, 10, 20, 30, 50, 80];
+  const CF = new Flow($("caf"), { width: 720, height: 180 });
+  CF.node("u", { x: 70, y: 90, w: 100, label: "👤 Users", sub: "500 req/s", kind: "cl" })
+    .node("a", { x: 290, y: 90, w: 150, label: "Service A", sub: "200 threads", kind: "sv" })
+    .node("b", { x: 540, y: 40, w: 130, label: "Service B", sub: "10 ms", kind: "sv" })
+    .node("c", { x: 540, y: 140, w: 130, label: "Service C", sub: "20 ms", kind: "sv" })
+    .edge("u", "a").edge("a", "b", { label: "every request" }).edge("a", "c", { label: "20% of requests" }).render();
+  const labels = () => {
+    $("caSv").textContent = (+$("caS").value / 1000).toFixed(1) + " s";
+    const to = TOS[+$("caT").value]; $("caTv").textContent = to ? to + " ms" : "none";
+    $("caRv").textContent = $("caR").value;
+    const bh = BHS[+$("caB").value]; $("caBv").textContent = bh ? bh + " threads" : "off";
+  };
+  function caRun() {
+    labels();
+    const SICK = +$("caS").value / 1000, TO = TOS[+$("caT").value] / 1000, R = +$("caR").value, BH = BHS[+$("caB").value];
+    const POOL = 200, RATE = 500, DT = 0.01, END = 20, T_SICK = 5, rng = MX.seeded(3);
+    const busy = [], cbusy = []; // end times
+    let okB = 0, nB = 0, okC = 0, nC = 0, peak = 0, cCalls = 0, cNorm = 0;
+    const thrS = [], failS = []; let secFail = 0, secN = 0;
+    const pushSorted = (arr, v) => { let i = arr.length; arr.push(v); while (i > 0 && arr[i - 1] > v) { arr[i] = arr[i - 1]; i--; } arr[i] = v; };
+    for (let k = 0; k < END / DT; k++) {
+      const t = k * DT;
+      while (busy.length && busy[0] <= t) busy.shift();
+      while (cbusy.length && cbusy[0] <= t) cbusy.shift();
+      const arrivals = RATE * DT;
+      for (let i = 0; i < arrivals; i++) {
+        const needC = rng() < 0.2, count = t >= T_SICK; // score only the time after C turns sick
+        secN++;
+        if (count) { if (needC) nC++; else nB++; }
+        if (busy.length >= POOL) { secFail++; continue; } // A has no free thread: rejected
+        let dur = 0.01, ok = true;
+        if (needC) {
+          const cLat = t >= T_SICK ? SICK : 0.02;
+          if (BH && cbusy.length >= BH) { /* bulkhead full: fail fast, fallback */ }
+          else {
+            const attempts = 1 + (TO && cLat > TO ? R : 0);
+            const each = TO ? Math.min(cLat, TO) : cLat;
+            dur += attempts * each; cCalls += attempts; if (t >= T_SICK) cNorm += 1;
+            if (BH) pushSorted(cbusy, t + attempts * each);
+          }
+        }
+        pushSorted(busy, t + dur);
+        if (ok && count) { if (needC) okC++; else okB++; }
+      }
+      peak = Math.max(peak, busy.length);
+      if ((k + 1) % 20 === 0) { thrS.push([t, 100 * busy.length / POOL]); failS.push([t, 100 * secFail / secN]); secFail = 0; secN = 0; }
+    }
+    $("caOkB").textContent = (100 * okB / nB).toFixed(1) + "%";
+    $("caOkC").textContent = (100 * okC / nC).toFixed(1) + "%";
+    $("caPeak").textContent = peak + " / 200";
+    $("caLoad").textContent = "×" + (R && TO && SICK > TO ? (1 + R).toFixed(0) : "1") + " calls per request";
+    CF.set("a", { load: peak / POOL, hot: peak >= POOL, sub: peak >= POOL ? "threads exhausted!" : peak + " threads peak" });
+    CF.set("c", { sub: "sick: " + SICK.toFixed(1) + " s", hot: true });
+    Plot.line($("cac"), {
+      series: [
+        { label: "A's thread pool in use %", color: MX.css("--c-sv"), data: thrS, fill: true },
+        { label: "% of all requests rejected", color: MX.css("--c-er"), data: failS, dash: [5, 4] }
+      ],
+      xMin: 0, xMax: 20, yMin: 0, yMax: 105, xLabel: "seconds (C turns slow at 5 s)", yLabel: "%", hlines: [{ y: 100, label: "pool full", color: MX.css("--c-er") }]
+    });
+    $("camsg").textContent = peak >= POOL ? `A is drowning: its pool is full of requests stuck on C, so requests that never call C (80% of traffic) are rejected too. Only ${(100 * okB / nB).toFixed(0)}% of them got through.` :
+      `A survived (peak ${peak} threads). Requests needing C got C's answer, a timeout or a fallback, and the other 80% never noticed.`;
+  }
+  const setCa = (t, r, b) => { $("caT").value = t; $("caR").value = r; $("caB").value = b; caRun(); };
+  $("caNone").onclick = () => setCa(0, 0, 0);
+  $("caFix").onclick = () => setCa(4, 0, 3);
+  $("caRetry").onclick = () => setCa(6, 2, 0);
+  ["caS", "caT", "caR", "caB"].forEach(id => ($(id).oninput = labels));
+  $("caRun").onclick = caRun;
+  caRun();
+})();
+</script>
+</body>
+</html>

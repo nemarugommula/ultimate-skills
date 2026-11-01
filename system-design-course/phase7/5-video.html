@@ -1,0 +1,570 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.5 Design video streaming (YouTube/Netflix) · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .rungs label { margin-right: 10px; font-size: .9rem; }
+  .log { font-family: var(--mono); font-size: .82rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-height: 3.2em; max-height: 9em; overflow-y: auto; }
+</style>
+</head>
+<body data-lesson="s7-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 5</div>
+  <h1>Design video streaming (YouTube/Netflix)</h1>
+  <p class="subtitle">Take a creator's raw file, turn it into many small, ready-to-play pieces at several qualities, and deliver them from servers near every viewer. Video is the biggest consumer of internet bandwidth, so every design choice here is really a cost choice.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The design framework</b>: clarify → estimate → API and data model → high-level design → deep dives → wrap-up (Lesson 7.1).</li>
+      <li><b>Object storage</b> (S3 and friends): cheap, durable storage for big files, addressed by key (Lesson 2.7). <b>CDNs</b> (content delivery networks) keep copies of files in cities near users (Lesson 1.4).</li>
+      <li><b>Queues</b> hand work to background workers so the request path stays fast (Lesson 3.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2021 YouTube said that, on average, <b>more than 500 hours of video are uploaded every minute</b>. Every one of those hours has to be converted into several qualities and formats before anyone can watch it smoothly.</p>
+    <p>Doing that on ordinary servers got so expensive that YouTube designed its own chip for it, the <b>Video (trans)Coding Unit</b>, and reported <b>20–33× better compute efficiency</b> than its previous optimized system. By the end of this lesson you'll know why that conversion step exists, why it's split into hundreds of small jobs, and how a player on a shaky train connection keeps playing.</p>
+  </div>
+
+  <h2>Step 1 · Clarify the requirements</h2>
+  <p>“Design YouTube” is too big for 45 minutes. A senior candidate narrows it first. Questions worth asking:</p>
+  <ul>
+    <li><b>Upload, watch, or both?</b> Both, but the deep dives will be on processing and playback, not comments or recommendations.</li>
+    <li><b>Video on demand or live?</b> On demand (pre-recorded). Live streaming has a different latency budget; mention it as an extension.</li>
+    <li><b>Which devices?</b> Phones, browsers and TVs, on networks from fibre to patchy mobile. That forces several qualities.</li>
+    <li><b>How fast must an upload become watchable?</b> Minutes, not hours, for a typical 10-minute video.</li>
+    <li><b>Global?</b> Yes, viewers everywhere. That forces a CDN.</li>
+  </ul>
+  <table>
+    <tr><th>Functional (what it does)</th><th>Non-functional (how well)</th></tr>
+    <tr><td>Creators upload videos (up to a few GB)</td><td>Uploads survive flaky networks (resume, don't restart)</td></tr>
+    <tr><td>Viewers press play and watch at a quality their network can carry</td><td>Fast start (about 1–2 s) and few <b>rebuffers</b> (the spinning wheel when the player runs out of video)</td></tr>
+    <tr><td>Video pages show title, views, thumbnail</td><td>Videos are never lost (durable storage); playback stays up even if uploads break</td></tr>
+  </table>
+
+  <h2>Step 2 · Numbers first</h2>
+  <p>Two numbers drive this whole design: how much <b>storage</b> each video costs, and how much <b>bandwidth</b> watching costs. Start with one video.</p>
+  <p>Video quality is measured in <b>bitrate</b>: how many bits per second of video. 5,000 <b>kbps</b> (kilobits per second) = 5 Mbps. A player can only play smoothly if the network delivers at least the bitrate.</p>
+  <p>We'll produce several versions of each video, called <b>renditions</b>. The list of them is the <b>bitrate ladder</b>. An example ladder (typical values, rounded):</p>
+  <table>
+    <tr><th>Rendition</th><th>Bitrate</th><th>10-minute video</th></tr>
+    <tr><td>240p</td><td>400 kbps</td><td>30 MB</td></tr>
+    <tr><td>360p</td><td>800 kbps</td><td>60 MB</td></tr>
+    <tr><td>480p</td><td>1,400 kbps</td><td>105 MB</td></tr>
+    <tr><td>720p</td><td>2,800 kbps</td><td>210 MB</td></tr>
+    <tr><td>1080p</td><td>5,000 kbps</td><td>375 MB</td></tr>
+    <tr><td><b>Whole ladder</b></td><td><b>10,400 kbps</b></td><td><b class="db">780 MB</b></td></tr>
+  </table>
+  <div class="eq">
+    size = <span class="lt">bitrate</span> × <span class="lt">duration</span> ÷ 8
+    <span class="say">“Size in bytes is the bitrate in bits per second, times the seconds, divided by 8 bits per byte.”</span>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: YouTube-sized storage and bandwidth</span>
+    <ul>
+      <li><b>One 1080p rung, 10 minutes:</b> 5,000,000 bits/s × 600 s ÷ 8 = 375,000,000 bytes = <b>375 MB</b>.</li>
+      <li><b>The whole ladder for one hour:</b> 10,400 kbps × 3,600 s ÷ 8 = <b>4.68 GB</b> per hour of video.</li>
+      <li><b>Uploads per day at 500 hours/minute:</b> 500 × 60 × 24 = <b>720,000 hours</b> per day.</li>
+      <li><b>New ladder storage per day:</b> 720,000 × 4.68 GB ≈ <b class="db">3.4 PB per day</b> (a petabyte is a million GB). Keeping the original upload too (assume 10 Mbps sources, 4.5 GB/hour) adds about 3.2 PB more.</li>
+      <li><b>Watching:</b> assume 100 million viewers watch 60 minutes a day at an average 3 Mbps. That's 10<sup>8</sup> × 3,600 s × 3 Mbps ÷ 8 = <b class="lt">135 PB served per day</b>, an average of <b class="lt">12.5 terabits per second</b>.</li>
+    </ul>
+    <p>Conclusions you can say out loud: storage grows by petabytes a day, so <b>storage tiers</b> matter. Egress (bytes sent out) is even bigger, so the design lives or dies on the <b>CDN</b>. And the request rate for metadata (titles, view counts) is small by comparison.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Never stream one big file. Cut each video into <b>small segments</b> (a few seconds each), encode every segment at <b>several bitrates</b>, and let the <b>player</b> pick the next segment's quality based on how fast its network is right now. Small, immutable files are what make CDNs, parallel encoding and adaptive playback all work.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a buffet, not a set menu</span>
+    <p>A restaurant that serves one giant plate to everyone wastes food on small eaters and starves big ones. A buffet puts out small portions in several sizes, and each diner takes what they can manage, one plate at a time. Segments are the small plates. The bitrate ladder is the choice of sizes. The player is the diner deciding, plate by plate, how hungry (how fast) it is.</p>
+  </div>
+
+  <h2>Step 3 · API and data model</h2>
+  <p>The upload API never carries the video bytes itself. Your servers hand out <b>presigned URLs</b>: short-lived links that let the client upload straight into object storage without any cloud credentials of its own.</p>
+<pre><code><span class="c"># 1. start an upload: the API returns one presigned URL per part</span>
+POST /v1/uploads            { "title": "My trip", "size_bytes": 1800000000, "content_type": "video/mp4" }
+  → 201 { "upload_id": "up_42", "video_id": "v_9f3", "part_size": 100000000,
+          "part_urls": ["https://bucket.s3…/raw/v_9f3?partNumber=1&amp;X-Amz-Signature=…", …] }
+
+<span class="c"># 2. the client PUTs each 100 MB part directly to object storage (retry just the failed part)</span>
+PUT  {part_url}             &lt;bytes&gt;   → 200, ETag
+
+<span class="c"># 3. finish: object storage stitches the parts; we enqueue processing</span>
+POST /v1/uploads/up_42/complete { "parts": [{ "n": 1, "etag": "…" }, …] }   → 202 Accepted
+
+<span class="c"># 4. watching: metadata from the API, video bytes from the CDN</span>
+GET  /v1/videos/v_9f3       → { "title": "…", "status": "READY", "manifest": "https://cdn…/v_9f3/master.m3u8" }
+GET  https://cdn…/v_9f3/720p/seg_00042.m4s     <span class="c"># plain HTTP GETs of small files</span></code></pre>
+  <table>
+    <tr><th>Data</th><th>Where it lives</th><th>Why</th></tr>
+    <tr><td><code>videos(video_id, owner_id, title, status, duration_s, created_at)</code>; status: UPLOADING → PROCESSING → READY / FAILED</td><td><span class="db">SQL database</span> (Lesson 2.1), sharded by <code>video_id</code> later</td><td>Small rows, needs transactions on status changes</td></tr>
+    <tr><td><code>renditions(video_id, height, bitrate_kbps, codec, path)</code></td><td><span class="db">SQL</span>, same shard as the video</td><td>The player's menu</td></tr>
+    <tr><td>Raw uploads and segments: <code>raw/v_9f3/source.mp4</code>, <code>hls/v_9f3/720p/seg_00042.m4s</code></td><td><span class="db">Object storage</span></td><td>Petabytes, cheap, 11-nines-style durability, served by the CDN</td></tr>
+    <tr><td>View counts</td><td><span class="ca">Counters</span> fed by an event stream</td><td>Millions of increments per second; slightly stale is fine</td></tr>
+  </table>
+
+  <h2>Step 4 · High-level design</h2>
+  <p>Two paths that barely touch: a <b class="nw">write path</b> (upload → process) that can be slow, and a <b class="ca">read path</b> (watch) that must be fast and is almost entirely files on a CDN.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Trace an upload and a view</span>
+    <p class="hint">Press <b>Upload a video</b> to watch the parts go straight to object storage, then the job fan out to parallel transcode workers. Press <b>Watch it</b> for the read path: metadata from the API, segments from the CDN (the first viewer misses, later ones hit). Then <b>kill a worker</b> mid-upload: its chunk is retried by another worker and the video still finishes.</p>
+    <svg id="arch"></svg>
+    <div class="controls">
+      <button class="btn primary" id="upBtn">⬆ Upload a video</button>
+      <button class="btn" id="watchBtn">▶ Watch it</button>
+      <button class="btn" id="killBtn">💥 Kill a transcode worker</button>
+    </div>
+    <div class="log" id="archLog">Ready.</div>
+  </div>
+
+  <h2>Step 5 · Deep dives</h2>
+  <h3>Deep dive 1: resumable upload and the transcoding pipeline</h3>
+  <p>A 2 GB upload over a phone connection will fail somewhere. If failure means “start again”, big uploads never finish. So the client splits the file into parts (S3 calls this <b>multipart upload</b>: up to 10,000 numbered parts, recommended for anything 100 MB or larger) and retries only the part that failed. Google's YouTube Data API has its own <b>resumable upload</b> protocol for the same reason.</p>
+  <p>When the upload completes, object storage emits an event and a <b>workflow</b> starts. It's a <b>DAG</b> (directed acyclic graph: a set of jobs where arrows say “this must finish before that starts”):</p>
+  <table>
+    <tr><th>Stage</th><th>What it does</th><th>Parallel?</th></tr>
+    <tr><td>Inspect</td><td>Is the file valid? Duration, resolution, frame rate</td><td>Per chunk</td></tr>
+    <tr><td>Split</td><td>Cut into chunks at <b>keyframes</b> (full pictures the decoder can start from)</td><td>One job</td></tr>
+    <tr><td>Encode</td><td>Each chunk × each rung of the ladder (and each <b>codec</b>, the compression format, like H.264 or AV1)</td><td><b>Yes: chunks × rungs jobs</b></td></tr>
+    <tr><td>Assemble + package</td><td>Join chunks, cut into 2–6 s segments, write manifests (HLS/DASH, below)</td><td>Per rung</td></tr>
+    <tr><td>Side jobs</td><td>Thumbnails, captions, content checks</td><td>Alongside encode</td></tr>
+    <tr><td>Publish</td><td>Set status = READY in the database</td><td>Last</td></tr>
+  </table>
+  <p>Why chunk? A 10-minute video in 1-minute chunks × 5 rungs = <b>50 independent jobs</b>. If one 1080p chunk takes about 2 minutes to encode (an assumption for software encoding), 50 workers finish in roughly the time of the slowest chunk plus split and assembly, instead of the hour or so one machine would need. And a crashed worker only loses one chunk, which the queue hands to someone else (at-least-once delivery, Lesson 3.1; make each job <b>idempotent</b>, safe to run twice, Lesson 3.3).</p>
+
+  <h3>Deep dive 2: adaptive bitrate streaming (HLS and DASH)</h3>
+  <p><b>ABR</b> (adaptive bitrate) streaming is the trick that makes playback smooth. The two standard formats are Apple's <b>HLS</b> (HTTP Live Streaming, published as RFC 8216) and <b>MPEG-DASH</b> (Dynamic Adaptive Streaming over HTTP). Both work the same way: a <b>manifest</b> (a small text file) lists the renditions, and each rendition's playlist lists its segments.</p>
+<pre><code><span class="c"># master.m3u8: the menu</span>
+#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=800000,RESOLUTION=640x360
+360p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=2800000,RESOLUTION=1280x720
+720p/index.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=5000000,RESOLUTION=1920x1080
+1080p/index.m3u8
+
+<span class="c"># 720p/index.m3u8: the segments of one rendition</span>
+#EXTM3U
+#EXT-X-TARGETDURATION:4
+#EXTINF:4.0,
+seg_00001.m4s
+#EXTINF:4.0,
+seg_00002.m4s</code></pre>
+  <p>The player keeps a <b>buffer</b> (seconds of video downloaded but not yet played). Before each segment it decides which rung to fetch. Fetch too high and the buffer drains: rebuffer. Fetch too low and the picture is needlessly blurry. Two families of rules:</p>
+  <ul>
+    <li><b>Throughput-based:</b> measure how fast the last few segments downloaded and pick the highest rung below, say, 80% of that.</li>
+    <li><b>Buffer-based:</b> look at the buffer. Nearly empty? Lowest rung. Comfortably full? Highest. In between, step up gradually.</li>
+  </ul>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Break an adaptive player</span>
+    <p class="hint">120 seconds of playback on the ladder above. Pick a network and a rule, then press <b>Play</b>. Try <b>Fixed 1080p</b> on the <b>Commute</b> network to cause rebuffers, then switch the rule to <b>Throughput</b> or <b>Buffer</b>. In <b>Tunnel</b> the connection nearly dies for 15 seconds: a full buffer is what carries you through. Longer segments react more slowly.</p>
+    <div class="controls">
+      <span class="hint">Network:</span>
+      <span class="seg" id="net"><button id="net-steady" data-v="steady">Steady 6 Mbps</button><button id="net-commute" data-v="commute" class="on">Commute</button><button id="net-tunnel" data-v="tunnel">Tunnel</button></span>
+    </div>
+    <div class="controls">
+      <span class="hint">Rule:</span>
+      <span class="seg" id="algo"><button id="algo-fixed" data-v="fixed" class="on">Fixed 1080p</button><button id="algo-tput" data-v="tput">Throughput</button><button id="algo-buffer" data-v="buffer">Buffer</button></span>
+      <label>segment length <input type="range" id="segLen" min="0" max="3" step="1" value="1"> <b class="mono" id="segLenV"></b></label>
+      <button class="btn primary" id="abrRun">▶ Play 120 s</button>
+    </div>
+    <canvas class="chart" id="abrBw" style="height:200px"></canvas>
+    <canvas class="chart" id="abrBuf" style="height:150px"></canvas>
+    <div class="stat-row">
+      <div class="stat">startup <b id="abrStart">–</b></div>
+      <div class="stat">rebuffers <b id="abrStalls">–</b></div>
+      <div class="stat">time stalled <b id="abrStallT">–</b></div>
+      <div class="stat">avg bitrate <b id="abrAvg">–</b></div>
+      <div class="stat">quality switches <b id="abrSw">–</b></div>
+    </div>
+    <p class="hint" id="abrMsg"></p>
+  </div>
+  <p>What you should see: a fixed high bitrate works only while the network beats it; the moment it dips, the buffer empties and the video stalls. Adaptive rules trade a few seconds of lower quality for no spinning wheel, which viewers care about far more. Real players (hls.js, Shaka Player, ExoPlayer, AVPlayer) use more refined versions of these same rules.</p>
+
+  <h3>Deep dive 3: CDN delivery and storage tiers</h3>
+  <p>At 12.5 Tbps no single data centre can serve everyone. Segments are perfect CDN content: small, immutable (a segment never changes, so caches never go stale), and requested with plain HTTP. Popularity is lopsided: a small share of videos gets most views, so edge caches hit very often for them, while the long tail is fetched from origin on demand (Lesson 1.3's skew, Lesson 1.4's edge).</p>
+  <p>Netflix goes further: its own CDN, <b>Open Connect</b>, puts Netflix's cache servers inside internet service providers' networks; it says it partners with over a thousand ISPs. Storage gets the same lopsided treatment: hot renditions in standard object storage, old unwatched ones moved to cheaper “infrequent access” or archive classes, and expensive extras (4K, newer codecs) produced only for videos that turn out to be popular.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Storage and egress estimator</span>
+    <p class="hint">Your platform's daily uploads. Choose the ladder, then watch storage and the bill. Turn on <b>4K for everything</b> to see why nobody does that, then fix it with <b>4K only for popular videos</b> and <b>cold tiering</b>. Prices are assumptions you can change (real contracts vary a lot).</p>
+    <div class="controls">
+      <label>uploads/day <input type="range" id="upd" min="0" max="5" step="1" value="2"> <b class="mono" id="updV"></b></label>
+      <label>avg length <input type="range" id="len" min="1" max="60" step="1" value="10"> <b class="mono" id="lenV"></b></label>
+      <label>views per video/day <input type="range" id="vpv" min="0" max="5" step="1" value="2"> <b class="mono" id="vpvV"></b></label>
+    </div>
+    <div class="controls rungs" id="rungs">
+      <span class="hint">Ladder:</span>
+      <label><input type="checkbox" data-k="400" checked> 240p</label>
+      <label><input type="checkbox" data-k="800" checked> 360p</label>
+      <label><input type="checkbox" data-k="1400" checked> 480p</label>
+      <label><input type="checkbox" data-k="2800" checked> 720p</label>
+      <label><input type="checkbox" data-k="5000" checked> 1080p</label>
+      <label><input type="checkbox" data-k="15000" id="k4"> 4K (15 Mbps) for everything</label>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="pop4k"> 4K only for the top 2% of videos</label>
+      <label><input type="checkbox" id="keepSrc" checked> keep the original upload</label>
+      <label>cold-tier share after 30 days <input type="range" id="cold" min="0" max="90" step="10" value="0"> <b class="mono" id="coldV"></b></label>
+    </div>
+    <div class="controls">
+      <label>storage $/GB-month <input type="range" id="pS" min="5" max="30" step="1" value="20"> <b class="mono" id="pSV"></b></label>
+      <label>egress $/GB <input type="range" id="pE" min="1" max="10" step="1" value="2"> <b class="mono" id="pEV"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">per video <b id="eVid">–</b></div>
+      <div class="stat">new storage/day <b id="eDay">–</b></div>
+      <div class="stat">stored after 1 year <b id="eYear">–</b></div>
+      <div class="stat">storage bill/month (year 1 end) <b id="eCost">–</b></div>
+      <div class="stat">egress/day <b id="eEg">–</b></div>
+    </div>
+    <canvas class="chart" id="estBars" style="height:180px"></canvas>
+    <p class="hint" id="estMsg"></p>
+  </div>
+
+  <h3>One more: counting views</h3>
+  <p>A viral video can get millions of view events per minute. Don't run <code>UPDATE videos SET views = views + 1</code> for each: that's a hot row (Lesson 2.4). Send view events to a stream (Kafka, Lesson 3.2), aggregate per video every few seconds (Lesson 3.6), and write the totals in batches. Viewers accept a count that's a few seconds behind; deduplicate and filter bots before the count becomes “official”.</p>
+
+  <h2>Step 6 · Bottlenecks and the scaling path</h2>
+  <table>
+    <tr><th>Stage</th><th>What you run</th><th>What breaks next</th></tr>
+    <tr><td><b>v1 · startup</b> (thousands of uploads/day)</td><td>One API + Postgres; presigned uploads to S3; a managed transcoder (AWS Elemental MediaConvert) or a video API (Mux, Cloudflare Stream); a managed CDN; 3–4 rung H.264 ladder</td><td>Transcoding bill and queue time during upload spikes</td></tr>
+    <tr><td><b>v2 · growing</b> (100k uploads/day)</td><td>Own chunked transcoding workers on spot/preemptible machines, a workflow engine for the DAG, priority queues (paying creators first), view-count pipeline</td><td>Storage growth; egress bill</td></tr>
+    <tr><td><b>v3 · 100M users</b></td><td>Multi-CDN or your own edge appliances, storage tiering, lazy expensive renditions, per-title or per-scene encoding, hardware encoders, multi-region metadata</td><td>The economics: every 10% of bitrate saved is 10% of a huge egress bill</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>FFmpeg</b> (the open-source workhorse behind most transcoders), <b>Shaka Packager</b> / <b>Bento4</b> (packaging), managed <b>AWS Elemental MediaConvert</b>, <b>Google Transcoder API</b>, or all-in-one <b>Mux</b> / <b>Cloudflare Stream</b>; players <b>hls.js</b>, <b>Shaka Player</b>, <b>ExoPlayer</b>; CDNs <b>CloudFront</b>, <b>Akamai</b>, <b>Fastly</b>. A two-rung HLS ladder with FFmpeg:</p>
+<pre><code>ffmpeg -i source.mp4 \
+  -map 0:v -map 0:a -map 0:v -map 0:a \
+  -c:v libx264 -c:a aac -g 48 -keyint_min 48 \          <span class="c"># fixed keyframe spacing so rungs line up</span>
+  -b:v:0 800k  -s:v:0 640x360 \
+  -b:v:1 2800k -s:v:1 1280x720 \
+  -f hls -hls_time 4 -hls_playlist_type vod \
+  -hls_segment_filename "out/%v/seg_%05d.ts" \
+  -master_pl_name master.m3u8 \
+  -var_stream_map "v:0,a:0 v:1,a:1" out/%v/index.m3u8</code></pre>
+<pre><code><span class="k">import</span> boto3                                     <span class="c"># a presigned upload URL, valid 15 minutes</span>
+s3 = boto3.client(<span class="s">"s3"</span>)
+url = s3.generate_presigned_url(<span class="s">"put_object"</span>,
+    Params={<span class="s">"Bucket"</span>: <span class="s">"raw-uploads"</span>, <span class="s">"Key"</span>: <span class="s">"raw/v_9f3/source.mp4"</span>}, ExpiresIn=<span class="n">900</span>)</code></pre>
+    <p class="hint">Try it locally: install FFmpeg, run the command on any MP4, then serve the folder with <code>python3 -m http.server</code> and open <code>out/master.m3u8</code> in Safari (native HLS) or an hls.js demo page. Watch the network tab switch rungs when you throttle it.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Decision</th><th>Option A</th><th>Option B</th></tr>
+      <tr><td>Segment length</td><td><b>Short (2 s)</b>: faster start and quicker quality switches; more files and requests</td><td><b>Long (6–10 s)</b>: better compression, fewer requests; slow to react to a network drop</td></tr>
+      <tr><td>Ladder size</td><td><b>Many rungs</b>: smoother adaptation; more encode time and storage</td><td><b>Few rungs</b>: cheaper; bigger jumps in quality</td></tr>
+      <tr><td>Encode when</td><td><b>Eagerly, everything</b>: instant for every viewer; pays for renditions no one watches</td><td><b>Lazily for popular videos</b>: big savings on the long tail; first 4K viewers wait or get 1080p</td></tr>
+      <tr><td>Fixed vs per-title ladder</td><td><b>Fixed</b>: simple, predictable</td><td><b>Per-title</b>: fewer bits for simple content (cartoons), more for grainy film; needs analysis jobs</td></tr>
+      <tr><td>CDN</td><td><b>Buy</b> (CloudFront, Akamai): zero ops</td><td><b>Build</b> (Open Connect style): only pays off at enormous, steady volume</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Don't build a transcoder. Presigned uploads to S3, then Mux, Cloudflare Stream or MediaConvert, behind a managed CDN, with a 3–4 rung ladder. Spend your time on the product. Watch two numbers: encoding cost per uploaded hour and egress per viewer-hour.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Own chunked encoding fleet (or custom chips), per-title/per-shot ladders, several codecs chosen per device, storage tiering, lazy renditions, multi-CDN or embedded ISP caches, and player teams tuning ABR with A/B tests on rebuffer rate and startup time (Lesson 6.3).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>What interviewers listen for:</p>
+    <ul>
+      <li>You <b>separate the write path from the read path</b> and say the read path is “files on a CDN”.</li>
+      <li>You do the <b>storage and egress math</b> and conclude that cost, not QPS, is the main constraint.</li>
+      <li>You explain <b>segments + bitrate ladder + ABR</b> and who decides the quality (the player).</li>
+      <li>You make the pipeline <b>chunked, parallel and retryable</b>, with a status field the API exposes.</li>
+    </ul>
+    <p><b>Common mistakes:</b> streaming one MP4 from an app server; uploading through your API servers; one big “transcode” box with no failure story; forgetting the CDN. <b>Likely follow-ups:</b> “How would you support live streaming?” (shorter segments, low-latency HLS, no time to encode a full ladder ahead), “A video goes viral in a country with weak networks; what changes?”, “How do you count views without a hot row?”, “How do you stop people downloading paid content?” (DRM, digital rights management: encrypted segments plus licence servers).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Per-title encoding</b> <span class="tag co">🏢 Netflix · 2015</span> <a href="https://netflixtechblog.com/per-title-encode-optimization-7e99442b62a2" target="_blank" rel="noopener">Per-Title Encode Optimization</a></div>
+      <p><b>How:</b> instead of one fixed ladder whose top rung was 5,800 kbps for 1080p, Netflix analyses each title and builds its own ladder. For one simple title the top 1080p rung dropped to 4,640 kbps, a 20% bitrate saving at the same quality.</p>
+      <p><b>Why this method:</b> a cartoon needs far fewer bits than grainy film, so a one-size ladder either wastes bandwidth or looks blocky.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Custom transcoding chips</b> <span class="tag co">🏢 YouTube · 2021</span> <a href="https://blog.youtube/inside-youtube/new-era-video-infrastructure/" target="_blank" rel="noopener">Reimagining video infrastructure to empower YouTube</a></div>
+      <p><b>How:</b> YouTube built the Video (trans)Coding Unit, hardware dedicated to transcoding, and reported 20–33× compute-efficiency improvements over its previous optimized software system. The same post cites more than 500 hours uploaded per minute.</p>
+      <p><b>Why this method:</b> at that upload volume, transcoding is a fleet-sized bill, so specialised hardware pays for itself.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A CDN inside ISPs</b> <span class="tag co">🏢 Netflix · Open Connect</span> <a href="https://openconnect.netflix.com/en/" target="_blank" rel="noopener">Netflix Open Connect</a></div>
+      <p><b>How:</b> Netflix places its own cache appliances inside ISP networks and peers openly at interconnection points; it says it partners with over a thousand ISPs.</p>
+      <p><b>Why this method:</b> serving video from inside the viewer's ISP shortens the path, cuts transit costs for both sides and makes playback faster.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The HLS standard</b> <span class="tag hist">📜 RFC 8216 · 2017</span> <a href="https://www.rfc-editor.org/rfc/rfc8216" target="_blank" rel="noopener">HTTP Live Streaming (RFC 8216)</a></div>
+      <p><b>How:</b> defines the playlists (manifests), media segments and the tags like <code>EXT-X-STREAM-INF</code> and <code>EXT-X-TARGETDURATION</code> that every HLS player reads.</p>
+      <p><b>Why this method:</b> everything is ordinary HTTP files, so any web server or CDN can deliver video with no special streaming servers.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Multipart, resumable uploads</b> <span class="tag prod">🏭 In production · AWS S3</span> <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html" target="_blank" rel="noopener">Uploading and copying objects using multipart upload</a></div>
+      <p><b>How:</b> a file is uploaded as up to 10,000 numbered parts that can be sent in parallel, paused and resumed; AWS recommends it for objects of 100 MB or more. Presigned URLs let clients upload parts without AWS credentials.</p>
+      <p><b>Why this method:</b> a network error only costs one part, not the whole multi-GB upload.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the strangest number in the HLS spec</span>
+    <p>The example playlist in RFC 8216 lists segments of <b>9.009 seconds</b>. That isn't a typo: 9.009 s is exactly 270 frames of video at 29.97 frames per second, the frame rate inherited from North American broadcast TV. Segment boundaries have to land on whole frames (ideally keyframes), so real playlists are full of numbers like this.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This design is Lesson 1.4 (CDNs) and Lesson 2.7 (object storage) at full volume, with Lesson 3.1's queues and Lesson 3.3's idempotent retries in the pipeline. View counting reuses Lessons 3.2 and 3.6. The cost reasoning is Lesson 6.5's. In AI systems the same shape appears for model weights and datasets: huge immutable blobs in object storage, cached close to the GPUs that read them.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://netflixtechblog.com/high-quality-video-encoding-at-scale-d159db052746" target="_blank" rel="noopener">Netflix: High Quality Video Encoding at Scale</a>. How chunked inspection and encoding are parallelised across cloud instances.</li>
+      <li><span class="kind">Blog</span> <a href="https://netflixtechblog.com/rebuilding-netflix-video-processing-pipeline-with-microservices-4e5e6310e359" target="_blank" rel="noopener">Netflix: Rebuilding the video processing pipeline with microservices</a>. Why a monolithic pipeline became a set of services (2024).</li>
+      <li><span class="kind">Docs</span> <a href="https://developers.google.com/youtube/v3/guides/using_resumable_upload_protocol" target="_blank" rel="noopener">YouTube Data API: resumable uploads</a>. A real resumable-upload protocol, step by step.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. One hour of video is encoded into a ladder whose bitrates add up to 10 Mbps. Roughly how much storage does the ladder take?</div>
+    <div class="opts"><button class="opt">450 MB</button><button class="opt" data-ok>4.5 GB</button><button class="opt">45 GB</button></div>
+    <div class="explain">10,000,000 bits/s × 3,600 s ÷ 8 = 4,500,000,000 bytes = <b>4.5 GB</b>. Multiply by hundreds of thousands of uploaded hours a day and storage tiering stops being optional.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Viewers on trains complain the video keeps freezing, though it looks great when it plays. You serve one 1080p MP4 file. What's the best fix?</div>
+    <div class="opts"><button class="opt">Bigger, faster origin servers</button><button class="opt" data-ok>Encode a bitrate ladder in short segments and let the player adapt (HLS/DASH)</button><button class="opt">Switch to 10-second segments of the same 1080p file</button></div>
+    <div class="explain">The bottleneck is the viewer's last-mile network, not your servers. With several renditions in small segments, the player drops to a lower bitrate when the train enters a bad patch and climbs back up after. Longer segments of one bitrate still stall.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Why do clients upload video straight to object storage with presigned URLs instead of through your API servers?</div>
+    <div class="opts"><button class="opt">Presigned URLs make the video smaller</button><button class="opt">It's the only way to get HTTPS</button><button class="opt" data-ok>App servers stay small and stateless, and object storage handles multi-GB, resumable, parallel part uploads</button></div>
+    <div class="explain">Streaming gigabytes through your API ties up servers for minutes per upload and makes failures expensive. A presigned URL is a short-lived permission slip for one object; the bytes go where they'll live anyway, part by part.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Size = bitrate × duration ÷ 8. A 5-rung ladder is about 4.7 GB per hour; at YouTube scale that's petabytes a day, and egress is bigger still.</li>
+      <li>Write path: presigned, multipart uploads → a chunked DAG of retryable encode jobs → segments + manifests in object storage.</li>
+      <li>Read path: the player fetches small segments from a CDN and picks each one's bitrate (ABR) from its buffer and throughput.</li>
+      <li>The main constraint is cost: tier storage, encode expensive renditions lazily, tune the ladder per title, push bytes to the edge.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const fmtBytes = gb => gb >= 1e6 ? (gb / 1e6).toFixed(2) + " PB" : gb >= 1e3 ? (gb / 1e3).toFixed(1) + " TB" : gb >= 1 ? gb.toFixed(1) + " GB" : Math.round(gb * 1000) + " MB";
+  const money = v => "$" + (v >= 1e6 ? (v / 1e6).toFixed(2) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "k" : v.toFixed(0));
+
+  // ---------- architecture flow ----------
+  const F = new Flow($("arch"), { width: 720, height: 340 });
+  F.node("creator", { x: 80, y: 60, label: "🎬 Creator", sub: "2 GB file", kind: "cl" })
+   .node("api", { x: 270, y: 60, label: "Upload API", sub: "presigns URLs", kind: "sv" })
+   .node("meta", { x: 460, y: 60, label: "🗄️ Metadata DB", sub: "status", kind: "db" })
+   .node("raw", { x: 270, y: 180, label: "Raw store", sub: "object storage", kind: "db" })
+   .node("queue", { x: 460, y: 180, label: "Job queue", sub: "encode DAG", kind: "nw" })
+   .node("workers", { x: 640, y: 180, w: 120, label: "Transcode workers", sub: "idle", kind: "sv" })
+   .node("hls", { x: 640, y: 290, w: 120, label: "Segments", sub: "HLS / DASH", kind: "db" })
+   .node("cdn", { x: 270, y: 290, label: "⚡ CDN edge", sub: "cold", kind: "ca" })
+   .node("viewer", { x: 80, y: 290, label: "👤 Viewer", sub: "", kind: "cl" })
+   .edge("creator", "api").edge("creator", "raw", { dashed: true, label: "parts" }).edge("api", "meta")
+   .edge("raw", "queue").edge("queue", "workers").edge("workers", "hls").edge("workers", "meta")
+   .edge("viewer", "api", { dashed: true }).edge("viewer", "cdn").edge("cdn", "hls").render();
+  const log = t => { $("archLog").innerHTML = t + "<br>" + $("archLog").innerHTML; };
+  let busy = false, workerDown = false, ready = false, cdnWarm = false;
+  $("killBtn").onclick = () => {
+    workerDown = !workerDown;
+    F.set("workers", { down: workerDown, sub: workerDown ? "1 of 50 crashed" : "idle" });
+    $("killBtn").textContent = workerDown ? "🔧 Repair the worker" : "💥 Kill a transcode worker";
+    log(workerDown ? "💥 One transcode worker is down. Its jobs will time out and be retried." : "🔧 Worker repaired.");
+  };
+  $("upBtn").onclick = async () => {
+    if (busy) return; busy = true; ready = false; cdnWarm = false;
+    F.set("cdn", { sub: "cold", load: 0 }).set("meta", { sub: "UPLOADING" });
+    log("1 · POST /v1/uploads → 18 presigned part URLs (100 MB each). Status UPLOADING.");
+    await F.packet(["creator", "api", "meta"], { color: "--c-cl", dur: 600, back: true });
+    log("2 · Client PUTs parts straight to object storage, 3 at a time. A failed part is retried alone.");
+    await Promise.all([0, 1, 2].map(i => sleep(i * 150).then(() => F.packet(["creator", "raw"], { color: "--c-cl", dur: 700 }))));
+    F.set("meta", { sub: "PROCESSING" });
+    log("3 · Upload complete → event → workflow: inspect, split into 10 chunks × 5 rungs = 50 encode jobs.");
+    await F.packet(["raw", "queue"], { color: "--c-nw", dur: 500 });
+    F.set("workers", { sub: "50 jobs", load: 0.9, hot: true });
+    const jobs = [];
+    for (let i = 0; i < 6; i++) jobs.push(sleep(i * 120).then(() => F.packet(["queue", "workers"], { color: "--c-nw", dur: 500 })));
+    await Promise.all(jobs);
+    if (workerDown) {
+      log("⚠️ Chunk 7 @ 720p: worker crashed, no ack. After the visibility timeout the queue re-delivers it to a healthy worker.");
+      F.edgeStyle("queue", "workers", { color: "--c-er", dashed: true });
+      await sleep(700);
+      F.edgeStyle("queue", "workers", { color: "--line", dashed: false });
+      await F.packet(["queue", "workers"], { color: "--c-lt", dur: 600 });
+      log("↻ Retry succeeded. The job is idempotent: it overwrites the same output key.");
+    }
+    log("4 · Encoded chunks assembled, packaged into 4 s segments + manifests.");
+    await F.packet(["workers", "hls"], { color: "--c-db", dur: 600 });
+    await F.packet(["workers", "meta"], { color: "--c-db", dur: 500 });
+    F.set("workers", { sub: workerDown ? "1 of 50 crashed" : "idle", load: 0, hot: false }).set("meta", { sub: "READY" });
+    log("✅ Status READY. The video is watchable" + (workerDown ? " despite the crashed worker." : "."));
+    ready = true; busy = false;
+  };
+  $("watchBtn").onclick = async () => {
+    if (busy) return;
+    if (!ready) { log("Nothing to watch yet: upload a video first (status must be READY)."); return; }
+    busy = true;
+    log("▶ GET /v1/videos/v_9f3 → title + manifest URL (tiny request to the API).");
+    await F.packet(["viewer", "api", "meta"], { color: "--c-cl", dur: 500, back: true });
+    if (!cdnWarm) {
+      log("CDN miss for master.m3u8 and seg_00001: the edge fetches from origin once and keeps a copy.");
+      await F.packet(["viewer", "cdn", "hls"], { color: "--c-er", dur: 600, back: true });
+      cdnWarm = true; F.set("cdn", { sub: "warm", load: 0.3 });
+    }
+    for (let i = 0; i < 3; i++) await F.packet(["viewer", "cdn"], { color: "--c-ca", dur: 350, back: true });
+    log("Segments 2–4: CDN hits, served from a nearby city. The next viewer gets everything from the edge.");
+    busy = false;
+  };
+
+  // ---------- ABR simulator ----------
+  const LAD = [400, 800, 1400, 2800, 5000], NAMES = ["240p", "360p", "480p", "720p", "1080p"];
+  const SEGS = [2, 4, 6, 10], T = 120, DT = 0.1, MAXBUF = 30;
+  function trace(kind) {
+    const rng = MX.seeded(11), bw = [];
+    let lv = Math.log(4000);
+    for (let s = 0; s <= T + 60; s++) {
+      if (kind === "steady") bw.push(6000 * (0.9 + 0.2 * rng()));
+      else if (kind === "tunnel") bw.push(s >= 40 && s < 55 ? 150 : 5000 * (0.9 + 0.2 * rng()));
+      else { // wobbles around 4 Mbps, with short drops to 0.5 Mbps (a bad patch of track)
+        lv += 0.2 * (Math.log(4000) - lv) + (rng() - 0.5) * 0.9; lv = MX.clamp(lv, Math.log(500), Math.log(9000));
+        bw.push(rng() < 0.07 ? 500 : Math.exp(lv));
+      }
+    }
+    return bw;
+  }
+  function simulate(kind, algo, segDur) {
+    const bw = trace(kind), bwAt = t => bw[Math.min(bw.length - 1, Math.floor(t))];
+    let t = 0, buf = 0, playing = false, started = false, startup = null, stalls = 0, stallT = 0;
+    let dl = null, tputs = [], chosen = [], cur = 0, switches = 0, last = -1;
+    const sBw = [], sRate = [], sBuf = [];
+    const pick = () => {
+      if (algo === "fixed") return 4;
+      if (algo === "tput") {
+        if (!tputs.length) return 0;
+        const r = tputs.slice(-3), est = r.length / r.reduce((s, v) => s + 1 / v, 0); // harmonic mean
+        let i = 0; LAD.forEach((b, k) => { if (b <= 0.8 * est) i = k; }); return i;
+      }
+      if (buf < 6) return 0;
+      if (buf >= 24) return 4;
+      return Math.min(4, Math.floor((buf - 6) / 18 * 5));
+    };
+    while (t < T) {
+      if (!dl && buf + segDur <= MAXBUF + 1e-9) { cur = pick(); dl = { left: LAD[cur] * segDur, size: LAD[cur] * segDur, t0: t }; if (last >= 0 && cur !== last) switches++; last = cur; chosen.push(LAD[cur]); }
+      if (dl) {
+        dl.left -= bwAt(t) * DT;
+        if (dl.left <= 0) { buf += segDur; tputs.push(dl.size / Math.max(DT, t + DT - dl.t0)); dl = null; }
+      }
+      if (playing) { buf -= DT; if (buf <= 0) { buf = 0; playing = false; stalls++; } }
+      else {
+        if (started) stallT += DT;
+        if (buf >= Math.min(segDur, 4) - 1e-9) { playing = true; if (!started) { started = true; startup = t + DT; } }
+      }
+      t += DT;
+      if (Math.abs(t * 2 - Math.round(t * 2)) < 1e-6) { sBw.push([t, bwAt(t) / 1000]); sRate.push([t, LAD[cur] / 1000]); sBuf.push([t, buf]); }
+    }
+    return { sBw, sRate, sBuf, startup, stalls, stallT, avg: MX.mean(chosen), switches };
+  }
+  const getNet = seg("net", () => abr()), getAlgo = seg("algo", () => abr());
+  function abr() {
+    const sd = SEGS[+$("segLen").value]; $("segLenV").textContent = sd + " s";
+    const r = simulate(getNet(), getAlgo(), sd);
+    Plot.line($("abrBw"), { series: [
+      { label: "network (Mbps)", color: MX.css("--c-lt"), data: r.sBw },
+      { label: "rendition fetched (Mbps)", color: MX.css("--c-ca"), data: r.sRate, fill: true } ],
+      xMin: 0, xMax: T, yMin: 0, yMax: 10, xLabel: "seconds", yLabel: "Mbps" });
+    Plot.line($("abrBuf"), { series: [{ label: "buffer (s of video)", color: MX.css(r.stalls ? "--c-er" : "--c-db"), data: r.sBuf, fill: true }],
+      xMin: 0, xMax: T, yMin: 0, yMax: 32, xLabel: "seconds", hlines: [{ y: 0.5, label: "empty = rebuffer", color: MX.css("--c-er") }] });
+    $("abrStart").textContent = r.startup == null ? "never" : r.startup.toFixed(1) + " s";
+    $("abrStalls").textContent = r.stalls;
+    $("abrStallT").textContent = r.stallT.toFixed(1) + " s";
+    $("abrAvg").textContent = (r.avg / 1000).toFixed(2) + " Mbps";
+    $("abrSw").textContent = r.switches;
+    $("abrMsg").textContent = r.stalls > 2 ? `${r.stalls} rebuffers, ${r.stallT.toFixed(0)} s of spinning wheel. The bitrate is higher than the network can carry, so the buffer keeps emptying.` :
+      r.stalls ? `Mostly smooth: ${r.stalls} rebuffer(s). Look at where the buffer hit zero.` :
+      `No rebuffers. The player traded some quality (average ${(r.avg / 1000).toFixed(1)} Mbps) for smooth playback.`;
+  }
+  $("segLen").oninput = abr; $("abrRun").onclick = abr;
+  abr();
+
+  // ---------- storage estimator ----------
+  const UPD = [100, 1000, 10000, 100000, 1000000, 4320000], VPV = [0, 1, 10, 100, 1000, 10000];
+  // 4.32M uploads/day × 10 min = 720,000 hours/day, the 500-hours-per-minute scale from the hook
+  function est() {
+    const n = UPD[+$("upd").value], mins = +$("len").value, views = VPV[+$("vpv").value];
+    const cold = +$("cold").value / 100, pS = +$("pS").value / 1000, pE = +$("pE").value / 100;
+    $("updV").textContent = n.toLocaleString(); $("lenV").textContent = mins + " min"; $("vpvV").textContent = views.toLocaleString();
+    $("coldV").textContent = Math.round(cold * 100) + "%"; $("pSV").textContent = "$" + pS.toFixed(3); $("pEV").textContent = "$" + pE.toFixed(2);
+    const pop = $("pop4k").checked;
+    if (pop && $("k4").checked) $("k4").checked = false;
+    const rungs = [...$("rungs").querySelectorAll("input")].filter(i => i.checked).map(i => +i.dataset.k);
+    const gbOf = kbps => kbps * 1000 * mins * 60 / 8 / 1e9;
+    let perVid = rungs.reduce((s, k) => s + gbOf(k), 0);
+    if (pop) perVid += 0.02 * gbOf(15000);
+    if ($("keepSrc").checked) perVid += gbOf(10000);
+    const day = perVid * n, year = day * 365;
+    // after a year: the last 30 days hot; older content: share `cold` at 1/5 of the price (assumed cold tier)
+    const hot = day * 30, older = year - hot;
+    const bill = (hot + older * (1 - cold)) * pS + older * cold * pS / 5;
+    const avgKbps = Math.min(3000, Math.max(0, ...rungs.filter(k => k <= 5000))); // typical viewer: about 3 Mbps, or less if the ladder tops out lower
+    const egress = n * views * mins * 60 * 0.5 * avgKbps * 1000 / 8 / 1e9; // viewers watch half the video on average (assumed)
+    $("eVid").textContent = fmtBytes(perVid);
+    $("eDay").textContent = fmtBytes(day);
+    $("eYear").textContent = fmtBytes(year);
+    $("eCost").textContent = money(bill);
+    $("eEg").textContent = fmtBytes(egress) + " · " + money(egress * pE);
+    const bars = rungs.map(k => ({ label: k >= 15000 ? "4K" : NAMES[LAD.indexOf(k)], value: gbOf(k) * n / 1000, color: MX.css(k >= 15000 ? "--c-er" : "--c-db") }));
+    if (pop) bars.push({ label: "4K top 2%", value: 0.02 * gbOf(15000) * n / 1000, color: MX.css("--c-ca") });
+    if ($("keepSrc").checked) bars.push({ label: "source", value: gbOf(10000) * n / 1000, color: MX.css("--c-lt") });
+    Plot.bars($("estBars"), { bars, yMin: 0, yLabel: "TB per day" });
+    const has4k = $("k4").checked;
+    $("estMsg").textContent = has4k ? "4K for every upload more than doubles the ladder, and most of those 4K files will never be watched. Try “4K only for the top 2%”." :
+      cold === 0 && year > 1e5 ? "Everything is in the hot tier. Most old videos are rarely watched: move them to a cold tier and watch the bill drop." :
+      egress * pE > bill / 30 ? "Daily egress costs more than a day of storage: the CDN and bitrate efficiency matter most here." :
+      "Storage dominates. Tiering and skipping renditions nobody watches are the levers.";
+  }
+  ["upd", "len", "vpv", "cold", "pS", "pE"].forEach(id => ($(id).oninput = est));
+  [...document.querySelectorAll("#rungs input"), $("pop4k"), $("keepSrc")].forEach(i => (i.onchange = est));
+  est();
+})();
+</script>
+</body>
+</html>

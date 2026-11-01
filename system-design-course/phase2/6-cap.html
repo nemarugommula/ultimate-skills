@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.6 CAP, PACELC &amp; consistency models · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .carts { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 8px 0; }
+  .cart { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; font-size: .9rem; min-height: 52px; }
+  .cart b { font-size: .85rem; }
+  @media (max-width: 600px) { .carts { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-lesson="s2-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 6</div>
+  <h1>CAP, PACELC &amp; consistency models</h1>
+  <p class="subtitle">When copies of your data live in different places, you must choose: during a network split, refuse some requests or let the copies disagree; and the rest of the time, wait for distant copies or answer fast with possibly old data.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Replication lag</b>, read-your-writes and quorums (W + R &gt; N) (Lesson 2.3).</li>
+      <li>A <b>round trip</b> across a continent takes tens of milliseconds; light in fibre can't go faster (Lesson 0.3).</li>
+      <li>Isolation levels: how much concurrent transactions can see of each other (Lesson 2.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Google wanted a database that behaves like a single machine, with transactions in the order they really happened, while its copies sit on different continents. Clocks on different servers never agree exactly, so Spanner (2012) puts a set of time servers in every datacenter, most with <b>GPS receivers</b> and the rest with <b>atomic clocks</b>, behind an API, TrueTime, that returns the time <b>with an error bar</b>: in production, typically between about 1 and 7 ms, about 4 ms most of the time.</p>
+    <p>Then, before a transaction's commit becomes visible, Spanner simply <b>waits out the uncertainty</b>. Google bought consistency across the planet with hardware and a few milliseconds of waiting. Most of us pay with latency or with availability. This lesson is about which one, when.</p>
+  </div>
+
+  <h2>Numbers first: two regions, one network cable</h2>
+  <p>Your app runs in <b>US-East</b> and <b>EU-West</b>, each with a copy of the data. A round trip between them is typically about <b>70–80 ms</b>. A local write takes about <b>2 ms</b>.</p>
+  <table>
+    <tr><th></th><th>Strong: both copies agree before “OK”</th><th>Eventual: answer locally, sync later</th></tr>
+    <tr><td>Write latency</td><td class="lt">2 + ~75 = <b>~77 ms</b></td><td class="ca"><b>~2 ms</b></td></tr>
+    <tr><td>Read sees the latest write?</td><td class="db">Always</td><td>After about half a round trip plus any queueing (typically under a second)</td></tr>
+    <tr><td>The cable is cut for 10 minutes, 300 writes/s per region</td><td class="er">One side refuses its writes: 300 × 600 = <b>180,000 errors</b></td><td class="er">Both sides accept; copies diverge and must be merged when the cable is fixed</td></tr>
+  </table>
+  <p>The bottom row is the <b>CAP</b> choice. The top row is the everyday cost that <b>PACELC</b> adds. You pay one of them; physics doesn't let you pay neither.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>CAP</b>: when a network <b>P</b>artition separates replicas, a system must either refuse some requests to stay <b>C</b>onsistent, or answer them and stay <b>A</b>vailable while copies drift. <b>PACELC</b> adds: <b>E</b>lse (no partition), it trades <b>L</b>atency against <b>C</b>onsistency. Partitions are rare; the latency trade-off is paid on every request.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: two shops, one stock ledger</span>
+    <p>A bakery has two shops across town sharing one stock count, kept in sync by phone. The phone line goes dead. The shops can stop selling the last cakes until the line is back (consistent, not available), or keep selling and sort it out later, maybe apologizing for an oversold cake (available, not consistent). Even with the phone working, calling the other shop before every sale makes the queue slower: that's the latency side.</p>
+  </div>
+
+  <h2>CAP, said precisely</h2>
+  <ul>
+    <li><b>Consistency</b> (in CAP) means <b>linearizable</b>: every read sees the latest completed write, as if there were one copy. It's not the C in ACID (Lesson 2.5), which is about your rules holding.</li>
+    <li><b>Availability</b>: every request to a node that's still running gets a real answer, not an error.</li>
+    <li><b>Partition tolerance</b>: the system keeps working when messages between nodes are lost. Networks do fail (GitHub's 43 seconds, Lesson 2.3), so you don't get to opt out of P.</li>
+  </ul>
+  <p>Eric Brewer, who proposed CAP, wrote in 2012 that the “2 of 3” framing was always misleading: partitions are rare, so there's little reason to give up C or A when there's no partition, and the choice can be made differently for different operations and data in the same system.</p>
+
+  <div class="playground" id="pg-split">
+    <span class="label">🎮 Playground · Cut the cable</span>
+    <p class="hint">A shared shopping cart is edited from the US (phone) and from the EU (laptop). The US copy is the primary in CP mode. Add items on both sides, <b>cut the link</b>, add more, then <b>heal</b> it and see what each mode does. Then simulate a 10-minute partition at scale.</p>
+    <svg id="cf"></svg>
+    <div class="controls">
+      <span class="seg" id="c-mode"><button id="c-mode-cp" data-v="cp" class="on">CP: refuse if unsure</button><button id="c-mode-lww" data-v="lww">AP: last write wins</button><button id="c-mode-merge" data-v="merge">AP: merge both sides</button></span>
+    </div>
+    <div class="controls">
+      <button class="btn" id="c-us">🇺🇸 Add item in US</button>
+      <button class="btn" id="c-eu">🇪🇺 Add item in EU</button>
+      <button class="btn" id="c-cut">✂ Cut the link</button>
+      <button class="btn" id="c-heal">🔧 Heal</button>
+      <button class="btn" id="c-reset">Reset</button>
+      <button class="btn primary" id="c-sim">Simulate a 10-minute partition</button>
+    </div>
+    <div class="carts"><div class="cart" id="c-cus"></div><div class="cart" id="c-ceu"></div></div>
+    <div class="stat-row">
+      <div class="stat">requests refused <b id="c-ref">0</b></div>
+      <div class="stat">copies agree? <b id="c-agree">yes</b></div>
+      <div class="stat">items lost on heal <b id="c-lost">0</b></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">sim: errors returned <b id="c-serr">–</b></div>
+      <div class="stat">sim: carts diverged <b id="c-sdiv">–</b></div>
+      <div class="stat">sim: updates lost <b id="c-slost">–</b></div>
+    </div>
+    <p class="hint" id="c-msg"></p>
+  </div>
+  <p>Things to try: in CP mode, cut the link and add an item in the EU: refused, because the EU copy can't confirm it has the latest cart. In AP with last-write-wins, both sides accept, and on heal one side's whole cart replaces the other's: items vanish silently. AP with merge keeps every added item, which is what Amazon's Dynamo did for carts; the Dynamo paper notes the catch: an “add to cart” is never lost, but deleted items can resurface.</p>
+
+  <h2>PACELC: the trade-off you pay every day</h2>
+  <p>Daniel Abadi's 2012 article argued that CAP describes only failures, while the bigger day-to-day cost of consistency is <b>latency</b>: keeping replicas in sync means waiting for them. PACELC reads: if <b>P</b>artition, choose <b>A</b> or <b>C</b>; <b>E</b>lse, choose <b>L</b>atency or <b>C</b>onsistency. His classifications at the time:</p>
+  <table>
+    <tr><th>Class</th><th>Meaning</th><th>Examples given (defaults, 2012)</th></tr>
+    <tr><td><b>PA/EL</b></td><td>Available during partitions, fast otherwise</td><td>Dynamo, Cassandra, Riak</td></tr>
+    <tr><td><b>PC/EC</b></td><td>Consistent always, pays in availability and latency</td><td>VoltDB/H-Store, Megastore, BigTable/HBase</td></tr>
+    <tr><td><b>PA/EC</b></td><td>Consistent normally, available during partitions</td><td>MongoDB</td></tr>
+  </table>
+  <p>Many modern databases let you choose <b>per request</b>: Cassandra's consistency level, DynamoDB's <code>ConsistentRead</code>, MongoDB's read and write concerns.</p>
+
+  <div class="playground" id="pg-lat">
+    <span class="label">🎮 Playground · What strong consistency costs in latency</span>
+    <p class="hint">Three replicas: one in your region and two remote ones (the second 1.6× farther). Strong writes need a majority (2 of 3) to confirm; strong reads go to the leader. Each simulated request has realistic jitter. Turn on commit wait to add a Spanner-style clock-uncertainty wait.</p>
+    <div class="controls">
+      <label>round trip to nearest other region <input type="range" id="l-rtt" min="10" max="250" step="5" value="75"> <b class="mono" id="l-rttv"></b></label>
+      <label><input type="checkbox" id="l-local" checked> leader is in my region</label>
+      <label>clock uncertainty (commit wait) <input type="range" id="l-eps" min="0" max="10" step="1" value="0"> <b class="mono" id="l-epsv"></b></label>
+      <button class="btn primary" id="l-run">▶ Run 2,000 requests</button>
+    </div>
+    <canvas class="chart" id="l-chart" style="height:210px"></canvas>
+    <div class="stat-row">
+      <div class="stat">eventual write p50 / p99 <b id="l-ew">–</b></div>
+      <div class="stat">strong write p50 / p99 <b id="l-sw">–</b></div>
+      <div class="stat">strong read p50 <b id="l-sr">–</b></div>
+      <div class="stat">eventual reads possibly stale for <b id="l-stale">–</b></div>
+    </div>
+    <p class="hint" id="l-msg"></p>
+  </div>
+  <p>Things to try: at 75 ms, a strong write costs about 35× an eventual one. Untick “leader is in my region” and even reads pay a round trip. Slide the distance to 200 ms (US to Asia, roughly) and strong writes pass 200 ms: that's why global apps keep strongly consistent data close to its users, and use eventual consistency for things like like counts and view counters.</p>
+
+  <h2>The consistency ladder</h2>
+  <p>“Consistent” isn't one thing. From strongest to weakest:</p>
+  <table>
+    <tr><th>Model</th><th>Promise</th><th>Typical cost</th><th>Example</th></tr>
+    <tr><td><b>Linearizable</b> (strong)</td><td>Acts like one copy: every read sees the latest write</td><td>A round trip to a leader or quorum on every operation</td><td>Spanner (externally consistent), DynamoDB strongly consistent reads, etcd</td></tr>
+    <tr><td><b>Causal</b></td><td>If B depends on A (a reply to a message), everyone sees A before B</td><td>Track dependencies; no global waiting</td><td>Some geo-replicated stores and research systems</td></tr>
+    <tr><td><b>Session</b> (read-your-writes, monotonic reads)</td><td>You see your own writes; your view never goes backwards</td><td>Sticky sessions or tracking log positions</td><td>Most apps on read replicas, done right (Lesson 2.3)</td></tr>
+    <tr><td><b>Eventual</b></td><td>If writes stop, all copies converge eventually</td><td>Cheapest and fastest</td><td>DNS, DynamoDB default reads, async replicas</td></tr>
+  </table>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: picking per feature, not per company</span>
+    <p>A global marketplace, users in the US and EU, typical RTT 75 ms between regions.</p>
+    <ul>
+      <li><b>Payments and stock</b> (overselling costs money): strong consistency, data homed in one region per seller. A buyer abroad pays ~75 ms extra on checkout, a few times per order. Fine.</li>
+      <li><b>Product pages and reviews</b>: eventual. Read locally in ~2 ms; a new review appearing 1 second later in the other region harms nobody.</li>
+      <li><b>“My orders” page</b>: session consistency (read-your-writes), so a buyer always sees the order they just placed.</li>
+      <li>During a partition: checkout in the cut-off region fails with a clear error (CP); browsing keeps working (AP).</li>
+    </ul>
+    <p>That's Brewer's point: the choice happens many times inside one system.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>The knobs, per request: <b>DynamoDB</b> <code>ConsistentRead</code> and global tables, <b>Cassandra/ScyllaDB</b> consistency levels (<code>ONE</code>, <code>QUORUM</code>, <code>LOCAL_QUORUM</code>), <b>MongoDB</b> write and read concerns, <b>Postgres</b> <code>synchronous_commit</code>. Globally consistent SQL: <b>Spanner</b>, <b>CockroachDB</b>. And <b>Jepsen</b> for testing what a database really guarantees.</p>
+<pre><code><span class="c"># DynamoDB: eventually consistent by default (half the read cost); ask for strong per call</span>
+aws dynamodb get-item --table-name Carts --key <span class="s">'{"user_id":{"S":"u42"}}'</span> --consistent-read
+
+<span class="c">-- Cassandra (cqlsh): strong-ish inside one region, async to the others</span>
+<span class="k">CONSISTENCY</span> LOCAL_QUORUM;
+<span class="k">INSERT INTO</span> carts (user_id, item) <span class="k">VALUES</span> (<span class="n">42</span>, <span class="s">'book'</span>);
+
+<span class="c">// MongoDB: wait for a majority of replicas before "OK"</span>
+db.orders.insertOne({ user: <span class="n">42</span>, total: <span class="n">30</span> }, { writeConcern: { w: <span class="s">"majority"</span> } })
+db.orders.find({ user: <span class="n">42</span> }).readConcern(<span class="s">"majority"</span>)</code></pre>
+    <p class="hint">A rule worth remembering: with replicas spread evenly over several regions, Cassandra's <code>QUORUM</code> counts replicas in every region, so writes usually wait on a cross-region round trip; <code>LOCAL_QUORUM</code> counts only the local region and accepts that other regions lag.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choose consistency (CP / EC) for…</th><th>Choose availability and speed (AP / EL) for…</th></tr>
+      <tr><td>Money, balances, stock, seats, unique usernames</td><td>Likes, views, feeds, recommendations, presence</td></tr>
+      <tr><td>Anything where a wrong answer is worse than no answer</td><td>Anything where no answer is worse than a slightly old one</td></tr>
+      <tr><td>Cost: errors during partitions, round trips on every write</td><td>Cost: conflicts to merge, anomalies to explain to users</td></tr>
+    </table>
+    <p><b>Conflict handling</b> is the hidden work of AP: last-write-wins is simple but silently drops updates; merging (like Dynamo's carts, or CRDTs, data types designed to merge automatically) keeps data but needs care with deletes. How replicas detect that two writes were concurrent (vector clocks) is Lesson 3.4b.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>One region, one primary database: you're strongly consistent by default and CAP barely applies. Use read replicas only for reads that tolerate lag. Don't go multi-region for “availability” before you need to; a second region doubles the operational work and forces exactly these choices.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Multiple regions, with a deliberate consistency choice per data type: home regions for user data, strongly consistent stores for money, eventually consistent global tables for caches and social data. Teams document what happens during a region partition, test it in game days (Lesson 8.4), and measure replication lag as an SLO (Lesson 0.5).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“It's AP because CAP” is a weak answer. What a senior answer covers:</p>
+    <ul>
+      <li>For <b>each kind of data</b>, which consistency it needs and why (what's the harm of a stale read?).</li>
+      <li>What happens during a <b>partition</b>: who gets errors, who gets old data, how copies reconcile afterwards.</li>
+      <li>The <b>latency</b> cost of strong consistency across regions, with a number.</li>
+      <li>How <b>conflicts</b> are resolved in AP parts (last-write-wins, merge, CRDTs) and what's lost.</li>
+    </ul>
+    <p>Common follow-ups: “Two users in different regions grab the same username during a partition. What happens?” “Is your system CP or AP?” (good answer: “it depends on the operation, here's the table”).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>CAP, revisited by its author</b> <span class="tag hist">📜 History · 2012</span> <a href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/" target="_blank" rel="noopener">CAP Twelve Years Later (Eric Brewer)</a></div>
+      <p><b>How:</b> Brewer explains that “2 of 3” was misleading, that partitions are rare, and that designers should detect partitions, operate in a limited mode during them, and recover (merge) afterwards.</p>
+      <p><b>Why this method:</b> treating a partition as a mode you plan for gives better systems than picking a letter once.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Latency is the everyday trade-off</b> <span class="tag hist">📜 History · 2012</span> <a href="https://www.cs.umd.edu/~abadi/papers/abadi-pacelc.pdf" target="_blank" rel="noopener">Consistency Tradeoffs in Modern Distributed Database System Design (Abadi, IEEE Computer)</a></div>
+      <p><b>How:</b> introduces PACELC and classifies systems: Dynamo, Cassandra and Riak as PA/EL by default; VoltDB/H-Store and Megastore as PC/EC; MongoDB as PA/EC.</p>
+      <p><b>Why this method:</b> CAP says nothing about normal operation, where most of the cost of consistency (waiting for replicas) is actually paid.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Global consistency with clocks</b> <span class="tag co">🏢 Google · 2012</span> <a href="https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett" target="_blank" rel="noopener">Spanner: Google's Globally-Distributed Database (OSDI)</a></div>
+      <p><b>How:</b> TrueTime exposes clock uncertainty (kept small with GPS and atomic clocks); commit wait makes sure a transaction's timestamp has passed everywhere before it's visible. F1, Google's ad backend, ran on five replicas spread across the US.</p>
+      <p><b>Why this method:</b> externally consistent transactions at global scale, paid for with special hardware and a few milliseconds per commit.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Consistency as a per-read choice</b> <span class="tag co">🏢 Amazon Web Services</span> <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/HowItWorks.ReadConsistency.html" target="_blank" rel="noopener">DynamoDB read consistency</a></div>
+      <p><b>How:</b> reads are eventually consistent by default and cost half as much as strongly consistent reads, which you request per call. Reads from global secondary indexes and streams are always eventually consistent.</p>
+      <p><b>Why this method:</b> most reads tolerate a little staleness, so the cheap, fast option is the default and you pay for strength only where needed.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Both choices across regions</b> <span class="tag co">🏢 Amazon Web Services</span> <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/V2globaltables_HowItWorks.html" target="_blank" rel="noopener">DynamoDB global tables: how it works</a></div>
+      <p><b>How:</b> the default mode (MREC) replicates asynchronously, typically within a second, and resolves concurrent writes with last writer wins. The strong mode (MRSC) synchronously replicates each change to at least one other Region before returning, and must be deployed in exactly three Regions.</p>
+      <p><b>Why this method:</b> AP/EL by default for speed, with a CP-style option for data that must never diverge.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a keynote that became a theorem</span>
+    <p>CAP began as a conjecture in Brewer's keynote at the 2000 ACM Symposium on Principles of Distributed Computing (PODC), and that talk led to a formal proof. A slide in a keynote became one of the most cited, and most misquoted, ideas in distributed systems.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Quorums (Lesson 2.3) are how you dial along this spectrum. Consensus protocols like Raft (Lesson 3.4) are how CP systems agree on one leader without split brain. Idempotency and retries (Lesson 3.3) make AP systems safe to retry. Chat (Lesson 7.4) needs causal ordering of messages; payments (Lesson 7.7) need strong consistency for the ledger. In AI systems, a vector index that lags the source documents by a few seconds is a classic eventual-consistency choice.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://www.infoq.com/articles/cap-twelve-years-later-how-the-rules-have-changed/" target="_blank" rel="noopener">CAP Twelve Years Later</a>. The best short read on what CAP really says.</li>
+      <li><span class="kind">Paper</span> <a href="https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett" target="_blank" rel="noopener">Spanner (OSDI 2012)</a>. Section 3 on TrueTime is very readable.</li>
+      <li><span class="kind">Blog</span> <a href="https://jepsen.io/consistency" target="_blank" rel="noopener">Jepsen: consistency models</a>. A clickable map of consistency models and how they relate.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Replicas sit in Frankfurt, Virginia and Oregon. A Frankfurt user writes with a majority quorum. Frankfurt–Virginia is about 90 ms round trip, Frankfurt–Oregon about 150 ms. Roughly how long does the write take?</div>
+    <div class="opts"><button class="opt">About 2 ms</button><button class="opt" data-ok>About 90 ms</button><button class="opt">About 150 ms</button></div>
+    <div class="explain">A majority of 3 is 2: the local replica plus the nearest remote one, Virginia. So the write waits about one <b>90 ms</b> round trip. Waiting for all three would cost the 150 ms one; eventual consistency would answer in ~2 ms.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. During a partition between regions, which feature should refuse requests rather than risk inconsistency?</div>
+    <div class="opts"><button class="opt">Showing a post's like count</button><button class="opt" data-ok>Claiming a unique username</button><button class="opt">Loading a user's news feed</button></div>
+    <div class="explain">Two people could claim the same username on opposite sides of the partition, and there's no good merge afterwards. A like count that's off for a few minutes, or a slightly old feed, is harmless, so those should stay available.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A database is described as PA/EL. What does that mean?</div>
+    <div class="opts"><button class="opt">It's always strongly consistent</button><button class="opt" data-ok>During a partition it stays available; normally it favours low latency over consistency</button><button class="opt">It's available only when there's no partition</button></div>
+    <div class="explain">PACELC: if Partition, choose A or C (here A); Else, choose Latency or Consistency (here L). Abadi gave Dynamo, Cassandra and Riak (default settings) as PA/EL examples.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>CAP: during a partition, refuse requests (C) or let copies diverge (A). Partitions are rare; choose per operation.</li>
+      <li>PACELC: otherwise, strong consistency costs a round trip to other replicas on every write (tens to hundreds of ms across regions).</li>
+      <li>Consistency ladder: linearizable → causal → session (read-your-writes) → eventual.</li>
+      <li>Strong for money, stock and uniqueness; eventual for counts, feeds and caches; plan how AP data merges (last-write-wins loses updates).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- playground 1: partition ----------
+  const F = new Flow($("cf"), { width: 720, height: 170 });
+  F.node("pu", { x: 70, y: 85, w: 100, label: "📱 Phone", sub: "in the US", kind: "cl" })
+   .node("us", { x: 260, y: 85, w: 140, label: "US-East copy", sub: "", kind: "db" })
+   .node("eu", { x: 470, y: 85, w: 140, label: "EU-West copy", sub: "", kind: "db" })
+   .node("pe", { x: 655, y: 85, w: 100, label: "💻 Laptop", sub: "in the EU", kind: "cl" })
+   .edge("pu", "us").edge("us", "eu", { label: "replication", noArrow: true }).edge("pe", "eu").render();
+  const getM = seg("c-mode", () => cReset());
+  const ITEMS = ["🍎 apples", "📕 book", "🎧 headphones", "🧦 socks", "☕ coffee", "🔋 batteries", "🪴 plant", "🧴 sunscreen", "🎲 dice", "🧁 cupcakes"];
+  let C;
+  function cReset() {
+    C = { us: { items: ["🍎 apples"], t: 1 }, eu: { items: ["🍎 apples"], t: 1 }, cut: false, refused: 0, lost: 0, next: 1, clock: 1 };
+    F.edgeStyle("us", "eu", { color: "--line", dashed: false, label: "replication" });
+    F.set("us", { down: false }).set("eu", { down: false });
+    $("c-msg").textContent = ""; cPaint();
+  }
+  const same = () => C.us.items.join() === C.eu.items.join();
+  function cPaint() {
+    const m = getM();
+    $("c-cus").innerHTML = `<b>US copy</b><br>${C.us.items.join(", ") || "(empty)"}`;
+    $("c-ceu").innerHTML = `<b>EU copy</b><br>${C.eu.items.join(", ") || "(empty)"}`;
+    $("c-ref").textContent = C.refused; $("c-lost").textContent = C.lost;
+    $("c-agree").textContent = same() ? "yes" : "no ❌";
+    F.set("us", { sub: C.us.items.length + " items" + (m === "cp" ? " · primary" : "") }).set("eu", { sub: C.eu.items.length + " items" + (C.cut && m === "cp" ? " · refusing writes" : "") });
+  }
+  async function add(side) {
+    const m = getM(), other = side === "us" ? "eu" : "us", item = ITEMS[C.next++ % ITEMS.length];
+    const path = side === "us" ? ["pu", "us"] : ["pe", "eu"];
+    if (C.cut && m === "cp" && side === "eu") {
+      await F.packet(path, { color: "--c-er", dur: 350, back: true });
+      C.refused++; cPaint();
+      $("c-msg").textContent = "Refused: the EU copy can't reach the primary, so it can't promise the cart is current. Error 503, please retry.";
+      return;
+    }
+    await F.packet(path, { color: "--c-cl", dur: 350 });
+    C[side].items = [...C[side].items, item]; C[side].t = ++C.clock;
+    if (!C.cut) {
+      await F.packet([side, other], { color: "--c-db", dur: 450 });
+      C[other].items = C[side].items.slice(); C[other].t = C[side].t;
+      $("c-msg").textContent = `Added ${item}; replicated to the other region.`;
+    } else $("c-msg").textContent = `Added ${item} in ${side.toUpperCase()} only: the link is down, so the copies now differ.`;
+    cPaint();
+  }
+  $("c-us").onclick = () => add("us");
+  $("c-eu").onclick = () => add("eu");
+  $("c-cut").onclick = () => {
+    C.cut = true; F.edgeStyle("us", "eu", { color: "--c-er", dashed: true, label: "✂ partition" });
+    $("c-msg").textContent = getM() === "cp" ? "Link cut. The US primary keeps working; the EU side will refuse writes." : "Link cut. Both sides keep accepting writes.";
+    cPaint();
+  };
+  $("c-heal").onclick = async () => {
+    if (!C.cut) return;
+    C.cut = false; F.edgeStyle("us", "eu", { color: "--line", dashed: false, label: "replication" });
+    const m = getM();
+    await Promise.all([F.packet(["us", "eu"], { color: "--c-db", dur: 450 }), F.packet(["eu", "us"], { color: "--c-db", dur: 450 })]);
+    if (m === "lww") {
+      const win = C.us.t >= C.eu.t ? "us" : "eu", lose = win === "us" ? "eu" : "us";
+      const dropped = C[lose].items.filter(x => !C[win].items.includes(x));
+      C.lost += dropped.length; C[lose].items = C[win].items.slice(); C[lose].t = C[win].t;
+      $("c-msg").textContent = dropped.length ? `Last write wins: the ${win.toUpperCase()} cart was written last, so it replaced the other copy. Silently dropped: ${dropped.join(", ")}.` : "Last write wins: nothing was dropped this time.";
+    } else if (m === "merge") {
+      const all = [...new Set([...C.us.items, ...C.eu.items])];
+      C.us.items = all.slice(); C.eu.items = all.slice();
+      $("c-msg").textContent = "Merged both carts (a set union), like Dynamo's shopping cart: no added item is lost. A deleted item could come back, though.";
+    } else {
+      C.eu.items = C.us.items.slice();
+      $("c-msg").textContent = "Healed. The EU copy caught up from the primary. Nothing diverged, because the EU refused writes during the partition.";
+    }
+    cPaint();
+  };
+  $("c-reset").onclick = cReset;
+  $("c-sim").onclick = () => {
+    const m = getM(), RATE = 300, SECS = 600, CARTS = 1000000, rng = MX.seeded(8);
+    const per = RATE * SECS, usT = new Float64Array(CARTS), euT = new Float64Array(CARTS), usN = new Int32Array(CARTS), euN = new Int32Array(CARTS);
+    for (let i = 0; i < per; i++) { const c = Math.floor(rng() * CARTS); usN[c]++; usT[c] = rng() * SECS; }
+    for (let i = 0; i < per; i++) { const c = Math.floor(rng() * CARTS); euN[c]++; euT[c] = rng() * SECS; }
+    let div = 0, lost = 0;
+    for (let c = 0; c < CARTS; c++) if (usN[c] && euN[c]) { div++; lost += usT[c] >= euT[c] ? euN[c] : usN[c]; }
+    if (m === "cp") {
+      $("c-serr").textContent = per.toLocaleString(); $("c-sdiv").textContent = "0"; $("c-slost").textContent = "0";
+      $("c-msg").textContent = `CP: every EU cart update for 10 minutes failed: ${per.toLocaleString()} errors. In exchange, no cart ever disagreed.`;
+    } else {
+      $("c-serr").textContent = "0"; $("c-sdiv").textContent = div.toLocaleString();
+      $("c-slost").textContent = m === "lww" ? lost.toLocaleString() : "0";
+      $("c-msg").textContent = m === "lww" ? `AP + last write wins: no errors, but ${div.toLocaleString()} carts were edited on both sides, and ${lost.toLocaleString()} updates were silently thrown away on heal.` :
+        `AP + merge: no errors and no lost additions; ${div.toLocaleString()} carts needed merging (deletes in those carts might reappear).`;
+    }
+  };
+  cReset();
+
+  // ---------- playground 2: latency ----------
+  function jitter(rng, base) { // mostly near base, with a long tail
+    const u = rng();
+    return base * (0.9 + 0.2 * rng()) + (u < 0.03 ? base * (0.5 + rng()) : 0) + 0.3 * rng();
+  }
+  const pct = (a, p) => a[Math.min(a.length - 1, Math.floor(a.length * p))];
+  function lat() {
+    const rtt = +$("l-rtt").value, local = $("l-local").checked, eps = +$("l-eps").value, rng = MX.seeded(13);
+    $("l-rttv").textContent = rtt + " ms"; $("l-epsv").textContent = eps ? eps + " ms" : "off";
+    const T = 2000, LOCAL = 2, ew = [], sw = [], sr = [];
+    for (let i = 0; i < T; i++) {
+      ew.push(jitter(rng, LOCAL));
+      const a = jitter(rng, rtt), b = jitter(rng, rtt * 1.6);
+      const toLeader = local ? 0 : jitter(rng, rtt); // a remote leader adds a round trip
+      sw.push(LOCAL + toLeader + Math.min(a, b) + eps); // majority = leader + fastest other replica
+      sr.push(LOCAL + (local ? 0 : jitter(rng, rtt)));
+    }
+    [ew, sw, sr].forEach(a => a.sort((x, y) => x - y));
+    const f = v => v < 10 ? v.toFixed(1) : Math.round(v);
+    $("l-ew").textContent = f(pct(ew, 0.5)) + " / " + f(pct(ew, 0.99)) + " ms";
+    $("l-sw").textContent = f(pct(sw, 0.5)) + " / " + f(pct(sw, 0.99)) + " ms";
+    $("l-sr").textContent = f(pct(sr, 0.5)) + " ms";
+    $("l-stale").textContent = "≈ " + Math.round(rtt / 2) + "–" + Math.round(rtt * 1.6 / 2 + 50) + " ms after a write";
+    const cdf = a => { const out = []; for (let p = 0; p <= 100; p += 2) out.push([p, pct(a, Math.min(0.999, p / 100))]); return out; };
+    Plot.line($("l-chart"), { series: [
+      { label: "eventual write", color: MX.css("--c-ca"), data: cdf(ew) },
+      { label: "strong read", color: MX.css("--c-cl"), data: cdf(sr), dash: [5, 4] },
+      { label: "strong write (majority)", color: MX.css("--c-lt"), data: cdf(sw) },
+    ], xMin: 0, xMax: 100, yMin: 0, xLabel: "percentile of requests", yLabel: "latency (ms)" });
+    $("l-msg").textContent = `A strong write here takes about ${Math.round(pct(sw, 0.5) / pct(ew, 0.5))}× as long as an eventual one.` + (eps ? ` Commit wait adds ${eps} ms on top, the price Spanner pays for externally consistent timestamps.` : "") + (local ? "" : " With the leader far away, even strong reads pay a round trip.");
+  }
+  $("l-run").onclick = lat;
+  ["l-rtt", "l-eps"].forEach(id => ($(id).oninput = lat));
+  $("l-local").onchange = lat;
+  lat();
+})();
+</script>
+</body>
+</html>

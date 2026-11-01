@@ -1,0 +1,413 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.5 Capacity planning, load testing & cost · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+</style>
+</head>
+<body data-lesson="s6-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 5</div>
+  <h1>Capacity planning, load testing &amp; cost</h1>
+  <p class="subtitle">How many servers do you need, how do you know before launch day, and what does each request cost? Get it wrong one way and you fall over; get it wrong the other way and you burn money.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Back-of-the-envelope estimation</b>: QPS (queries per second), peak vs average (Lesson 0.3).</li>
+      <li><b>Horizontal scaling</b> and the <b>Kubernetes HPA</b> (horizontal pod autoscaler, adds pods when a metric is high) (Lessons 1.1 and 5.3).</li>
+      <li><b>Saturation</b> and <b>p99 latency</b> from your metrics (Lesson 6.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>When Pokémon GO launched in 2016, Niantic and Google's reliability engineers had planned for a baseline traffic target, with a worst-case estimate of about <b>5×</b> that. Real player traffic surged to <b>50×</b> the target: <b>ten times the worst case</b>. Google provisioned extra capacity on the fly, and before the launch in Japan the teams even upgraded the game's Kubernetes cluster to allow more than a thousand extra nodes.</p>
+    <p>You can't always predict demand. But you can know your limits, test them, and keep enough headroom and automation to react. That's capacity planning.</p>
+  </div>
+
+  <h2>Numbers first: Little's law</h2>
+  <p>Your API gets <b>2,000 requests per second</b>, and each takes <b>200 ms</b> (0.2 s) to finish. How many requests are in progress at any moment?</p>
+  <div class="eq">
+    <span class="sv">L</span> = <span class="cl">λ</span> × <span class="lt">W</span> = 2,000 /s × 0.2 s = <b>400 requests in flight</b>
+    <span class="say">“The average number of things in the system equals the rate they arrive times how long each one stays.” It works for requests, database connections, threads, even people in a coffee shop.</span>
+  </div>
+  <div class="legend"><span class="sv">L: requests in progress (concurrency)</span><span class="cl"><span class="nt">λ</span> (lambda): arrival rate</span><span class="lt">W: time each spends inside</span></div>
+  <p>So if each server can handle <b>50 requests at once</b> (say, 50 worker threads or database connections), you need at least <b>400 ÷ 50 = 8 servers</b>. At 100% busy. Which is exactly where you must never run, as the next section shows.</p>
+  <p>Little's law also explains a classic outage: a dependency slows from 200 ms to 2 s. Same 2,000 requests per second, but now 4,000 are in flight. Your thread pools and connection pools fill up, and the whole service stops, even though traffic didn't change.</p>
+
+  <h2>Why “100% utilized” means “broken”</h2>
+  <p><b>Utilization</b> (written ρ, “rho”) is the share of time a server is busy. In a simple queue where requests arrive at random, the average time in the system is:</p>
+  <div class="eq">
+    W = <span class="lt">S</span> ÷ (1 − <span class="er"><span class="nt">ρ</span></span>)
+    <span class="say">“Response time is the service time S divided by the idle share.” At 50% busy, requests take 2× their service time; at 90%, 10×; at 99%, 100×.</span>
+  </div>
+  <table>
+    <tr><th>Utilization ρ</th><th>50%</th><th>80%</th><th>90%</th><th>95%</th><th>99%</th></tr>
+    <tr><td>Slowdown 1 ÷ (1 − ρ)</td><td class="db">2×</td><td class="db">5×</td><td class="lt">10×</td><td class="er">20×</td><td class="er">100×</td></tr>
+  </table>
+  <p>This is the textbook single-server queue with random arrivals (called M/M/1). Real systems differ in the details, but the shape is universal: a <b>knee</b> where latency stops growing gently and shoots up. Requests that arrive while the server is busy wait in line, and near 100% the line almost never empties.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Capacity is the load where latency is still acceptable, not the load where things crash.</b> Plan to run well below the knee at peak (often around 50–70% utilization), so you have room for spikes, for a lost server or zone, and for the minutes autoscaling needs to react.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the supermarket checkout</span>
+    <p>One cashier, customers arriving at random. If the cashier is busy half the time, you rarely wait. At 90% busy, a short lull never quite clears the line, and one slow customer with coupons backs it up for everyone. Opening a second till before the line forms is capacity planning. Calling someone in from home after the line reaches the door is autoscaling with lead time.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The queueing knee</span>
+    <p class="hint">20,000 simulated requests, each needing about 20 ms of work (random, average 20 ms), arriving at random. Slide utilization up and watch latency. More servers sharing one queue handle the same utilization better: that's why pooling capacity helps.</p>
+    <div class="controls">
+      <label>utilization <input type="range" id="q-r" min="10" max="99" step="1" value="70"> <b class="mono" id="q-rv"></b></label>
+      <span class="hint">Servers sharing the queue:</span>
+      <span class="seg" id="q-c"><button id="q-c-1" data-v="1" class="on">1</button><button id="q-c-2" data-v="2">2</button><button id="q-c-4" data-v="4">4</button><button id="q-c-8" data-v="8">8</button></span>
+      <button class="btn primary" id="q-run">▶ Simulate</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">arrival rate λ <b id="q-l">–</b></div>
+      <div class="stat">mean latency W <b id="q-w">–</b></div>
+      <div class="stat">p99 latency <b id="q-p">–</b></div>
+      <div class="stat">avg in system L <b id="q-L">–</b></div>
+      <div class="stat">λ × W (Little) <b id="q-lw">–</b></div>
+    </div>
+    <canvas class="chart" id="q-ch" style="height:220px"></canvas>
+    <p class="hint" id="q-msg"></p>
+  </div>
+  <p>Check the last two numbers: the measured average number of requests in the system matches λ × W, whatever the utilization. That's Little's law, live. And notice p99: near the knee, the slowest requests suffer far more than the average.</p>
+
+  <h2>Headroom: what you keep in reserve</h2>
+  <ul>
+    <li><b>Peak, not average.</b> Daily peaks are often 2–3× the average; launches and sales are bigger.</li>
+    <li><b>Lose a zone.</b> Running in 3 availability zones and want to survive losing one? The other two must carry everything, so at peak each zone should sit at no more than about two thirds of its safe capacity (often called N+1).</li>
+    <li><b>Autoscaling lead time.</b> A new server needs time to boot, pull its image, start and warm up: often a few minutes. Your headroom has to absorb growth during that time.</li>
+  </ul>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: headroom for a launch</span>
+    <p>During a launch, traffic grows <b>5% per minute</b>. New pods take <b>4 minutes</b> to become ready.</p>
+    <ul>
+      <li>By the time new capacity arrives, traffic has grown 1.05<sup>4</sup> ≈ <b>1.22×</b>.</li>
+      <li>So the current fleet must already handle 22% more than today's load: run at most about 1 ÷ 1.22 ≈ <b>82%</b> of safe capacity, before any other margin.</li>
+      <li>Add the zone-loss margin (each zone ≤ 67%) and the stricter one wins: plan for about <b>65%</b> at peak.</li>
+    </ul>
+    <p>For a known event (a sale, a launch, a ticket on-sale), don't rely on autoscaling: <b>pre-scale</b> the day before, and load-test at the expected peak.</p>
+  </div>
+
+  <h2>Load testing: find the limit before your users do</h2>
+  <p>A <b>load test</b> sends synthetic traffic at your system to measure how it behaves. The k6 documentation names the common shapes:</p>
+  <table>
+    <tr><th>Test</th><th>Load</th><th>Duration</th><th>Answers</th></tr>
+    <tr><td><b>Smoke</b></td><td>Minimal</td><td>Short</td><td>Does the script and system work at all?</td></tr>
+    <tr><td><b>Average-load</b></td><td>Typical traffic</td><td>Mid</td><td>Do we meet our SLO on a normal day?</td></tr>
+    <tr><td><b>Stress</b></td><td>Above average</td><td>Mid (5–60 min)</td><td>What happens at peak and beyond?</td></tr>
+    <tr><td><b>Soak</b></td><td>Average</td><td>Hours</td><td>Memory leaks, filling disks, slow degradation</td></tr>
+    <tr><td><b>Spike</b></td><td>Very high, sudden</td><td>A few minutes</td><td>Do we survive a flash crowd? Does autoscaling keep up?</td></tr>
+    <tr><td><b>Breakpoint</b></td><td>Increases until it breaks</td><td>As long as needed</td><td>Where exactly is the limit, and which part breaks first?</td></tr>
+  </table>
+  <p>One subtle point: generate load as an <b>arrival rate</b> (“1,000 new requests per second”), not as a fixed number of users who each wait for a reply before sending the next. With a fixed number of waiting users, a slow server automatically gets fewer requests, which hides the very overload you're testing for. k6 calls the arrival-rate style an “open model.”</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Find the breaking point</span>
+    <p class="hint">A service with app pods (each safely handles about 250 req/s) in front of one database (about 1,800 queries/s, one query per request). Requests time out after 2 s. Pick a test shape, size the fleet, and see where it breaks, and <b>which part</b> breaks. Try adding pods past the database's limit.</p>
+    <div class="controls">
+      <span class="seg" id="lt-s"><button id="lt-s-ramp" data-v="ramp" class="on">Breakpoint ramp</button><button id="lt-s-spike" data-v="spike">Spike</button></span>
+      <label>app pods <input type="range" id="lt-p" min="2" max="12" step="1" value="4"> <b class="mono" id="lt-pv"></b></label>
+      <label><input type="checkbox" id="lt-as"> autoscale (target 60% CPU)</label>
+      <label>new pod ready after <input type="range" id="lt-lead" min="1" max="6" step="1" value="3"> <b class="mono" id="lt-leadv"></b></label>
+      <button class="btn primary" id="lt-run">▶ Run load test</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">breaking point <b id="lt-bp">–</b></div>
+      <div class="stat">first bottleneck <b id="lt-bn">–</b></div>
+      <div class="stat">timed-out requests <b id="lt-err">–</b></div>
+      <div class="stat">worst p95 <b id="lt-p95">–</b></div>
+      <div class="stat">pod-hours used <b id="lt-ph">–</b></div>
+    </div>
+    <canvas class="chart" id="lt-c1" style="height:180px"></canvas>
+    <canvas class="chart" id="lt-c2" style="height:160px"></canvas>
+    <p class="hint" id="lt-msg"></p>
+  </div>
+  <p>Things to try: on the ramp, go from 4 to 8 pods: the breaking point moves up, then stops at the database. More app pods can't fix a database limit (that's when you reach for caching, read replicas or sharding, Lessons 1.3, 2.3, 2.4). On the spike, turn on autoscaling with a 3-minute lead time: the new pods arrive after the damage is done. Then try pre-scaling with more pods instead.</p>
+
+  <h2>Cost: the other half of capacity</h2>
+  <p>Every extra server is money. The useful unit is <b>cost per request</b> (or per user, per order), because it tells you whether growth makes you richer or poorer.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: cost per million requests</span>
+    <p>Say 10 servers at about <b>$0.10 per hour</b> each (an illustrative price for a small cloud VM; check your provider) serve an average of <b>800 requests/s</b>.</p>
+    <ul>
+      <li>Cost per hour: 10 × $0.10 = <b>$1.00</b>. Requests per hour: 800 × 3,600 = 2.88 million.</li>
+      <li>Cost per million requests: $1.00 ÷ 2.88 ≈ <b>$0.35</b>.</li>
+      <li>If nights are quiet and autoscaling halves the fleet for 12 hours a day, the average drops to about $0.26 per million, a 25% saving with no code change.</li>
+    </ul>
+  </div>
+  <table>
+    <tr><th>Pricing model</th><th>What it is</th><th>Good for</th></tr>
+    <tr><td><b>On-demand</b></td><td>Pay by the second or hour, no commitment</td><td>Spiky or unknown load; the baseline price</td></tr>
+    <tr><td><b>Reserved / savings plans</b></td><td>Commit to 1 or 3 years of usage for a discount; AWS advertises up to 72% off on-demand for Savings Plans</td><td>The steady base load you're sure you'll have</td></tr>
+    <tr><td><b>Spot / preemptible</b></td><td>Spare capacity at a deep discount (AWS: up to 90% off), but it can be taken back; AWS gives a two-minute interruption notice</td><td>Batch jobs, CI runners, stateless workers that tolerate being killed</td></tr>
+  </table>
+  <p>A common mix: reserved for the base, on-demand for the daily peak, spot for batch work. <b>FinOps</b> is the practice of making engineers see and own these costs: the FinOps Foundation calls it an operational framework and cultural practice that creates financial accountability through collaboration between engineering, finance and business teams.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Load testing: <b>k6</b> (JavaScript scripts, Go engine), <b>Locust</b> (Python), <b>Gatling</b>, <b>JMeter</b>, <b>vegeta</b>; managed: Grafana Cloud k6, Azure Load Testing. Cost: AWS Cost Explorer, GCP billing reports, <b>Kubecost</b>/<b>OpenCost</b> for per-team Kubernetes costs. A k6 breakpoint-style test with pass/fail thresholds:</p>
+<pre><code><span class="k">import</span> http <span class="k">from</span> <span class="s">'k6/http'</span>;
+
+<span class="k">export const</span> options = {
+  scenarios: {
+    ramp: {
+      executor: <span class="s">'ramping-arrival-rate'</span>,   <span class="c">// open model: new requests per second, whatever the latency</span>
+      startRate: <span class="n">100</span>, timeUnit: <span class="s">'1s'</span>,
+      preAllocatedVUs: <span class="n">200</span>, maxVUs: <span class="n">2000</span>,
+      stages: [
+        { target: <span class="n">500</span>,  duration: <span class="s">'2m'</span> },
+        { target: <span class="n">2000</span>, duration: <span class="s">'8m'</span> },   <span class="c">// keep climbing until something breaks</span>
+      ],
+    },
+  },
+  thresholds: {
+    http_req_failed:   [<span class="s">'rate&lt;0.01'</span>],     <span class="c">// under 1% errors</span>
+    http_req_duration: [<span class="s">'p(95)&lt;500'</span>],     <span class="c">// 95% of requests under 500 ms</span>
+  },
+};
+
+<span class="k">export default function</span> () {
+  http.get(<span class="s">'https://staging.example.com/api/products'</span>);
+}</code></pre>
+<pre><code><span class="c"># Kubernetes HPA: keep average CPU near 60%, between 4 and 40 pods</span>
+<span class="k">apiVersion:</span> autoscaling/v2
+<span class="k">kind:</span> HorizontalPodAutoscaler
+<span class="k">metadata:</span> { <span class="k">name:</span> shop }
+<span class="k">spec:</span>
+  <span class="k">scaleTargetRef:</span> { <span class="k">apiVersion:</span> apps/v1, <span class="k">kind:</span> Deployment, <span class="k">name:</span> shop }
+  <span class="k">minReplicas:</span> <span class="n">4</span>        <span class="c"># the floor is your headroom for sudden spikes</span>
+  <span class="k">maxReplicas:</span> <span class="n">40</span>
+  <span class="k">metrics:</span>
+    - <span class="k">type:</span> Resource
+      <span class="k">resource:</span>
+        <span class="k">name:</span> cpu
+        <span class="k">target:</span> { <span class="k">type:</span> Utilization, <span class="k">averageUtilization:</span> <span class="n">60</span> }</code></pre>
+    <p class="hint">Try it locally: <code>k6 run load.js</code>, or <code>docker run --rm -i grafana/k6 run - &lt;load.js</code>. Locust: write a <code>HttpUser</code> class with <code>@task</code> methods, then <code>locust -f locustfile.py --headless -u 500 -r 50 --host https://staging.example.com</code>. Never load-test production or someone else's site without permission.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Lots of headroom (run at 40%)</td><td>Survives spikes and zone loss; low latency</td><td>Paying for idle machines most of the day</td></tr>
+      <tr><td>Thin headroom + autoscaling (run at 75%)</td><td>Cheaper</td><td>Spikes faster than the lead time hurt users; scaling itself can fail</td></tr>
+      <tr><td>Load test in staging</td><td>Safe, repeatable</td><td>Staging is smaller and its data is different; results don't transfer exactly</td></tr>
+      <tr><td>Load test in production (off-peak, with synthetic users)</td><td>The real system and real limits</td><td>Risky; needs kill switches, test-data isolation and careful coordination</td></tr>
+      <tr><td>Spot capacity</td><td>Up to 90% cheaper</td><td>Can vanish with two minutes' notice; never for a single database</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Know your one bottleneck (it's usually the database) and roughly what load breaks it: run a 30-minute k6 breakpoint test before every big launch. Set billing alerts on day one. Use managed and serverless services that scale for you, and buy reserved capacity only once your base load is boringly predictable.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Quarterly capacity plans built from growth forecasts, per-service load models (requests → CPU, memory, storage), regular production load tests and “game days,” region-level N+1 or N+2, organization-wide reserved-capacity buying, and FinOps dashboards that show each team its cost per request.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Capacity math is where design interviews get concrete. A senior answer:</p>
+    <ul>
+      <li>Estimates <b>peak</b> QPS, then concurrency with <b>Little's law</b>, then servers needed at a <b>target utilization</b> (not 100%).</li>
+      <li>Names the <b>first bottleneck</b> (often the database or a single hot shard) and what happens beyond it.</li>
+      <li>Explains <b>headroom</b>: zone loss, autoscaling lead time, pre-scaling for known events.</li>
+      <li>Mentions how you'd <b>verify</b> it (a load test) and what it <b>costs</b>.</li>
+    </ul>
+    <p class="hint">Follow-ups: “Latency doubled but traffic is flat. Why?” (a dependency got slower: Little's law means more requests in flight, pools fill up). “Why not run at 95% CPU to save money?” (the queueing knee: latency and the risk of collapse explode).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Demand 10× the worst case</b> <span class="tag co">🏢 Niantic + Google Cloud · 2016</span> <a href="https://cloud.google.com/blog/products/gcp/bringing-pokemon-go-to-life-on-google-cloud" target="_blank" rel="noopener">Bringing Pokémon GO to life on Google Cloud</a></div>
+      <p><b>How:</b> the game's logic ran on Google Container Engine (GKE, Kubernetes). Traffic reached 50× the initial target, ten times the worst-case estimate, and Google's Customer Reliability Engineering team provisioned extra capacity and upgraded the cluster to add over a thousand more nodes before the Japan launch.</p>
+      <p><b>Why this method:</b> when forecasts are wrong by 10×, what saves you is elastic infrastructure and people who know where the limits are.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A traffic peak nobody planned for</b> <span class="tag co">🏢 Ticketmaster · 2022</span> <a href="https://business.ticketmaster.com/press-release/taylor-swift-the-eras-tour-onsale-explained/" target="_blank" rel="noopener">Taylor Swift | The Eras Tour Onsale Explained</a></div>
+      <p><b>How:</b> Ticketmaster wrote that bot attacks and fans without presale codes drove 3.5 billion total system requests during the on-sale, 4× its previous peak.</p>
+      <p><b>Why this method:</b> capacity plans are built on past peaks; a launch that attracts bots and a huge fan base can break that assumption, which is why systems also need admission control (queues, rate limits, Lesson 1.5).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Named load-test shapes</b> <span class="tag oss">🧰 Open source · Grafana k6</span> <a href="https://grafana.com/docs/k6/latest/testing-guides/test-types/" target="_blank" rel="noopener">k6: load test types</a></div>
+      <p><b>How:</b> the guide defines smoke, average-load, stress, soak, spike and breakpoint tests by their load level and duration, and when to run each.</p>
+      <p><b>Why this method:</b> each shape answers a different question; a team that only runs one kind finds the others' failures in production.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Spare capacity at a discount</b> <span class="tag prod">🏭 In production · AWS</span> <a href="https://aws.amazon.com/ec2/spot/" target="_blank" rel="noopener">Amazon EC2 Spot Instances</a></div>
+      <p><b>How:</b> Spot Instances run on spare EC2 capacity for up to 90% off on-demand prices; AWS sends an interruption notice two minutes before it stops or terminates one.</p>
+      <p><b>Why this method:</b> fault-tolerant, stateless work (batch, CI, queue workers) can checkpoint or retry, so a cheap machine that might vanish is a great deal.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The queueing formula</b> <span class="tag hist">📜 History · 1961</span> <a href="https://ideas.repec.org/a/inm/oropre/v9y1961i3p383-387.html" target="_blank" rel="noopener">Little: A Proof for the Queuing Formula L = λW (Operations Research)</a></div>
+      <p><b>How:</b> John D. C. Little's short paper proved that the average number in a queueing system equals the arrival rate times the average time spent, under very general conditions.</p>
+      <p><b>Why this method:</b> it lets you turn throughput and latency (which you measure) into concurrency (which you must provision: threads, connections, memory).</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a formula from 1961 in your thread pool</span>
+    <p>Little's law is older than the internet, and MIT still describes its author, John Little, as best known for his proof of L = λW. Every time you size a database connection pool or a Kubernetes concurrency limit, you're using a result from a 5-page operations research paper.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Capacity sits on the estimation skills from Lesson 0.3 and the autoscaling tools from Lesson 5.3. When the database is the bottleneck, the fixes are caching (1.3), replicas (2.3) and sharding (2.4); when overload is unavoidable, shed load with rate limits (1.5) and queues (3.1). Every design in Phase 7 starts with exactly this math. In AI serving, the same law sizes GPU fleets: concurrent requests = request rate × generation time, and GPUs are expensive enough that cost per request is a board-level number.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://grafana.com/docs/k6/latest/testing-guides/test-types/" target="_blank" rel="noopener">k6 load test types</a>. What to run, when, and for how long.</li>
+      <li><span class="kind">Docs</span> <a href="https://grafana.com/docs/k6/latest/using-k6/thresholds/" target="_blank" rel="noopener">k6 thresholds</a>. Turn a load test into a pass/fail check your pipeline can run.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.finops.org/introduction/what-is-finops/" target="_blank" rel="noopener">FinOps Foundation: What is FinOps?</a> The principles behind cloud cost ownership.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A service handles 3,000 requests/s with an average latency of 50 ms. Each pod has a pool of 20 database connections, and each request holds one for its whole duration. How many pods do you need at minimum (before headroom)?</div>
+    <div class="opts"><button class="opt">2</button><button class="opt" data-ok>8</button><button class="opt">150</button></div>
+    <div class="explain">Little's law: L = 3,000 × 0.05 = 150 requests in flight, each holding a connection. 150 ÷ 20 = 7.5, so 8 pods at 100% busy. With headroom for the queueing knee and zone loss, you'd plan for 12 or more.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your servers run at 70% CPU at peak and someone proposes cutting the fleet so they run at 95% to save money. What happens to latency, roughly?</div>
+    <div class="opts"><button class="opt">It goes up by about a third (95 ÷ 70)</button><button class="opt" data-ok>Queueing delay grows several times over: 1 ÷ (1 − ρ) goes from about 3.3 to 20</button><button class="opt">Nothing until CPU hits 100%</button></div>
+    <div class="explain">Latency isn't linear in utilization. In the simple queue model the slowdown goes from 1 ÷ 0.3 ≈ 3.3× to 1 ÷ 0.05 = 20×, about six times worse, and any spike pushes it over the edge.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A big ticket sale starts at 10:00 sharp; traffic will jump 20× within a minute. Your autoscaler needs about 4 minutes to add pods. What's the best plan?</div>
+    <div class="opts"><button class="opt">Trust the autoscaler; that's what it's for</button><button class="opt" data-ok>Pre-scale before 10:00 to the load-tested peak, and add a waiting room or rate limit for anything beyond it</button><button class="opt">Switch all servers to spot instances to afford more of them</button></div>
+    <div class="explain">Autoscaling reacts after the fact; a 20× jump in one minute is over before new pods are ready. For known events, pre-scale to a capacity you've verified with a spike test, and protect the system with admission control so excess users wait instead of everyone failing.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Little's law: concurrency L = λ × W. It sizes threads, connections and pods, and explains why slow dependencies cause outages.</li>
+      <li>Latency ≈ S ÷ (1 − ρ): run well below 100% (often 50–70% at peak) for spikes, zone loss and autoscaling lead time.</li>
+      <li>Load test with an arrival rate: smoke, average, stress, soak, spike, breakpoint. Find the first bottleneck before users do.</li>
+      <li>Track cost per request; mix reserved (base), on-demand (peaks) and spot (batch).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const ms = v => v >= 1000 ? (v / 1000).toFixed(2) + " s" : v >= 10 ? Math.round(v) + " ms" : v.toFixed(1) + " ms";
+
+  // ---------- M/M/c queue simulation ----------
+  const S = 20, NREQ = 20000;
+  const getC = seg("q-c", () => queue());
+  function simQ(rho, c, seed) {
+    const rng = MX.seeded(seed), exp = m => -m * Math.log(1 - rng());
+    const lam = rho * c / S; // requests per ms
+    const free = new Float64Array(c); let t = 0, sumW = 0; const lat = new Float64Array(NREQ);
+    for (let i = 0; i < NREQ; i++) {
+      t += exp(1 / lam);
+      let k = 0; for (let j = 1; j < c; j++) if (free[j] < free[k]) k = j;
+      const start = Math.max(t, free[k]), done = start + exp(S);
+      free[k] = done; lat[i] = done - t; sumW += lat[i];
+    }
+    const W = sumW / NREQ, L = sumW / t; // time-average number in system = total time spent / elapsed time
+    const s = Array.from(lat).sort((a, b) => a - b);
+    return { lam, W, L, p99: s[Math.floor(0.99 * NREQ)] };
+  }
+  function queue() {
+    const rho = +$("q-r").value / 100, c = +getC();
+    $("q-rv").textContent = Math.round(rho * 100) + "%";
+    const r = simQ(rho, c, 5);
+    $("q-l").textContent = Math.round(r.lam * 1000) + " req/s";
+    $("q-w").textContent = ms(r.W); $("q-p").textContent = ms(r.p99);
+    $("q-L").textContent = r.L.toFixed(2); $("q-lw").textContent = (r.lam * r.W).toFixed(2);
+    const theory = [], sim = [];
+    for (let p = 10; p <= 97; p += 1) theory.push([p, S / (1 - p / 100)]);
+    for (let p = 10; p <= 95; p += 5) sim.push([p, simQ(p / 100, c, 9).W]);
+    Plot.line($("q-ch"), { series: [
+      { label: "theory, 1 server: S ÷ (1 − ρ)", color: MX.css("--muted"), data: theory, dash: [6, 4] },
+      { label: `simulated, ${c} server${c > 1 ? "s" : ""}`, color: MX.css("--c-sv"), data: sim, dots: true },
+    ], xLabel: "utilization %", yLabel: "mean ms", yMin: 0, yMax: 450, hlines: [{ y: Math.min(440, r.W), label: "now: " + ms(r.W), color: MX.css("--c-er") }] });
+    $("q-msg").textContent = rho >= 0.95 ? `At ${Math.round(rho * 100)}% busy the line rarely empties: mean ${ms(r.W)} for 20 ms of work, p99 ${ms(r.p99)}.` :
+      rho >= 0.8 ? "Past the knee: small increases in load now cost a lot of latency." :
+      r.W > 2 * S ? `Already ${(r.W / S).toFixed(1)}× the 20 ms of real work, all of it time spent waiting in line. The knee is coming.` :
+      "Below the knee: latency is close to the 20 ms of real work.";
+  }
+  $("q-r").oninput = queue; $("q-run").onclick = queue;
+  queue();
+
+  // ---------- load test ----------
+  const POD = 250, DB = 1800, DT = 5, T = 600, TIMEOUT = 2, SVC = 20;
+  const getShape = seg("lt-s", () => loadtest());
+  function rate(shape, t) {
+    if (shape === "ramp") return 100 + (2900 * t) / T;
+    return t >= 180 && t < 300 ? 1500 : 300;
+  }
+  function loadtest() {
+    const shape = getShape(), P0 = +$("lt-p").value, auto = $("lt-as").checked, lead = +$("lt-lead").value;
+    $("lt-pv").textContent = P0; $("lt-leadv").textContent = lead + " min";
+    let lowFor = 0, pods = P0, backlog = 0, err = 0, worst = 0, bp = null, bn = null, podSec = 0;
+    const pending = [], lamS = [], capS = [], p95S = [];
+    for (let t = 0; t < T; t += DT) {
+      const lam = rate(shape, t);
+      while (pending.length && pending[0].at <= t) pods = Math.max(pods, pending.shift().n);
+      if (auto) { // HPA-like: desired pods so app CPU sits near 60%, capped at 12
+        const want = Math.min(12, Math.max(P0, Math.ceil(lam / (POD * 0.6))));
+        const target = Math.max(pods, ...pending.map(p => p.n));
+        if (want > target) pending.push({ at: t + lead * 60, n: want });
+        if (want < pods && !pending.length) { lowFor += DT; if (lowFor >= 300) { pods = Math.max(P0, want); lowFor = 0; } } // scale down after 5 calm minutes
+        else lowFor = 0;
+      }
+      podSec += pods * DT;
+      const appCap = pods * POD, cap = Math.min(appCap, DB);
+      backlog = Math.max(0, backlog + (lam - cap) * DT);
+      let dropped = 0;
+      if (backlog > TIMEOUT * cap) { dropped = backlog - TIMEOUT * cap; backlog = TIMEOUT * cap; }
+      err += dropped;
+      const rho = Math.min(0.99, lam / cap);
+      const p95 = Math.min(TIMEOUT * 1000, 3 * SVC / (1 - rho) + 1000 * backlog / cap);
+      worst = Math.max(worst, p95);
+      if (bp === null && (p95 > 500 || dropped > 0.01 * lam * DT)) { bp = lam; bn = appCap <= DB ? "app pods (" + pods + " × 250 req/s)" : "database (1,800 q/s)"; }
+      lamS.push([t / 60, lam]); capS.push([t / 60, cap]); p95S.push([t / 60, p95]);
+    }
+    $("lt-bp").textContent = bp === null ? "not reached" : Math.round(bp).toLocaleString() + " req/s";
+    $("lt-bn").textContent = bn || "–";
+    $("lt-err").textContent = Math.round(err).toLocaleString();
+    $("lt-p95").textContent = ms(worst);
+    $("lt-ph").textContent = (podSec / 3600).toFixed(2);
+    Plot.line($("lt-c1"), { series: [{ label: "offered load (req/s)", color: MX.css("--c-cl"), data: lamS }, { label: "capacity (req/s)", color: MX.css("--c-db"), data: capS, dash: [6, 4] }], xLabel: "minutes", yMin: 0 });
+    Plot.line($("lt-c2"), { series: [{ label: "p95 latency (ms)", color: MX.css("--c-lt"), data: p95S, fill: true }], xLabel: "minutes", yMin: 0, yMax: 2100, hlines: [{ y: 500, label: "SLO 500 ms", color: MX.css("--c-er") }] });
+    $("lt-msg").textContent = bn && bn.startsWith("database") ? "The database is the wall. Adding app pods past this point only adds cost. Cache reads, add read replicas, or shard." :
+      shape === "spike" && auto && err > 0 ? `Autoscaling started adding pods, but they were ready ${lead} min later: the spike had already timed out ${Math.round(err).toLocaleString()} requests.` :
+      shape === "spike" && err === 0 ? "The spike was absorbed: enough capacity was there before it arrived." :
+      bp ? "Found the limit. Your safe operating point is well below it: plan peak traffic at 50–70% of this." : "Didn't break in this test. Push harder next time.";
+  }
+  ["lt-p", "lt-lead"].forEach(id => ($(id).oninput = loadtest));
+  $("lt-as").onchange = loadtest; $("lt-run").onclick = loadtest;
+  loadtest();
+})();
+</script>
+</body>
+</html>

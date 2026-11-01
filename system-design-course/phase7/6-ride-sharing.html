@@ -1,0 +1,561 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.6 Design ride sharing (Uber): geo at scale · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  #hex { width: 100%; height: 360px; display: block; border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); cursor: crosshair; }
+  .states { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: .8em 0; font-size: .85rem; }
+  .states span { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg2); font-family: var(--mono); }
+  .log { font-family: var(--mono); font-size: .82rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-height: 3.2em; max-height: 9em; overflow-y: auto; }
+</style>
+</head>
+<body data-lesson="s7-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 6</div>
+  <h1>Design ride sharing (Uber): geo at scale</h1>
+  <p class="subtitle">Track a million moving cars, find the closest free one to a rider in milliseconds, and make sure no car is ever sent to two riders. It's the classic “geospatial plus real-time plus consistency” design.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The design framework</b> (clarify → estimate → API → high-level → deep dives → wrap-up) from Lesson 7.1.</li>
+      <li><b>Sharding</b>: split data across machines by a key, and beware of hot keys (Lesson 2.4).</li>
+      <li><b>WebSockets and push</b>: the server sends updates without being asked (Lesson 0.4), and <b>Kafka</b> streams events between services (Lesson 3.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Uber divides the world into <b>hexagons</b>. Its 2018 post on <b>H3</b>, its open-source hexagonal grid, explains that it calculates <b>surge pricing</b> by measuring supply and demand in hexagons, and uses the grid to optimise pricing and dispatch.</p>
+    <p>And the apps used to ask the server “anything new?” over and over. Uber wrote that at one point <b>80% of requests to its backend API gateway were polling calls</b>, which led it to build a push platform. By the end of this lesson you'll know why both choices (hexagons and push) fall straight out of the numbers.</p>
+  </div>
+
+  <h2>Step 1 · Clarify the requirements</h2>
+  <p>Questions a senior candidate asks before drawing anything:</p>
+  <ul>
+    <li><b>Which flows?</b> Rider requests a ride, we match a nearby driver, both see each other move, the trip ends and is paid for. (Payments are Lesson 7.7; we'll call that service.)</li>
+    <li><b>How fresh must locations be?</b> A few seconds old is fine. A car moves about 50 m in 4 s at city speed.</li>
+    <li><b>What does “nearest” mean?</b> Closest by driving time (the <b>ETA</b>, estimated time of arrival), not straight-line distance. A driver across a river is not close.</li>
+    <li><b>Scale?</b> Global, but every match is local: a rider in Paris never needs a driver in Lima.</li>
+    <li><b>Surge, pooling, scheduled rides?</b> Mention surge; leave pooling and scheduling out of scope.</li>
+  </ul>
+  <table>
+    <tr><th>Functional</th><th>Non-functional</th></tr>
+    <tr><td>Drivers send their location; riders request rides</td><td>Match in a few seconds; location reads in milliseconds</td></tr>
+    <tr><td>Match a rider to a nearby available driver</td><td><b>Never assign one driver to two riders</b> (strong consistency for the assignment)</td></tr>
+    <tr><td>Both apps see live positions and ETA</td><td>Highly available: a dead server must not strand riders in a city</td></tr>
+    <tr><td>Trip lifecycle: requested → … → completed</td><td>Location data can be lossy; trip and payment data cannot</td></tr>
+  </table>
+
+  <h2>Step 2 · Numbers first</h2>
+  <p>Use round, clearly assumed numbers. Say them out loud in an interview: the interviewer cares about the reasoning.</p>
+  <table>
+    <tr><th>Assumption (typical, for the exercise)</th><th>Value</th></tr>
+    <tr><td>Drivers online at peak</td><td>1,000,000</td></tr>
+    <tr><td>Location update every</td><td>4 seconds</td></tr>
+    <tr><td>One update (driver id, lat, lng, heading, speed, timestamp)</td><td>about 100 bytes</td></tr>
+    <tr><td>Trips per day</td><td>20,000,000</td></tr>
+  </table>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: where the load really is</span>
+    <ul>
+      <li><b>Location writes:</b> 1,000,000 ÷ 4 s = <b class="er">250,000 writes per second</b>. Bandwidth: 250,000 × 100 B = <b>25 MB/s</b>. Easy to receive, hard to index if every write touches a disk-backed B-tree (Lesson 2.2).</li>
+      <li><b>Ride requests:</b> 20,000,000 ÷ 86,400 s ≈ <b>231 per second</b> on average; assume 3× at the evening peak ≈ <b>700 per second</b>. Each needs one “drivers near here” query.</li>
+      <li><b>Ratio:</b> about 350 location writes for every match query. This is a <b>write-heavy</b> system, and the writes are <b>ephemeral</b>: only the latest position matters.</li>
+      <li><b>History</b> (for trip receipts, fraud, ML): if every online driver's updates were kept all day, 1,000,000 × (86,400 ÷ 4) × 100 B = <b class="db">2.16 TB per day</b>, an upper bound. That goes to a cheap append-only store, not the matching path.</li>
+    </ul>
+    <p>Conclusion: keep <b>current</b> locations <b>in memory</b>, sharded by geography; stream the history to cheap storage asynchronously.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Turn a 2-D question (“who's near this point?”) into a 1-D lookup. Cut the map into <b>cells</b> with ids, keep a list of drivers per cell, and search the rider's cell and its neighbours, ring by ring. Every geospatial index (geohash, quadtree, S2, H3) is a different way of cutting the map.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: finding a friend at a festival</span>
+    <p>You don't ask all 80,000 people “are you Sam?”. The festival map has numbered zones. You check your own zone first, then the zones touching it, then the next ring out. And you'd rather the zones were hexagons than squares: from a hexagon, all six neighbours are the same distance away, so “one ring out” means the same thing in every direction.</p>
+  </div>
+
+  <h2>Step 3 · API and data model</h2>
+<pre><code><span class="c"># driver app: a stream of locations over a persistent connection (WebSocket / gRPC stream)</span>
+→ { "type": "loc", "driver_id": "d_77", "lat": 48.8566, "lng": 2.3522, "heading": 90, "ts": 1730390400 }
+
+<span class="c"># rider app</span>
+POST /v1/trips   { "pickup": {"lat": …, "lng": …}, "dropoff": {…}, "product": "standard" }
+                 Idempotency-Key: 7d1c…            <span class="c"># a retried tap must not order two cars (Lesson 3.3)</span>
+  → 202 { "trip_id": "t_123", "status": "MATCHING" }
+GET  /v1/trips/t_123                               <span class="c"># fallback; live updates arrive by push</span>
+
+<span class="c"># server → driver (push): an offer that expires</span>
+← { "type": "offer", "trip_id": "t_123", "pickup": {…}, "expires_in_s": 15 }
+POST /v1/trips/t_123/accept   (driver)             → 200 | 409 Conflict (offer expired / taken)</code></pre>
+  <table>
+    <tr><th>Data</th><th>Store</th><th>Why</th></tr>
+    <tr><td>Current location per driver + per-cell sets of available drivers</td><td><span class="ca">In memory</span> (Redis or the location service's own RAM), sharded by region</td><td>250k writes/s, only the latest value matters, losing it costs 4 s</td></tr>
+    <tr><td>Driver status: <code>AVAILABLE / OFFERED / ON_TRIP / OFFLINE</code></td><td><span class="db">Strongly consistent store</span> with conditional writes</td><td>The “one driver, one rider” guarantee lives here</td></tr>
+    <tr><td><code>trips(trip_id, rider_id, driver_id, status, pickup, dropoff, fare, timestamps)</code></td><td><span class="db">SQL</span>, sharded by city or trip id</td><td>Money and history: transactions, audits</td></tr>
+    <tr><td>Location history</td><td><span class="db">Append-only</span> (Kafka → Cassandra / object storage)</td><td>Terabytes a day, written once, read rarely</td></tr>
+  </table>
+
+  <h2>Step 4 · High-level design</h2>
+  <p>Three flows: a firehose of <b class="nw">locations</b> into an in-memory geo index, a small stream of <b class="cl">ride requests</b> that query it, and <b class="ca">push</b> updates back to both phones.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The location firehose and the double-dispatch race</span>
+    <p class="hint">Set the fleet and how often drivers report. The three geo shards show the busiest, a typical, and the quietest shard. Turn on <b>New Year's Eve</b> (30% of all drivers in one city) with <b>shard by city</b> and watch one shard melt; switch to <b>shard by cell</b>. Then press <b>Two riders, one driver</b> with and without the <b>conditional write</b> to see a double dispatch happen.</p>
+    <svg id="pipe"></svg>
+    <div class="controls">
+      <label>drivers online <input type="range" id="drv" min="0" max="5" step="1" value="3"> <b class="mono" id="drvV"></b></label>
+      <label>update every <input type="range" id="intv" min="0" max="4" step="1" value="2"> <b class="mono" id="intvV"></b></label>
+      <label>geo shards <input type="range" id="shards" min="0" max="5" step="1" value="2"> <b class="mono" id="shardsV"></b></label>
+    </div>
+    <div class="controls">
+      <span class="hint">Shard key:</span>
+      <span class="seg" id="skey"><button id="skey-city" data-v="city" class="on">by city</button><button id="skey-cell" data-v="cell">by H3 cell</button></span>
+      <label><input type="checkbox" id="nye"> 🎆 New Year's Eve in one city</label>
+      <label><input type="checkbox" id="parked"> skip updates from parked drivers (assume 40% are parked)</label>
+    </div>
+    <div class="controls">
+      <button class="btn" id="sendLoc">📍 Send location updates</button>
+      <label><input type="checkbox" id="cas" checked> conditional write (only if AVAILABLE)</label>
+      <button class="btn primary" id="race">🏁 Two riders, one driver</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">location writes/s <b id="pQps">–</b></div>
+      <div class="stat">ingress <b id="pIn">–</b></div>
+      <div class="stat">history/day (max) <b id="pHist">–</b></div>
+      <div class="stat">busiest shard <b id="pHot">–</b></div>
+    </div>
+    <p class="hint" id="pMsg"></p>
+    <div class="log" id="raceLog">Race log.</div>
+  </div>
+
+  <h2>Step 5 · Deep dives</h2>
+  <h3>Deep dive 1: the geospatial index</h3>
+  <p>Why not just SQL? <code>SELECT … WHERE lat BETWEEN a AND b AND lng BETWEEN c AND d</code> can use an index on one column, but then filters a whole strip of the planet on the other. And rewriting 250,000 rows a second in a disk-backed index is the wrong tool. The four common ways to cut the map:</p>
+  <table>
+    <tr><th>Index</th><th>How it cuts the map</th><th>Good at</th><th>Watch out for</th></tr>
+    <tr><td><b>Geohash</b></td><td>Repeatedly halve lat/lng; interleave the bits into a string. Nearby points share a prefix (<code>u09tv…</code>)</td><td>Simple; works in any key-value store; Redis GEO uses it</td><td>Two points across a cell edge can have very different prefixes: always check neighbours</td></tr>
+    <tr><td><b>Quadtree</b></td><td>Split a square into 4 whenever it holds too many points</td><td>Adapts to density: small cells downtown, big ones in the countryside</td><td>A tree in memory; rebalancing as cars move</td></tr>
+    <tr><td><b>S2</b> (Google)</td><td>Project the globe onto a cube, then a quadtree of squares on each face, ordered along a space-filling curve</td><td>Precise coverings of any shape; tested on Google's geographic data</td><td>Squares: diagonal neighbours are farther than edge neighbours</td></tr>
+    <tr><td><b>H3</b> (Uber)</td><td>Hexagons on an icosahedron, 16 resolutions, each about 7× finer than the last</td><td>All 6 neighbours equidistant; great for “rings” and for aggregating supply/demand</td><td>A few cells aren't hexagons: 12 pentagons per resolution (placed in the oceans)</td></tr>
+  </table>
+  <p>Sizes to know (H3's published averages): resolution 7 cells are about <b>5.2 km²</b>, resolution 8 about <b>0.74 km²</b>, resolution 9 about <b>0.11 km²</b> (a few hundred metres across). Matching typically searches at a fine resolution; surge and analytics aggregate at coarser ones.</p>
+
+  <h3>Deep dive 2: matching with an expanding radius</h3>
+  <p>The algorithm: look up the rider's cell, collect available drivers in it; if too few, add the ring of neighbours (k = 1), then k = 2, and so on up to a maximum radius. With hexagons, k rings cover 1 + 3k(k + 1) cells: 1, 7, 19, 37, 61. Then rank the candidates by <b>ETA</b> from a routing service (road graph + live traffic), not by straight-line distance, and offer the trip to the best one.</p>
+  <p>Subtle bug: the first ring that contains a driver doesn't necessarily contain the <b>nearest</b> driver. A driver just across the edge of the next ring can be closer than one in a far corner of this ring. Fix: once you've found enough candidates, search <b>one more ring</b>, then sort by real distance (or ETA). Try to catch it:</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Nearest driver, ring by ring</span>
+    <p class="hint">Each hexagon is about an H3 resolution-9 cell (~0.35 km between centres). <b>Click the map</b> to place a rider, then press <b>Search</b> to watch rings expand. Lower the density to see a suburb: many rings, longer pickups, maybe “no cars nearby”. Use <b>Find a tricky spot</b> with “stop at first ring” to catch the edge bug, then switch to “+1 ring, sort by distance”.</p>
+    <canvas id="hex"></canvas>
+    <div class="controls">
+      <label>drivers on this map <input type="range" id="dens" min="0" max="4" step="1" value="2"> <b class="mono" id="densV"></b></label>
+      <label>candidates wanted <input type="range" id="need" min="1" max="5" step="1" value="1"> <b class="mono" id="needV"></b></label>
+      <span class="seg" id="mode"><button id="mode-first" data-v="first" class="on">Stop at first ring</button><button id="mode-plus" data-v="plus">+1 ring, sort by distance</button></span>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="search">🔍 Search</button>
+      <button class="btn" id="tricky">🎯 Find a tricky spot</button>
+      <button class="btn" id="shuffle">🔀 Move the drivers</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">rings searched <b id="hRings">–</b></div>
+      <div class="stat">cells checked <b id="hCells">–</b></div>
+      <div class="stat">drivers examined <b id="hDrv">–</b> <span class="muted" id="hAll"></span></div>
+      <div class="stat">picked driver <b id="hPick">–</b></div>
+      <div class="stat">true nearest <b id="hTrue">–</b></div>
+    </div>
+    <p class="hint" id="hMsg"></p>
+  </div>
+
+  <h3>Deep dive 3: the trip state machine and “one driver, one rider”</h3>
+  <p>Every trip moves through explicit states, and every transition is a conditional write (“move to X only if currently Y”):</p>
+  <div class="states">
+    <span>REQUESTED</span>→<span>MATCHING</span>→<span>DRIVER_OFFERED</span>→<span>DRIVER_ASSIGNED</span>→<span>DRIVER_ARRIVED</span>→<span>IN_PROGRESS</span>→<span>COMPLETED</span>
+    <span class="er">CANCELLED</span> <span class="muted">(from any state before IN_PROGRESS)</span>
+  </div>
+  <p>The dangerous moment is the offer. Two matchers, serving two nearby riders, both see driver d_77 as available. If both just write “d_77 → OFFERED”, the driver gets two trips. The fix is a <b>compare-and-set</b>: an atomic write that succeeds only if the current value is what you expected.</p>
+<pre><code><span class="c">-- SQL: only one of two concurrent matchers gets rowcount = 1</span>
+UPDATE drivers SET status = 'OFFERED', trip_id = 't_123', offer_expires = now() + interval '15 seconds'
+ WHERE driver_id = 'd_77' AND status = 'AVAILABLE';
+
+<span class="c"># Redis: a lease that disappears by itself if the driver never answers</span>
+SET driver:d_77:lock t_123 NX EX 15</code></pre>
+  <p>The offer has a <b>timeout</b>: the <code>EX 15</code> is a <b>TTL</b> (time to live), so if the driver doesn't accept in 15 s, the lease expires, the driver returns to AVAILABLE, and matching moves to the next candidate. The same pattern (state machine + conditional writes + timeouts) shows up again in payments (Lesson 7.7).</p>
+
+  <h3>Live updates: push, not poll</h3>
+  <p>During a trip both phones want the other party's position every few seconds. If a million riders polled every 4 s, that's another 250,000 requests a second that mostly answer “nothing new”. Instead, keep one persistent connection per phone (WebSocket, gRPC stream, or MQTT, a lightweight messaging protocol built for phones and devices) and <b>push</b> updates to it, with mobile push notifications (Lesson 7.8) as a fallback when the app is in the background.</p>
+  <p><b>Surge</b> (mention, don't design unless asked): count open requests and available drivers per coarse hexagon every minute or so; where demand far exceeds supply, raise the price multiplier for that area. It's a stream-processing job (Lesson 3.6) over the same location and request events.</p>
+
+  <h2>Step 6 · Bottlenecks and the scaling path</h2>
+  <table>
+    <tr><th>Stage</th><th>What you run</th><th>What breaks next</th></tr>
+    <tr><td><b>v1 · one city</b> (a few thousand drivers)</td><td>One service + Postgres with PostGIS, or Redis <code>GEOADD</code>/<code>GEOSEARCH</code>; polling every 5 s; a map provider's ETA API</td><td>Polling load and ETA API costs; one Redis is a single point of failure</td></tr>
+    <tr><td><b>v2 · a few countries</b></td><td>Location service with in-memory H3 cell index, sharded by region; Kafka for location events; WebSocket gateway for push; conditional writes for dispatch</td><td>Hot regions (big events, airports); cross-shard searches at region edges</td></tr>
+    <tr><td><b>v3 · 100M riders</b></td><td>Fine-grained cell sharding with consistent hashing (Lesson 2.4), replicated in-memory state, cell-based regional deployments, own routing/ETA engine with machine-learning corrections, batched matching (match many riders and drivers together every few seconds)</td><td>Marketplace quality: wait times, utilisation, fairness</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>H3</b> (Uber, open source, bindings for many languages), <b>Google S2</b>, <b>PostGIS</b> (geo for Postgres), <b>Redis GEO</b> commands, <b>Elasticsearch / OpenSearch</b> geo queries, <b>OSRM</b> or <b>Valhalla</b> (open-source routing for ETA), managed <b>Google Maps Platform</b> / <b>Mapbox</b> APIs; <b>Kafka</b> for the location stream.</p>
+<pre><code><span class="c"># Redis GEO (geohash under the hood): add drivers, then search around a rider</span>
+GEOADD drivers:available 2.3522 48.8566 d_77 2.3601 48.8590 d_12
+GEOSEARCH drivers:available FROMLONLAT 2.3530 48.8570 BYRADIUS 2 km ASC COUNT 5 WITHDIST</code></pre>
+<pre><code><span class="k">import</span> h3                                        <span class="c"># pip install h3  (v4 API)</span>
+cell = h3.latlng_to_cell(<span class="n">48.8566</span>, <span class="n">2.3522</span>, <span class="n">9</span>)      <span class="c"># the rider's resolution-9 hexagon</span>
+ring1 = h3.grid_disk(cell, <span class="n">1</span>)                      <span class="c"># 7 cells: itself + 6 neighbours</span>
+candidates = [d <span class="k">for</span> c <span class="k">in</span> ring1 <span class="k">for</span> d <span class="k">in</span> drivers_by_cell.get(c, ())]</code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 6379:6379 redis</code>, then run the two GEO commands above in <code>redis-cli</code>. Add a few more drivers and change the radius.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Decision</th><th>Option A</th><th>Option B</th></tr>
+      <tr><td>Update interval</td><td><b>1–2 s</b>: smooth cars on the map, fresher matches; 2–4× the writes and battery</td><td><b>5–10 s</b>: cheap; positions up to ~100 m stale. Middle ground: adaptive (faster when moving or on a trip)</td></tr>
+      <tr><td>Index</td><td><b>Redis GEO / PostGIS</b>: off the shelf, fine for one city</td><td><b>Own in-memory H3/S2 cell index</b>: scales, but you run it</td></tr>
+      <tr><td>Shard key</td><td><b>By city</b>: simple, local queries; hot cities melt shards</td><td><b>By cell</b>: spreads load; searches near cell-group edges touch two shards</td></tr>
+      <tr><td>Matching</td><td><b>Greedy</b>: nearest driver per request, instantly</td><td><b>Batched</b>: collect requests for a few seconds and optimise globally; better total wait times, slight delay</td></tr>
+      <tr><td>Nearest</td><td><b>Straight line</b>: free</td><td><b>ETA</b>: correct (rivers, one-way streets), costs a routing call per candidate</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Launch in one city with Postgres + PostGIS or Redis GEO, a hosted maps API for ETA, polling every few seconds, and a conditional <code>UPDATE</code> for dispatch. That handles thousands of drivers. Spend your effort on the trip state machine and payments: those bugs cost money and trust.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Hexagon-indexed in-memory location services sharded across a ring of nodes, Kafka everywhere, a push platform holding millions of connections, in-house routing and ETA models, batched marketplace matching, surge computed per hexagon, and cell-based regional isolation so one city's outage doesn't spread.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <ul>
+      <li>Do the estimate and say the punchline: <b>location writes dominate</b> (hundreds of thousands per second) and are <b>ephemeral</b>, so they belong in memory.</li>
+      <li>Name a <b>geo index</b> and explain how a “nearby” search works, including <b>neighbour cells</b> and <b>expanding rings</b>.</li>
+      <li>Rank by <b>ETA</b>, not distance.</li>
+      <li>Show the <b>trip state machine</b> and how a <b>conditional write + offer timeout</b> prevents double dispatch.</li>
+      <li>Push instead of polling for live updates; shard by geography and handle <b>hot regions</b>.</li>
+    </ul>
+    <p><b>Common mistakes:</b> storing every location in SQL and querying with <code>BETWEEN</code>; ignoring cell edges; no story for two matchers grabbing the same driver. <b>Likely follow-ups:</b> “A stadium empties: 50,000 requests in one hexagon. What happens?”, “A location shard dies: how fast do you recover?” (drivers resend every 4 s: rebuild from the stream), “How would you add pooled rides?”, “How do you compute surge?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Hexagonal grid for pricing and dispatch</b> <span class="tag co">🏢 Uber · 2018</span> <a href="https://www.uber.com/blog/h3/" target="_blank" rel="noopener">H3: Uber's Hexagonal Hierarchical Spatial Index</a></div>
+      <p><b>How:</b> the world is covered by hexagons at 16 resolutions; Uber measures supply and demand per hexagon to calculate surge pricing and to optimise dispatch.</p>
+      <p><b>Why this method:</b> hexagons have equidistant neighbours and minimise the error when people move through a city, so rings and gradients behave the same in every direction.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Push instead of polling</b> <span class="tag co">🏢 Uber · 2020</span> <a href="https://www.uber.com/blog/real-time-push-platform/" target="_blank" rel="noopener">Uber's Real-Time Push Platform</a></div>
+      <p><b>How:</b> at one point 80% of requests to Uber's backend API gateway were polling calls. Its push platform (RAMEN) later ran with more than 1.5 million concurrent connections, pushing over 250,000 messages per second.</p>
+      <p><b>Why this method:</b> polling drained batteries, slowed the app and loaded the backend with “nothing new” answers; one long-lived connection carries only real changes.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A consistent hash ring for app servers</b> <span class="tag oss">🧰 Open source · Uber</span> <a href="https://github.com/uber/ringpop-node" target="_blank" rel="noopener">Ringpop</a></div>
+      <p><b>How:</b> a library that keeps a consistent hash ring on top of a membership protocol and forwards each request to the node that owns its key.</p>
+      <p><b>Why this method:</b> it lets a stateful in-memory service (like “who owns this area's drivers”) be spread over many nodes that agree on ownership as nodes come and go (Lesson 2.4).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Spherical geometry on a cube</b> <span class="tag oss">🧰 Open source · Google</span> <a href="https://s2geometry.io/" target="_blank" rel="noopener">S2 Geometry</a></div>
+      <p><b>How:</b> a library for cells, coverings and spatial indexing on the sphere, tested extensively on Google's geographic data.</p>
+      <p><b>Why this method:</b> working on the sphere avoids the distortions of flat lat/lng math, and cell ids turn regions into ranges of integers any database can index.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Geo search in a cache</b> <span class="tag prod">🏭 In production · Redis</span> <a href="https://redis.io/docs/latest/commands/geosearch/" target="_blank" rel="noopener">Redis GEOSEARCH</a></div>
+      <p><b>How:</b> members are stored in a sorted set whose scores are geohashes (latitude and longitude bits interleaved into one 52-bit integer); <code>GEOSEARCH … BYRADIUS … ASC COUNT</code> returns the closest ones, in O(N + log M) time.</p>
+      <p><b>Why this method:</b> one command gives a startup a working “drivers near me” in memory, long before it needs its own index.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · you can't tile a ball with hexagons</span>
+    <p>It's mathematically impossible to cover a sphere with hexagons alone. So every H3 resolution contains <b>exactly 12 pentagons</b>, one at each corner of the underlying icosahedron (a 20-sided die). H3 places those corners over the oceans, so they almost never matter for a ride in a city. A football makes the same compromise: 12 black pentagons among the hexagons.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This design reuses sharding and hot keys (Lesson 2.4), in-memory stores (Lesson 1.3), Kafka (Lesson 3.2), idempotent requests (Lesson 3.3), stream processing for surge (Lesson 3.6) and push connections like chat's (Lesson 7.4). The state machine with conditional writes returns in payments (Lesson 7.7), and push fallbacks in notifications (Lesson 7.8). In AI systems, ETA prediction is a classic ML service: a model that corrects the routing engine's estimate from live data.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://h3geo.org/docs/core-library/restable" target="_blank" rel="noopener">H3 cell statistics by resolution</a>. Areas and counts for all 16 resolutions; handy for estimates.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/uber/h3" target="_blank" rel="noopener">uber/h3 on GitHub</a>. The C library and links to bindings for Python, Java, JavaScript and more.</li>
+      <li><span class="kind">Blog</span> <a href="https://www.uber.com/blog/real-time-push-platform/" target="_blank" rel="noopener">Uber's Real-Time Push Platform</a>. Why polling hurt and how a push system for millions of phones is built.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 2,000,000 drivers are online and each sends a location every 5 seconds. How many location writes per second must the system absorb?</div>
+    <div class="opts"><button class="opt">40,000</button><button class="opt" data-ok>400,000</button><button class="opt">10,000,000</button></div>
+    <div class="explain">2,000,000 ÷ 5 s = <b>400,000 writes/s</b>. That's why current locations live in memory, sharded by geography, and only the history goes to disk, asynchronously.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your matcher returns the first driver found while expanding hexagon rings. Riders sometimes get a car that's farther than another available one. Why, and what's the fix?</div>
+    <div class="opts"><button class="opt">Hexagons are inaccurate; switch to squares</button><button class="opt" data-ok>A closer driver can sit just across the edge in the next ring; search one more ring, then sort by distance or ETA</button><button class="opt">The location updates are too slow; send them every second</button></div>
+    <div class="explain">Rings are a coarse filter. Cells are hundreds of metres wide, so the first ring with a driver bounds the answer but doesn't settle it. One extra ring plus a real ranking (ideally by ETA) fixes it cheaply. Squares would make the problem worse, not better.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Two matchers, serving two riders, both read driver d_77 as AVAILABLE and both send an offer. What's the right design?</div>
+    <div class="opts"><button class="opt">Read the driver's status twice before writing</button><button class="opt">Put both offers in a queue and let the driver choose</button><button class="opt" data-ok>A conditional write (“set OFFERED only if AVAILABLE”) or a lease with a TTL, so only one matcher wins and the loser tries the next driver</button></div>
+    <div class="explain">Reading twice still races. A compare-and-set makes the check and the write one atomic step; a TTL on the offer frees the driver if they never answer. This is the same idea as optimistic concurrency in Lesson 2.5.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>1M drivers × one update per 4 s = 250k writes/s of ephemeral data: keep current locations in memory, history in cheap append-only storage.</li>
+      <li>Cut the map into cells (geohash, quadtree, S2, H3) and search the rider's cell and neighbouring rings; search one extra ring, then rank by ETA.</li>
+      <li>Trips are an explicit state machine; a conditional write + offer timeout guarantees one driver per rider.</li>
+      <li>Push over persistent connections instead of polling; shard by geography and plan for hot regions.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- pipeline flow + estimator ----------
+  const F = new Flow($("pipe"), { width: 720, height: 300 });
+  F.node("drivers", { x: 70, y: 60, label: "🚗 Drivers", sub: "", kind: "cl" })
+   .node("gw", { x: 220, y: 60, label: "Location gateway", sub: "WebSockets", kind: "sv", w: 120 })
+   .node("kafka", { x: 380, y: 60, label: "Kafka", sub: "locations", kind: "nw" })
+   .node("hist", { x: 560, y: 60, label: "🗄️ History", sub: "append-only", kind: "db" })
+   .node("s1", { x: 380, y: 160, label: "Geo shard (busiest)", sub: "", kind: "sv", w: 140 })
+   .node("s2", { x: 540, y: 160, label: "Geo shard (typical)", sub: "", kind: "sv", w: 140 })
+   .node("s3", { x: 690, y: 160, label: "quietest", sub: "", kind: "sv", w: 56 })
+   .node("riders", { x: 70, y: 250, label: "👤 Riders", sub: "", kind: "cl" })
+   .node("match", { x: 220, y: 250, label: "Matcher", sub: "", kind: "sv" })
+   .node("state", { x: 460, y: 250, label: "🗄️ Driver status", sub: "conditional writes", kind: "db", w: 140 })
+   .edge("drivers", "gw").edge("gw", "kafka").edge("kafka", "hist").edge("kafka", "s1").edge("kafka", "s2")
+   .edge("riders", "match").edge("match", "s1", { dashed: true, label: "nearby?" }).edge("match", "state").render();
+  const DRV = [10000, 100000, 500000, 1000000, 2000000, 5000000], INT = [1, 2, 4, 8, 15], SH = [1, 4, 16, 32, 64, 128];
+  const CAP = 50000; // assumed updates/s one in-memory geo shard can index
+  // 200 cities with Zipf-like popularity; each city has 60 cells
+  const CITY = Array.from({ length: 200 }, (_, i) => 1 / Math.pow(i + 1, 0.9));
+  const cityTot = MX.sum(CITY);
+  function shardShares(nShards, byCell, nye) {
+    const shares = CITY.map(w => w / cityTot);
+    if (nye) { const rest = 1 - shares[0]; for (let i = 1; i < shares.length; i++) shares[i] *= 0.7 / rest; shares[0] = 0.3; }
+    const rng = MX.seeded(5), load = new Array(nShards).fill(0);
+    shares.forEach(sh => {
+      if (byCell) for (let c = 0; c < 60; c++) load[Math.floor(rng() * nShards)] += sh / 60;
+      else load[Math.floor(rng() * nShards)] += sh;
+    });
+    return load.sort((a, b) => b - a);
+  }
+  const getKey = seg("skey", () => est());
+  let qps = 0;
+  function est() {
+    const n = DRV[+$("drv").value], iv = INT[+$("intv").value], S = SH[+$("shards").value];
+    $("drvV").textContent = n.toLocaleString(); $("intvV").textContent = iv + " s"; $("shardsV").textContent = S;
+    qps = n / iv * ($("parked").checked ? 0.6 : 1);
+    const loads = shardShares(S, getKey() === "cell", $("nye").checked);
+    const hot = loads[0] * qps, mid = loads[Math.floor(S / 2)] * qps, cold = loads[S - 1] * qps;
+    $("pQps").textContent = Math.round(qps).toLocaleString();
+    $("pIn").textContent = (qps * 100 / 1e6).toFixed(1) + " MB/s";
+    $("pHist").textContent = (qps * 100 * 86400 / 1e12).toFixed(2) + " TB";
+    $("pHot").textContent = Math.round(hot).toLocaleString() + "/s (" + Math.round(100 * hot / CAP) + "%)";
+    $("pHot").style.color = hot > CAP ? MX.css("--c-er") : "";
+    F.set("drivers", { sub: n.toLocaleString() + " online" }).set("gw", { sub: Math.round(qps).toLocaleString() + "/s", load: Math.min(1, qps / 2e6) })
+     .set("s1", { sub: Math.round(hot).toLocaleString() + "/s", load: Math.min(1, hot / CAP), down: hot > CAP * 1.2, hot: hot > CAP })
+     .set("s2", { sub: Math.round(mid).toLocaleString() + "/s", load: Math.min(1, mid / CAP) })
+     .set("s3", { sub: Math.round(cold).toLocaleString(), load: Math.min(1, cold / CAP) });
+    const need = Math.ceil(qps / (CAP * 0.7));
+    $("pMsg").textContent = hot > CAP ? `💥 The busiest shard needs ${Math.round(hot).toLocaleString()} writes/s but one shard handles about ${CAP.toLocaleString()} (assumed). ` +
+        (getKey() === "city" && $("nye").checked ? "One city is 30% of all traffic and a city can't be split: shard by cell instead." : `Add shards (at 70% target utilisation you need about ${need}), or send updates less often.`) :
+      `Every shard is under its assumed capacity of ${CAP.toLocaleString()} writes/s. Busiest: ${Math.round(100 * hot / CAP)}%.`;
+  }
+  ["drv", "intv", "shards"].forEach(id => ($(id).oninput = est));
+  ["nye", "parked"].forEach(id => ($(id).onchange = est));
+  est();
+  let busy = false;
+  $("sendLoc").onclick = async () => {
+    if (busy) return; busy = true;
+    await Promise.all([0, 1, 2, 3].map(i => sleep(i * 160).then(() => F.packet(["drivers", "gw", "kafka", i % 2 ? "s2" : "s1"], { color: "--c-nw", dur: 700 }))));
+    await F.packet(["kafka", "hist"], { color: "--c-db", dur: 400 });
+    busy = false;
+  };
+  const rlog = t => { $("raceLog").innerHTML = t + "<br>" + $("raceLog").innerHTML; };
+  $("race").onclick = async () => {
+    if (busy) return; busy = true;
+    const cas = $("cas").checked;
+    rlog("— Rider A and rider B request rides 200 m apart. Both matchers find d_77 as the nearest AVAILABLE driver.");
+    F.set("state", { sub: "d_77: AVAILABLE", hot: false, down: false });
+    await Promise.all([F.packet(["riders", "match", "s1"], { color: "--c-cl", dur: 500, back: true }), sleep(120).then(() => F.packet(["riders", "match", "s1"], { color: "--c-lt", dur: 500, back: true }))]);
+    if (cas) {
+      rlog("Matcher A: UPDATE … SET status='OFFERED' WHERE status='AVAILABLE' → 1 row ✅");
+      await F.packet(["match", "state"], { color: "--c-cl", dur: 400 });
+      F.set("state", { sub: "d_77: OFFERED to A" });
+      rlog("Matcher B: same UPDATE → 0 rows ❌ (already OFFERED). B moves on to the next candidate, d_12.");
+      await F.packet(["match", "state"], { color: "--c-lt", dur: 400, back: true });
+      rlog("✅ One driver, one rider. A's offer expires in 15 s if d_77 doesn't answer.");
+    } else {
+      rlog("Matcher A: SET status='OFFERED', trip=A (no condition)");
+      await F.packet(["match", "state"], { color: "--c-cl", dur: 400 });
+      rlog("Matcher B: SET status='OFFERED', trip=B (overwrites A!)");
+      await F.packet(["match", "state"], { color: "--c-er", dur: 400 });
+      F.set("state", { sub: "d_77: 2 offers!", hot: true, down: true });
+      rlog("💥 Double dispatch: d_77's phone shows trip B, rider A also sees d_77 coming. One rider is stranded. Turn on the conditional write.");
+    }
+    busy = false;
+  };
+
+  // ---------- hex grid nearest driver ----------
+  const cv = $("hex"), S3 = Math.sqrt(3), SIZE = 17, KM_PER_STEP = 0.35, MAXK = 8;
+  const DENS = [8, 25, 80, 250, 800];
+  let W = 0, H = 0, cells = new Map(), drivers = [], rider = null, highlight = new Set(), picked = null, trueNear = null, seed = 3, ringNow = -1;
+  const key = (q, r) => q + "," + r;
+  const center = (q, r) => [SIZE * S3 * (q + r / 2) + 20, SIZE * 1.5 * r + 22];
+  const toHex = (x, y) => {
+    x -= 20; y -= 22;
+    let q = (S3 / 3 * x - y / 3) / SIZE, r = (2 / 3 * y) / SIZE, s = -q - r;
+    let rq = Math.round(q), rr = Math.round(r), rs = Math.round(s);
+    const dq = Math.abs(rq - q), dr = Math.abs(rr - r), ds = Math.abs(rs - s);
+    if (dq > dr && dq > ds) rq = -rr - rs; else if (dr > ds) rr = -rq - rs;
+    return [rq, rr];
+  };
+  const DIRS = [[1, 0], [1, -1], [0, -1], [-1, 0], [-1, 1], [0, 1]];
+  const ring = (q, r, k) => {
+    if (k === 0) return [[q, r]];
+    const out = []; let cq = q + DIRS[4][0] * k, cr = r + DIRS[4][1] * k;
+    for (let i = 0; i < 6; i++) for (let j = 0; j < k; j++) { out.push([cq, cr]); cq += DIRS[i][0]; cr += DIRS[i][1]; }
+    return out;
+  };
+  function layout() {
+    W = cv.clientWidth || 700; H = cv.clientHeight || 360;
+    const dpr = window.devicePixelRatio || 1; cv.width = W * dpr; cv.height = H * dpr;
+    cv.getContext("2d").setTransform(dpr, 0, 0, dpr, 0, 0);
+    cells = new Map();
+    const rows = Math.floor((H - 30) / (SIZE * 1.5)) + 1, cols = Math.floor((W - 30) / (SIZE * S3)) + 1;
+    for (let r = 0; r < rows; r++) for (let c = 0; c < cols; c++) { const q = c - Math.floor(r / 2); cells.set(key(q, r), { q, r, d: [] }); }
+  }
+  function placeDrivers() {
+    const n = DENS[+$("dens").value], rng = MX.seeded(seed);
+    $("densV").textContent = n;
+    cells.forEach(c => (c.d = []));
+    drivers = [];
+    let tries = 0;
+    while (drivers.length < n && tries++ < n * 20) {
+      const x = 20 + rng() * (W - 40), y = 20 + rng() * (H - 40), [q, r] = toHex(x, y), c = cells.get(key(q, r));
+      if (!c) continue;
+      const d = { id: drivers.length, x, y }; drivers.push(d); c.d.push(d);
+    }
+  }
+  function draw() {
+    const ctx = cv.getContext("2d"); ctx.clearRect(0, 0, W, H);
+    const line = MX.css("--line"), ca = MX.css("--c-ca"), cl = MX.css("--c-cl"), sv = MX.css("--c-sv"), er = MX.css("--c-er"), good = MX.css("--c-db");
+    cells.forEach(c => {
+      const [x, y] = center(c.q, c.r);
+      ctx.beginPath();
+      for (let i = 0; i < 6; i++) { const a = Math.PI / 180 * (60 * i - 30); ctx.lineTo(x + SIZE * Math.cos(a), y + SIZE * Math.sin(a)); }
+      ctx.closePath();
+      if (highlight.has(key(c.q, c.r))) { ctx.fillStyle = ca + "33"; ctx.fill(); }
+      ctx.strokeStyle = line; ctx.lineWidth = 1; ctx.stroke();
+    });
+    drivers.forEach(d => { ctx.beginPath(); ctx.arc(d.x, d.y, 3.2, 0, 7); ctx.fillStyle = sv; ctx.fill(); });
+    if (trueNear && picked && trueNear !== picked) { ctx.beginPath(); ctx.arc(trueNear.x, trueNear.y, 8, 0, 7); ctx.strokeStyle = good; ctx.lineWidth = 2.5; ctx.stroke(); }
+    if (picked && rider) {
+      ctx.beginPath(); ctx.moveTo(rider.x, rider.y); ctx.lineTo(picked.x, picked.y); ctx.strokeStyle = trueNear === picked ? good : er; ctx.lineWidth = 2; ctx.stroke();
+      ctx.beginPath(); ctx.arc(picked.x, picked.y, 7, 0, 7); ctx.strokeStyle = trueNear === picked ? good : er; ctx.stroke();
+    }
+    if (rider) { ctx.beginPath(); ctx.arc(rider.x, rider.y, 6, 0, 7); ctx.fillStyle = cl; ctx.fill(); ctx.strokeStyle = "#fff"; ctx.lineWidth = 2; ctx.stroke(); }
+    ctx.font = "12px " + MX.css("--font");
+    ctx.beginPath(); ctx.arc(14, H - 12, 3.2, 0, 7); ctx.fillStyle = sv; ctx.fill();
+    ctx.beginPath(); ctx.arc(70, H - 12, 5, 0, 7); ctx.fillStyle = cl; ctx.fill();
+    ctx.fillStyle = MX.css("--muted");
+    ctx.fillText("driver", 22, H - 8); ctx.fillText("rider" + (ringNow >= 0 ? "    ring k = " + ringNow : ""), 80, H - 8);
+  }
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y) / (SIZE * S3) * KM_PER_STEP;
+  // pure search: returns the full trace without drawing
+  function searchTrace(rd, mode, need) {
+    const [q0, r0] = toHex(rd.x, rd.y), rings = [];
+    let found = [], firstK = -1, cellsChecked = 0;
+    for (let k = 0; k <= MAXK; k++) {
+      const rc = ring(q0, r0, k).map(([q, r]) => cells.get(key(q, r))).filter(Boolean);
+      cellsChecked += rc.length; rings.push(rc);
+      rc.forEach(c => found.push(...c.d));
+      if (found.length >= need && firstK < 0) firstK = k;
+      if (firstK >= 0 && (mode === "first" || k >= firstK + 1)) break;
+    }
+    let pick = null;
+    if (found.length) {
+      // both modes sort what they found by real distance; "first" just stops searching too early
+      pick = found.slice().sort((a, b) => dist(a, rd) - dist(b, rd))[0];
+    }
+    const tn = drivers.length ? drivers.reduce((b, d) => (dist(d, rd) < dist(b, rd) ? d : b), drivers[0]) : null;
+    return { rings, found, cellsChecked, pick, tn, k: rings.length - 1 };
+  }
+  const getMode = seg("mode", () => { clearResult(); if (rider) runSearch(false); });
+  function clearResult() { highlight = new Set(); picked = null; trueNear = null; ringNow = -1; ["hRings", "hCells", "hDrv", "hPick", "hTrue"].forEach(id => ($(id).textContent = "–")); $("hAll").textContent = ""; }
+  let anim = 0;
+  async function runSearch(animate) {
+    if (!rider) rider = { x: W / 2, y: H / 2 };
+    const my = ++anim, need = +$("need").value, tr = searchTrace(rider, getMode(), need);
+    highlight = new Set(); picked = null; trueNear = null;
+    for (let k = 0; k < tr.rings.length; k++) {
+      tr.rings[k].forEach(c => highlight.add(key(c.q, c.r))); ringNow = k; draw();
+      if (animate) { await sleep(260); if (my !== anim) return; }
+    }
+    picked = tr.pick; trueNear = tr.tn; draw();
+    $("hRings").textContent = tr.k + 1;
+    $("hCells").textContent = tr.cellsChecked;
+    $("hDrv").textContent = tr.found.length; $("hAll").textContent = "(full scan: " + drivers.length + ")";
+    $("hPick").textContent = picked ? dist(picked, rider).toFixed(2) + " km" : "none";
+    $("hTrue").textContent = trueNear ? dist(trueNear, rider).toFixed(2) + " km" : "–";
+    const wrong = picked && trueNear && picked !== trueNear && dist(picked, rider) - dist(trueNear, rider) > 0.01;
+    $("hPick").style.color = wrong ? MX.css("--c-er") : "";
+    $("hMsg").textContent = !picked ? `No driver within ${MAXK} rings (about ${(MAXK * KM_PER_STEP).toFixed(1)} km). In a real app: “No cars available”, widen the radius, or show a longer wait.` :
+      wrong ? `💥 Picked a driver ${dist(picked, rider).toFixed(2)} km away, but one ${dist(trueNear, rider).toFixed(2)} km away (green ring) sat just across the ring edge. Switch to “+1 ring, sort by distance”.` :
+      `✅ Examined ${tr.found.length} of ${drivers.length} drivers in ${tr.cellsChecked} cells. A full scan would check all ${drivers.length}; at a million drivers that's the difference between microseconds and a meltdown.`;
+  }
+  cv.addEventListener("click", e => { const b = cv.getBoundingClientRect(); rider = { x: e.clientX - b.left, y: e.clientY - b.top }; clearResult(); draw(); runSearch(true); });
+  $("search").onclick = () => runSearch(true);
+  $("shuffle").onclick = () => { seed++; placeDrivers(); clearResult(); draw(); };
+  $("tricky").onclick = () => {
+    const rng = MX.seeded(seed * 97 + 1), mode = getMode(), need = +$("need").value;
+    let best = null;
+    for (let i = 0; i < 400; i++) {
+      const rd = { x: 40 + rng() * (W - 80), y: 40 + rng() * (H - 80) }, tr = searchTrace(rd, "first", need);
+      if (tr.pick && tr.tn && tr.pick !== tr.tn) { const gap = dist(tr.pick, rd) - dist(tr.tn, rd); if (!best || gap > best.gap) best = { rd, gap }; }
+    }
+    if (!best) { $("hMsg").textContent = "No tricky spot found with this layout; press “Move the drivers” and try again."; return; }
+    rider = best.rd; clearResult(); runSearch(true);
+    if (mode === "plus") $("hMsg").textContent += " (This spot fools “stop at first ring”; switch modes to compare.)";
+  };
+  $("dens").oninput = () => { placeDrivers(); clearResult(); draw(); };
+  $("need").oninput = () => { $("needV").textContent = $("need").value; };
+  $("needV").textContent = $("need").value;
+  layout(); placeDrivers(); draw();
+  window.addEventListener("resize", () => {
+    if ((cv.clientWidth || 700) === W) { draw(); return; } // height-only or no change: keep the current search on screen
+    layout(); placeDrivers(); rider = null; clearResult(); draw();
+  });
+  window.addEventListener("themechange", draw);
+})();
+</script>
+</body>
+</html>

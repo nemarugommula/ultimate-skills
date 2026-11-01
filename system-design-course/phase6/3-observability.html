@@ -1,0 +1,387 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.3 Observability · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .wf { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+  .wrow { display: grid; grid-template-columns: 230px 1fr; align-items: center; gap: 8px; margin: 3px 0; font-size: .82rem; cursor: pointer; }
+  .wrow:hover .wname { color: var(--accent); }
+  .wrow.sel .wname { color: var(--accent); font-weight: 700; }
+  .wname { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); }
+  .wtrack { position: relative; height: 16px; }
+  .wbar { position: absolute; top: 0; height: 16px; border-radius: 4px; font-size: .7rem; color: #fff; padding-left: 4px; line-height: 16px; white-space: nowrap; overflow: hidden; }
+  .wdetail { margin-top: 8px; font-size: .88rem; background: var(--panel); border-radius: 10px; padding: 8px 12px; }
+</style>
+</head>
+<body data-lesson="s6-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 3</div>
+  <h1>Observability: logs, metrics, traces (Prometheus, Grafana, OpenTelemetry)</h1>
+  <p class="subtitle">Observability is being able to answer “what is my system doing, and why?” from the outside, without shipping new code. At scale you can't SSH into a thousand servers; you read the signals they emit.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Latency</b> = time for one request; an <b>SLO</b> is a reliability target such as “99% of requests under 300 ms” (Lessons 0.3 and 0.5).</li>
+      <li><b>Microservices</b>: one user request travels through many services (Lessons 4.1 and 4.3).</li>
+      <li><b>Canary analysis</b> needs metrics to compare old vs new (Lesson 6.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In “The Tail at Scale” (2013), Google's Jeff Dean and Luiz André Barroso describe a server that usually answers in <b>10 ms</b>, but whose <b>99th-percentile</b> latency is <b>one second</b>: one request in 100 is slow. Fine for one server. But if a user request must wait for <b>100 such servers</b> in parallel, then <b>63% of user requests</b> take more than one second.</p>
+    <p>The average latency of that server looks great. The users' experience is terrible. Seeing the difference is what observability is for.</p>
+  </div>
+
+  <h2>Numbers first: why averages lie</h2>
+  <p>Your API serves 1,000 requests. <b>980</b> take <b>50 ms</b>. <b>20</b> (2%) hit a slow database lock and take <b>2,000 ms</b>.</p>
+  <table>
+    <tr><th>Statistic</th><th>Value</th><th>What it tells you</th></tr>
+    <tr><td>Average (mean)</td><td class="lt">(980 × 50 + 20 × 2,000) / 1,000 = <b>89 ms</b></td><td>“Everything's fine.” Nobody actually waited 89 ms.</td></tr>
+    <tr><td><b>p50</b> (median: half are faster)</td><td class="ca">50 ms</td><td>The typical user is happy</td></tr>
+    <tr><td><b>p99</b> (99% are faster)</td><td class="er">2,000 ms</td><td>1 in 50 users waits 2 seconds. That's your real problem.</td></tr>
+  </table>
+  <p>A <b>percentile</b> pN is the latency that N% of requests beat. Dashboards show <b>p50, p95, p99</b> (and sometimes p99.9), because the slow tail is where users suffer and where systems break first.</p>
+  <div class="eq">
+    P(user request is slow) = 1 − (1 − <span class="er">p</span>)<sup><span class="sv">N</span></sup>
+    <span class="say">“If a page waits for N backend calls and each is slow with chance p, the page is slow unless all N are fast.” 1 − 0.99<sup>100</sup> ≈ 63%, the number in the hook.</span>
+  </div>
+  <div class="legend"><span class="er">p: chance one backend call is slow</span><span class="sv">N: calls the user request waits for</span></div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Three signals, three questions.</b> <b>Metrics</b> tell you <i>that</i> something is wrong (cheap numbers over time, perfect for alerts). <b>Traces</b> tell you <i>where</i> (which service, which call). <b>Logs</b> tell you <i>why</i> (the exact error and its details). Connect them with a shared <b>trace ID</b> and you can jump from a spike on a graph to the one log line that explains it.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a hospital patient</span>
+    <p>Metrics are the bedside monitor: heart rate, blood pressure, a beep when a number crosses a line. A trace is the patient's journey through the hospital: 5 minutes at reception, 3 hours waiting for radiology, 20 minutes with the doctor. Logs are the doctor's written notes. The monitor tells you to worry; the journey tells you where time went; the notes tell you what happened.</p>
+  </div>
+
+  <h2>The three signals</h2>
+  <h3>1. Logs: structured, not prose</h3>
+  <p>A log line written as a sentence (<code>User 42 checkout failed</code>) is hard to search across a billion lines. Write <b>structured logs</b>: one JSON object per event, with fields you can filter on.</p>
+<pre><code>{<span class="s">"ts"</span>:<span class="s">"2026-10-31T14:02:11Z"</span>, <span class="s">"level"</span>:<span class="s">"error"</span>, <span class="s">"service"</span>:<span class="s">"checkout"</span>,
+ <span class="s">"msg"</span>:<span class="s">"payment declined"</span>, <span class="s">"user_id"</span>:<span class="n">42</span>, <span class="s">"order_id"</span>:<span class="s">"o-981"</span>,
+ <span class="s">"trace_id"</span>:<span class="s">"0af7651916cd43dd8448eb211c80319c"</span>, <span class="s">"duration_ms"</span>:<span class="n">412</span>}</code></pre>
+  <p>Logs are the most expensive signal at scale (every request can write several lines), so teams sample the boring ones and keep all errors. Typical stores: Elasticsearch/OpenSearch, Grafana Loki, Splunk, cloud log services.</p>
+
+  <h3>2. Metrics: numbers over time</h3>
+  <table>
+    <tr><th>Type</th><th>What it is</th><th>Example</th></tr>
+    <tr><td><b>Counter</b></td><td>Only goes up (resets on restart). You look at its <i>rate</i>.</td><td><code>http_requests_total</code></td></tr>
+    <tr><td><b>Gauge</b></td><td>A value that goes up and down</td><td><code>queue_depth</code>, memory in use</td></tr>
+    <tr><td><b>Histogram</b></td><td>Counts observations into buckets (≤ 50 ms, ≤ 100 ms, …) so you can compute percentiles later, across many servers</td><td><code>http_request_duration_seconds</code></td></tr>
+  </table>
+  <p>What to measure? Three checklists everyone uses:</p>
+  <ul>
+    <li><b>RED</b> (for every <span class="sv">service</span>): <b>R</b>ate of requests, <b>E</b>rrors, <b>D</b>uration. Coined by Tom Wilkie.</li>
+    <li><b>USE</b> (for every <span class="db">resource</span>: CPU, disk, network, memory): <b>U</b>tilization, <b>S</b>aturation (work waiting in line), <b>E</b>rrors. From Brendan Gregg.</li>
+    <li>Google's <b>four golden signals</b>: latency, traffic, errors, saturation.</li>
+  </ul>
+  <p>Each metric can carry <b>labels</b> (key-value tags like <code>status="500"</code>, <code>route="/checkout"</code>). Every unique combination of labels is a separate <b>time series</b> stored by the database. That's the trap called <b>cardinality</b>, in the worked example below.</p>
+
+  <h3>3. Traces: one request's journey</h3>
+  <p>A <b>trace</b> follows one request through every service. It's made of <b>spans</b>: one span per unit of work (an HTTP call, a database query), each with a start time, a duration, a parent span and attributes. Services pass the trace ID along in a header, which is called <b>context propagation</b>. The W3C standard header looks like:</p>
+<pre><code>traceparent: 00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01
+             <span class="c">ver  trace-id (same for the whole request)   parent span id  sampled</span></code></pre>
+  <p>Tracing every request is expensive, so systems <b>sample</b>: keep 1 in 100, or 1 in 1,000, plus every error and every slow request (“tail-based sampling”).</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Averages lie, percentiles don't</span>
+    <p class="hint">10,000 requests. Most take about 50 ms. Add a slow tail (a lock, a garbage-collection pause, a cold cache) and watch the mean barely move while p99 explodes. Then fan out: the user request waits for several backend calls in parallel, so it's as slow as the slowest one.</p>
+    <div class="controls">
+      <label>slow requests <input type="range" id="lt-f" min="0" max="5" step="1" value="3"> <b class="mono" id="lt-fv"></b></label>
+      <label>slow ones take <input type="range" id="lt-t" min="0" max="4" step="1" value="3"> <b class="mono" id="lt-tv"></b></label>
+      <label>backend calls per user request <input type="range" id="lt-n" min="0" max="4" step="1" value="0"> <b class="mono" id="lt-nv"></b></label>
+      <button class="btn" id="lt-ex">Load the hook's example</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">mean <b id="lt-mean">–</b></div>
+      <div class="stat">p50 <b id="lt-p50">–</b></div>
+      <div class="stat">p90 <b id="lt-p90">–</b></div>
+      <div class="stat">p99 <b id="lt-p99">–</b></div>
+      <div class="stat">p99 estimated from Prometheus buckets <b id="lt-hq">–</b></div>
+    </div>
+    <canvas class="chart" id="lt-c" style="height:220px"></canvas>
+    <p class="hint" id="lt-msg"></p>
+  </div>
+  <p>Notice the bucket estimate. Prometheus doesn't store every request, only how many fell in each bucket (≤ 50 ms, ≤ 100 ms, ≤ 250 ms…). <code>histogram_quantile()</code> guesses where inside a bucket the percentile falls, by straight-line interpolation. So choose bucket edges near your SLO threshold, or the estimate is coarse.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the label that ate the monitoring bill</span>
+    <p>A counter <code>http_requests_total</code> has labels <code>route</code> (20 values), <code>status</code> (5 values) and <code>pod</code> (10 pods).</p>
+    <ul>
+      <li>Time series = 20 × 5 × 10 = <b>1,000</b>. Easy for one Prometheus server.</li>
+      <li>Someone adds <code>user_id</code> with 1,000,000 active users: 1,000 × 1,000,000 = <b>1,000,000,000</b> series. The database runs out of memory.</li>
+      <li>Rule (from the Prometheus docs): don't use labels for unbounded values like user IDs or email addresses. Put those in <b>logs and trace attributes</b>, which are built for per-request detail.</li>
+    </ul>
+  </div>
+
+  <h2>Find the slow span</h2>
+  <p>Metrics say p99 for <code>/checkout</code> is too high. A trace shows where the time went. In the view below (a “waterfall,” like Jaeger or Grafana Tempo show), each bar is a span; children sit under their parent. Bars that overlap ran in parallel.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · A distributed trace</span>
+    <p class="hint">One slow <code>GET /checkout</code> trace. Click any span to see its details. Then apply fixes and see which ones actually shorten the request: only work on the <b>critical path</b> (the chain of spans the request waits for) matters.</p>
+    <div class="controls">
+      <label><input type="checkbox" id="tr-batch"> batch the cart's item queries (fix the N+1)</label>
+      <label><input type="checkbox" id="tr-par"> call pricing and inventory in parallel</label>
+      <label><input type="checkbox" id="tr-to"> 200 ms timeout + fallback on the fraud check</label>
+      <label><input type="checkbox" id="tr-auth"> cache auth tokens</label>
+    </div>
+    <div class="controls"><button class="btn" id="tr-slow">🔍 Highlight the slowest span</button><button class="btn" id="tr-reset">Reset</button></div>
+    <div class="wf" id="tr-wf"></div>
+    <div class="wdetail" id="tr-d">Click a span.</div>
+    <div class="stat-row">
+      <div class="stat">request duration <b id="tr-tot">–</b></div>
+      <div class="stat">spans <b id="tr-n">–</b></div>
+      <div class="stat">slowest span <b id="tr-sl">–</b></div>
+    </div>
+    <p class="hint" id="tr-msg"></p>
+  </div>
+  <p>Two classic findings live in this trace. The <b>N+1 query</b>: one query for the cart, then one more per item, each a separate trip to the database. And a <b>slow dependency</b> with no timeout, which makes your p99 equal to <i>their</i> p99. Caching auth looks tempting but saves only a few milliseconds: always measure before you optimize.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Prometheus</b> (metrics, pull model: it scrapes an HTTP <code>/metrics</code> endpoint on each target), <b>Grafana</b> (dashboards over any data source), <b>OpenTelemetry</b> (the vendor-neutral standard and SDKs for emitting traces, metrics and logs), <b>Jaeger</b> or <b>Grafana Tempo</b> (traces), <b>Loki</b> or <b>OpenSearch</b> (logs). Managed: Datadog, Honeycomb, New Relic, Grafana Cloud, AWS CloudWatch/X-Ray, Google Cloud Monitoring.</p>
+<pre><code><span class="c"># prometheus.yml: scrape the app every 15 s (the global default is 1 m)</span>
+<span class="k">global:</span>
+  <span class="k">scrape_interval:</span> 15s
+<span class="k">scrape_configs:</span>
+  - <span class="k">job_name:</span> shop
+    <span class="k">static_configs:</span>
+      - <span class="k">targets:</span> [<span class="s">'shop:8080'</span>]        <span class="c"># Prometheus GETs http://shop:8080/metrics</span></code></pre>
+<pre><code><span class="c"># PromQL. Requests per second over the last 5 minutes, by status code (the R in RED)</span>
+sum by (status) (rate(http_requests_total{job=<span class="s">"shop"</span>}[5m]))
+
+<span class="c"># Error ratio (the E): share of requests that returned 5xx</span>
+sum(rate(http_requests_total{status=~<span class="s">"5.."</span>}[5m])) / sum(rate(http_requests_total[5m]))
+
+<span class="c"># p99 latency (the D), computed from histogram buckets across all pods</span>
+histogram_quantile(<span class="n">0.99</span>, sum by (le) (rate(http_request_duration_seconds_bucket[5m])))</code></pre>
+<pre><code><span class="c"># OpenTelemetry in Python: one span around the work, attributes for detail</span>
+<span class="k">from</span> opentelemetry <span class="k">import</span> trace
+tracer = trace.get_tracer(<span class="s">"checkout"</span>)
+
+<span class="k">def</span> checkout(cart):
+    <span class="k">with</span> tracer.start_as_current_span(<span class="s">"checkout"</span>) <span class="k">as</span> span:
+        span.set_attribute(<span class="s">"cart.items"</span>, len(cart.items))   <span class="c"># high-cardinality detail is fine here</span>
+        <span class="k">with</span> tracer.start_as_current_span(<span class="s">"fraud.score"</span>):  <span class="c"># child span, same trace ID</span>
+            score_fraud(cart)</code></pre>
+    <p><b>A Grafana panel</b> for this service is a <i>Time series</i> visualization with three queries: the request rate by status, the error ratio with a red threshold line at your SLO, and p50/p99 from <code>histogram_quantile</code>. One row of RED panels per service is the classic layout.</p>
+    <p class="hint">Try it locally: <code>docker run -p 9090:9090 prom/prometheus</code> (it scrapes itself; open localhost:9090 and run <code>rate(prometheus_http_requests_total[1m])</code>). For traces: <code>docker run --rm -p 16686:16686 -p 4317:4317 -p 4318:4318 cr.jaegertracing.io/jaegertracing/jaeger:2.22.0</code>, then send OpenTelemetry data to port 4317 and open localhost:16686.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Signal</th><th>✅ Great for</th><th>❌ Weak at / costs</th></tr>
+      <tr><td><b>Metrics</b></td><td>Alerts, dashboards, trends; cheap to store for months</td><td>No per-request detail; high-cardinality labels blow up storage</td></tr>
+      <tr><td><b>Traces</b></td><td>Finding which service or call is slow; seeing fan-out and N+1s</td><td>Need instrumentation in every service; must sample, so a rare bug may not be in the sample</td></tr>
+      <tr><td><b>Logs</b></td><td>The exact error message, stack trace and inputs</td><td>The most expensive signal by volume; hard to search if unstructured</td></tr>
+      <tr><td>Push vs pull (metrics)</td><td>Pull (Prometheus) knows when a target is down and is easy to run</td><td>Short-lived jobs may finish before a scrape: use a push gateway or OpenTelemetry push</td></tr>
+    </table>
+    <p>Self-hosted (Prometheus + Grafana + Loki + Tempo) is cheap in licences but costs engineering time. Managed tools are fast to adopt, but their bills grow with data volume, so cardinality and log volume become cost questions.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Structured JSON logs with a request ID from day one. Instrument with OpenTelemetry so you can switch vendors later. One managed tool (or Grafana Cloud's free tier) with a RED dashboard per service and an error-tracking tool for exceptions. Measure p50 and p99, never only the average.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Dedicated observability teams, metrics systems built for billions of series, tail-based trace sampling, log pipelines that sample and route by value, strict cardinality budgets per team, and SLO dashboards that feed alerting (Lesson 6.4) and canary analysis (Lesson 6.2).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>In a design round, “how would you monitor this?” is a chance to sound senior. Cover:</p>
+    <ul>
+      <li>The <b>SLIs</b> (service level indicators: the measured numbers behind an SLO) for this system: e.g. checkout success rate and p99 latency.</li>
+      <li><b>RED</b> per service and <b>USE</b> per resource, with <b>percentiles</b>, not averages.</li>
+      <li><b>Distributed tracing</b> with context propagation, plus logs linked by trace ID.</li>
+      <li>Costs: <b>sampling</b> and <b>cardinality</b>.</li>
+    </ul>
+    <p class="hint">Follow-ups: “p99 doubled but p50 didn't move. What do you check?” (traces for the slow requests: one dependency, one shard, GC pauses). “Why not just average latency per minute?” (averages hide the tail, and you can't average percentiles across servers; histograms can be combined).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Distributed tracing at Google</b> <span class="tag co">🏢 Google · 2010</span> <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/" target="_blank" rel="noopener">Dapper, a Large-Scale Distributed Systems Tracing Infrastructure</a></div>
+      <p><b>How:</b> Dapper traces requests across Google's services with very low overhead by instrumenting a small number of common libraries (so application developers barely notice), and by sampling. The paper reports it had been Google's production tracing system for over two years.</p>
+      <p><b>Why this method:</b> one user request touches many services built by different teams; without ubiquitous tracing, nobody can see where the time goes.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Pull-based metrics with labels</b> <span class="tag oss">🧰 Open source · SoundCloud, 2012</span> <a href="https://prometheus.io/docs/introduction/overview/" target="_blank" rel="noopener">Prometheus overview</a></div>
+      <p><b>How:</b> Prometheus was originally built at SoundCloud (from 2012), stores metrics as time series with key-value labels, collects them via a pull model over HTTP, and is queried with PromQL. It joined the CNCF in 2016 as its second hosted project, after Kubernetes.</p>
+      <p><b>Why this method:</b> labels let one metric be sliced by route, status or pod; pulling means the monitoring server controls the load and notices when a target stops answering.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One standard for telemetry</b> <span class="tag oss">🧰 Open source · CNCF</span> <a href="https://opentelemetry.io/docs/what-is-opentelemetry/" target="_blank" rel="noopener">What is OpenTelemetry?</a></div>
+      <p><b>How:</b> OpenTelemetry is a CNCF project formed by merging two earlier projects, OpenTracing and OpenCensus. It provides APIs, SDKs and a wire protocol (OTLP) for traces, metrics and logs that many backends accept.</p>
+      <p><b>Why this method:</b> instrument your code once, and choose or switch the backend (Jaeger, Prometheus, a vendor) without rewriting it.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Tracing from a ride-sharing company</b> <span class="tag co">🏢 Uber → CNCF</span> <a href="https://www.jaegertracing.io/" target="_blank" rel="noopener">Jaeger</a></div>
+      <p><b>How:</b> Jaeger is an open-source distributed tracing platform; the project credits Uber for its initial, project-launching donation, and it lives at the CNCF. Its v2 release moved it much closer to OpenTelemetry.</p>
+      <p><b>Why this method:</b> a company running many microservices needed to see request paths end to end, and an open standard backend lets everyone else reuse it.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Why tails matter</b> <span class="tag co">🏢 Google · 2013</span> <a href="https://research.google/pubs/the-tail-at-scale/" target="_blank" rel="noopener">The Tail at Scale (CACM)</a></div>
+      <p><b>How:</b> the paper shows how rare slow responses on single servers become common at the user level when requests fan out, and proposes techniques like hedged requests (send a backup request to another replica if the first is slow).</p>
+      <p><b>Why this method:</b> you can't make every server fast every time, so large systems are designed to tolerate the tail, and they measure p99 and p99.9 to see it.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 1 in 1,024 is enough</span>
+    <p>Dapper's paper reports that for high-volume services, there was still enough trace data with a sampling rate as low as <b>1/1024</b>. When a service handles thousands of requests a second, even a tiny sample contains plenty of slow ones. That's why sampling makes tracing affordable at scale.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>These metrics are the SLIs behind the SLOs from Lesson 0.5, and the input to canary analysis (Lesson 6.2) and burn-rate alerts (Lesson 6.4). Saturation metrics drive autoscaling (Lesson 5.3) and capacity planning (Lesson 6.5). Tail latency is why timeouts, retries and hedging matter (Lesson 4.4). For AI systems, the same three signals apply, plus model-specific ones: tokens per request, time to first token, cost per request and output quality scores.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://research.google/pubs/dapper-a-large-scale-distributed-systems-tracing-infrastructure/" target="_blank" rel="noopener">Dapper (Google, 2010)</a>. The paper behind modern tracing; short and readable.</li>
+      <li><span class="kind">Docs</span> <a href="https://prometheus.io/docs/practices/histograms/" target="_blank" rel="noopener">Prometheus: histograms and summaries</a>. How bucket choice affects percentile accuracy.</li>
+      <li><span class="kind">Book</span> <a href="https://sre.google/sre-book/monitoring-distributed-systems/" target="_blank" rel="noopener">SRE book: Monitoring Distributed Systems</a>. The four golden signals and symptoms vs causes.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A page calls 50 backend services in parallel and waits for all of them. Each call is slow (over 1 s) 1% of the time. About what share of page loads are slow?</div>
+    <div class="opts"><button class="opt">About 1%</button><button class="opt" data-ok>About 40%</button><button class="opt">About 50%</button></div>
+    <div class="explain">1 − 0.99<sup>50</sup> ≈ 0.395. Fan-out turns a rare per-call tail into a common user-level problem. Fixes: fewer calls on the critical path, timeouts with fallbacks, or hedged requests.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. The dashboard's average latency is a flat 80 ms, but support tickets say checkout “hangs sometimes.” What do you look at first?</div>
+    <div class="opts"><button class="opt">The average over a longer time window</button><button class="opt" data-ok>The p99 latency from the histogram, then traces of the slow requests</button><button class="opt">CPU utilization of the load balancer</button></div>
+    <div class="explain">Averages hide the tail. p99 shows whether a slice of users is waiting seconds, and a trace of one slow request shows which span is to blame.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A teammate adds a <code>user_id</code> label to <code>http_requests_total</code> to debug one customer. You have 5 million users. What's the right response?</div>
+    <div class="opts"><button class="opt">Fine, Prometheus compresses labels</button><button class="opt">Fine, as long as the scrape interval is longer</button><button class="opt" data-ok>Remove it: each user ID creates new time series; put user IDs in logs or trace attributes instead</button></div>
+    <div class="explain">Each unique label combination is its own time series, so millions of user IDs multiply the series count by millions. Per-request detail belongs in logs and traces, which are designed for it.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Metrics say <i>that</i>, traces say <i>where</i>, logs say <i>why</i>. Link them with a trace ID.</li>
+      <li>Never trust averages: track p50, p95, p99 from histograms. Fan-out makes tails common: 1 − (1 − p)<sup>N</sup>.</li>
+      <li>Measure RED per service and USE per resource; keep label cardinality bounded.</li>
+      <li>Prometheus pulls metrics and is queried with PromQL (<code>rate</code>, <code>histogram_quantile</code>); Grafana draws them; OpenTelemetry is the standard way to emit them.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const ms = v => v >= 1000 ? (v / 1000).toFixed(2) + " s" : Math.round(v) + " ms";
+
+  // ---------- latency distribution ----------
+  const FS = [0, 0.005, 0.01, 0.02, 0.05, 0.1], TS = [250, 500, 1000, 2000, 4000], NS = [1, 5, 10, 50, 100];
+  const BUCKETS = [25, 50, 100, 250, 500, 1000, 2500, 5000, Infinity];
+  const M = 10000;
+  const q = (s, p) => s[Math.min(s.length - 1, Math.floor(p * s.length))];
+  function histQuantile(sorted, phi) { // Prometheus-style: linear interpolation inside the bucket
+    const counts = BUCKETS.map(b => 0); let j = 0;
+    sorted.forEach(v => { while (v > BUCKETS[j]) j++; counts[j]++; });
+    const rank = phi * sorted.length; let cum = 0;
+    for (let i = 0; i < BUCKETS.length; i++) {
+      if (cum + counts[i] >= rank) {
+        if (BUCKETS[i] === Infinity) return BUCKETS[i - 1];
+        const lo = i ? BUCKETS[i - 1] : 0;
+        return lo + (BUCKETS[i] - lo) * (rank - cum) / counts[i];
+      }
+      cum += counts[i];
+    }
+    return BUCKETS[BUCKETS.length - 2];
+  }
+  function latency() {
+    const f = FS[+$("lt-f").value], T = TS[+$("lt-t").value], N = NS[+$("lt-n").value];
+    $("lt-fv").textContent = (f * 100) + "%"; $("lt-tv").textContent = ms(T); $("lt-nv").textContent = N;
+    const rng = MX.seeded(11);
+    const g = () => Math.sqrt(-2 * Math.log(rng() + 1e-12)) * Math.cos(2 * Math.PI * rng());
+    const one = () => rng() < f ? T * Math.exp(0.15 * g()) : 50 * Math.exp(0.25 * g());
+    const lat = new Float64Array(M);
+    for (let i = 0; i < M; i++) { let m = 0; for (let k = 0; k < N; k++) m = Math.max(m, one()); lat[i] = m; }
+    const s = Array.from(lat).sort((a, b) => a - b);
+    const mean = s.reduce((a, b) => a + b, 0) / M;
+    $("lt-mean").textContent = ms(mean); $("lt-p50").textContent = ms(q(s, 0.5)); $("lt-p90").textContent = ms(q(s, 0.9));
+    const p99 = q(s, 0.99); $("lt-p99").textContent = ms(p99); $("lt-hq").textContent = ms(histQuantile(s, 0.99));
+    const curve = []; for (let p = 50; p <= 99.9; p += 0.1) curve.push([p, q(s, p / 100)]);
+    Plot.line($("lt-c"), { series: [{ label: "latency at each percentile", color: MX.css("--c-lt"), data: curve, fill: true }], xLabel: "percentile (50 = median, 99 = p99)", yLabel: "ms", yMin: 0, hlines: [{ y: mean, label: "mean " + ms(mean), color: MX.css("--c-ca") }] });
+    const slowUsers = s.filter(v => v > 500).length / M;
+    $("lt-msg").textContent = f === 0 ? "No tail: mean, p50 and p99 are all close. Real systems are rarely this kind." :
+      N > 1 ? `With ${N} parallel calls, ${(slowUsers * 100).toFixed(1)}% of user requests take over 500 ms, though only ${(f * 100)}% of single calls are slow. Fan-out amplifies the tail.` :
+      `The mean is ${ms(mean)}, which looks fine. But ${(f * 100)}% of users wait about ${ms(T)}: the p99 shows it, the mean hides it.`;
+  }
+  ["lt-f", "lt-t", "lt-n"].forEach(id => ($(id).oninput = latency));
+  $("lt-ex").onclick = () => { $("lt-f").value = 2; $("lt-t").value = 2; $("lt-n").value = 4; latency(); };
+  latency();
+
+  // ---------- trace waterfall ----------
+  const KC = { gw: "--c-nw", auth: "--c-cl", cart: "--c-sv", db: "--c-db", price: "--c-sv", inv: "--c-sv", ext: "--c-er", pay: "--c-lt" };
+  let sel = null, hl = false;
+  function buildTrace() {
+    const batch = $("tr-batch").checked, par = $("tr-par").checked, to = $("tr-to").checked, ac = $("tr-auth").checked;
+    const S = []; let t = 0;
+    const add = (name, svc, start, dur, depth, kind, attrs) => { S.push({ name, svc, start, dur, depth, kind, attrs }); return start + dur; };
+    const authDur = ac ? 3 : 10;
+    t = add("auth.verify_token", "auth-service", 0, authDur, 1, "auth", { "cache.hit": ac });
+    const ITEMS = 12, cartStart = t;
+    const cartDur = 4 + (batch ? 6 : ITEMS * 4) + 2;
+    add("cart.load", "cart-service", cartStart, cartDur, 1, "cart", { "cart.items": ITEMS });
+    add("SELECT carts WHERE user_id=?", "postgres", cartStart + 1, 4, 2, "db", { "db.system": "postgresql" });
+    if (batch) add("SELECT items WHERE id IN (…12 ids)", "postgres", cartStart + 5, 6, 2, "db", { "db.rows": ITEMS });
+    else for (let i = 0; i < ITEMS; i++) add("SELECT items WHERE id=?", "postgres", cartStart + 5 + 4 * i, 4, 2, "db", { "db.rows": 1, "item.index": i + 1 });
+    t = cartStart + cartDur;
+    const pEnd = add("pricing.quote", "pricing-service", t, 40, 1, "price", { "currency": "EUR" });
+    const iEnd = add("inventory.reserve", "inventory-service", par ? t : pEnd, 35, 1, "inv", { "warehouse": "eu-1" });
+    t = Math.max(pEnd, iEnd);
+    const fd = to ? 200 : 620;
+    t = add("fraud.score (external API)", "fraud-vendor", t, fd, 1, "ext", to ? { "timeout": "200 ms", "fallback": "allow + review later", "error": true } : { "http.status": 200, "note": "no timeout set" });
+    const payStart = t;
+    t = add("payment.charge", "payments", payStart, 110, 1, "pay", { "amount": 59.9 });
+    add("POST bank /authorize", "bank-api", payStart + 8, 95, 2, "ext", { "http.status": 200 });
+    S.unshift({ name: "GET /checkout", svc: "api-gateway", start: 0, dur: t + 2, depth: 0, kind: "gw", attrs: { "http.route": "/checkout", "trace_id": "0af7651916cd43dd…" } });
+    return S;
+  }
+  function trace() {
+    const S = buildTrace(), total = S[0].dur;
+    const slowest = S.slice(1).reduce((a, b) => (b.dur > a.dur ? b : a));
+    $("tr-wf").innerHTML = S.map((s, i) => `<div class="wrow${sel === s.name + s.start ? " sel" : ""}" data-i="${i}"><span class="wname" style="padding-left:${s.depth * 14}px">${s.name}</span><div class="wtrack"><div class="wbar" style="left:${100 * s.start / total}%;width:${Math.max(0.5, 100 * s.dur / total)}%;background:${MX.css(KC[s.kind])};${hl && s === slowest ? "outline:3px solid var(--text);" : ""}">${s.dur >= total * 0.08 ? ms(s.dur) : ""}</div></div></div>`).join("");
+    [...$("tr-wf").querySelectorAll(".wrow")].forEach(r => (r.onclick = () => {
+      const s = S[+r.dataset.i]; sel = s.name + s.start;
+      $("tr-d").innerHTML = `<b class="mono">${s.name}</b> · service <b>${s.svc}</b> · ${ms(s.dur)} (${(100 * s.dur / total).toFixed(0)}% of the request)<br><span class="hint">attributes: ${Object.entries(s.attrs).map(([k, v]) => k + "=" + v).join(", ")}</span>`;
+      trace();
+    }));
+    $("tr-tot").textContent = ms(total); $("tr-n").textContent = S.length;
+    $("tr-sl").textContent = slowest.name.split(" ")[0] + " (" + ms(slowest.dur) + ")";
+    const fixes = ["tr-batch", "tr-par", "tr-to", "tr-auth"].filter(id => $(id).checked).length;
+    $("tr-msg").textContent = total > 800 ? "Over 800 ms. The fraud check alone is most of it, and twelve tiny queries in a row add up too." :
+      total > 450 ? "Better. Look for whatever's still the longest bar on the critical path." :
+      `Down to ${ms(total)} with ${fixes} fix${fixes === 1 ? "" : "es"}. What is left is mostly other companies: the fraud vendor, now capped at 200 ms, and the bank call inside payment. Their latency you can only cap, hide (confirm asynchronously) or accept.`;
+  }
+  ["tr-batch", "tr-par", "tr-to", "tr-auth"].forEach(id => ($(id).onchange = trace));
+  $("tr-slow").onclick = () => { hl = !hl; trace(); };
+  $("tr-reset").onclick = () => { ["tr-batch", "tr-par", "tr-to", "tr-auth"].forEach(id => ($(id).checked = false)); hl = false; sel = null; $("tr-d").textContent = "Click a span."; trace(); };
+  trace();
+})();
+</script>
+</body>
+</html>

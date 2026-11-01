@@ -1,0 +1,456 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0.2 What happens when you hit Enter: DNS, TCP, TLS, HTTP · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .seg button:disabled { opacity: .4; cursor: not-allowed; }
+  .wf { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin: 10px 0; }
+  .wf .row { display: grid; grid-template-columns: 120px 1fr 64px; gap: 8px; align-items: center; margin: 3px 0; font-size: .82rem; }
+  .wf .track { position: relative; height: 16px; background: var(--panel); border-radius: 4px; overflow: hidden; }
+  .wf .track i { position: absolute; top: 0; bottom: 0; border-radius: 3px; }
+  .wf .t { font-family: var(--mono); text-align: right; color: var(--muted); }
+  .chk { font-size: .92rem; display: inline-flex; gap: 6px; align-items: center; }
+  .dnslog { font-family: var(--mono); font-size: .82rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-height: 3.2em; }
+</style>
+</head>
+<body data-lesson="s0-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 0 · Lesson 2</div>
+  <h1>What happens when you hit Enter: DNS, TCP, TLS, HTTP</h1>
+  <p class="subtitle">Before your server does any work, a request makes several trips across the network to find the server, connect, and set up encryption. At scale, those round trips, not your code, are often most of the time a user waits.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Latency</b> = how long one request takes, in milliseconds (ms, thousandths of a second). <b>p99</b> = the time 99% of requests beat (Lesson 0.1).</li>
+      <li><b>Non-functional requirements</b> like “under 200 ms for users worldwide” decide where servers must live (Lesson 0.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On October 4th, 2021, Facebook and the rest of Meta's platforms vanished from the internet. During routine maintenance, a command meant to check backbone capacity accidentally took down every connection in Meta's backbone network.</p>
+    <p>Then it got worse. Meta's <b>DNS servers</b>, the machines that tell the world which IP address “facebook.com” lives at, are built to stop announcing themselves if they can't reach the data centers. They did exactly that. In Meta's own words, the DNS servers <b>became unreachable even though they were still operational</b>, so nobody on the internet could find Meta's servers at all. Every request starts with that lookup. Let's walk through what happens after you hit Enter.</p>
+  </div>
+
+  <h2>Numbers first: where 630 ms goes</h2>
+  <p>A <b>round trip</b> (<span class="lt">RTT</span>, round-trip time) is the time for a message to go to the server and the reply to come back. Light in fiber covers roughly <b>200 km per millisecond</b>, so distance sets a floor nobody can engineer away: New York ↔ London is at least <b>56 ms</b> round trip, New York ↔ Sydney at least <b>160 ms</b>, and real routes are longer.</p>
+  <p>A user in Sydney opens your site, hosted in New York, for the first time. Assume a full DNS lookup of about 100 ms and a server that takes 50 ms to build the page:</p>
+  <table>
+    <tr><th>Step</th><th>Round trips</th><th>Time</th></tr>
+    <tr><td><span class="nw">DNS</span>: find the IP address for the name</td><td>several, to DNS servers</td><td>~100 ms</td></tr>
+    <tr><td><span class="nw">TCP</span> handshake: open a connection</td><td>1</td><td>160 ms</td></tr>
+    <tr><td><span class="lt">TLS 1.3</span> handshake: set up encryption</td><td>1</td><td>160 ms</td></tr>
+    <tr><td><span class="cl">HTTP</span> request → response</td><td>1</td><td>160 ms</td></tr>
+    <tr><td><span class="sv">Server</span> builds the page</td><td>0</td><td>50 ms</td></tr>
+    <tr><td><b>Total, first visit</b></td><td></td><td><b>630 ms</b></td></tr>
+    <tr><td>Next request, connection reused, DNS cached</td><td>1</td><td><b>210 ms</b></td></tr>
+  </table>
+  <p>Your code was 50 ms of the 630. The other 580 ms was the network setting up. Two fixes follow directly: <b>reuse connections</b> so you only pay the setup once, and <b>move the server closer</b> to the user (a CDN, Lesson 1.4).</p>
+  <div class="eq">
+    first-request time ≈ <span class="nw">DNS</span> + (number of round trips × <span class="lt">RTT</span>) + <span class="sv">server time</span>
+    <span class="say">“The DNS lookup, plus how many round trips the protocols need times the round-trip time, plus the time your server spends.” Cut the round trips or cut the RTT.</span>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Far-away users mostly wait on <b>round trips × distance</b>, not on your server. Each protocol upgrade (TLS 1.3, HTTP/3) is about removing round trips, and each CDN is about shrinking the distance.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: calling a shop</span>
+    <p>You want to ask a shop if they have your size. First you find their number: in your phone's contacts (a <b>cached DNS</b> answer), or by calling directory assistance, which may have to ask around (a full <b>DNS lookup</b>). You dial and wait for “Hello?” before talking (the <b>TCP handshake</b>). You check it's really the shop and agree to speak in a code nobody else understands (<b>TLS</b>). Only then do you ask your question (<b>HTTP</b>). If you stay on the line for your next question, you skip all of that (<b>connection reuse</b>). And calling a shop across the world takes longer per sentence no matter how fast they answer (the <b>RTT</b>).</p>
+  </div>
+
+  <h2>Step 1: DNS, the internet's address book</h2>
+  <p>Computers connect to IP addresses like <code>104.20.23.154</code>, not names. <b>DNS</b> (the Domain Name System) turns a name into an address. It's a chain of servers, each knowing a bit:</p>
+  <ul>
+    <li>Your browser and operating system keep a small <span class="ca">cache</span> of recent answers. If it's there, the lookup takes 0 ms.</li>
+    <li>Otherwise they ask a <b>recursive resolver</b>: your internet provider's, or a public one like Cloudflare's <code>1.1.1.1</code> or Google's <code>8.8.8.8</code>. It does the hard work, and caches answers for everyone it serves.</li>
+    <li>On a miss, the resolver asks a <b>root server</b> (“who handles <code>.com</code>?”), then the <b>TLD server</b> for the top-level domain (“who handles <code>example.com</code>?”), then the domain's <b>authoritative server</b>, which holds the real answer.</li>
+  </ul>
+  <p>Each answer comes with a <span class="lt">TTL</span> (time to live): how many seconds everyone may cache it. Long TTL = fewer lookups and more resilience. Short TTL = you can move your site to a new IP quickly. Common record types: <b>A</b> (IPv4 address), <b>AAAA</b> (IPv6 address), <b>CNAME</b> (an alias to another name).</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Follow a DNS lookup</span>
+    <p class="hint">Look up <code>www.shop.example</code> and watch the question travel. Look it up again (cache hit), wait for the TTL to run out, move the site to a new IP, or break the authoritative servers like Meta's on October 4th, 2021. Times are typical round numbers: 10 ms to the resolver, 30 ms to each DNS server it asks.</p>
+    <svg id="dns"></svg>
+    <div class="controls">
+      <label>TTL <input type="range" id="ttl" min="0" max="3" step="1" value="1"> <b class="mono" id="ttlv"></b></label>
+      <button class="btn primary" id="look">🔎 Look up www.shop.example</button>
+      <button class="btn" id="wait">⏩ Wait 5 minutes</button>
+    </div>
+    <div class="controls">
+      <button class="btn" id="move">🚚 Move site to a new IP</button>
+      <button class="btn" id="break">💥 Make authoritative servers unreachable</button>
+      <button class="btn" id="dreset">Reset</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">clock <b id="clk">–</b></div>
+      <div class="stat">last lookup <b id="dms">–</b></div>
+      <div class="stat">answered by <b id="dby">–</b></div>
+      <div class="stat">cached copy expires in <b id="dexp">–</b></div>
+      <div class="stat">queries to authoritative <b id="dq">–</b></div>
+    </div>
+    <div class="dnslog" id="dlog">Press Look up to start.</div>
+  </div>
+  <p>Things to try: with a 1-day TTL, move the site and look up again: you get the <i>old</i> address for up to a day. That's why teams lower the TTL a day before a migration. Then break the authoritative servers: lookups still work while the cached copy lasts, and the site vanishes the moment it expires. Meta's resolvers worldwide hit exactly that wall.</p>
+
+  <h2>Step 2: TCP, opening a reliable connection</h2>
+  <p><b>TCP</b> (Transmission Control Protocol) gives you a reliable, in-order stream of bytes over an unreliable network: lost packets are re-sent, and the receiver puts them back in order. It starts with a <b>three-way handshake</b>: the client sends <code>SYN</code>, the server answers <code>SYN-ACK</code>, the client sends <code>ACK</code>. That costs <b>one round trip</b> before any data moves.</p>
+  <p>The catch of “in order”: if one packet is lost, everything behind it waits until it's re-sent. That's called <b>head-of-line blocking</b>, and it matters for HTTP/2 below.</p>
+
+  <h2>Step 3: TLS, encryption and identity</h2>
+  <p><b>TLS</b> (Transport Layer Security, the “S” in HTTPS) does two jobs. The server proves it's really <code>shop.example</code> with a <b>certificate</b> signed by an authority your browser trusts, and both sides agree on encryption keys. TLS 1.2 needed <b>two</b> extra round trips for this; <b>TLS 1.3</b> (2018) cut it to <b>one</b>. Reconnecting to a server you've seen before can be even faster.</p>
+
+  <h2>Step 4: HTTP, the actual request</h2>
+  <p><b>HTTP</b> (HyperText Transfer Protocol) is the request itself: a method and path like <code>GET /products/42</code>, headers, and a response with a status code (<code>200 OK</code>, <code>404 Not Found</code>…) and a body. A web page is rarely one request: the HTML points to CSS, scripts and images, each its own request.</p>
+  <table>
+    <tr><th>Version</th><th>Runs on</th><th>How many requests at once per connection</th><th>Main idea</th></tr>
+    <tr><td>HTTP/1.1</td><td>TCP</td><td>One at a time</td><td><b>Keep-alive</b>: reuse the connection for the next request instead of reconnecting.</td></tr>
+    <tr><td>HTTP/2</td><td>TCP</td><td>Many, interleaved (<b>multiplexing</b>)</td><td>One connection carries all the page's files. But one lost TCP packet stalls them all.</td></tr>
+    <tr><td>HTTP/3</td><td><b>QUIC</b> over UDP</td><td>Many, independent streams</td><td>Connection + encryption setup in one round trip, and a lost packet only stalls its own stream. Falls back to TCP if a network blocks UDP.</td></tr>
+  </table>
+  <p><b>UDP</b> (User Datagram Protocol) is TCP's bare-bones sibling: just send packets, no handshake, no ordering. <b>QUIC</b> builds its own reliability and encryption on top of it, so it can fix TCP's head-of-line problem without waiting for every router on the internet to be upgraded.</p>
+
+  <h2>Step 5: the response</h2>
+  <p>The request usually lands on a load balancer (Lesson 1.2), which picks an app server; the server reads from a cache or database and sends the response back along the same connection. The browser starts drawing as bytes arrive. The time until the first byte of the response arrives is called <span class="lt">TTFB</span> (time to first byte), a standard thing to measure.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what a CDN buys a user in Sydney</span>
+    <p>Same user, same New York server, round trip 160 ms, server time 50 ms.</p>
+    <ul>
+      <li><b>First visit, TLS 1.3, HTTP/2:</b> 100 (DNS) + 3 × 160 + 50 = <b>630 ms</b>.</li>
+      <li><b>Same, but TLS 1.2:</b> one more round trip → 100 + 4 × 160 + 50 = <b>790 ms</b>.</li>
+      <li><b>HTTP/3:</b> connection + TLS in one round trip → 100 + 2 × 160 + 50 = <b>470 ms</b>.</li>
+      <li><b>Next request on the same connection:</b> 160 + 50 = <b>210 ms</b>.</li>
+      <li><b>A CDN edge in Sydney</b> (RTT about 5 ms) with the page cached there, DNS cached: 3 × 5 + 5 (edge lookup) = <b>20 ms</b>.</li>
+    </ul>
+    <p>Protocol upgrades saved 160–320 ms. Moving closer saved 600. That's why every large site uses a CDN.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The latency waterfall</span>
+    <p class="hint">A page = 1 HTML file (server takes 50 ms) + 6 files (CSS, scripts, images; 5 ms each). Toggle each optimisation and watch the waterfall. Round trips use the fiber minimums above; real networks are slower. Then <b>lose a packet</b> and compare HTTP/2 with HTTP/3.</p>
+    <div class="controls">
+      <span class="hint">User ↔ server</span>
+      <span class="seg" id="dist"><button id="dist-5" data-v="5">Same city · 5 ms</button><button id="dist-56" data-v="56" class="on">NY ↔ London · 56 ms</button><button id="dist-160" data-v="160">NY ↔ Sydney · 160 ms</button></span>
+    </div>
+    <div class="controls">
+      <span class="hint">DNS</span>
+      <span class="seg" id="dnsm"><button id="dnsm-0" data-v="0">cached in browser</button><button id="dnsm-10" data-v="10">resolver cached</button><button id="dnsm-100" data-v="100" class="on">full lookup</button></span>
+      <span class="hint">TLS</span>
+      <span class="seg" id="tls"><button id="tls-2" data-v="2">1.2</button><button id="tls-1" data-v="1" class="on">1.3</button></span>
+      <span class="hint">HTTP</span>
+      <span class="seg" id="hv"><button id="hv-1" data-v="1">1.1</button><button id="hv-2" data-v="2" class="on">2</button><button id="hv-3" data-v="3">3</button></span>
+    </div>
+    <div class="controls">
+      <label class="chk"><input type="checkbox" id="reuse"> reuse an open connection</label>
+      <label class="chk"><input type="checkbox" id="cdn"> CDN edge nearby (5 ms) with files cached</label>
+      <label class="chk"><input type="checkbox" id="loss"> lose one packet</label>
+      <button class="btn small" id="worst">Worst case</button>
+      <button class="btn small" id="best">Best case</button>
+    </div>
+    <div class="wf" id="wf"></div>
+    <div class="legend"><span class="nw">DNS / connect</span><span class="lt">TLS</span><span class="sv">server working</span><span class="cl">waiting on the network</span><span class="er">stalled by a lost packet</span></div>
+    <div class="stat-row">
+      <div class="stat">round trips before HTML <b id="rt">–</b></div>
+      <div class="stat">time to first byte <b id="ttfb">–</b></div>
+      <div class="stat">page complete <b id="done">–</b></div>
+      <div class="stat">files stalled by loss <b id="stl">–</b></div>
+    </div>
+    <p class="hint" id="wmsg"></p>
+  </div>
+  <p>Things to try: set Sydney + full lookup + TLS 1.2 + HTTP/1.1: over a second and a half. Now switch to HTTP/2: the six files arrive together. Tick <b>lose one packet</b>: under HTTP/2 every file waits behind it; under HTTP/3 only one does. Finally tick the CDN edge and watch everything collapse to a few dozen milliseconds.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><code>dig</code> for DNS, <code>curl -w</code> to time each phase of a request, <code>openssl s_client</code> to inspect TLS, and your browser's DevTools Network tab (its “Timing” view is this waterfall). Managed side: Cloudflare, AWS Route 53 and Google Cloud DNS host your DNS records. Example output below; your numbers will differ.</p>
+<pre><code><span class="c"># What does a name resolve to, and for how long may it be cached? (the number is the TTL in seconds)</span>
+$ dig +noall +answer example.com
+example.com.   <span class="n">232</span>   IN   A   104.20.23.154
+
+<span class="c"># Watch the whole chain: root → .com → authoritative</span>
+$ dig +trace example.com
+
+<span class="c"># Time every phase of one HTTPS request (seconds, cumulative from the start)</span>
+$ curl -s -o /dev/null -w <span class="s">'dns=%{time_namelookup} tcp=%{time_connect} tls=%{time_appconnect} ttfb=%{time_starttransfer} total=%{time_total} http=%{http_version}\n'</span> https://www.google.com/
+dns=<span class="n">0.004</span> tcp=<span class="n">0.005</span> tls=<span class="n">0.158</span> ttfb=<span class="n">0.428</span> total=<span class="n">0.502</span> http=<span class="n">2</span>
+
+<span class="c"># Which TLS version and certificate does a server use?</span>
+$ openssl s_client -connect example.com:443 -servername example.com -brief &lt;/dev/null
+
+<span class="c"># Try HTTP/3 if your curl was built with it</span>
+$ curl -sI --http3 https://cloudflare.com/ | head -1</code></pre>
+    <p class="hint">Try it locally: run the <code>curl -w</code> line twice against a site far away and once against one nearby. The gap between <code>tcp</code> and <code>tls</code> is roughly one round trip.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Good when…</th><th>❌ Watch out…</th></tr>
+      <tr><td>Long DNS TTL (hours)</td><td>Records rarely change; fewer lookups; survives a short DNS outage</td><td>A migration or failover takes hours to reach everyone</td></tr>
+      <tr><td>Short DNS TTL (seconds–minutes)</td><td>You fail over by changing DNS</td><td>More lookups, more load and more dependence on your DNS provider</td></tr>
+      <tr><td>Keep connections open (keep-alive)</td><td>Repeat requests skip the handshakes</td><td>Each open connection uses server memory; load balancers must handle many idle ones</td></tr>
+      <tr><td>HTTP/3</td><td>Mobile and lossy networks; far-away users</td><td>Some networks block UDP (so you still need HTTP/2 as a fallback); newer tooling</td></tr>
+      <tr><td>CDN</td><td>Static files and cacheable pages, users far from your servers</td><td>Another vendor and bill; cache rules to get right (Lesson 1.4)</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Put your DNS and static files behind a managed provider with a CDN on day one (many have free tiers), host in the region where most users are, and let the platform handle TLS certificates (for example with Let's Encrypt). Turn on HTTP/2 and HTTP/3 where it's a setting.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Runs its own authoritative DNS and edge network, uses DNS and anycast (the same IP address announced from many cities) to send each user to the nearest healthy site, tunes TLS and QUIC, and measures TTFB per country. And, as Meta learned, makes sure DNS doesn't depend on the thing it's meant to point to.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“What happens when you type a URL and press Enter?” is a classic. A senior answer goes beyond listing steps:</p>
+    <ul>
+      <li>DNS with its caches and TTLs; TCP's handshake; TLS's certificate check and key exchange; the HTTP request; a load balancer and app server; the response.</li>
+      <li>Counts the <b>round trips</b> and ties them to latency: “across an ocean that's 3–4 RTTs before the first byte”.</li>
+      <li>Names the fixes: connection reuse, TLS 1.3, HTTP/2 and 3, CDNs, DNS caching.</li>
+      <li>Mentions failure: DNS as a single point of failure, certificate expiry, lost packets.</li>
+    </ul>
+    <p>Common follow-ups: “Why is the second request faster?” “What's the difference between HTTP/2 and HTTP/3?” “How would you make this fast for users in Asia?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>DNS as a single point of failure</b> <span class="tag co">🏢 Meta · 2021</span> <a href="https://engineering.fb.com/2021/10/05/networking-traffic/outage-details/" target="_blank" rel="noopener">More details about the October 4 outage</a></div>
+      <p><b>How:</b> Meta's authoritative DNS servers withdraw their BGP route announcements (BGP is how networks tell each other which addresses they can reach) when they can't reach the data centers. When the backbone went down, they all did, so the DNS servers became unreachable.</p>
+      <p><b>Why this method:</b> normally it's a smart safety rule: an unhealthy DNS location takes itself out so users go elsewhere. When every location was unhealthy at once, it removed the whole company from the internet.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A fast, private recursive resolver</b> <span class="tag co">🏢 Cloudflare · 2018</span> <a href="https://blog.cloudflare.com/announcing-1111/" target="_blank" rel="noopener">Announcing 1.1.1.1</a></div>
+      <p><b>How:</b> a public resolver running across Cloudflare's global network. They committed to never writing querying IP addresses to disk and to wiping logs within 24 hours.</p>
+      <p><b>Why this method:</b> resolvers see every site you visit, and default ones are often slow; running the resolver close to users makes the first step of every request faster.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>QUIC, the transport under HTTP/3</b> <span class="tag co">🏢 Google · 2017</span> <a href="https://research.google/pubs/the-quic-transport-protocol-design-and-internet-scale-deployment/" target="_blank" rel="noopener">The QUIC Transport Protocol (SIGCOMM)</a></div>
+      <p><b>How:</b> an encrypted, multiplexed, low-latency transport built on UDP, deployed on thousands of Google servers for Chrome and YouTube. The paper estimated that 7% of internet traffic was already QUIC.</p>
+      <p><b>Why this method:</b> building on UDP let Google evolve the transport in software, without waiting for operating systems and network gear to change TCP.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One round trip to connect</b> <span class="tag co">🏢 Cloudflare · 2018</span> <a href="https://blog.cloudflare.com/the-road-to-quic/" target="_blank" rel="noopener">The Road to QUIC</a></div>
+      <p><b>How:</b> QUIC combines the TCP-style handshake with the TLS 1.3 handshake, so a new connection takes a single round trip instead of the two needed for TCP plus TLS 1.3. Its streams are delivered independently, so a lost packet usually affects only one stream.</p>
+      <p><b>Why this method:</b> for far-away and mobile users, every removed round trip is directly visible as a faster page.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>HTTP/3 with a TCP fallback</b> <span class="tag oss">🧰 Standard · RFC 9114</span> <a href="https://www.rfc-editor.org/rfc/rfc9114.html" target="_blank" rel="noopener">RFC 9114: HTTP/3</a></div>
+      <p><b>How:</b> HTTP/3 is selected during the TLS handshake with the token <code>h3</code>. If a network blocks UDP, the standard says clients should try the TCP-based versions of HTTP instead.</p>
+      <p><b>Why this method:</b> the internet is full of old middleboxes. A fast path with a safe fallback lets a new protocol roll out without breaking anyone.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · DNS on the walls</span>
+    <p>In March 2014, Turkish internet providers blocked Twitter by making their DNS resolvers refuse to answer for twitter.com. People spray-painted <code>8.8.8.8</code>, the address of Google's public resolver, on walls so others could switch resolvers and get back online. Cloudflare tells the story in its 1.1.1.1 launch post.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Lesson 0.3 puts these round trips next to memory and disk speeds. Load balancers (Lesson 1.2) sit at the end of this journey, CDNs (Lesson 1.4) shrink the distance, and API gateways (Lesson 1.6) terminate TLS for you. gRPC (Lesson 0.4) runs on HTTP/2, and mTLS (Lesson 4.6) is TLS where both sides show a certificate. For AI apps, streaming tokens to the user over one open connection hides most of this setup cost.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Book</span> <a href="https://hpbn.co/" target="_blank" rel="noopener">High Performance Browser Networking</a> (Ilya Grigorik, free online). Chapters 1–4 cover latency, TCP and TLS with numbers.</li>
+      <li><span class="kind">Docs</span> <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Evolution_of_HTTP" target="_blank" rel="noopener">MDN: Evolution of HTTP</a>. From HTTP/0.9 to HTTP/3, in plain language.</li>
+      <li><span class="kind">Blog</span> <a href="https://blog.cloudflare.com/the-road-to-quic/" target="_blank" rel="noopener">The Road to QUIC</a>. Why HTTP/3 needed a new transport, and what it changes.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A user is 100 ms round trip away. With DNS cached, how long until the first byte of a new HTTPS request arrives over TCP + TLS 1.3 + HTTP/2, if the server takes 20 ms?</div>
+    <div class="opts"><button class="opt">120 ms</button><button class="opt" data-ok>320 ms</button><button class="opt">520 ms</button></div>
+    <div class="explain">TCP handshake (1 RTT) + TLS 1.3 (1 RTT) + request/response (1 RTT) = 3 × 100 = 300 ms, plus 20 ms of server time = <b>320 ms</b>. On a reused connection it would be 120 ms.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You're moving your site to a new hosting provider tomorrow. Your DNS record's TTL is 86,400 seconds (1 day). What should you do today?</div>
+    <div class="opts"><button class="opt">Nothing: DNS updates instantly everywhere</button><button class="opt" data-ok>Lower the TTL (say to 300 s) now, so that by tomorrow caches only hold the old address for minutes</button><button class="opt">Raise the TTL so the new address sticks longer</button></div>
+    <div class="explain">Resolvers may keep the old answer for a full TTL. Lowering it a TTL ahead of the move means that, on moving day, stale copies expire within minutes. Keep the old servers running for a while anyway, for resolvers that cache too long.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your mobile app's users are on flaky cellular networks, and pages with many images load slowly even over HTTP/2. Which change targets the actual problem?</div>
+    <div class="opts"><button class="opt">Switch back to HTTP/1.1 so each image has its own request</button><button class="opt" data-ok>Enable HTTP/3, so a lost packet only stalls its own stream instead of every image on the connection</button><button class="opt">Increase the server's CPU</button></div>
+    <div class="explain">On lossy networks, HTTP/2 suffers TCP head-of-line blocking: one lost packet holds up every multiplexed stream. QUIC's independent streams fix that (with HTTP/2 kept as a fallback where UDP is blocked). The server's CPU isn't the bottleneck.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Every new request: <span class="nw">DNS</span> lookup → <span class="nw">TCP</span> handshake (1 RTT) → <span class="lt">TLS 1.3</span> (1 RTT; 1.2 needs 2) → <span class="cl">HTTP</span> request (1 RTT) → server time.</li>
+      <li>Light in fiber ≈ 200 km/ms: NY ↔ London ≥ 56 ms, NY ↔ Sydney ≥ 160 ms round trip. Distance sets the floor.</li>
+      <li>Fixes: cache DNS, reuse connections, TLS 1.3, HTTP/2 multiplexing, HTTP/3 (QUIC) for lossy networks, CDNs to get close.</li>
+      <li>DNS TTLs trade agility for resilience, and DNS itself can take your whole company offline.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { if (b.disabled) return; bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    const get = () => bs.find(b => b.classList.contains("on")).dataset.v;
+    get.set = v => bs.forEach(x => x.classList.toggle("on", x.dataset.v === String(v)));
+    get.btns = bs;
+    return get;
+  };
+  const hms = s => s >= 86400 ? (s / 86400).toFixed(s % 86400 ? 1 : 0) + " d" : s >= 3600 ? (s / 3600).toFixed(s % 3600 ? 1 : 0) + " h" : s >= 60 ? Math.round(s / 60) + " min" : Math.round(s) + " s";
+
+  // ---------- DNS lookup ----------
+  const TTLS = [30, 300, 3600, 86400];
+  const D = new Flow($("dns"), { width: 760, height: 300 });
+  D.node("br", { x: 70, y: 150, w: 110, label: "💻 Browser", sub: "+ OS cache", kind: "cl" })
+   .node("res", { x: 270, y: 150, w: 130, label: "Recursive resolver", sub: "1.1.1.1 / your ISP", kind: "nw" })
+   .node("root", { x: 500, y: 45, w: 120, label: "Root server", sub: "“who has .example?”", kind: "nw" })
+   .node("tld", { x: 500, y: 150, w: 120, label: "TLD server", sub: ".example", kind: "nw" })
+   .node("auth", { x: 500, y: 255, w: 140, label: "Authoritative", sub: "ns1.shop.example", kind: "db" })
+   .node("web", { x: 690, y: 150, w: 110, label: "🖥️ Web server", sub: "", kind: "sv" })
+   .edge("br", "res", { label: "10 ms" }).edge("res", "root", { label: "30 ms" }).edge("res", "tld", { label: "30 ms" }).edge("res", "auth", { label: "30 ms" })
+   .edge("br", "web", { dashed: true, noArrow: true }).render();
+  D.edgeStyle("br", "web", { hidden: true });
+  const IPS = ["203.0.113.10", "198.51.100.77"];
+  let st;
+  const resetDns = () => {
+    st = { t: 0, ip: 0, broken: false, bc: null, rc: null, tldc: null, q: 0 };
+    D.set("auth", { down: false, sub: "ns1.shop.example" }).set("web", { sub: IPS[0], down: false, hot: false });
+    $("break").textContent = "💥 Make authoritative servers unreachable";
+    paintDns("–", "–"); $("dlog").textContent = "Press Look up to start.";
+  };
+  function paintDns(ms, by) {
+    $("ttlv").textContent = hms(TTLS[+$("ttl").value]);
+    $("clk").textContent = "t = " + hms(st.t);
+    $("dms").textContent = ms; $("dby").textContent = by;
+    const exp = st.rc ? st.rc.exp - st.t : -1;
+    $("dexp").textContent = exp > 0 ? hms(exp) : "expired / none";
+    $("dq").textContent = st.q;
+  }
+  let busy = false;
+  $("look").onclick = async () => {
+    if (busy) return; busy = true;
+    const ttl = TTLS[+$("ttl").value], log = [];
+    let ms = 0, by, ip = null;
+    if (st.bc && st.bc.exp > st.t) { by = "browser cache"; ip = st.bc.ip; log.push("Browser cache hit: 0 ms, no network at all."); }
+    else {
+      await D.packet(["br", "res"], { color: "--c-cl", dur: 350 }); ms += 10;
+      if (st.rc && st.rc.exp > st.t) { by = "resolver cache"; ip = st.rc.ip; log.push("The resolver had a cached copy: one 10 ms round trip."); }
+      else {
+        if (!(st.tldc && st.tldc > st.t)) {
+          await D.packet(["res", "root"], { color: "--c-nw", dur: 380, back: true }); ms += 30;
+          log.push("Root: “ask the .example TLD servers.”");
+        }
+        await D.packet(["res", "tld"], { color: "--c-nw", dur: 380, back: true }); ms += 30;
+        log.push("TLD: “ask ns1.shop.example.”");
+        st.tldc = st.t + 2 * 86400; // referrals to TLD servers typically cached for a long time
+        if (st.broken) {
+          await D.packet(["res", "auth"], { color: "--c-er", dur: 420 });
+          ms += 2000; by = "nobody (SERVFAIL)";
+          log.push("Authoritative servers unreachable: the resolver times out and returns SERVFAIL. The web servers are fine, but nobody can find them.");
+        } else {
+          await D.packet(["res", "auth"], { color: "--c-db", dur: 380, back: true }); ms += 30; st.q++;
+          ip = IPS[st.ip]; by = "authoritative server";
+          st.rc = { ip, exp: st.t + ttl };
+          log.push(`Authoritative: “www.shop.example is ${ip}, cache it for ${hms(ttl)}.”`);
+        }
+      }
+      if (ip) await D.packet(["res", "br"], { color: "--c-ca", dur: 350 });
+      if (ip) st.bc = { ip, exp: st.t + Math.min(ttl, 60) };
+    }
+    if (ip) {
+      const stale = ip !== IPS[st.ip];
+      D.edgeStyle("br", "web", { hidden: false, color: stale ? "--c-er" : "--c-sv" });
+      D.set("web", { sub: ip + (stale ? " (old!)" : ""), hot: stale });
+      await D.packet(["br", "web"], { color: stale ? "--c-er" : "--c-sv", dur: 500 });
+      log.push(stale ? `Connected to ${ip}: the OLD server. The cached answer outlives your move until the TTL runs out.` : `Connecting to ${ip}. Next comes the TCP handshake.`);
+    } else D.edgeStyle("br", "web", { hidden: true });
+    paintDns(ms >= 1000 ? (ms / 1000).toFixed(0) + " s (timeout)" : ms + " ms", by);
+    $("dlog").textContent = log.join(" → ");
+    busy = false;
+  };
+  $("wait").onclick = () => { st.t += 300; paintDns($("dms").textContent, $("dby").textContent); $("dlog").textContent = "5 minutes later. Any cached copy older than its TTL has now expired."; };
+  $("move").onclick = () => {
+    st.ip = 1 - st.ip; D.set("web", { sub: IPS[st.ip] + " (new)", hot: false });
+    $("dlog").textContent = `The authoritative record now says ${IPS[st.ip]}. Resolvers holding the old answer will keep using it until their copy expires.`;
+  };
+  $("break").onclick = () => {
+    st.broken = !st.broken;
+    D.set("auth", { down: st.broken, sub: st.broken ? "unreachable" : "ns1.shop.example" });
+    $("break").textContent = st.broken ? "🔧 Fix authoritative servers" : "💥 Make authoritative servers unreachable";
+    $("dlog").textContent = st.broken ? "Authoritative servers withdrawn from the internet (like Meta, Oct 2021). Cached answers still work until they expire." : "Authoritative servers reachable again.";
+  };
+  $("ttl").oninput = () => paintDns($("dms").textContent, $("dby").textContent);
+  $("dreset").onclick = resetDns;
+  resetDns();
+
+  // ---------- latency waterfall ----------
+  const getDist = seg("dist", () => wf()), getDns = seg("dnsm", () => wf()), getTls = seg("tls", () => wf()), getHv = seg("hv", () => wf());
+  ["reuse", "cdn", "loss"].forEach(id => ($(id).onchange = wf));
+  const C = { dns: "--c-nw", tcp: "--c-nw", tls: "--c-lt", net: "--c-cl", sv: "--c-sv", er: "--c-er" };
+  function wf() {
+    const hv = +getHv(), reuse = $("reuse").checked, cdn = $("cdn").checked, loss = $("loss").checked;
+    getTls.btns.forEach(b => (b.disabled = hv === 3));
+    const rtt = cdn ? 5 : +getDist(), tlsRt = hv === 3 ? 0 : +getTls();
+    const dns = reuse ? 0 : +getDns();
+    const rows = []; let t = 0, rts = 0;
+    const seg2 = (name, parts) => rows.push({ name, parts });
+    if (dns) { seg2("DNS lookup", [[t, dns, C.dns]]); t += dns; }
+    if (!reuse) {
+      if (hv === 3) { seg2("QUIC + TLS 1.3", [[t, rtt, C.tls]]); t += rtt; rts += 1; }
+      else {
+        seg2("TCP handshake", [[t, rtt, C.tcp]]); t += rtt; rts += 1;
+        seg2("TLS " + (tlsRt === 2 ? "1.2" : "1.3"), [[t, rtt * tlsRt, C.tls]]); t += rtt * tlsRt; rts += tlsRt;
+      }
+    }
+    const htmlServer = cdn ? 5 : 50;
+    const ttfb = t + rtt / 2 + htmlServer + rtt / 2;
+    seg2("GET page.html", [[t, rtt / 2, C.net], [t + rtt / 2, htmlServer, C.sv], [t + rtt / 2 + htmlServer, rtt / 2, C.net]]);
+    t = ttfb; rts += 1;
+    const files = 6, lossAt = 2; // the 3rd file's packet is lost
+    let end = t, stalled = 0;
+    for (let i = 0; i < files; i++) {
+      const start = hv === 1 ? t + i * (rtt + 5) : t;
+      let parts = [[start, rtt / 2, C.net], [start + rtt / 2, 5, C.sv], [start + rtt / 2 + 5, rtt / 2, C.net]];
+      let fin = start + rtt + 5;
+      const hit = loss && (hv === 2 || i === lossAt);
+      if (hit) { parts.push([fin, rtt, C.er]); fin += rtt; stalled++; }
+      if (hv === 1 && loss && i > lossAt) { parts = parts.map(p => [p[0] + rtt, p[1], p[2]]); fin += rtt; }
+      rows.push({ name: ["style.css", "app.js", "hero.jpg", "logo.svg", "font.woff2", "photo.jpg"][i], parts });
+      end = Math.max(end, fin);
+    }
+    const scale = 100 / end;
+    $("wf").innerHTML = rows.map(r => {
+      const last = r.parts[r.parts.length - 1], fin = last[0] + last[1];
+      return `<div class="row"><span>${r.name}</span><div class="track">${r.parts.map(p => `<i style="left:${p[0] * scale}%;width:${Math.max(0.4, p[1] * scale)}%;background:var(${p[2]})"></i>`).join("")}</div><span class="t">${Math.round(fin)} ms</span></div>`;
+    }).join("");
+    $("rt").textContent = rts; $("ttfb").textContent = Math.round(ttfb) + " ms"; $("done").textContent = Math.round(end) + " ms";
+    $("stl").textContent = loss ? (hv === 1 ? `1 (+${files - lossAt - 1} queued behind it)` : stalled) : "–";
+    $("wmsg").textContent = hv === 3 && loss ? "HTTP/3: only the file whose packet was lost waits; the others are delivered on their own streams." :
+      hv === 2 && loss ? "HTTP/2 over TCP: one lost packet holds up every file on the connection until it is re-sent (head-of-line blocking)." :
+      hv === 1 ? "HTTP/1.1 on one connection fetches files one after another; browsers soften this by opening a few parallel connections, each paying its own handshakes." :
+      cdn ? "With a nearby edge, every round trip is tiny, so even the setup barely matters." :
+      `Setup round trips cost ${Math.round(ttfb - htmlServer - rtt)} ms before the request is even sent.`;
+  }
+  $("worst").onclick = () => { getDist.set(160); getDns.set(100); getTls.set(2); getHv.set(1); $("reuse").checked = false; $("cdn").checked = false; $("loss").checked = true; wf(); };
+  $("best").onclick = () => { getDist.set(160); getDns.set(0); getTls.set(1); getHv.set(3); $("reuse").checked = true; $("cdn").checked = true; $("loss").checked = false; wf(); };
+  wf();
+})();
+</script>
+</body>
+</html>

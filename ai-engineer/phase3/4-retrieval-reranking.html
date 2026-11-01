@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.4 Retrieval &amp; reranking · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .pair { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 760px) { .pair { grid-template-columns: 1fr; } }
+  .list { max-height: 330px; overflow-y: auto; }
+  .hit.gold { border-left-color: var(--c-ev); background: color-mix(in srgb, var(--c-ev) 12%, var(--bg2)); }
+  .hit.dim { opacity: .55; }
+  .hit .rk-n { font-family: var(--mono); font-weight: 700; margin-right: 6px; }
+  .tagline { font-size: .74rem; color: var(--muted); }
+  .verdict { font-weight: 700; margin: 8px 0; }
+</style>
+</head>
+<body data-lesson="a3-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 4</div>
+  <h1>Retrieval &amp; reranking: finding the five chunks that matter</h1>
+  <p class="subtitle">Fast search finds fifty candidates; a slower, smarter model picks the five the LLM will read. Then make sure those five aren't the same fact five times.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Embeddings and cosine similarity</b>: query and chunk become vectors; similar meanings score close to 1 (Lesson 2.1).</li>
+      <li><b>ANN indexes</b> (approximate nearest neighbour, such as HNSW) find the closest vectors among millions in milliseconds (Lesson 2.2).</li>
+      <li><b>Hybrid search</b> combines keyword search (BM25) with vectors, often by RRF, reciprocal rank fusion (Lesson 2.4).</li>
+      <li><b>Chunks</b> are the pieces you retrieve (Lesson 3.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In January 2019, two researchers at NYU took BERT, a model that had come out a few months earlier, and used it for one narrow job: given a question and <b>one</b> candidate passage, read them <b>together</b> and score how relevant the passage is. They didn't replace the search engine. They just re-sorted its top results.</p>
+    <p>That simple reranker went straight to the top of the MS MARCO passage-ranking leaderboard, <b>27% better</b> (relative, in MRR@10: mean reciprocal rank, which rewards putting the right passage near the top of the first 10) than the previous state of the art. Five years later Anthropic's retrieval tests told the same story: adding a reranker on top of their best retrieval setup cut failed retrievals from 2.9% to 1.9%.</p>
+  </div>
+
+  <h2>Numbers first: why two stages?</h2>
+  <p>There are two ways to score a question against a chunk:</p>
+  <ul>
+    <li>A <b>bi-encoder</b> (the embedding model from Phase 2) encodes the question and every chunk <b>separately</b> into vectors. Chunk vectors are computed once, at index time; a query costs one encoding plus a fast vector search.</li>
+    <li>A <b>cross-encoder</b> reads the question and a chunk <b>together</b>, in one pass, so every word of the question can attend to every word of the chunk. It sees “Plus members” and “60 days” side by side and judges whether this passage <i>answers</i> the question. Much more accurate, but nothing can be precomputed: it must run once per (question, chunk) pair, at query time.</li>
+  </ul>
+  <p>The Sentence-BERT paper put numbers on the gap. Finding the most similar pair in 10,000 sentences with a BERT cross-encoder means scoring 10,000 × 9,999 ÷ 2 ≈ <b>50 million pairs: about 65 hours</b>. With a bi-encoder: about <b>5 seconds</b>. So nobody cross-encodes a whole corpus. You do both:</p>
+  <div class="prompt">1,000,000 chunks ──(bi-encoder + ANN, ~10–50 ms)──▶ top 50 candidates
+                ──(cross-encoder reranker, ~50–300 ms)──▶ top 5 ──▶ LLM prompt</div>
+  <p class="muted">Latencies are typical orders of magnitude; they depend on hardware, model size and chunk length.</p>
+  <p>Two words you'll use constantly: <b>top-k</b>, how many results a stage keeps, and <b>recall@k</b>, the share of questions whose answer chunk is somewhere in the top k. The LLM can only use what's in its top k, so recall@k of the final stage is the number that matters most.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Recall first, precision second.</b> The first stage casts a wide, cheap net so the answer chunk is <i>somewhere</i> in the top 50. The reranker spends real compute putting it at the <i>top</i>. A reranker can only reorder what it's given: if the first stage missed the chunk, no reranker can bring it back.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: hiring</span>
+    <p>A thousand people apply. You can't interview them all, so a quick résumé screen picks 20 (fast, crude, generous). Then you interview those 20 properly (slow, accurate) and make 5 offers. Screen too strictly, say down to 5, and the best candidate may never get an interview. Interview everyone, and hiring takes a year. Retrieval works the same way: the bi-encoder is the résumé screen, the cross-encoder is the interview.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Retrieve 20, rerank to 5</span>
+    <p class="hint">30 chunks from Acme Gear's help centre, including the usual “helpful” overview pages full of keywords but no answers. Pick a question: the left list is the first stage (embedding similarity), the right list is what the model will actually read. The green chunk holds the answer. Turn the reranker on; then try shrinking the first stage to 5 candidates.</p>
+    <div class="controls">
+      <label>question <select id="rq" class="btn small"></select></label>
+    </div>
+    <div class="controls">
+      <label>first stage keeps <input type="range" id="rn" min="3" max="30" step="1" value="20"> <b class="mono" id="rnv"></b></label>
+      <label>model reads top <input type="range" id="rk" min="1" max="8" step="1" value="5"> <b class="mono" id="rkv"></b></label>
+      <label><input type="checkbox" id="rr"> rerank with a cross-encoder</label>
+      <button class="btn primary" id="rall">▶ Score all 8 questions</button>
+    </div>
+    <div class="verdict" id="rverdict"></div>
+    <div class="pair">
+      <div><p class="hint" style="margin:0">① First stage: embedding similarity</p><div class="list" id="l1"></div></div>
+      <div><p class="hint" style="margin:0">② Sent to the LLM</p><div class="list" id="l2"></div></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">answer chunk rank: first stage <b id="gr">–</b></div>
+      <div class="stat">after reranking <b id="gr2">–</b></div>
+      <div class="stat">recall@k, all questions <b id="rec">–</b></div>
+      <div class="stat">pairs the reranker scores <b id="pairs">–</b></div>
+    </div>
+    <canvas class="chart" id="rc" style="height:220px"></canvas>
+    <p class="hint">The first stage uses this course's toy embedding. The “cross-encoder” is a labelled, rule-based stand-in: it reads question and chunk together and rewards what a real cross-encoder learns to notice: the chunk contains the <i>kind</i> of answer asked for (a number of days, a price), names the same product or group, and isn't just a pile of keywords. Real rerankers learn these signals from millions of labelled pairs.</p>
+  </div>
+  <p>What you should see: the overview pages (“Refund policy overview: refunds, returns, reimbursement…”) win on similarity because they're stuffed with the same words as the question. The answer chunk sits at rank 6, 8 or 9: retrieved, but not in the top 5 the LLM reads. Turn the reranker on and every answer chunk jumps to rank 1. Now drop the first stage to 5 candidates: some answers are no longer in the pool, and the reranker can't help.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: recall and reranker cost by hand</span>
+    <ul>
+      <li><b>Recall@5 without reranking</b>: of the 8 questions, 5 have their answer chunk in the first-stage top 5 → 5 ÷ 8 = <b>62.5%</b>. With reranking over the top 20: 8 ÷ 8 = <b>100%</b>.</li>
+      <li><b>Reranker work</b>: 50 candidates × (300-token chunk + 20-token question) = <b>16,000 tokens</b> per query through the cross-encoder. At 100 queries per second, that's 1.6 million tokens a second: why rerankers are small models, and why the candidate count stays around 20 to 100.</li>
+      <li><b>Hosted rerankers</b> bill per search or per document, and usually cap request size (Cohere recommends at most 1,000 documents per request). Self-hosted ones cost GPU time.</li>
+    </ul>
+  </div>
+
+  <h2>Choosing k, and when to say “nothing found”</h2>
+  <ul>
+    <li><b>Final k</b> trades recall against tokens and noise. Typical starting points: 3 to 10 chunks to the LLM, 20 to 100 candidates to the reranker. Measure recall@k on your own questions (Lesson 5.4) and pick the smallest k that holds the answers.</li>
+    <li><b>Similarity thresholds</b> (“drop anything below 0.75”) are tempting but treacherous: raw cosine scores aren't calibrated and their scale differs between embedding models. In the playground, the reset-link answer chunk has a similarity of just 0.14 and still ranks 5th. A fixed threshold would have thrown away the answer.</li>
+    <li><b>Reranker scores</b> are better for that decision: they're trained as relevance judgements, and some (Cohere's current models, for example) are documented as calibrated. A low top score is a good signal to abstain (Lesson 3.5).</li>
+  </ul>
+
+  <h2>Reranker options</h2>
+  <table>
+    <tr><th>Kind</th><th>Examples (as of late 2026)</th><th>Good for</th><th>Watch out for</th></tr>
+    <tr><td><b>Hosted cross-encoder API</b></td><td>Cohere Rerank (<code>rerank-v5.0-pro</code> and <code>-fast</code>), Voyage, Jina</td><td>Best quality with no infrastructure; multilingual</td><td>Per-request cost, network latency, data leaves your network</td></tr>
+    <tr><td><b>Open cross-encoder</b></td><td><code>BAAI/bge-reranker-v2-m3</code> (about 0.6B parameters), <code>cross-encoder/ms-marco-MiniLM-L6-v2</code> (tiny, English)</td><td>Self-hosted, cheap at volume, fine-tunable on your data</td><td>You run the GPUs; check licences</td></tr>
+    <tr><td><b>Listwise rerankers</b></td><td><code>jina-reranker-v3</code> (0.6B; reads the query and all candidates in one context)</td><td>Candidates can be compared with each other</td><td>Context length limits the candidate count</td></tr>
+    <tr><td><b>LLM as reranker</b></td><td>Prompt a general LLM to order candidates (RankGPT)</td><td>Strong zero-shot quality; can follow instructions (“prefer official policy pages”)</td><td>Slowest and most expensive; output must be parsed</td></tr>
+  </table>
+
+  <h2>Diversity: MMR</h2>
+  <p>Reranking fixes <i>order</i>. It doesn't fix <b>redundancy</b>. If the same refund paragraph lives on the FAQ page, in the handbook, in an email template and in last year's PDF, all four copies score almost identically, and your top 5 becomes one fact repeated. <b>MMR</b> (maximal marginal relevance, Carbonell and Goldstein, 1998) picks results one at a time and penalises each candidate for being similar to what's already picked:</p>
+  <div class="prompt">next pick = argmax over remaining d of   λ · sim(question, d)  −  (1 − λ) · max over picked s of sim(d, s)</div>
+  <p>λ = 1 is plain relevance ranking. λ = 0 is pure novelty (relevance ignored). Values around 0.5 to 0.7 are common.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · MMR removes the copies</span>
+    <p class="hint">12 candidate chunks for a refund question, including five near-copies of the same sentence from different sources. Start at λ = 1 (pure relevance) and count the distinct facts. Slide λ down until the copies disappear; keep going to see what too much diversity does.</p>
+    <div class="controls">
+      <label>question <select id="mq" class="btn small"><option value="0">How many days do I have to get a refund?</option><option value="1">How do refunds work?</option></select></label>
+      <label>λ <input type="range" id="lam" min="0" max="1" step="0.05" value="1"> <b class="mono" id="lamv"></b></label>
+      <label>pick <input type="range" id="mk" min="3" max="6" step="1" value="5"> <b class="mono" id="mkv"></b></label>
+      <button class="btn" id="msweep">▶ Sweep λ</button>
+    </div>
+    <div id="mlist"></div>
+    <div class="stat-row">
+      <div class="stat">distinct refund facts <b id="facts">–</b></div>
+      <div class="stat">near-copies <b id="dups">–</b></div>
+      <div class="stat">off-topic picks <b id="off">–</b></div>
+    </div>
+    <canvas class="chart" id="mc" style="height:200px"></canvas>
+    <p class="hint">Uses <code>AI.mmr</code> from this course's toolkit with the toy embedding. The same formula runs inside LangChain's and LlamaIndex's MMR options.</p>
+  </div>
+  <p>What you should see: at λ = 1 the model gets “30 days” five times and nothing about Plus members, card refunds or final-sale items. Around λ = 0.5 to 0.6 it gets five different facts. Below about 0.4, chunks about the company's founding and gift cards sneak in: diverse, but useless. Dedup at ingestion (Lesson 3.2) removes exact copies for good; MMR handles the near-copies that slip through.</p>
+
+  <h2>Metadata filters: before or after?</h2>
+  <p>Filters (Lesson 3.2) restrict search to chunks whose metadata matches: product, date, region, permissions. Where you apply them matters. <b>Post-filtering</b> runs the vector search first, then drops non-matching results. Ask for the top 20 when only 5% of the corpus matches the filter, and on average just 20 × 0.05 = <b>1</b> result survives. <b>Filtering during the search</b> keeps looking until it has k matches: Qdrant, Weaviate and Pinecone filter inside the index, and pgvector (0.8 and later) offers <i>iterative index scans</i> for exactly this reason. For permissions, always filter in the query, never after generation.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Cohere Rerank</b>, <b>sentence-transformers</b> <code>CrossEncoder</code> with open rerankers (bge-reranker, MiniLM), Jina and Voyage rerank APIs, framework wrappers (LangChain's <code>max_marginal_relevance_search</code>, LlamaIndex node postprocessors), and your vector database's filter syntax.</p>
+<pre><code><span class="c"># 1. First stage: generous, filtered (Chroma shown; every vector DB has an equivalent)</span>
+res = collection.query(query_embeddings=[embed(q)], n_results=<span class="n">50</span>,
+                       where={<span class="s">"$and"</span>: [{<span class="s">"audience"</span>: <span class="s">"public"</span>}, {<span class="s">"region"</span>: {<span class="s">"$in"</span>: [<span class="s">"CA"</span>, <span class="s">"all"</span>]}}]})
+candidates = res[<span class="s">"documents"</span>][<span class="n">0</span>]
+
+<span class="c"># 2a. Rerank with a hosted model (Cohere v2 API)</span>
+<span class="k">import</span> cohere
+co = cohere.ClientV2()
+rr = co.rerank(model=<span class="s">"rerank-v5.0-fast"</span>, query=q, documents=candidates, top_n=<span class="n">5</span>)
+top = [(candidates[r.index], r.relevance_score) <span class="k">for</span> r <span class="k">in</span> rr.results]
+
+<span class="c"># 2b. ...or with an open cross-encoder you host</span>
+<span class="k">from</span> sentence_transformers <span class="k">import</span> CrossEncoder
+ce = CrossEncoder(<span class="s">"BAAI/bge-reranker-v2-m3"</span>)
+scores = ce.predict([(q, d) <span class="k">for</span> d <span class="k">in</span> candidates])
+top = sorted(zip(candidates, scores), key=<span class="k">lambda</span> x: -x[<span class="n">1</span>])[:<span class="n">5</span>]
+
+<span class="k">if</span> top[<span class="n">0</span>][<span class="n">1</span>] &lt; MIN_SCORE:                     <span class="c"># tune MIN_SCORE on labelled data</span>
+    <span class="k">return</span> <span class="s">"I couldn't find this in our documents."</span>
+
+<span class="c"># 3. Diversity with MMR (LangChain vector stores)</span>
+docs = vector_store.max_marginal_relevance_search(q, k=<span class="n">5</span>, fetch_k=<span class="n">20</span>, lambda_mult=<span class="n">0.5</span>)</code></pre>
+    <p class="hint">Model names change; check the provider's model list. Cohere's rerank endpoint also returns relevance scores you can threshold on.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Bigger first-stage k</td><td>Higher recall: the answer is in the pool</td><td>More reranker work and latency</td></tr>
+      <tr><td>Bigger final k</td><td>More chances the answer is in the prompt</td><td>More tokens, more noise, answers lost in the middle (Lesson 1.4)</td></tr>
+      <tr><td>Cross-encoder reranker</td><td>Much better ordering; usable relevance scores</td><td>+50 to 300 ms typical; a model to host or pay for</td></tr>
+      <tr><td>LLM reranker</td><td>Best zero-shot judgement; instructions</td><td>Seconds and dollars per query at volume</td></tr>
+      <tr><td>MMR</td><td>Diverse context, fewer wasted slots</td><td>Can drop a second, genuinely relevant chunk; one more knob (λ)</td></tr>
+      <tr><td>Filtering during search</td><td>Exact k results that match; safe permissions</td><td>Slower on very selective filters in some indexes</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Hybrid first stage (Lesson 2.4) with top 30 to 50, a hosted reranker down to 5, metadata filters for permissions and dates. Log the scores. One afternoon of work, and often the single biggest quality jump after fixing ingestion.</p></div>
+      <div><h4>At scale</h4><p>Self-hosted rerankers fine-tuned on click and feedback data, multi-stage cascades (a cheap reranker on 500, an expensive one on 50), per-tenant filters inside the ANN index, latency budgets per stage, and offline evals of recall@k and nDCG (a ranking-quality score, Lesson 5.4) on every change.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Our RAG answers are often incomplete, though the right document exists. How would you debug retrieval?” A senior answer:</p>
+    <ul>
+      <li>Measures first: for a labelled set, where does the answer chunk rank? Not retrieved at all (a recall problem: chunking, hybrid search, query rewriting in Lesson 4.1) vs retrieved but ranked below k (an ordering problem: reranking).</li>
+      <li>Proposes retrieve-many-then-rerank-few, explaining bi-encoders vs cross-encoders and the latency budget.</li>
+      <li>Checks for duplicates filling the top k (dedup, MMR) and for filters applied after search.</li>
+      <li>Avoids raw cosine thresholds; uses reranker scores to decide when to abstain.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The reranker that topped MS MARCO</b> <span class="tag res">🧪 Research · 2019</span> <a href="https://arxiv.org/abs/1901.04085" target="_blank" rel="noopener">Nogueira &amp; Cho, Passage Re-ranking with BERT</a></div>
+      <p><b>How:</b> BERT reads the query and one passage together and outputs a relevance score; it re-sorts the top results of a keyword search.</p>
+      <p><b>Why this method:</b> full attention between query and passage beats separate encodings; +27% relative MRR@10 over the previous best.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Why bi-encoders exist</b> <span class="tag res">🧪 Research · 2019</span> <a href="https://arxiv.org/abs/1908.10084" target="_blank" rel="noopener">Reimers &amp; Gurevych, Sentence-BERT</a></div>
+      <p><b>How:</b> trained BERT to produce standalone sentence embeddings compared by cosine similarity.</p>
+      <p><b>Why this method:</b> the most-similar-pair search over 10,000 sentences dropped from about 65 hours (cross-encoding) to about 5 seconds.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Retrieve 150, rerank to 20</b> <span class="tag co">🏢 Anthropic · 2024</span> <a href="https://www.anthropic.com/research/contextual-retrieval" target="_blank" rel="noopener">Introducing Contextual Retrieval</a></div>
+      <p><b>How:</b> initial retrieval of the top 150 chunks, a reranking model scores each against the query, the top 20 go to the model.</p>
+      <p><b>Why this method:</b> on top of contextual embeddings and BM25, reranking took the top-20 retrieval failure rate from 2.9% to 1.9%.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>LLMs as rerankers</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2304.09542" target="_blank" rel="noopener">Sun et al., Is ChatGPT Good at Search? (RankGPT)</a></div>
+      <p><b>How:</b> prompted GPT-class models to output a ranking of candidate passages, then distilled that skill into small models.</p>
+      <p><b>Why this method:</b> properly instructed LLMs matched or beat supervised rerankers, and a distilled 440M model beat a 3B supervised one on the BEIR benchmark.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Relevance plus novelty</b> <span class="tag hist">📜 History · 1998</span> <a href="https://www.cs.cmu.edu/~jgc/publication/The_Use_MMR_Diversity_Based_LTMIR_1998.pdf" target="_blank" rel="noopener">Carbonell &amp; Goldstein, The Use of MMR</a></div>
+      <p><b>How:</b> score each candidate as a weighted mix of relevance to the query and dissimilarity to results already chosen.</p>
+      <p><b>Why this method:</b> users want “relevant novelty”, not ten copies of the best hit; the same one-line formula is still the default diversity option today.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · free citations from the reranker</span>
+    <p>Cohere's current rerank API can return not just a score per document but the <b>relevant spans</b> inside it: character ranges with their own scores. The reranker that sorted your chunks can also tell you which sentence made it relevant, which is half of a citation (Lesson 3.5).</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The first stage is Phase 2: ANN indexes (2.2), vector databases (2.3), hybrid search and RRF (2.4). Chunk quality (3.3) sets the ceiling for everything here. The ranked chunks become the context of a grounded prompt (3.5). Query rewriting and HyDE (4.1), parent-child and ColBERT indexing (4.2) and agentic retrieval (4.4) all improve the first stage; recall@k, MRR and nDCG are defined properly in Lesson 5.4. The geometry of cosine similarity is in the Math for AI course: <a href="../../math-course/phase1/3-dot-product.html">the dot product</a>; precision and recall in <a href="../../math-course/phase5/6b-metrics.html">metrics</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.cohere.com/docs/rerank" target="_blank" rel="noopener">Cohere: Rerank overview</a>. Current models, limits and best practices.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.sbert.net/docs/cross_encoder/usage/usage.html" target="_blank" rel="noopener">Sentence Transformers: cross-encoder usage</a>. Running and training open rerankers.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1901.04085" target="_blank" rel="noopener">Passage Re-ranking with BERT</a>. Four pages; the idea every reranker builds on.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You retrieve the top 40 by vector search and then apply a filter that only 10% of your corpus matches. About how many results survive, on average?</div>
+    <div class="opts"><button class="opt" data-ok>4</button><button class="opt">36</button><button class="opt">40</button></div>
+    <div class="explain">40 × 0.10 = <b>4</b>, and sometimes zero. That's post-filtering. pgvector's README uses this very example: with HNSW's default candidate list of 40 and a filter matching 10% of rows, about 4 rows come back. Filter inside the search (or enable iterative scans) so the database keeps looking until it finds k matches.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your logs show the answer chunk usually isn't anywhere in the top 50 candidates. What helps most?</div>
+    <div class="opts"><button class="opt">A stronger reranker</button><button class="opt" data-ok>Improve the first stage: hybrid search, better chunks, query rewriting, or more candidates</button><button class="opt">Send the top 10 instead of the top 5 to the LLM</button></div>
+    <div class="explain">A reranker can only reorder what it receives, and sending 10 of the same 50 doesn't help either. This is a recall problem, so fix recall: keyword + vector search (2.4), chunking (3.3), query transformations (4.1).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Why don't we simply run the cross-encoder over every chunk in the corpus?</div>
+    <div class="opts"><button class="opt">Cross-encoders can't read short questions</button><button class="opt" data-ok>It must run once per (question, chunk) pair at query time, so a million chunks means a million model calls per question</button><button class="opt">Cross-encoders are less accurate than embeddings</button></div>
+    <div class="explain">Embeddings of chunks are computed once and searched in milliseconds. A cross-encoder needs the question, so nothing can be precomputed. That's why it only sees the top 20 to 100 candidates.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Two stages: a bi-encoder (embeddings + ANN, often hybrid with BM25) retrieves 20 to 100 candidates cheaply; a cross-encoder reranks them and keeps 3 to 10.</li>
+      <li>Recall first: the reranker can't recover a chunk the first stage missed. Measure recall@k and where the answer ranks.</li>
+      <li>Don't trust raw cosine thresholds; use reranker scores to decide when nothing relevant was found.</li>
+      <li>Use MMR (λ ≈ 0.5 to 0.7) or dedup so the top k isn't one fact repeated; apply metadata filters during the search, never after.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  /* ---------- corpus: 30 help-centre chunks ---------- */
+  const C = [
+    ["Refunds", "Refunds are available within 30 days of delivery for every order."],
+    ["Refunds", "Members of the Plus program get a longer window: 60 days from the day the parcel arrives."],
+    ["Refunds", "Once approved, the money goes back to the original card within 5 business days."],
+    ["Refunds", "We love making refunds and returns easy! Our friendly returns team handles every refund request and return with care."],
+    ["Refunds", "Questions about refunds, returns or money back? Visit our returns and refunds page for help with your refund."],
+    ["Refunds", "Refund policy overview: refunds, returns, reimbursement and money back for orders, explained by our refunds team."],
+    ["Shipping", "Standard shipping takes 3 to 5 business days."],
+    ["Shipping", "Express shipping arrives the next business day if you order before 2 pm."],
+    ["Shipping", "Shipping and delivery questions: we ship parcels with trusted couriers, and delivery tracking keeps your package on its way."],
+    ["Shipping", "Orders can be sent to addresses in the United States and Canada only, for now."],
+    ["Shipping", "Shipping, delivery and courier updates: track every parcel, package and delivery from our shipping page."],
+    ["Warranty", "Every jacket has a two-year warranty against defects."],
+    ["Warranty", "Boots are covered for one year against manufacturing defects."],
+    ["Warranty", "The warranty does not cover damage from normal wear."],
+    ["Warranty", "Warranty, guarantee and repair questions: our warranty team loves helping with any defect, repair or guarantee."],
+    ["Warranty", "Warranty guide: warranty coverage, defect repair and guarantee options for jackets, boots and tents."],
+    ["Warranty", "To make a warranty claim, send a photo of the defect to support."],
+    ["Plus", "The Plus membership is 49 dollars a year."],
+    ["Plus", "Plus includes free express shipping on every order."],
+    ["Plus", "Plus pricing and billing: the Plus fee, charges, payment and cost questions are handled by our billing team."],
+    ["Plus", "Plus membership perks, Plus member benefits and Plus program news for members."],
+    ["Plus", "Plus member pricing: cost, fees and charges for the Plus membership, explained by our billing team."],
+    ["Plus", "To cancel Plus, open Account settings and choose Cancel membership. You keep the benefits until the end of the paid year."],
+    ["Account", "If you are locked out, use the Forgot password link on the sign in page."],
+    ["Account", "For safety, the link we email you stops working after 30 minutes."],
+    ["Account", "Password and login help: sign in problems, locked out accounts, credentials and password reset questions are covered here."],
+    ["Account", "Reset your password, reset your login, reset your credentials: password reset help."],
+    ["Account", "For security, we never ask for your password by email."],
+    ["Stores", "Gift cards never expire and can be used online or in stores."],
+    ["Stores", "Price matching: we match the price of an identical item sold by a major retailer within 14 days of purchase."],
+  ];
+  const Q = [
+    ["How long do Plus members have to get a refund?", 1],
+    ["How many days until refund money is back on my card?", 2],
+    ["What does the Plus membership cost?", 17],
+    ["When does the password reset link expire?", 24],
+    ["How long is the warranty on boots?", 12],
+    ["Is express shipping free for Plus members?", 18],
+    ["Do you ship to Canada?", 9],
+    ["Does the warranty cover normal wear and tear?", 13],
+  ];
+  const V = C.map(c => AI.embed(c[1]));
+  $("rq").innerHTML = Q.map((q, i) => `<option value="${i}">${i + 1}. ${q[0]}</option>`).join("");
+
+  // Simulated cross-encoder: reads question + chunk together (rule-based stand-in, see the hint)
+  function crossEncoder(q, txt) {
+    const dense = AI.cosine(AI.embed(q), AI.embed(txt));
+    const st = w => w.replace(/s$/, "");
+    const qw = new Set(AI.words(q).map(st)), dw = new Set(AI.words(txt).map(st));
+    const overlap = [...dw].filter(w => qw.has(w)).length / Math.max(3, qw.size);
+    const ql = q.toLowerCase(), tl = txt.toLowerCase();
+    let ans = 0;
+    if (/how long|how many|when|expire/.test(ql) && /\b\d+\s*(days?|minutes?|years?|business days)|\b(one|two|three)[- ]year|next business day/.test(tl)) ans += 1;
+    if (/cost|price|how much/.test(ql) && /\d+\s*dollars/.test(tl)) ans += 1;
+    if (/^(is|do|does|can)\b/.test(ql) && /\b(not|never|free|includes|only)\b/.test(tl)) ans += 0.6;
+    const fluff = /love|friendly|questions|help with|covered here|handled by|explained|news|updates|help\./.test(tl) ? -0.8 : 0;
+    let ent = 0;
+    ["plus", "boots", "jacket", "canada", "express", "wear"].forEach(e => { if (ql.includes(e)) ent += tl.includes(e) ? 0.5 : -0.3; });
+    const raw = 0.6 * dense + 1.2 * overlap + ans + ent + fluff;
+    return 1 / (1 + Math.exp(-3 * (raw - 1))); // squash to 0..1 like a relevance score
+  }
+  function run(qi, N, k, rerank) {
+    const [q, gold] = Q[qi], qv = AI.embed(q);
+    const first = V.map((v, i) => ({ i, s: AI.cosine(qv, v) })).sort((a, b) => b.s - a.s);
+    const pool = first.slice(0, N);
+    const second = rerank ? pool.map(x => ({ i: x.i, s: crossEncoder(q, C[x.i][1]), d: x.s })).sort((a, b) => b.s - a.s) : pool.map(x => ({ ...x, d: x.s }));
+    return { first, pool, top: second.slice(0, k), r1: first.findIndex(x => x.i === gold) + 1, r2: second.findIndex(x => x.i === gold) + 1, gold };
+  }
+  const row = (x, n, gold, label, dim) => `<div class="hit${x.i === gold ? " gold" : " miss"}${dim ? " dim" : ""}"><span class="sc">${label}</span><span class="rk-n">#${n + 1}</span>${esc(C[x.i][1])} <span class="tagline">· ${C[x.i][0]}</span></div>`;
+  function render() {
+    const N = +$("rn").value, k = +$("rk").value, rr = $("rr").checked, qi = +$("rq").value;
+    $("rnv").textContent = N; $("rkv").textContent = k;
+    const r = run(qi, N, k, rr);
+    $("l1").innerHTML = r.first.slice(0, Math.max(N, 10)).map((x, n) => row(x, n, r.gold, "cosine " + x.s.toFixed(2), n >= N)).join("")
+      + (N < 10 ? `<p class="hint">Faded rows are below the cut: the reranker never sees them.</p>` : "");
+    $("l2").innerHTML = r.top.map((x, n) => row(x, n, r.gold, rr ? "relevance " + x.s.toFixed(2) : "cosine " + x.s.toFixed(2))).join("");
+    $("gr").textContent = "#" + r.r1;
+    $("gr2").textContent = !rr ? "(off)" : r.r2 ? "#" + r.r2 : "not in pool";
+    const inTop = r.top.some(x => x.i === r.gold);
+    $("rverdict").innerHTML = inTop ? `<span class="ev">✅ The answer chunk is in the top ${k} the LLM reads.</span>`
+      : r.r1 > N ? `<span class="rk">❌ The answer chunk ranked #${r.r1} in the first stage, outside the ${N} candidates. No reranker can bring it back: widen the first stage.</span>`
+      : `<span class="rk">❌ The answer chunk was retrieved (#${r.r1}) but not in the top ${k}. The LLM never sees it${rr ? "" : ": try the reranker"}.</span>`;
+    let hits = 0; Q.forEach((_, i) => { const x = run(i, N, k, rr); hits += x.top.some(t => t.i === x.gold); });
+    $("rec").textContent = `${hits} / ${Q.length} (${Math.round(100 * hits / Q.length)}%)`;
+    $("pairs").textContent = rr ? N + " per question" : "0";
+  }
+  ["rn", "rk", "rq"].forEach(id => ($(id).oninput = render));
+  $("rr").onchange = render;
+  $("rall").onclick = () => {
+    const N = +$("rn").value, series = [false, true].map(rr => {
+      const pts = [];
+      for (let k = 1; k <= 8; k++) { let h = 0; Q.forEach((_, i) => { const x = run(i, N, k, rr); h += x.top.some(t => t.i === x.gold); }); pts.push([k, 100 * h / Q.length]); }
+      return pts;
+    });
+    Plot.line($("rc"), {
+      series: [
+        { label: "embedding similarity only", color: MX.css("--c-rk"), data: series[0], width: 3, dots: true },
+        { label: `reranked (from top ${N})`, color: MX.css("--c-ev"), data: series[1], width: 3, dots: true },
+      ], xLabel: "k (chunks the LLM reads)", yLabel: "recall@k %", yMin: 0, yMax: 100,
+    });
+  };
+  render(); $("rall").onclick();
+
+  /* ---------- MMR ---------- */
+  const M = [
+    ["handbook 2026", "You have 30 days after delivery to ask for a refund.", "30 days"],
+    ["FAQ page", "Refund window: you have 30 days after delivery to ask for a refund.", "30 days"],
+    ["email template", "Reminder: you have 30 days after delivery to request your refund.", "30 days"],
+    ["handbook 2025 PDF", "You have 30 days after delivery to ask for a refund (2025 edition).", "30 days"],
+    ["help widget", "Need a refund? You have 30 days after delivery.", "30 days"],
+    ["handbook 2026", "Plus members get 60 days instead of 30.", "Plus"],
+    ["handbook 2026", "Once approved, the money reaches your original card within 5 business days.", "card"],
+    ["handbook 2026", "Items marked final sale cannot be refunded.", "final sale"],
+    ["handbook 2026", "To start, open your order and choose Request refund.", "how to start"],
+    ["handbook 2026", "If the item arrived damaged, return shipping is free.", "damaged"],
+    ["blog", "Acme Gear was started in a garage in 2009.", null],
+    ["handbook 2026", "Gift cards never expire.", null],
+  ];
+  const MQ = ["How many days do I have to get a refund?", "How do refunds work?"];
+  const MV = M.map(m => AI.embed(m[1]));
+  function pickMMR(qi, lam, k) { return AI.mmr(AI.embed(MQ[qi]), MV, k, lam); }
+  function stats(pick) {
+    const facts = new Set(pick.map(i => M[i][2]).filter(Boolean)).size;
+    const off = pick.filter(i => !M[i][2]).length;
+    return { facts, off, dups: pick.length - facts - off };
+  }
+  function renderMMR() {
+    const lam = +$("lam").value, k = +$("mk").value, qi = +$("mq").value, qv = AI.embed(MQ[qi]);
+    $("lamv").textContent = lam.toFixed(2); $("mkv").textContent = k;
+    const pick = pickMMR(qi, lam, k), seen = new Map();
+    $("mlist").innerHTML = pick.map((i, n) => {
+      const fact = M[i][2], copy = fact && seen.has(fact);
+      if (fact && !copy) seen.set(fact, n + 1);
+      const note = !fact ? `<span class="rk">off-topic</span>` : copy ? `<span class="rk">same fact as #${seen.get(fact)}</span>` : `<span class="ev">new fact: ${fact}</span>`;
+      return `<div class="hit${!fact || copy ? " miss" : ""}"><span class="sc">relevance ${AI.cosine(qv, MV[i]).toFixed(2)}</span><span class="rk-n">#${n + 1}</span>${esc(M[i][1])} <span class="tagline">· ${M[i][0]}</span> · ${note}</div>`;
+    }).join("");
+    const s = stats(pick);
+    $("facts").textContent = s.facts + " / " + k; $("dups").textContent = s.dups; $("off").textContent = s.off;
+  }
+  ["lam", "mk", "mq"].forEach(id => ($(id).oninput = renderMMR));
+  $("msweep").onclick = () => {
+    const k = +$("mk").value, qi = +$("mq").value, F = [], O = [];
+    for (let l = 0; l <= 1.0001; l += 0.05) { const s = stats(pickMMR(qi, l, k)); F.push([+l.toFixed(2), s.facts]); O.push([+l.toFixed(2), s.off]); }
+    Plot.line($("mc"), {
+      series: [
+        { label: "distinct facts", color: MX.css("--c-cx"), data: F, width: 3 },
+        { label: "off-topic picks", color: MX.css("--c-rk"), data: O, width: 2, dash: [6, 4] },
+      ], xLabel: "λ (1 = pure relevance)", yMin: 0, yMax: k,
+    });
+  };
+  renderMMR(); $("msweep").onclick();
+})();
+</script>
+</body>
+</html>

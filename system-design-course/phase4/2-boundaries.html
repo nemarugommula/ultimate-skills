@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.2 Service boundaries & domain-driven design · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .bins { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 12px 0; }
+  .bin { border: 2px dashed var(--line); border-radius: 12px; padding: 8px; min-height: 92px; background: var(--bg2); cursor: pointer; }
+  .bin.over, .bin.target { border-color: var(--accent); }
+  .bin h5 { margin: 0 0 6px; font-size: .8rem; color: var(--c-sv); text-transform: uppercase; letter-spacing: .05em; }
+  .chip { display: inline-block; margin: 3px; padding: 3px 9px; border-radius: 999px; font-size: .82rem; font-weight: 600;
+          border: 1.5px solid var(--c-db); background: var(--panel); color: var(--text); cursor: grab; user-select: none; }
+  .chip.sel { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .chip.warn { border-color: var(--c-er); }
+  .acts { width: 100%; font-size: .85rem; }
+  .acts td, .acts th { padding: 4px 8px; }
+  .stepper { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+  .stepper .dot { width: 26px; height: 26px; border-radius: 50%; border: 2px solid var(--line); display: inline-grid; place-items: center; font-size: .8rem; font-weight: 700; }
+  .stepper .dot.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+</style>
+</head>
+<body data-lesson="s4-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 2</div>
+  <h1>Service boundaries & domain-driven design</h1>
+  <p class="subtitle">Where you draw the lines between services decides whether you get independent teams or a “distributed monolith” that has all the costs of microservices and none of the benefits.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Microservices</b> = independently deployable services, each owning its data; every call between them crosses the network (Lesson 4.1).</li>
+      <li><b>Transactions</b> = several writes that succeed or fail together; they only work inside one database (Lesson 2.5).</li>
+      <li><b>Sagas</b> = a chain of local transactions with “undo” steps, used when one business action spans services (Lesson 3.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>By 2020 Uber had grown to around <b>2,200 critical microservices</b>. Their engineering blog describes an investigation where engineers had to work through around <b>50 services across 12 teams</b> just to find the root cause of one problem.</p>
+    <p>Their fix wasn't fewer services. It was <b>better boundaries</b>: they grouped the 2,200 services into <b>70 domains</b>, each with one entry point (a “gateway”). Teams that used to call many services now call one, and Uber reports that onboarding a new feature onto a platform got 25–50% faster. Drawing the lines well is the whole game.</p>
+  </div>
+
+  <h2>Numbers first: the price of a bad line</h2>
+  <p>Take an online shop doing <b>1,000 product-page views per second</b>. The page needs the product, its price, its reviews and whether it's in stock.</p>
+  <table>
+    <tr><th>Design</th><th>Services the page touches</th><th>Network calls per second</th><th>Typical added latency</th></tr>
+    <tr><td>Product, price and reviews together; stock elsewhere</td><td>2</td><td class="db">1 × 1,000 = 1,000</td><td>~1 call (a few ms)</td></tr>
+    <tr><td>One service per table (“entity services”)</td><td>4</td><td class="er">3 × 1,000 = 3,000</td><td>~3 calls, and 3 more things that can fail</td></tr>
+  </table>
+  <p>Three times the network traffic, and the page now fails if <i>any</i> of four services is down. The data didn't change. Only the lines did. The rule that falls out:</p>
+  <div class="eq">
+    cross-service calls/s = Σ<sub>actions</sub> <span class="cl">rate</span> × (<span class="sv">services touched</span> − 1)
+    <span class="say">“For each user action, multiply how often it happens by how many extra services it must reach. Good boundaries keep that sum small for the frequent actions.”</span>
+  </div>
+
+  <h2>Domain-driven design in five words</h2>
+  <p><b>Domain-driven design</b> (DDD, from Eric Evans' 2004 book) is a way to model software around the business. Five ideas matter for service boundaries:</p>
+  <table>
+    <tr><th>Term</th><th>Plain meaning</th><th>Example in a shop</th></tr>
+    <tr><td><b>Domain</b></td><td>The business area the software serves</td><td>Online retail</td></tr>
+    <tr><td><b>Ubiquitous language</b></td><td>The exact words the business uses, used in the code too</td><td>“Order”, “refund”, “backorder”, not <code>tbl_ord_2</code></td></tr>
+    <tr><td><b>Bounded context</b></td><td>A boundary inside which each word has <b>one</b> meaning and one model</td><td>“Product” in Catalog = photos and descriptions; in Inventory = a SKU (stock-keeping unit) in a warehouse bin; in Shipping = weight and box size</td></tr>
+    <tr><td><b>Aggregate</b></td><td>A cluster of objects that must change together in one transaction; one “root” guards it</td><td>An Order and its OrderLines: you never save half an order</td></tr>
+    <tr><td><b>Context map</b></td><td>A diagram of how contexts relate and translate between models</td><td>Ordering sends “OrderPlaced”; Shipping turns it into a shipment</td></tr>
+  </table>
+  <p>The service rule of thumb: <b>one bounded context ≈ one service (or a few), owned by one team</b>. And never split an aggregate across services, or you've turned one transaction into a distributed one.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Split by <b>business capability</b> (catalog, ordering, payments, shipping), not by <b>technical layer</b> or by <b>table</b>. Things that change together and are read together belong together. A good boundary is one most user actions don't cross.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: departments in a company</span>
+    <p>A company isn't split into “the people who use spreadsheets” and “the people who use email” (technical layers). It's split into Sales, Warehouse, Accounting. Each department has its own files and its own meaning for words: to Sales a “customer” is a lead with a phone number; to Accounting it's an account with a credit limit.</p>
+    <p>Departments talk through clear requests (“please ship order 42”), not by walking into each other's filing cabinets. That's a <b>bounded context</b> with a <b>private database</b>.</p>
+  </div>
+
+  <h2>Database per service</h2>
+  <p>If two services read and write the same tables, they are coupled no matter how many repos they live in. Rename a column and both break; one team's slow query locks the other team's rows. The pattern on microservices.io is blunt: <b>keep each service's persistent data private to that service</b>, reachable only through its API.</p>
+  <ul>
+    <li><b>Private tables per service</b> in a shared database server: cheapest; enforce with database permissions.</li>
+    <li><b>Schema per service</b>: stronger separation, still one server to run.</li>
+    <li><b>Database server per service</b>: full isolation, and each service can pick the right store (Lesson 2.1).</li>
+  </ul>
+  <p>The price: no <code>JOIN</code> across services. You either call the other service, or keep a <b>read-only copy</b> of the data you need, updated by events (Lesson 3.2). Copies are fast but a little stale.</p>
+
+  <h2>The distributed monolith trap</h2>
+  <p>A <b>distributed monolith</b> is a system split into services that still can't change independently. You pay the network and ops costs of Lesson 4.1 and keep the coordination costs of a monolith. Symptoms:</p>
+  <table>
+    <tr><th>Symptom</th><th>What it tells you</th></tr>
+    <tr><td>Releasing service A requires releasing B and C at the same time</td><td>The interface between them isn't stable (Lesson 4.5)</td></tr>
+    <tr><td>Several services read and write the same tables</td><td>The real boundary is the database, not the services</td></tr>
+    <tr><td>One page load runs a synchronous chain of 6+ services</td><td>The lines cut through a frequent action</td></tr>
+    <tr><td>Every feature needs pull requests in 4 repos and 3 teams</td><td>Boundaries follow layers or tables, not business capabilities</td></tr>
+  </table>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Draw the boundaries</span>
+    <p class="hint">12 entities, 6 services. <b>Click an entity</b>, then <b>click a service</b> to move it (or drag it). The score counts cross-service calls per second for 7 real user actions, how many writes per second span services (each needs a saga), and whether you split an aggregate. Try the presets first, then beat them.</p>
+    <div class="controls">
+      <button class="btn" id="bOne">One big service</button>
+      <button class="btn" id="bEnt">Entity services</button>
+      <button class="btn" id="bCtx">Bounded contexts</button>
+      <button class="btn" id="bRnd">Random</button>
+      <button class="btn" id="bCopy">Read copies via events: off</button>
+    </div>
+    <div class="bins" id="bins"></div>
+    <div class="stat-row">
+      <div class="stat">cross-service calls <b id="sCalls">–</b></div>
+      <div class="stat">multi-service writes (sagas) <b id="sSaga">–</b></div>
+      <div class="stat">services in use <b id="sUsed">–</b></div>
+      <div class="stat">biggest service <b id="sBig">–</b></div>
+    </div>
+    <table class="acts" id="acts"></table>
+    <p class="hint" id="bmsg"></p>
+  </div>
+  <p>What the presets show. <b>One big service</b> has zero network calls but one team owns everything (Lesson 4.1's deploy train). <b>Entity services</b> look tidy on a slide and are a disaster: over 2,000 calls per second, and Order is split from its OrderLines. <b>Bounded contexts</b> cut the calls nearly in half (about 2,150/s down to about 1,190/s), keep both aggregates whole, and the remaining sagas are real business processes (checkout touches money, stock and the order). Now turn on <b>read copies via events</b>: Catalog keeps its own copy of stock levels, Ordering keeps a copy of prices. Calls drop to almost nothing, and the price is data that can be a second or so stale.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: scoring the bounded-context design</span>
+    <p>Services: Catalog (Product, Price, Review), Inventory (Stock), Ordering (Cart, Order, OrderLine), Payments (Payment, Invoice), Shipping (Shipment), Customers (Customer, Address).</p>
+    <table>
+      <tr><th>Action</th><th>Rate</th><th>Services touched</th><th>Calls/s</th></tr>
+      <tr><td>View product page</td><td>1,000/s</td><td>Catalog, Inventory = 2</td><td>1,000 × 1 = 1,000</td></tr>
+      <tr><td>Add to cart</td><td>100/s</td><td>Ordering, Catalog = 2</td><td>100</td></tr>
+      <tr><td>Track order</td><td>50/s</td><td>Ordering, Shipping = 2</td><td>50</td></tr>
+      <tr><td>Checkout</td><td>10/s</td><td>Ordering, Payments, Inventory, Customers, Catalog = 5</td><td>10 × 4 = 40</td></tr>
+      <tr><td>Write review, refund, change address</td><td>2 + 1 + 1</td><td>2, 2, 1</td><td>2 + 1 + 0 = 3</td></tr>
+    </table>
+    <p>Total ≈ <b>1,193 calls/s</b>, and 1,000 of them come from one action. That tells you exactly where to spend effort: give Catalog an event-fed copy of “in stock / out of stock” and the biggest line disappears. Focus on the <b>frequent</b> actions, not the rare ones.</p>
+  </div>
+
+  <h2>Getting there: the strangler fig</h2>
+  <p>You almost never draw boundaries on a blank page. You have a monolith that works and earns money. A <b>big-bang rewrite</b> (build the new system for a year, switch over in one night) is famously risky: no value until the end, and one giant cutover.</p>
+  <p>The alternative is named after the <b>strangler fig</b>, a vine Martin Fowler saw in the Queensland rainforest that grows around a host tree until it can stand on its own. In software: put a <b>routing layer</b> in front of the monolith, rebuild one capability at a time as a service, move its traffic over gradually, and repeat. Each step is small and can be rolled back by flipping a route.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Strangle a monolith</span>
+    <p class="hint">Traffic mix: 60% product pages, 10% payments, 30% everything else. Step through the migration and press <b>Send 10 requests</b> at each step to see where they go. The chart compares how much traffic runs on new code over time, strangler fig vs a big-bang rewrite.</p>
+    <div class="stepper" id="sdots"></div>
+    <svg id="sf"></svg>
+    <div class="controls">
+      <button class="btn" id="sPrev">◀ Back</button>
+      <button class="btn primary" id="sNext">Next step ▶</button>
+      <button class="btn" id="sSend">Send 10 requests</button>
+      <button class="btn" id="sBreak">Bug in new Catalog!</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">step <b id="sStep">–</b></div>
+      <div class="stat">traffic on new code <b id="sNew">–</b></div>
+      <div class="stat">traffic changed in this step <b id="sRisk">–</b></div>
+      <div class="stat">rollback <b id="sRoll">–</b></div>
+    </div>
+    <p id="sDesc"></p>
+    <canvas class="chart" id="sc" style="height:190px"></canvas>
+    <p class="hint" id="smsg"></p>
+  </div>
+  <p>Two things make the strangler fig safe. Every step moves a <b>small</b> share of traffic, and every step is <b>reversible in seconds</b> (change the route back). Press “Bug in new Catalog!” during the 5% canary step and only 3% of all requests are affected until you roll back. In a big-bang cutover, the same bug hits everyone.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Finding boundaries:</b> <b>Event Storming</b> (a workshop with sticky notes for every business event, like “OrderPlaced”, that surfaces contexts), and context maps. <b>Routing for the strangler fig:</b> any reverse proxy or API gateway (Nginx, Envoy, Kong, AWS API Gateway; Lesson 1.6). <b>Moving data:</b> change data capture with <b>Debezium</b> streams the monolith's row changes into Kafka so the new service can build its own copy (Lesson 3.2).</p>
+<pre><code><span class="c"># nginx.conf: the strangler fig's routing layer</span>
+split_clients <span class="s">"${remote_addr}"</span> $catalog_backend {
+    <span class="n">5%</span>   catalog_service;            <span class="c"># canary: 5% of users get the new service</span>
+    *    legacy_monolith;            <span class="c"># everyone else: unchanged</span>
+}
+upstream catalog_service { server catalog.internal:8080; }
+upstream legacy_monolith { server monolith.internal:8080; }
+
+server {
+    location /api/products/ { proxy_pass http://$catalog_backend; }   <span class="c"># migrated path</span>
+    location /              { proxy_pass http://legacy_monolith; }   <span class="c"># everything else</span>
+}</code></pre>
+    <p class="hint">Rolling back is one line: set the canary to <code>0%</code> and reload (<code>nginx -s reload</code>). Try it locally with <code>docker run -p 8080:80 -v $PWD/nginx.conf:/etc/nginx/conf.d/default.conf nginx</code> and two tiny backends.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs: drawing and moving boundaries</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Bigger services (one per context)</td><td>Fewer calls, local transactions, simpler ops</td><td>More people per codebase; the service can grow into a mini-monolith</td></tr>
+      <tr><td>Smaller services</td><td>Fine-grained scaling and ownership</td><td>More calls, more sagas, more things to run; easy to split an aggregate</td></tr>
+      <tr><td>Calling the owner for data</td><td>Always fresh</td><td>Latency and a runtime dependency on every request</td></tr>
+      <tr><td>Event-fed read copies</td><td>Fast, works when the owner is down</td><td>Stale for a moment; more storage; you must handle replays (Lesson 3.3)</td></tr>
+      <tr><td>Strangler fig</td><td>Value and learning at every step; reversible</td><td>The routing layer and two systems live side by side for months</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Use DDD lightly: name modules after business capabilities, keep each module's tables private to it, and keep the business's words in the code. Those are your future service boundaries, for free. When you do extract the first service, use a strangler-fig route, not a rewrite.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Boundaries are an org-design question: domains map to groups of teams, each domain exposes one gateway, and architecture reviews look for chatty or shared-database designs. Migrations off legacy systems run for years with routing layers, shadow traffic and change data capture.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>When you draw boxes in a design interview, interviewers are checking:</p>
+    <ul>
+      <li>Do boundaries follow <b>business capabilities</b>, and does each service <b>own its data</b>?</li>
+      <li>Do the <b>frequent</b> requests stay inside one or two services? Where they don't, do you use read copies or caching?</li>
+      <li>Which actions span services, and how do you keep them consistent (saga, outbox; Lesson 3.5)?</li>
+      <li>If there's a legacy system: how do you <b>migrate incrementally</b> (strangler fig, shadow traffic, canary)?</li>
+    </ul>
+    <p class="hint">Common follow-ups: “Two services both need customer data. Who owns it?” · “Your checkout touches four services. What happens if payment succeeds and the stock reservation fails?” · “How would you know a boundary is wrong?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Domain-oriented microservices</b> <span class="tag co">🏢 Uber · 2020</span> <a href="https://www.uber.com/blog/microservice-architecture/" target="_blank" rel="noopener">Introducing Domain-Oriented Microservice Architecture</a></div>
+      <p><b>How:</b> Uber grouped around 2,200 microservices into 70 domains, arranged domains in layers that limit who may depend on whom, and gave each domain a single gateway as its entry point. The post also estimates that half of Uber's microservices churn every 1.5 years.</p>
+      <p><b>Why this method:</b> with that much churn, callers that depend on one stable gateway per domain don't have to change every time services behind it are rewritten.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The strangler fig</b> <span class="tag hist">📜 Martin Fowler · updated 2024</span> <a href="https://martinfowler.com/bliki/StranglerFigApplication.html" target="_blank" rel="noopener">Strangler Fig</a></div>
+      <p><b>How:</b> gradually build new capabilities around the edges of a legacy system, moving behavior and traffic piece by piece until the old system can be retired. The 2024 update explains the botanical name.</p>
+      <p><b>Why this method:</b> each step delivers value and teaches you something, and none of them requires betting the business on one cutover night.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Database per service</b> <span class="tag oss">🧰 Pattern catalog</span> <a href="https://microservices.io/patterns/data/database-per-service.html" target="_blank" rel="noopener">microservices.io: Database per service</a></div>
+      <p><b>How:</b> each service's data is private and reachable only through its API, implemented as private tables, a private schema or a private database server.</p>
+      <p><b>Why this method:</b> a shared database is a hidden contract: schema changes and slow queries in one service break others.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Bounded contexts</b> <span class="tag hist">📜 Martin Fowler · 2014</span> <a href="https://martinfowler.com/bliki/BoundedContext.html" target="_blank" rel="noopener">BoundedContext</a></div>
+      <p><b>How:</b> a large domain is divided into contexts, each with its own model and language, with explicit relationships between them.</p>
+      <p><b>Why this method:</b> one unified model for a whole big business becomes contradictory (“customer” means different things in different departments); separate models stay consistent inside their boundary.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · it used to have a scarier name</span>
+    <p>Fowler's original post was called just “Strangler Application”. In the 2024 update he notes that people kept saying “strangler” and forgetting the botany, so it's now “Strangler Fig”: a plant that starts in a nook of a host tree and slowly grows its own roots to the ground.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Boundaries decide how much services talk (Lesson 4.3) and how much one service's failure can hurt another (Lesson 4.4). Actions that cross boundaries need sagas and the outbox (Lesson 3.5); read copies are fed by event streams (Lesson 3.2). In the design problems of Phase 7, the first boxes you draw are bounded contexts. In AI systems, the same thinking separates the model-serving context from the product context so each can evolve on its own.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Book</span> <a href="https://www.domainlanguage.com/ddd/reference/" target="_blank" rel="noopener">Domain-Driven Design Reference (Eric Evans)</a>. A free summary of the patterns from the original DDD book.</li>
+      <li><span class="kind">Blog</span> <a href="https://www.uber.com/blog/microservice-architecture/" target="_blank" rel="noopener">Uber: Domain-Oriented Microservice Architecture</a>. Layers, gateways and extensions at 2,200-service scale.</li>
+      <li><span class="kind">Docs</span> <a href="https://microservices.io/patterns/microservices.html" target="_blank" rel="noopener">microservices.io pattern language</a>. Decomposition, data and migration patterns, each with trade-offs.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A home page is viewed 2,000 times per second and touches 4 services. A redesign makes it touch 2. How many cross-service calls per second does that save?</div>
+    <div class="opts"><button class="opt">2,000</button><button class="opt" data-ok>4,000</button><button class="opt">8,000</button></div>
+    <div class="explain">Before: 2,000 × (4 − 1) = 6,000 calls/s. After: 2,000 × (2 − 1) = 2,000 calls/s. Saved: <b>4,000 calls/s</b>, and two fewer services that can break the home page.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A team wants an “Order service” and a separate “OrderLine service”. What's the main problem?</div>
+    <div class="opts"><button class="opt">Two services cost more to host</button><button class="opt" data-ok>Order and its lines are one aggregate: saving an order now needs a distributed transaction, and nearly every read crosses the network</button><button class="opt">OrderLine is too small to be worth deploying</button></div>
+    <div class="explain">An aggregate is what must change together in one transaction. Splitting it turns every order save into a saga and every order read into two calls. Keep aggregates whole; split between contexts, not inside them.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You must move a busy payments flow out of a 10-year-old monolith with zero downtime. Which plan is best?</div>
+    <div class="opts"><button class="opt">Rewrite payments from scratch, then switch all traffic over on a quiet Sunday night</button><button class="opt" data-ok>Put a routing layer in front, build the new service, mirror traffic to compare results, then shift a small canary share and grow it</button><button class="opt">Have the new service write directly into the monolith's payment tables so nothing changes</button></div>
+    <div class="explain">That's the strangler fig: small, reversible steps with real traffic. The big-bang cutover bets everything on one night. Writing into the monolith's tables creates a shared-database distributed monolith.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Draw boundaries around <b>business capabilities</b> (bounded contexts), not tables or technical layers; never split an aggregate.</li>
+      <li>Each service owns its data. Need someone else's? Call them, or keep an event-fed read copy and accept a little staleness.</li>
+      <li>Score a design by Σ rate × (services touched − 1): keep the <b>frequent</b> actions inside one service.</li>
+      <li>Watch for the distributed monolith: lockstep releases, shared tables, long synchronous chains.</li>
+      <li>Migrate with the strangler fig: route, extract, canary, grow, repeat.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+
+  // ---------- boundaries playground ----------
+  const ENT = ["Product", "Price", "Review", "Stock", "Cart", "Order", "OrderLine", "Payment", "Invoice", "Shipment", "Customer", "Address"];
+  const SVC = ["Service A", "Service B", "Service C", "Service D", "Service E", "Service F"];
+  const ACTIONS = [
+    { name: "View product page", rate: 1000, w: [], r: ["Product", "Price", "Review", "Stock"] },
+    { name: "Add to cart", rate: 100, w: ["Cart"], r: ["Product", "Price"] },
+    { name: "Track order", rate: 50, w: [], r: ["Order", "Shipment"] },
+    { name: "Checkout", rate: 10, w: ["Order", "OrderLine", "Payment", "Stock"], r: ["Cart", "Customer", "Address", "Price"] },
+    { name: "Write review", rate: 2, w: ["Review"], r: ["Customer", "Product"] },
+    { name: "Refund", rate: 1, w: ["Payment", "Invoice", "Order"], r: [] },
+    { name: "Change address", rate: 1, w: ["Address", "Customer"], r: [] },
+  ];
+  const AGG = [["Order", "OrderLine"], ["Customer", "Address"]];
+  const PRESETS = {
+    one: { A: ENT },
+    ent: { A: ["Product", "Review"], B: ["Price", "Cart"], C: ["Order", "Shipment"], D: ["OrderLine", "Stock"], E: ["Payment", "Address"], F: ["Customer", "Invoice"] },
+    ctx: { A: ["Product", "Price", "Review"], B: ["Stock"], C: ["Cart", "Order", "OrderLine"], D: ["Payment", "Invoice"], E: ["Shipment"], F: ["Customer", "Address"] },
+  };
+  const NAMES = { ctx: ["Catalog", "Inventory", "Ordering", "Payments", "Shipping", "Customers"] };
+  let place = {}, sel = null, copies = false, names = SVC.slice();
+  const apply = k => {
+    place = {}; names = (NAMES[k] || SVC).slice();
+    Object.entries(PRESETS[k]).forEach(([s, list]) => list.forEach(e => (place[e] = "ABCDEF".indexOf(s))));
+    sel = null; paint();
+  };
+  function score() {
+    let calls = 0, saga = 0; const rows = [];
+    ACTIONS.forEach(a => {
+      const reads = copies ? [] : a.r; // with event-fed copies, reads of other services' data are local
+      const touched = new Set([...a.w, ...reads].map(e => place[e]));
+      if (!touched.size) touched.add(-1);
+      const writeSvcs = new Set(a.w.map(e => place[e]));
+      const k = touched.size, c = a.rate * (k - 1), sg = writeSvcs.size > 1 ? a.rate : 0;
+      calls += c; saga += sg;
+      rows.push(`<tr><td>${a.name}</td><td class="mono">${a.rate}/s</td><td class="mono">${k} svc</td><td class="mono ${c ? "er" : "db"}">${c} calls/s</td><td>${sg ? "⚠️ saga" : ""}</td></tr>`);
+    });
+    const broken = AGG.filter(([x, y]) => place[x] !== place[y]).map(p => p.join("+"));
+    const sizes = [0, 0, 0, 0, 0, 0]; ENT.forEach(e => sizes[place[e]]++);
+    return { calls, saga, rows, broken, used: sizes.filter(Boolean).length, big: Math.max(...sizes) };
+  }
+  function paint() {
+    const s = score();
+    $("bins").innerHTML = SVC.map((_, i) => `<div class="bin${sel ? " target" : ""}" id="svc-${i}" data-i="${i}"><h5>${names[i]}</h5>` +
+      ENT.filter(e => place[e] === i).map(e => `<span class="chip${sel === e ? " sel" : ""}${s.broken.some(b => b.split("+").includes(e)) ? " warn" : ""}" id="ent-${e}" draggable="true" data-e="${e}">${e}</span>`).join("") + "</div>").join("");
+    $("acts").innerHTML = "<tr><th>User action</th><th>Rate</th><th>Touches</th><th>Calls</th><th></th></tr>" + s.rows.join("");
+    $("sCalls").textContent = s.calls.toLocaleString() + "/s";
+    $("sSaga").textContent = s.saga + "/s";
+    $("sUsed").textContent = s.used;
+    $("sBig").textContent = s.big + " of 12 entities";
+    $("bmsg").textContent = s.broken.length ? `Aggregate split: ${s.broken.join(", ")}. Every save of these is now a distributed transaction.` :
+      s.used === 1 ? "No network calls at all, but one service (and one team) owns everything: this is the monolith." :
+      s.calls > 2000 ? "Very chatty: frequent actions cross many boundaries. This is the distributed-monolith shape." :
+      s.calls < 100 ? "Excellent: the frequent actions stay local. Remaining sagas are genuine business processes." :
+      "Reasonable. Look at the biggest number in the Calls column: that action is where better lines (or read copies) pay off most.";
+    $("bCopy").textContent = "Read copies via events: " + (copies ? "on" : "off");
+    document.querySelectorAll("#bins .chip").forEach(c => {
+      c.onclick = ev => { ev.stopPropagation(); sel = sel === c.dataset.e ? null : c.dataset.e; paint(); };
+      c.ondragstart = ev => { ev.dataTransfer.setData("text/plain", c.dataset.e); };
+    });
+    document.querySelectorAll("#bins .bin").forEach(b => {
+      b.onclick = () => { if (sel) { place[sel] = +b.dataset.i; sel = null; paint(); } };
+      b.ondragover = ev => { ev.preventDefault(); b.classList.add("over"); };
+      b.ondragleave = () => b.classList.remove("over");
+      b.ondrop = ev => { ev.preventDefault(); const e = ev.dataTransfer.getData("text/plain"); if (ENT.includes(e)) { place[e] = +b.dataset.i; sel = null; paint(); } };
+    });
+  }
+  $("bOne").onclick = () => apply("one");
+  $("bEnt").onclick = () => apply("ent");
+  $("bCtx").onclick = () => apply("ctx");
+  $("bRnd").onclick = () => { const r = MX.seeded(Date.now() % 1e6); names = SVC.slice(); ENT.forEach(e => (place[e] = Math.floor(r() * 6))); sel = null; paint(); };
+  $("bCopy").onclick = () => { copies = !copies; paint(); };
+  apply("ent");
+
+  // ---------- strangler fig ----------
+  const MIX = { prod: 0.6, pay: 0.1, rest: 0.3 };
+  const STEPS = [
+    { t: "Today: users talk to the monolith directly.", prod: 0, pay: 0, router: false, cat: false, payS: false, shadow: false, roll: "–", changed: 0 },
+    { t: "Add a routing layer in front. It sends 100% to the monolith, so users notice nothing, but you now control every route.", prod: 0, pay: 0, router: true, cat: false, payS: false, shadow: false, roll: "remove the proxy", changed: 0 },
+    { t: "Build the Catalog service with its own database, filled by change data capture from the monolith. Mirror product requests to it and compare answers (shadow traffic). Users still get the monolith's answer.", prod: 0, pay: 0, router: true, cat: true, payS: false, shadow: true, roll: "stop mirroring", changed: 0 },
+    { t: "Canary: route 5% of product requests to Catalog. Watch errors and latency.", prod: 0.05, pay: 0, router: true, cat: true, payS: false, shadow: false, roll: "seconds (route to 0%)", changed: 0.6 * 0.05 },
+    { t: "Ramp to 100% of product traffic. Catalog's database becomes the source of truth; the monolith now asks Catalog for product data.", prod: 1, pay: 0, router: true, cat: true, payS: false, shadow: false, roll: "seconds (route back)", changed: 0.6 * 0.95 },
+    { t: "Repeat for Payments: shadow, canary, ramp. Payments now owns its data.", prod: 1, pay: 1, router: true, cat: true, payS: true, shadow: false, roll: "seconds (route back)", changed: 0.1 },
+    { t: "The monolith is smaller and handles the remaining 30%. Keep strangling, or stop here: a small, stable core is a fine end state.", prod: 1, pay: 1, router: true, cat: true, payS: true, shadow: false, roll: "–", changed: 0 },
+  ];
+  let step = 0, broken = false, busy = false;
+  const F = new Flow($("sf"), { width: 720, height: 250 });
+  F.node("u", { x: 60, y: 125, w: 90, label: "👤 Users", kind: "cl" })
+   .node("r", { x: 200, y: 125, w: 110, label: "Router", sub: "facade", kind: "nw" })
+   .node("m", { x: 400, y: 125, w: 130, label: "🏚️ Monolith", kind: "sv" })
+   .node("c", { x: 400, y: 35, w: 130, label: "Catalog svc", kind: "sv" })
+   .node("p", { x: 400, y: 215, w: 130, label: "Payments svc", kind: "sv" })
+   .node("mdb", { x: 620, y: 125, w: 120, label: "🗄️ Monolith DB", kind: "db" })
+   .node("cdb", { x: 620, y: 35, w: 120, label: "🗄️ Catalog DB", kind: "db" })
+   .node("pdb", { x: 620, y: 215, w: 120, label: "🗄️ Payments DB", kind: "db" })
+   .edge("u", "r").edge("u", "m").edge("r", "m").edge("r", "c", { label: " " }).edge("r", "p")
+   .edge("m", "mdb").edge("c", "cdb").edge("p", "pdb").edge("mdb", "cdb", { dashed: true, label: "CDC" }).render();
+  const newShare = s => MIX.prod * s.prod + MIX.pay * s.pay;
+  function paintStep() {
+    const s = STEPS[step];
+    $("sdots").innerHTML = STEPS.map((_, i) => `<span class="dot${i === step ? " on" : ""}">${i}</span>`).join("");
+    F.edgeStyle("u", "m", { hidden: s.router }).edgeStyle("u", "r", { hidden: !s.router });
+    F.set("r", { label: s.router ? "Router" : "(no router)", sub: s.router ? "facade" : "" });
+    F.edgeStyle("r", "m", { hidden: !s.router });
+    F.edgeStyle("r", "c", { hidden: !s.cat, dashed: s.shadow, label: s.shadow ? "mirror" : s.prod ? Math.round(100 * s.prod) + "% /products" : "" });
+    F.edgeStyle("c", "cdb", { hidden: !s.cat }).edgeStyle("mdb", "cdb", { hidden: !(s.cat && s.prod < 1) });
+    F.edgeStyle("r", "p", { hidden: !s.payS }).edgeStyle("p", "pdb", { hidden: !s.payS });
+    F.set("c", { down: !s.cat, sub: s.cat ? (broken && s.prod > 0 ? "🐛 buggy" : s.shadow ? "shadow only" : Math.round(100 * s.prod) + "% of products") : "not built" });
+    F.set("p", { down: !s.payS, sub: s.payS ? "100% of payments" : "not built" });
+    F.set("cdb", { down: !s.cat }).set("pdb", { down: !s.payS });
+    const share = newShare(s);
+    F.set("m", { sub: Math.round(100 * (1 - share)) + "% of traffic", load: 1 - share });
+    $("sStep").textContent = step + " / " + (STEPS.length - 1);
+    $("sNew").textContent = (100 * share).toFixed(0) + "%";
+    $("sRisk").textContent = (100 * s.changed).toFixed(0) + "%";
+    $("sRoll").textContent = s.roll;
+    $("sDesc").textContent = s.t;
+    const months = [0, 1, 3, 4, 5, 8, 10, 12];
+    const strang = [0, 0, 0, 3, 60, 70, 70, 70];
+    const cur = Math.min(step + 1, months.length - 1);
+    Plot.line($("sc"), {
+      series: [
+        { label: "strangler fig", color: MX.css("--c-ca"), data: months.map((m, i) => [m, strang[i]]), dots: true },
+        { label: "big-bang rewrite", color: MX.css("--c-er"), data: [[0, 0], [11.9, 0], [12, 100]], dash: [6, 4] },
+        { label: "this step", color: MX.css("--text"), data: [[months[cur], 0], [months[cur], 100]], dash: [2, 3] }
+      ],
+      xMin: 0, xMax: 12, yMin: 0, yMax: 100, xLabel: "month", yLabel: "% traffic on new code"
+    });
+    $("smsg").textContent = broken && s.prod > 0 && s.prod < 1 ? `The bug only reaches the canary: ${(100 * MIX.prod * s.prod).toFixed(0)}% of all requests. Roll back by setting the route to 0%.` :
+      broken && s.prod === 1 ? "At 100% the bug reaches every product request. This is why you ramp slowly and watch error rates at each stage." :
+      broken ? "The new service isn't serving users yet, so the bug only shows up in shadow comparisons. Free to fix." :
+      "Big-bang: nothing runs on new code for a year, then 100% switches in one night.";
+  }
+  const pick = r => (r < MIX.prod ? "prod" : r < MIX.prod + MIX.pay ? "pay" : "rest");
+  $("sNext").onclick = () => { step = Math.min(STEPS.length - 1, step + 1); paintStep(); };
+  $("sPrev").onclick = () => { step = Math.max(0, step - 1); paintStep(); };
+  $("sBreak").onclick = () => { broken = !broken; $("sBreak").textContent = broken ? "Fix the bug" : "Bug in new Catalog!"; paintStep(); };
+  $("sSend").onclick = async () => {
+    if (busy) return; busy = true;
+    const s = STEPS[step];
+    for (let i = 0; i < 10; i++) {
+      const kind = pick(Math.random()), first = s.router ? ["u", "r"] : ["u"];
+      let path, color = "--c-cl";
+      if (kind === "prod" && s.cat && Math.random() < s.prod) { path = [...first, "c", "cdb"]; if (broken) color = "--c-er"; }
+      else if (kind === "pay" && s.payS) path = [...first, "p", "pdb"];
+      else path = [...first, "m", "mdb"];
+      if (s.shadow && kind === "prod") F.packet(["u", "r", "c"], { color: "--muted", dur: 500, r: 4 });
+      await F.packet(path, { color, dur: 500, back: true });
+    }
+    busy = false;
+  };
+  paintStep();
+})();
+</script>
+</body>
+</html>

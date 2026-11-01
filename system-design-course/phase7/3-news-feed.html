@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.3 Design a news feed · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+</style>
+</head>
+<body data-lesson="s7-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 3</div>
+  <h1>Design a news feed (fan-out)</h1>
+  <p class="subtitle">Show each user the latest posts from everyone they follow, in milliseconds, for hundreds of millions of users. The core decision, doing the work when a post is written or when the feed is read, shapes the whole system.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Redis</b> keeps data in memory: lists and sorted sets answer in about a millisecond (Lesson 1.3).</li>
+      <li><b>Queues and workers</b> do slow work in the background instead of in the request (Lesson 3.1).</li>
+      <li><b>p99</b> = the latency 99% of requests beat; asking many servers at once means waiting for the slowest (Lessons 0.5 and 6.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>At QCon London 2014, a Twitter engineer showed the timeline numbers: <b>more than 240 million active users</b> and <b>300,000 queries per second</b> of timeline reads, answered in <b>1 ms at the median and 4 ms at p99</b>, out of a Redis timeline cache filled by a “fanout” service.</p>
+    <p>Four milliseconds to assemble a personal feed from hundreds of followed accounts is only possible because the feed was mostly built <i>before</i> anyone asked for it. This lesson is about when to do that work, and the celebrity who breaks it.</p>
+  </div>
+
+  <h2>Step 1 · Requirements</h2>
+  <p><b>Functional:</b> users publish posts (text, photo links); users follow other users; the <b>home feed</b> shows recent posts from followed accounts, newest or most relevant first, 20 at a time, with infinite scroll.</p>
+  <p><b>Non-functional:</b> feed loads fast (target p99 under about 200 ms end to end); very read-heavy; <b>eventual consistency</b> is fine (a new post can take a few seconds to show up in followers' feeds); highly available (a stale feed beats an error page).</p>
+  <table>
+    <tr><th>Clarifying question</th><th>Assumed answer</th><th>Design impact</th></tr>
+    <tr><td>Daily active users? Feed opens per user?</td><td>200M, about 10 a day</td><td>The read rate (below)</td></tr>
+    <tr><td>How many accounts does a typical user follow? Any huge accounts?</td><td>About 200; some have 100M followers</td><td>Fan-out cost, and the celebrity problem</td></tr>
+    <tr><td>Chronological or ranked?</td><td>Ranked, with a chronological option</td><td>A ranking step after collecting candidates</td></tr>
+    <tr><td>How far back can you scroll?</td><td>A few hundred posts; older via profile pages</td><td>Cap each stored feed (about 500 IDs)</td></tr>
+    <tr><td>Must new posts appear live?</td><td>No, on refresh is fine</td><td>No push connections needed (unlike chat, Lesson 7.4)</td></tr>
+  </table>
+
+  <h2>Step 2 · Estimates (by hand)</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the feed's numbers</span>
+    <ul>
+      <li>Feed reads: 200M × 10 = 2B a day ÷ 86,400 ≈ <b>23,000/s</b>, peak (×2.5) ≈ <b>58,000/s</b>.</li>
+      <li>Posts: 10% of users post once a day = 20M a day ≈ <b>230/s</b>. Reads outnumber posts 100 to 1.</li>
+      <li>Fan-out on write: each post copied into ~200 followers' feeds = 20M × 200 = 4B inserts a day ≈ <b>46,000 inserts/s</b>.</li>
+      <li>Fan-out on read instead: each feed load asks ~200 followed accounts for recent posts: 58,000 × 200 ≈ <b>11.6 million lookups/s</b> at peak.</li>
+      <li>Feed storage: keep 500 post IDs × 8 bytes per active user = 4 KB; × 200M ≈ <b>800 GB</b> of raw data (Redis overhead can roughly double it): a cluster of a few dozen big Redis nodes.</li>
+      <li>One celebrity with 100M followers posts. Fan-out on write = <b>100M inserts for one post</b>. At 1M inserts/s of worker capacity, that's <b>100 seconds</b> of backlog, and everyone else's posts wait behind it.</li>
+    </ul>
+  </div>
+
+  <h2>Step 3 · API</h2>
+<pre><code>POST /v1/posts                 {text, media_ids}  → 201 {post_id}
+GET  /v1/feed?cursor=…&amp;limit=20  → 200 {posts:[…], next_cursor}      <span class="c"># cursor = "older than post_id X"</span>
+POST /v1/users/{id}/follow     → 204
+GET  /v1/users/{id}/posts?cursor=…  → 200 {…}                         <span class="c"># a profile: one author, easy</span></code></pre>
+
+  <h2>Step 4 · Data model</h2>
+  <table>
+    <tr><th>Store</th><th>Shape</th><th>Notes</th></tr>
+    <tr><td><span class="db">posts</span> (sharded SQL or wide-column)</td><td><code>post_id</code> (a time-sortable Snowflake ID, Lesson 7.2) → author_id, text, media, created_at</td><td>Source of truth; index (author_id, post_id)</td></tr>
+    <tr><td><span class="db">follows</span> (graph or SQL)</td><td>(follower_id, followee_id), indexed both ways</td><td>“Who follows X?” drives fan-out; “Whom does Y follow?” drives reads</td></tr>
+    <tr><td><span class="ca">timelines</span> (Redis)</td><td><code>feed:{user_id}</code> → the newest ~500 post IDs</td><td>Only IDs, not post bodies: small, and edits or deletes only touch one copy</td></tr>
+    <tr><td><span class="ca">post cache</span> (Redis/Memcached)</td><td><code>post:{id}</code> → post body + counts</td><td>“Hydrating” 20 IDs into posts is one multi-get</td></tr>
+  </table>
+
+  <h2>Step 5 · High-level design and the core decision</h2>
+  <p>There are two ways to build a feed, and the names say where the copying happens:</p>
+  <table>
+    <tr><th></th><th>Fan-out on write (push)</th><th>Fan-out on read (pull)</th></tr>
+    <tr><td>When a post is published</td><td>A worker inserts its ID into every follower's timeline</td><td>Just store it</td></tr>
+    <tr><td>When a feed is read</td><td class="db">Read one precomputed list: fast</td><td>Ask every followed account for recent posts, merge, sort: slow</td></tr>
+    <tr><td>Cost scales with</td><td>Posts × followers (writes)</td><td>Feed reads × followings (reads)</td></tr>
+    <tr><td>Breaks on</td><td class="er">Celebrities (one post → 100M writes)</td><td class="er">Users who follow thousands; tail latency</td></tr>
+    <tr><td>Wasted work</td><td>Writing to feeds of users who never log in</td><td>None, but repeated on every refresh</td></tr>
+  </table>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A feed is a trade between <b>work at write time</b> and <b>work at read time</b>. Reads outnumber writes 100:1, so pushing work to write time usually wins, except for the few accounts whose single write fans out to millions. So big systems do <b>both</b>: push for normal accounts, pull for celebrities.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: newspapers vs a newsstand</span>
+    <p>Fan-out on write is home delivery: the moment the paper is printed, a copy goes into every subscriber's mailbox, so reading it in the morning is instant. Fan-out on read is the newsstand: nothing is delivered, and each reader walks around collecting the papers they like. Home delivery is great, until one paper has 100 million subscribers and the vans are still out at noon. So the giant papers stay at the newsstand, and your morning routine is: open the mailbox, then grab two papers on the way.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The fan-out simulator</span>
+    <p class="hint">200M daily users, 230 posts/s, 58,000 feed reads/s at peak, fan-out workers that can do 1M timeline inserts per second. Each lookup to a timeline or a user's post list usually takes about 1 ms, but 1% of lookups hit a slow server (15–40 ms, an assumption standing in for garbage-collection pauses and busy shards). At t = 10 s, a celebrity posts.</p>
+    <svg id="ff"></svg>
+    <div class="controls">
+      <span class="seg" id="st"><button id="stW" data-v="write" class="on">Fan-out on write</button><button id="stR" data-v="read">Fan-out on read</button><button id="stH" data-v="hybrid">Hybrid</button></span>
+    </div>
+    <div class="controls">
+      <label>accounts followed per user <input type="range" id="fol" min="0" max="4" step="1" value="2"> <b class="mono" id="folv"></b></label>
+      <label>celebrity's followers <input type="range" id="cel" min="0" max="4" step="1" value="3"> <b class="mono" id="celv"></b></label>
+    </div>
+    <div class="controls"><button class="btn primary" id="post">📝 Publish a post</button><button class="btn" id="read">📖 Load a feed</button></div>
+    <div class="stat-row">
+      <div class="stat">timeline writes <b id="wps">–</b></div>
+      <div class="stat">lookups per feed load <b id="lpf">–</b></div>
+      <div class="stat">feed latency p50 / p99 <b id="flat">–</b></div>
+      <div class="stat">celebrity post reaches everyone in <b id="lag">–</b></div>
+    </div>
+    <canvas class="chart" id="qc" style="height:190px"></canvas>
+    <p class="hint" id="fmsg"></p>
+  </div>
+  <p>Things to try: with fan-out on write, raise the celebrity to 100M followers and watch the backlog: for about 100 seconds every new post, from anyone, waits in line. Switch to fan-out on read: no backlog, but each feed load now asks 200 places and waits for the slowest, so p50 jumps from about 2 ms to tens of milliseconds. Push followings to 1,000 and it gets worse. Hybrid gets the best of both.</p>
+
+  <h2>Deep dive 1 · The celebrity problem</h2>
+  <p>Follower counts are wildly lopsided: most accounts have a few hundred followers, a few hundred accounts have millions. With pure fan-out on write, those few accounts cause:</p>
+  <ul>
+    <li><b>Write storms:</b> one post = tens of millions of inserts, delaying everyone's posts behind it (the backlog you just saw).</li>
+    <li><b>Hot shards:</b> fan-out workers all hammer the timeline shards at once.</li>
+    <li><b>Waste:</b> many of those followers won't open the app today; their feeds get written anyway.</li>
+  </ul>
+  <p>The <b>hybrid</b>: accounts above a follower threshold are <b>not</b> fanned out. Their recent posts sit in one small, heavily cached list per celebrity. At read time, the feed service fetches your precomputed timeline <i>plus</i> the recent posts of the few celebrities you follow, and merges them. Where should the threshold go?</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Pick the hybrid threshold</span>
+    <p class="hint">A model of 200M accounts whose follower counts follow a power law (the top account has 100M followers, the median account about 100), with about 236 follows per user. Accounts above the threshold are pulled at read time; the rest are pushed. Big accounts often post more than average: set how much more.</p>
+    <div class="controls">
+      <label>threshold <input type="range" id="thr" min="3" max="8" step="0.25" value="6"> <b class="mono" id="thrv"></b></label>
+      <label>accounts with 100k+ followers post <input type="range" id="mul" min="0" max="3" step="1" value="1"> <b class="mono" id="mulv"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">pulled (celebrity) accounts <b id="hc">–</b></div>
+      <div class="stat">fan-out writes/s <b id="hw">–</b></div>
+      <div class="stat">biggest single-post burst <b id="hb">–</b></div>
+      <div class="stat">celebrities merged per feed load <b id="hm">–</b></div>
+    </div>
+    <div class="two-col">
+      <canvas class="chart" id="hw1" style="height:170px"></canvas>
+      <canvas class="chart" id="hw2" style="height:170px"></canvas>
+    </div>
+    <p class="hint" id="hmsg"></p>
+  </div>
+  <p>The sweet spot is usually somewhere around a few hundred thousand to a million followers: only a few thousand accounts or fewer are pulled, the biggest burst drops from 100M to under a million inserts, and each feed load merges just a handful of extra lists. Those celebrity lists are hot keys, so they get replicated across cache servers (Lesson 1.3).</p>
+
+  <h2>Deep dive 2 · Storing, hydrating and paging the feed</h2>
+  <ul>
+    <li><b>Store IDs, not posts.</b> A timeline is a Redis list or sorted set of post IDs, capped at ~500 with <code>LTRIM</code>. On read: take 20 IDs, <b>hydrate</b> them with one multi-get from the post cache, drop deleted or blocked ones. The Twitter slides show this shape: get timeline tweet IDs, then get each tweet.</li>
+    <li><b>Only active users.</b> Skip fan-out for users who haven't logged in for weeks; rebuild their feed on demand (pull) when they return.</li>
+    <li><b>Pagination with a cursor, not an offset.</b> “Page 2 = items 21–40” breaks when 5 new posts arrive while you scroll: you see 5 duplicates. Instead the client sends “older than post_id X”. Time-sortable IDs make that a range query.</li>
+    <li><b>Ranking</b> runs after collecting candidates: gather a few hundred candidate posts (timeline + celebrities + recommendations), compute features (author affinity, engagement, freshness), score them with a model, re-rank, then page. Facebook's Multifeed does ranking and filtering in its aggregators at read time.</li>
+  </ul>
+
+  <h2>Bottlenecks and the scaling path</h2>
+  <table>
+    <tr><th>Stage</th><th>Design</th><th>What forces the next step</th></tr>
+    <tr><td><b>v1: startup</b> (thousands of users)</td><td>Fan-out on read in SQL: <code>SELECT … FROM posts WHERE author_id IN (…followees…) ORDER BY id DESC LIMIT 20</code> with an index on (author_id, id); cache each user's feed for 30 s</td><td>The query slows as follow lists and post tables grow</td></tr>
+    <tr><td><b>v2</b> (millions)</td><td>Fan-out on write via a queue into Redis timelines; post cache; read replicas for the graph</td><td>Celebrity posts cause backlogs and hot shards</td></tr>
+    <tr><td><b>v3</b> (100M+)</td><td>Hybrid push/pull, sharded timeline clusters, ranking service with candidate generation, multi-region timelines, fan-out only to active users</td><td>Cost of memory, ranking compute, and per-region consistency</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Redis</b> (lists or sorted sets for timelines), <b>Kafka</b> or <b>SQS</b> for the fan-out queue, <b>PostgreSQL</b>, <b>Cassandra</b> or <b>DynamoDB</b> for posts, a graph store for follows (Facebook built TAO), and managed feed services such as Stream (getstream.io) if you'd rather not build it. The fan-out worker and the read, in Redis commands:</p>
+<pre><code><span class="c"># fan-out worker: for each follower of the author (push)</span>
+LPUSH feed:<span class="n">42</span> <span class="n">1790000000000000123</span>     <span class="c"># newest post ID first</span>
+LTRIM feed:<span class="n">42</span> <span class="n">0</span> <span class="n">499</span>                     <span class="c"># keep only the newest 500</span>
+
+<span class="c"># read: first page, then hydrate the IDs</span>
+LRANGE feed:<span class="n">42</span> <span class="n">0</span> <span class="n">19</span>
+MGET post:<span class="n">1790000000000000123</span> post:<span class="n">1789999999999000777</span> …
+
+<span class="c"># or a sorted set scored by post ID, for cursor paging ("older than X")</span>
+ZADD feed:<span class="n">42</span> <span class="n">1790000000000000123</span> <span class="n">1790000000000000123</span>
+ZREVRANGEBYSCORE feed:<span class="n">42</span> (<span class="n">1790000000000000123</span> -inf LIMIT <span class="n">0</span> <span class="n">20</span></code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 6379:6379 redis</code>, then in <code>redis-cli</code> push 600 IDs with a loop, run the <code>LTRIM</code>, and check <code>LLEN feed:42</code> is 500. Redis's docs describe this exact LPUSH + LTRIM pair for capped lists.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>Pick it when…</th><th>Watch out for…</th></tr>
+      <tr><td>Fan-out on write</td><td>Read-heavy, follower counts mostly modest, latency matters</td><td>Celebrities, inactive users, memory cost of every timeline</td></tr>
+      <tr><td>Fan-out on read</td><td>Small scale, heavy per-viewer filtering (privacy checks) or very fresh ranking</td><td>Tail latency from asking many shards; repeated work on every refresh</td></tr>
+      <tr><td>Hybrid</td><td>Lopsided follower counts at scale (almost every social network)</td><td>Two code paths to build, test and debug; merge logic</td></tr>
+      <tr><td>Ranked feed</td><td>Users can't keep up with everything they follow</td><td>Compute cost, trust (“where did my friend's post go?”), needs a chronological fallback</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Fan-out on read with one indexed SQL query and a short cache. It's correct, easy to change (ranking experiments are just a different ORDER BY), and fine for the first hundreds of thousands of users. Move to Redis timelines when the query shows up in your p99 dashboards, not before.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Hybrid push/pull, timelines only for active users, machine-learned ranking over hundreds of candidates, separate teams for the graph, timelines, ranking and integrity (spam, abuse). Facebook goes further toward pull: its feed is assembled per viewer at read time from an in-memory index, because privacy checks depend on who is looking.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>What's evaluated: the <b>push vs pull trade-off with numbers</b>, the <b>celebrity problem</b> and the hybrid, storing <b>IDs and hydrating</b>, <b>cursor pagination</b>, and where ranking fits.</p>
+    <ul>
+      <li><b>Common mistakes:</b> picking push or pull without estimating both sides; storing full posts in every timeline (edits and deletes become fan-outs too); offset pagination; forgetting inactive users; no plan for a celebrity.</li>
+      <li><b>Likely follow-ups:</b> “A user unfollows someone: what happens to their feed?” (filter at read time or remove lazily), “How do deletes propagate?”, “What if the timeline cache cluster is lost?” (rebuild from posts + follows, pull mode meanwhile), “How do you add ads or recommendations?”, “How fresh must ranking features be?”</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Push into Redis timelines</b> <span class="tag co">🏢 Twitter · 2012–2014</span> <a href="https://www.infoq.com/presentations/twitter-timeline-scalability/" target="_blank" rel="noopener">Timelines at Scale (Raffi Krikorian, QCon San Francisco 2012, on InfoQ)</a></div>
+      <p><b>How:</b> the talk explains how Twitter delivers tweets into home timelines. A later QCon London 2014 deck by Twitter's Brian Degenhardt (<a href="https://qconlondon.com/london-2014/dl/qcon-london-2014/slides/BrianDegenhardt_RealTimeSystemsAtTwitter.pdf" target="_blank" rel="noopener">slides</a>) shows the write path (Write API → Fanout → Redis timeline cache) and reports 300k QPS of timeline reads at 1 ms p50 / 4 ms p99.</p>
+      <p><b>Why this method:</b> reads vastly outnumber tweets, so precomputing timelines makes each read a single in-memory lookup.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Pull, because every viewer sees something different</b> <span class="tag co">🏢 Facebook · 2013</span> <a href="https://www.usenix.org/conference/atc13/technical-sessions/presentation/bronson" target="_blank" rel="noopener">TAO: Facebook's Distributed Data Store for the Social Graph (USENIX ATC)</a></div>
+      <p><b>How:</b> because every item is privacy-checked for the current viewer, “we resolve data dependencies and check privacy each time the content is viewed. As much as possible we pull the social graph, rather than pushing it.” TAO serves “a billion reads and millions of writes each second”.</p>
+      <p><b>Why this method:</b> when the answer depends on who is asking, precomputing it per follower doesn't work; instead, make reads extremely cheap.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Ranking at read time</b> <span class="tag co">🏢 Facebook · 2015</span> <a href="https://engineering.fb.com/2015/03/10/production-engineering/serving-facebook-multifeed-efficiency-performance-gains-through-redesign/" target="_blank" rel="noopener">Serving Facebook Multifeed</a></div>
+      <p><b>How:</b> “leaf” servers keep recent News Feed actions indexed in memory; “aggregators” fan each query out to the leaves, then rank, filter and return results. Splitting the two onto separate machines brought a reported 40% efficiency gain.</p>
+      <p><b>Why this method:</b> aggregation is CPU-heavy and indexing is memory-heavy, so scaling them separately fits each one to the right hardware.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Redis feeds, then a ranked feed</b> <span class="tag co">🏢 Instagram · 2011 &amp; 2016</span> <a href="https://about.instagram.com/blog/announcements/see-posts-you-care-about-first-in-your-feed" target="_blank" rel="noopener">See Posts You Care About First in Your Feed</a></div>
+      <p><b>How:</b> in 2011 Instagram wrote that Redis “powers our main feed” (<a href="https://medium.com/instagram-engineering/what-powers-instagram-hundreds-of-instances-dozens-of-technologies-adf2e22da2ad" target="_blank" rel="noopener">What Powers Instagram</a>). In March 2016 it announced the feed would be ordered by how likely you are to care about each post, rather than purely by time.</p>
+      <p><b>Why this method:</b> people were missing on average 70% of their feeds; ranking puts the posts they care about where they'll see them.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · nobody reads the whole feed</span>
+    <p>When Instagram announced its ranked feed in 2016, it said people miss <b>on average 70 percent</b> of their feeds. That changes the design: if most of a feed is never seen, spending a lot to deliver every post instantly to everyone is wasted work, and spending on choosing the <i>right</i> 30% pays off.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The timeline cache is Lesson 1.3's cache-aside at huge scale; fan-out runs through queues (Lesson 3.1) or Kafka (Lesson 3.2); timelines are sharded by user ID (Lesson 2.4); post IDs are time-sortable like the Snowflake IDs in Lesson 7.2. Chat (Lesson 7.4) faces the same fan-out question for group messages, and notifications (Lesson 7.8) fan out too. Ranking is where AI enters: candidate generation and learned scoring are the same retrieve-then-rank pattern used in search and recommendation systems.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Video</span> <a href="https://www.infoq.com/presentations/twitter-timeline-scalability/" target="_blank" rel="noopener">Timelines at Scale (InfoQ)</a>. The classic talk on pushing tweets into Redis timelines.</li>
+      <li><span class="kind">Paper</span> <a href="https://www.usenix.org/conference/atc13/technical-sessions/presentation/bronson" target="_blank" rel="noopener">TAO (USENIX ATC 2013)</a>. Read section 2 for why Facebook pulls instead of pushing.</li>
+      <li><span class="kind">Docs</span> <a href="https://redis.io/docs/latest/develop/data-types/sorted-sets/" target="_blank" rel="noopener">Redis sorted sets</a>. The data type behind ranked and cursor-paged timelines.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 10 million posts a day, and authors have 300 followers on average. With fan-out on write, roughly how many timeline inserts per second?</div>
+    <div class="opts"><button class="opt">About 3,500</button><button class="opt" data-ok>About 35,000</button><button class="opt">About 350,000</button></div>
+    <div class="explain">10M × 300 = 3 billion inserts a day ÷ 86,400 ≈ <b>34,700/s</b>. That's the price of making every feed read a single lookup, and peaks (and celebrities) push it far higher.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A star with 80M followers posts, and for two minutes everyone's posts are delayed. What's the standard fix?</div>
+    <div class="opts"><button class="opt">Add fan-out workers until 80M inserts finish in a second</button><button class="opt" data-ok>Don't fan out accounts above a follower threshold; merge their recent posts into followers' feeds at read time</button><button class="opt">Switch everyone to fan-out on read</button></div>
+    <div class="explain">The hybrid. Only a few thousand accounts are above the threshold, so each feed read merges a handful of hot, well-cached lists, while normal accounts stay on fast push. Pure pull would make every read slow; scaling workers for a rare 80M burst is very expensive.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Users scrolling their feed see the same posts twice when new posts arrive. What's wrong?</div>
+    <div class="opts"><button class="opt" data-ok>Offset pagination; use a cursor such as “older than post_id X”</button><button class="opt">The cache TTL is too long</button><button class="opt">Fan-out on write creates duplicates</button></div>
+    <div class="explain">With offsets, 5 new posts at the top push everything down by 5, so “items 21–40” repeats 5 you've seen. A cursor anchored to the last post ID you saw is stable no matter what arrives on top.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>200M users → ~58k feed reads/s vs ~230 posts/s: make reads cheap.</li>
+      <li>Fan-out on write = precompute timelines (fast reads, write storms); fan-out on read = merge at read time (cheap writes, slow tail-heavy reads).</li>
+      <li>Hybrid: push for normal accounts, pull for celebrities above a threshold; merge a handful of hot lists per read.</li>
+      <li>Timelines store capped lists of post IDs in Redis; hydrate with a multi-get; paginate with cursors; rank after collecting candidates.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const human = n => n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M" : n >= 1e3 ? (n / 1e3).toFixed(n >= 1e4 ? 0 : 1) + "k" : Math.round(n) + "";
+
+  // ---------- fan-out simulator ----------
+  const FOL = [50, 100, 200, 500, 1000], CEL = [1e6, 1e7, 5e7, 1e8, 2e8];
+  const POSTS = 230, READS = 58000, WORKER = 1e6, CELEB_T = 1e6;
+  const F = new Flow($("ff"), { width: 760, height: 250 });
+  F.node("au", { x: 70, y: 45, w: 110, label: "✍️ Author", sub: "", kind: "cl" })
+   .node("ps", { x: 225, y: 45, w: 120, label: "Post service", sub: "", kind: "sv" })
+   .node("pdb", { x: 225, y: 135, w: 120, label: "🗄️ Posts", sub: "+ post cache", kind: "db" })
+   .node("q", { x: 400, y: 45, w: 130, label: "📨 Fan-out queue", sub: "", kind: "nw" })
+   .node("wk", { x: 620, y: 45, w: 130, label: "Fan-out workers", sub: "1M inserts/s", kind: "sv" })
+   .node("tl", { x: 620, y: 150, w: 130, label: "⚡ Timelines", sub: "Redis", kind: "ca" })
+   .node("fs", { x: 400, y: 210, w: 130, label: "Feed service", sub: "", kind: "sv" })
+   .node("rd", { x: 90, y: 210, w: 110, label: "📱 Reader", sub: "", kind: "cl" })
+   .edge("au", "ps").edge("ps", "pdb").edge("ps", "q").edge("q", "wk").edge("wk", "tl")
+   .edge("rd", "fs", { label: "GET /feed" }).edge("fs", "tl").edge("fs", "pdb").render();
+  const getSt = seg("st", () => runFan());
+  let lastLat = null;
+  function lookupLat(rng) { return rng() < 0.01 ? 15 + 25 * rng() : Math.exp(0.4 * MX.randn()) ; }
+  function feedLat(k, rng) { let m = 0; for (let i = 0; i < k; i++) m = Math.max(m, lookupLat(rng)); return m + 1 + 0.004 * k; } // + hydrate multi-get + merge
+  function runFan() {
+    const st = getSt(), fol = FOL[+$("fol").value], cel = CEL[+$("cel").value];
+    $("folv").textContent = fol; $("celv").textContent = human(cel);
+    const steady = POSTS * fol; // average followers = average followings
+    const celebsFollowed = st === "hybrid" ? Math.max(1, Math.round(fol * 0.032)) : 0; // ~3% of follows point at 1M+ accounts in the model below
+    const lookups = st === "write" ? 1 : st === "read" ? fol : 1 + celebsFollowed;
+    // latency sample
+    const rng = MX.seeded(5), L = [];
+    for (let i = 0; i < 1500; i++) L.push(feedLat(lookups, rng));
+    L.sort((a, b) => a - b);
+    const p50 = L[Math.floor(0.5 * L.length)], p99 = L[Math.floor(0.99 * L.length)];
+    lastLat = { p50, p99 };
+    // backlog over 60 s: celebrity post at t = 10 s
+    const pushCeleb = st === "write" || (st === "hybrid" && cel <= CELEB_T);
+    const series = []; let backlog = 0, doneAt = null;
+    for (let t = 0; t <= 60; t += 0.5) {
+      if (st !== "read") {
+        backlog += steady * 0.5;
+        if (t === 10 && pushCeleb) backlog += cel;
+        backlog = Math.max(0, backlog - WORKER * 0.5);
+        if (t > 10 && doneAt === null && backlog <= 0) doneAt = t - 10;
+      }
+      series.push([t, backlog / 1e6]);
+    }
+    const lagTxt = st === "read" ? "instantly (read time)" : !pushCeleb ? "instantly (pulled)" : doneAt !== null ? `≈ ${doneAt.toFixed(1)} s` : `> 50 s (≈ ${(cel / (WORKER - steady)).toFixed(0)} s)`;
+    $("wps").textContent = st === "read" ? "0 /s" : human(steady) + " /s" + (pushCeleb ? ` + ${human(cel)} burst` : "");
+    $("lpf").textContent = lookups + (st === "hybrid" ? ` (1 timeline + ${celebsFollowed} celebs)` : "");
+    $("flat").textContent = `${p50.toFixed(1)} / ${p99.toFixed(0)} ms`;
+    $("flat").style.color = p50 > 10 ? "var(--bad)" : "";
+    $("lag").textContent = lagTxt;
+    $("lag").style.color = pushCeleb && (doneAt === null || doneAt > 10) ? "var(--bad)" : "";
+    const peakB = Math.max(...series.map(p => p[1]));
+    F.set("q", { sub: st === "read" ? "unused" : `peak backlog ${human(peakB * 1e6)}`, load: st === "read" ? 0 : Math.min(1, peakB * 1e6 / 2e7), hot: peakB * 1e6 > 2e7 })
+     .set("wk", { sub: st === "read" ? "idle" : `${human(steady)}/s steady`, load: st === "read" ? 0 : steady / WORKER })
+     .set("fs", { sub: `${lookups} lookup${lookups > 1 ? "s" : ""}/load`, load: Math.min(1, lookups / 200), hot: lookups > 100 })
+     .set("tl", { sub: st === "read" ? "author lists only" : "one list per reader" })
+     .set("rd", { sub: `p50 ${p50.toFixed(1)} ms` });
+    Plot.line($("qc"), { series: [{ label: "fan-out backlog (millions of inserts waiting)", color: MX.css(peakB > 20 ? "--c-er" : "--c-nw"), data: series, fill: true }], xLabel: "seconds (celebrity posts at t = 10)", yMin: 0, yMax: Math.max(1, peakB * 1.1) });
+    $("fmsg").textContent = st === "write" ? (cel >= 5e7 ? `One post created ${human(cel)} inserts. Every other post published in the next ~${Math.round(cel / (WORKER - steady))} s waits in the same queue.` : "Reads are a single lookup: fast and flat. The cost moved to write time.") :
+      st === "read" ? `No fan-out at all, but every feed load waits for the slowest of ${fol} lookups. At 58,000 loads/s that's ${human(READS * fol)} lookups/s.` :
+      `Pushed for normal accounts, pulled for the ${cel > CELEB_T ? "celebrity" : "(below-threshold) celebrity"}: ${lookups} lookups per load and no big backlog.`;
+  }
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  let busy = false;
+  $("post").onclick = async () => {
+    if (busy) return; busy = true;
+    const st = getSt();
+    await F.packet(["au", "ps", "pdb"], { color: "--c-cl", dur: 450 });
+    if (st !== "read") {
+      await F.packet(["ps", "q", "wk"], { color: "--c-nw", dur: 450 });
+      await Promise.all([0, 1, 2].map(i => sleep(i * 120).then(() => F.packet(["wk", "tl"], { color: "--c-ca", dur: 350 }))));
+    }
+    busy = false;
+  };
+  $("read").onclick = async () => {
+    if (busy) return; busy = true;
+    const st = getSt();
+    await F.packet(["rd", "fs"], { color: "--c-cl", dur: 400 });
+    if (st === "write") await F.packet(["fs", "tl"], { color: "--c-ca", dur: 300, back: true });
+    else {
+      const n = st === "read" ? 6 : 2;
+      if (st === "hybrid") await F.packet(["fs", "tl"], { color: "--c-ca", dur: 300, back: true });
+      await Promise.all([...Array(n)].map((_, i) => sleep(i * 70).then(() => F.packet(["fs", "pdb"], { color: i === n - 1 && st === "read" ? "--c-er" : "--c-db", dur: i === n - 1 && st === "read" ? 700 : 300, back: true }))));
+    }
+    await F.packet(["fs", "pdb"], { color: "--c-db", dur: 250, back: true }); // hydrate
+    await F.packet(["fs", "rd"], { color: "--c-cl", dur: 350 });
+    busy = false;
+  };
+  ["fol", "cel"].forEach(id => ($(id).oninput = runFan));
+  runFan();
+
+  // ---------- hybrid threshold model ----------
+  const U = 2e8, FMAX = 1e8, A = 0.75, BASE = 0.1; // posts/day per account
+  const MULS = [1, 3, 10, 30];
+  const ranks = [], counts = [], fols = [];
+  { let prev = 0; const B = 3000;
+    for (let i = 0; i <= B; i++) { const r = Math.round(Math.pow(U, i / B)); if (r > prev) { ranks.push(r); prev = r; } }
+    for (let i = 0; i < ranks.length; i++) { counts.push((ranks[i + 1] || U + 1) - ranks[i]); fols.push(FMAX / Math.pow(ranks[i], A)); } }
+  function model(T, mul) {
+    let writes = 0, pulledEdges = 0, celebs = 0;
+    for (let i = 0; i < ranks.length; i++) {
+      const f = fols[i], c = counts[i], rate = BASE * (f >= 1e5 ? mul : 1);
+      if (f > T) { pulledEdges += f * c; celebs += c; } else writes += f * c * rate;
+    }
+    return { writes: writes / 86400, perRead: pulledEdges / U, celebs, burst: Math.min(T, FMAX) };
+  }
+  function runHy() {
+    const T = Math.pow(10, +$("thr").value), mul = MULS[+$("mul").value];
+    $("thrv").textContent = human(T) + " followers"; $("mulv").textContent = mul + "× as often";
+    const m = model(T, mul), all = model(Infinity, mul);
+    $("hc").textContent = Math.round(m.celebs).toLocaleString("en-US");
+    $("hw").textContent = human(m.writes) + "/s (" + Math.round(100 * (1 - m.writes / all.writes)) + "% saved)";
+    $("hb").textContent = human(m.burst) + " inserts";
+    $("hb").style.color = m.burst > 1e7 ? "var(--bad)" : "";
+    $("hm").textContent = m.perRead.toFixed(1);
+    $("hm").style.color = m.perRead > 30 ? "var(--bad)" : "";
+    const xs = MX.linspace(3, 8, 41), W = [], R = [];
+    xs.forEach(x => { const q = model(Math.pow(10, x), mul); W.push([x, q.writes / 1e3]); R.push([x, q.perRead]); });
+    const cur = +$("thr").value;
+    Plot.line($("hw1"), { series: [{ label: "fan-out writes (thousands/s)", color: MX.css("--c-nw"), data: W, fill: true }, { label: "your threshold", color: MX.css("--c-er"), data: [[cur, 0], [cur, Math.max(...W.map(p => p[1]))]], dash: [4, 4] }], xLabel: "log10(threshold)", yMin: 0 });
+    Plot.line($("hw2"), { series: [{ label: "celebrity lists merged per feed load", color: MX.css("--c-ca"), data: R, fill: true }, { label: "your threshold", color: MX.css("--c-er"), data: [[cur, 0], [cur, Math.max(...R.map(p => p[1]))]], dash: [4, 4] }], xLabel: "log10(threshold)", yMin: 0 });
+    $("hmsg").textContent = m.perRead > 30 ? `Threshold too low: ${Math.round(m.celebs).toLocaleString("en-US")} accounts are pulled, so every feed load merges ${m.perRead.toFixed(0)} extra lists, ${human(m.perRead * READS)} lookups/s. You're drifting back to fan-out on read.` :
+      m.burst > 1e7 ? `Threshold too high: a single post can still trigger ${human(m.burst)} inserts, the write storm you were trying to avoid.` :
+      `Balanced: one post never causes more than ${human(m.burst)} inserts, and each feed load merges about ${m.perRead.toFixed(1)} celebrity lists.`;
+  }
+  ["thr", "mul"].forEach(id => ($(id).oninput = runHy));
+  runHy();
+})();
+</script>
+</body>
+</html>

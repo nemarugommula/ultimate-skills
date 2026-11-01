@@ -1,0 +1,534 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P.1 Pythonic Python · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .pz-opts { display: flex; flex-wrap: wrap; gap: 8px; margin: 8px 0; }
+  .pz-opts .btn { font-family: var(--mono); }
+  .pz-opts .btn.right { background: color-mix(in srgb, var(--good) 25%, transparent); border-color: var(--good); }
+  .pz-opts .btn.wrong { background: color-mix(in srgb, var(--bad) 22%, transparent); border-color: var(--bad); }
+  .trace { font-family: var(--mono); font-size: .82rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-height: 60px; white-space: pre-wrap; }
+  .trace .ok { color: var(--good); font-weight: 700; }
+  .trace .bad { color: var(--bad); font-weight: 700; }
+  .trace .zz { color: var(--muted); }
+  .verdict { font-weight: 700; margin: 8px 0; }
+</style>
+</head>
+<body data-lesson="ap-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase P · Lesson 1</div>
+  <h1>Pythonic Python: the data model, typing, dataclasses and decorators</h1>
+  <p class="subtitle">The Python behind every LLM wrapper you'll write: how objects really behave, the traps that bite in production, and the idioms (decorators, context managers, typed models) that make AI code safe to change.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Basic Python: functions, classes, lists and dicts. This lesson goes deeper, not wider.</li>
+      <li>An <b>LLM API call</b> is an HTTP request: you send a prompt as JSON, you get JSON back, and it can fail with a <b>429</b> (rate limited) or a 5xx (server error) (Lesson 0.5).</li>
+      <li><b>Structured output</b> means asking the model for JSON that matches a schema (Lesson 1.3). Here we look at the Python objects that hold that JSON.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>By 2019 Dropbox had type-checked <b>4 million lines</b> of Python with mypy. Their engineering post explains why: at their scale, dynamic typing “made code needlessly hard to understand and started to seriously impact productivity.”</p>
+    <p>AI code hits the same wall sooner, because it is full of loosely shaped data: prompts, message lists, tool arguments, model JSON. That's why the official SDKs lean on Python's type system today. OpenAI's Python library types nested request parameters as <code>TypedDict</code>s and returns responses as <b>Pydantic models</b>. This lesson is the Python that makes that work.</p>
+  </div>
+
+  <h2>Numbers first: everything is an object</h2>
+  <p>In C, an integer is 4 or 8 bytes. In Python, it's a full object with a type pointer and a reference count. Measured with <code>sys.getsizeof</code> on 64-bit CPython 3.13 (exact sizes vary a little by version):</p>
+  <table>
+    <tr><th>Value</th><th>Size in memory</th><th>What it means for AI code</th></tr>
+    <tr><td><code>1</code> (an int)</td><td class="tk">28 bytes</td><td>Even a number carries a type and a reference count.</td></tr>
+    <tr><td><code>1.0</code> (a float)</td><td class="tk">24 bytes</td><td>One embedding dimension stored as a Python float costs 3× a raw 8-byte double.</td></tr>
+    <tr><td><code>[]</code> (empty list)</td><td class="tk">56 bytes</td><td>A list stores <b>pointers</b> to objects, not the objects themselves.</td></tr>
+    <tr><td>a list of 1,000,000 floats</td><td class="tk">≈ 8.4 MB of pointers + 24 MB of floats ≈ 32 MB</td><td>The same numbers as a NumPy array take 8 MB (Lesson P.7).</td></tr>
+  </table>
+  <p>Plain sentence: <b>every value is an object, every variable is a name pointing at one, and behaviour comes from the object's type.</b> Most Python surprises (and most Python power) follow from that.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Python is a language of <b>protocols</b>. <code>len(x)</code>, <code>for</code>, <code>with</code>, <code>if x:</code>, <code>x[i]</code> and <code>f(x)</code> all just call special methods on the object (“dunder” methods, named for their double underscores, like <code>__len__</code>). Learn the protocols, respect <b>mutability</b> (names share objects, they don't copy them), and the senior tools follow naturally: decorators wrap functions because functions are objects; context managers are objects with <code>__enter__</code>/<code>__exit__</code>; type hints and Pydantic describe the shapes of those objects.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: luggage tags, not boxes</span>
+    <p>A Python variable is not a box that holds a value. It's a <b>luggage tag</b> tied to a suitcase. <code>b = a</code> ties a second tag to the <i>same</i> suitcase; it doesn't pack a new one. If the suitcase can be opened (a list, a dict), anyone holding a tag sees what you put in. If it's sealed (an int, a string, a tuple), “changing” it really means tying your tag to a different suitcase. Almost every Python gotcha in this lesson is two tags on one open suitcase.</p>
+  </div>
+
+  <h2>The data model: what your syntax actually calls</h2>
+  <table>
+    <tr><th>You write</th><th>Python calls</th><th>Where you meet it in AI work</th></tr>
+    <tr><td><code>len(history)</code></td><td><code>history.__len__()</code></td><td>Counting messages before trimming a conversation.</td></tr>
+    <tr><td><code>for event in stream</code></td><td><code>iter(stream).__next__()</code> repeatedly</td><td>Streaming tokens from an SDK (Lesson P.2).</td></tr>
+    <tr><td><code>with client.messages.stream(...) as s</code></td><td><code>__enter__</code>, then <code>__exit__</code> even on error</td><td>Closing HTTP connections, timers, spans.</td></tr>
+    <tr><td><code>tool(**args)</code></td><td><code>tool.__call__(**args)</code></td><td>Any object with <code>__call__</code> can be a tool or a model wrapper.</td></tr>
+    <tr><td><code>if response.content:</code></td><td><code>__bool__</code>, else <code>__len__</code></td><td>Checking for an empty reply (see the trap below).</td></tr>
+    <tr><td><code>a == b</code> / <code>{a: 1}</code></td><td><code>__eq__</code> / <code>__hash__</code></td><td>Dedup of chunks, cache keys for embeddings.</td></tr>
+    <tr><td><code>repr(chunk)</code></td><td><code>__repr__</code></td><td>What shows up in your logs and traces. Make it useful.</td></tr>
+  </table>
+  <p><b>Truthiness:</b> <code>None</code>, <code>False</code>, <code>0</code>, <code>0.0</code>, <code>""</code>, <code>[]</code>, <code>{}</code> are all “falsy”; nearly everything else is “truthy”. That makes <code>x or default</code> tempting and dangerous: <code>temperature or 0.7</code> turns a deliberate <code>temperature=0</code> into 0.7. When <code>0</code>, <code>""</code> or <code>[]</code> are valid values, test <code>is None</code> instead.</p>
+
+  <h2>Mutability: the traps that ship to production</h2>
+  <p>Lists, dicts and sets are <b>mutable</b> (can change in place). Ints, floats, strings, tuples and <code>frozenset</code>s are <b>immutable</b>; Python 3.15 (released October 2026) added a built-in <code>frozendict</code> too. Four traps follow from luggage tags:</p>
+  <ul>
+    <li><b>Mutable default arguments.</b> <code>def add(msg, history=[])</code> creates the list <b>once</b>, when the function is defined. Every call without <code>history</code> shares it, so one user's conversation leaks into the next. Use <code>history=None</code> and create the list inside.</li>
+    <li><b>Shallow copies.</b> <code>config.copy()</code> copies the outer dict only; nested lists are shared. Use <code>copy.deepcopy</code>, or build a new value instead of mutating.</li>
+    <li><b>Late-binding closures.</b> A function defined in a loop looks up the loop variable when it's <i>called</i>, not when it's defined, so a list of per-tool lambdas can all point at the last tool.</li>
+    <li><b><code>is</code> vs <code>==</code>.</b> <code>==</code> asks “same value?”, <code>is</code> asks “same object?”. Use <code>is</code> only for <code>None</code> (and sentinels).</li>
+  </ul>
+
+  <div class="playground" id="pg-puzzles">
+    <span class="label">🎮 Playground · Guess the output</span>
+    <p class="hint">Six short snippets of the kind that turn up in real LLM code. Pick what Python prints, then read why and see the fix. Every output here was checked by running the code on CPython 3.13.</p>
+    <div class="controls"><b id="pzN"></b> <span class="muted" id="pzT"></span></div>
+    <pre><code id="pzCode"></code></pre>
+    <div class="pz-opts" id="pzOpts"><button class="btn" id="pzo0"></button><button class="btn" id="pzo1"></button><button class="btn" id="pzo2"></button></div>
+    <div class="verdict" id="pzV"></div>
+    <div id="pzWhy" class="hint"></div>
+    <pre id="pzFixWrap" style="display:none"><code id="pzFix"></code></pre>
+    <div class="controls"><button class="btn" id="pz-prev">← Previous</button><button class="btn primary" id="pz-next">Next puzzle →</button></div>
+    <div class="stat-row"><div class="stat">score <b id="pzScore">0 / 0</b></div></div>
+  </div>
+
+  <h2>Idioms you'll use every day</h2>
+  <table>
+    <tr><th>Idiom</th><th>Example</th><th>Why it's better</th></tr>
+    <tr><td>Unpacking</td><td><code>system, *turns = messages</code><br><code>params = {**defaults, "max_tokens": 1024}</code></td><td>Names the parts; merges request parameters without mutating the defaults.</td></tr>
+    <tr><td>Comprehensions</td><td><code>[c.text for c in chunks if c.score &gt; 0.5]</code></td><td>Filter + transform in one readable line; faster than an append loop.</td></tr>
+    <tr><td>f-strings</td><td><code>f"{cost:,.4f}"</code>, <code>f"{hit_rate:.1%}"</code>, <code>f"{tokens=}"</code></td><td>Formatting and quick debugging (<code>=</code> prints the name too).</td></tr>
+    <tr><td><code>enumerate</code> / <code>zip</code></td><td><code>for i, (chunk, vec) in enumerate(zip(chunks, vecs))</code></td><td>No index bookkeeping. <code>zip(..., strict=True)</code> (3.10+) catches length mismatches, for example a lost embedding.</td></tr>
+    <tr><td>Walrus <code>:=</code></td><td><code>if (m := re.search(pat, reply)):</code></td><td>Assign and test in one step when parsing model output.</td></tr>
+    <tr><td><code>with</code></td><td><code>with open(p) as f:</code>, <code>with timer("embed"):</code></td><td>Cleanup always runs, even when an exception is raised.</td></tr>
+  </table>
+  <p>A <b>context manager</b> is any object with <code>__enter__</code> and <code>__exit__</code>. The quickest way to write one is a generator with <code>@contextlib.contextmanager</code>: code before <code>yield</code> is setup, code after it (in a <code>finally</code>) is cleanup. You'll use them for timers, tracing spans and HTTP clients, and their async twins (<code>async with</code>) in Lesson P.3.</p>
+
+  <h2>Decorators: wrap every LLM call without touching it</h2>
+  <p>Functions are objects, so a function can take a function and return a new one. That's a <b>decorator</b>. <code>@timed</code> above <code>def ask_llm</code> is exactly <code>ask_llm = timed(ask_llm)</code>. Decorators are how you add retries, timing, caching, logging and tracing to LLM calls in one place. Three rules:</p>
+  <ul>
+    <li>Use <code>functools.wraps</code> inside, or the wrapped function loses its name and docstring (and your traces say <code>wrapper</code>).</li>
+    <li>A decorator that takes arguments, like <code>@retry(max_attempts=4)</code>, is a function that <b>returns</b> a decorator: three nested levels.</li>
+    <li><b>Order matters.</b> Decorators apply bottom-up. <code>@timed</code> above <code>@retry</code> measures the whole call with retries (what the user feels); below it, it times each attempt separately.</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what a retry policy really costs</span>
+    <p>An LLM endpoint returns 429 on 30% of calls at peak. You retry up to 4 attempts with exponential backoff: wait 1 s, then 2 s, then 4 s.</p>
+    <ul>
+      <li>Chance all 4 attempts fail: 0.3⁴ = <b>0.81%</b> (versus 30% with no retry).</li>
+      <li>Expected attempts per call: 1 + 0.3 + 0.3² + 0.3³ = <b>1.417</b>, so about 42% more requests (and cost, if failures are billed; 429s usually aren't).</li>
+      <li>Worst-case extra waiting: 1 + 2 + 4 = <b>7 s</b> of sleep on top of four call latencies. Your timeout and UX must allow for that.</li>
+      <li>Retrying a <b>400 Bad Request</b> buys nothing: the same bad request fails 4 times and adds 7 s. Retry only errors that can succeed later (429, 5xx, timeouts, connection errors).</li>
+    </ul>
+    <p class="muted">Both official SDKs already retry 429s and 5xx errors 2 times by default with exponential backoff (<code>max_retries</code>). Write your own decorator when you need something they don't do: a different policy, fallbacks to another model, or retries around a whole multi-call step.</p>
+  </div>
+
+  <div class="playground" id="pg-dec">
+    <span class="label">🎮 Playground · Build the decorator stack</span>
+    <p class="hint">A <b>simulated</b> flaky LLM call (no real API; latencies and failure rates are made up but realistic in shape). Stack decorators on it, call it once to read the trace, or run 200 calls for the statistics. Try: no retry on the 429 endpoint; retry everything on the 400 endpoint; the hanging endpoint without a timeout.</p>
+    <div class="controls">
+      endpoint <span class="seg" id="ep"><button data-v="rl" class="on">rate-limited (429s)</button><button data-v="bad">bad request (400)</button><button data-v="hang">sometimes hangs</button></span>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="dRetry" checked> @retry</label>
+      <label>attempts <input type="range" id="dAtt" min="1" max="6" step="1" value="4"> <b class="mono" id="dAttV"></b></label>
+      backoff <span class="seg" id="bo"><button data-v="none">none</button><button data-v="exp">exponential</button><button data-v="jit" class="on">exponential + jitter</button></span>
+    </div>
+    <div class="controls">
+      retry on <span class="seg" id="ro"><button data-v="any">any Exception</button><button data-v="safe" class="on">only 429 / 5xx / timeout</button></span>
+      <label><input type="checkbox" id="dTo"> @timeout(10 s)</label>
+      <label><input type="checkbox" id="dTimed" checked> @timed</label>
+      <span class="seg" id="ord"><button data-v="out" class="on">@timed outermost</button><button data-v="in">@timed innermost</button></span>
+    </div>
+    <pre><code id="dCode"></code></pre>
+    <div class="controls"><button class="btn primary" id="dec-run">▶ Call once</button><button class="btn" id="dec-many">Run 200 calls</button></div>
+    <div class="trace" id="dTrace"></div>
+    <div class="verdict" id="dVerdict"></div>
+    <div class="stat-row">
+      <div class="stat">success rate <b id="dOk">–</b></div>
+      <div class="stat">mean latency <b id="dMean">–</b></div>
+      <div class="stat">p95 latency <b id="dP95">–</b></div>
+      <div class="stat">API requests per call <b id="dReq">–</b></div>
+    </div>
+    <p class="hint">Toy rules: about 29% of first attempts get a 429; a retry sent less than 0.5 s after a 429 is still inside the rate-limit window and fails 80% of the time; plain exponential backoff without jitter makes many clients retry in lockstep (45% fail); with jitter, retries spread out (29%). A hung call runs until the client's timeout: the Anthropic SDK's default is 10 minutes.</p>
+  </div>
+  <p>What you should see: without retries, about 3 calls in 10 fail. Retries without backoff mostly hit the same rate-limit window. Retrying “any Exception” against the 400 endpoint wastes every attempt plus the backoff. The hanging endpoint shows why timeouts belong in the stack: with no timeout, p95 latency is measured in minutes.</p>
+
+  <h2>Typed data: dataclasses, TypedDict and Pydantic</h2>
+  <p>AI code passes around three kinds of structured data: your own internal records (chunks, documents), JSON dicts you send to APIs, and JSON you <b>receive</b> from models and users, which can be wrong. Python has a tool for each.</p>
+  <table>
+    <tr><th></th><th><code>@dataclass</code></th><th><code>TypedDict</code></th><th>Pydantic <code>BaseModel</code></th></tr>
+    <tr><td>What it is</td><td>A class with generated <code>__init__</code>, <code>__repr__</code>, <code>__eq__</code></td><td>A type hint for a plain dict with known keys</td><td>A class that <b>validates and converts</b> input at runtime</td></tr>
+    <tr><td>Checks at runtime?</td><td>No (hints are not enforced)</td><td>No (it's still a dict)</td><td class="ev">Yes: wrong types raise <code>ValidationError</code></td></tr>
+    <tr><td>JSON</td><td>Manual</td><td>It already is JSON-shaped</td><td><code>model_validate_json</code>, <code>model_dump_json</code>, <code>model_json_schema()</code></td></tr>
+    <tr><td>Use it for</td><td>Internal records: <code>Chunk</code>, <code>Document</code>, configs</td><td>Request params (how the OpenAI SDK types them)</td><td>Boundaries: model output, tool arguments, API bodies (Lesson P.6)</td></tr>
+  </table>
+  <p>Pydantic's <code>model_json_schema()</code> is how one class can become a structured-output schema or a tool definition (Lessons 1.3 and 6.2). Its validation core, <code>pydantic-core</code>, is written in Rust, so validating at the boundary is cheap.</p>
+
+  <h3>Type hints that matter in AI code</h3>
+  <table>
+    <tr><th>Hint</th><th>Example</th><th>Meaning</th></tr>
+    <tr><td><code>X | None</code> (3.10+), or <code>Optional[X]</code></td><td><code>system: str | None = None</code></td><td>May be missing. Forces you to handle <code>None</code>.</td></tr>
+    <tr><td><code>Literal</code></td><td><code>role: Literal["user", "assistant"]</code></td><td>Only these exact values. Great for labels a classifier may return.</td></tr>
+    <tr><td><code>TypedDict</code></td><td><code>class Msg(TypedDict): role: str; content: str</code></td><td>A dict with known keys and value types.</td></tr>
+    <tr><td><code>Protocol</code></td><td><code>class Embedder(Protocol): def embed(self, t: list[str]) -&gt; list[list[float]]: ...</code></td><td>“Anything with this method.” Swap providers without inheritance (structural typing).</td></tr>
+    <tr><td>Generics</td><td><code>def first[T](xs: list[T]) -&gt; T</code> (3.12+ syntax)</td><td>Types that carry a parameter: a <code>Cache[str, Vector]</code>, a <code>Result[T]</code>.</td></tr>
+  </table>
+  <p>Hints do nothing at runtime on their own. A <b>type checker</b> reads them before you run: <b>mypy</b> and <b>pyright</b> are the established ones, and Astral's <b>ty</b> and Meta's <b>Pyrefly</b> are newer, Rust-based options. Frameworks also read hints at runtime: the OpenAI Agents SDK builds a tool's JSON schema from your function's signature (with <code>inspect</code>) and its docstring, using Pydantic. Good hints literally become the tool description the model sees.</p>
+  <p><b>Also worth knowing:</b> <code>functools.lru_cache</code> memoises a function (cache repeated embedding or classification calls; arguments must be hashable, and set <code>maxsize</code> or it grows forever); <code>functools.partial</code> pre-fills arguments (<code>partial(call_model, model=CHEAP, max_tokens=256)</code>); <code>enum.StrEnum</code> (3.11+) gives named constants that still compare equal to strings; and <code>match</code> (3.10+) destructures nested data, perfect for routing on response content blocks.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Standard library:</b> <code>functools</code> (<code>wraps</code>, <code>lru_cache</code>, <code>partial</code>), <code>dataclasses</code>, <code>typing</code>, <code>contextlib</code>, <code>enum</code>, <code>copy</code>. <b>Libraries:</b> Pydantic for validation; <b>tenacity</b> if you want a ready-made retry decorator. <b>Type checkers:</b> mypy, pyright (also inside VS Code's Pylance), ty, Pyrefly. This runs on Python 3.10+ with <code>pip install pydantic</code> (checked on 3.13):</p>
+<pre><code><span class="k">import</span> functools, random, time
+<span class="k">from</span> dataclasses <span class="k">import</span> dataclass, field
+<span class="k">from</span> typing <span class="k">import</span> Literal, Protocol
+<span class="k">from</span> pydantic <span class="k">import</span> BaseModel, Field, ValidationError
+
+<span class="k">class</span> RateLimitError(Exception): ...          <span class="c"># stand-in for the SDK's 429 error</span>
+
+<span class="k">def</span> retry(max_attempts=<span class="n">4</span>, base=<span class="n">1.0</span>, retry_on=(RateLimitError, TimeoutError)):
+    <span class="k">def</span> decorator(fn):
+        <span class="k">@</span>functools.wraps(fn)                   <span class="c"># keep fn.__name__, docstring</span>
+        <span class="k">def</span> wrapper(*args, **kwargs):
+            <span class="k">for</span> attempt <span class="k">in</span> range(<span class="n">1</span>, max_attempts + <span class="n">1</span>):
+                <span class="k">try</span>:
+                    <span class="k">return</span> fn(*args, **kwargs)
+                <span class="k">except</span> retry_on:
+                    <span class="k">if</span> attempt == max_attempts:
+                        <span class="k">raise</span>
+                    time.sleep(base * <span class="n">2</span> ** (attempt - <span class="n">1</span>) * random.uniform(<span class="n">0.5</span>, <span class="n">1.5</span>))  <span class="c"># backoff + jitter</span>
+        <span class="k">return</span> wrapper
+    <span class="k">return</span> decorator
+
+<span class="k">def</span> timed(fn):
+    <span class="k">@</span>functools.wraps(fn)
+    <span class="k">def</span> wrapper(*args, **kwargs):
+        t0 = time.perf_counter()
+        <span class="k">try</span>:
+            <span class="k">return</span> fn(*args, **kwargs)
+        <span class="k">finally</span>:
+            print(<span class="s">f"{fn.__name__} took {time.perf_counter() - t0:.2f}s"</span>)
+    <span class="k">return</span> wrapper
+
+<span class="k">@</span>timed            <span class="c"># outermost: measures the total, retries included</span>
+<span class="k">@</span>retry(base=<span class="n">0.01</span>)
+<span class="k">def</span> ask_llm(prompt: str) -&gt; str:
+    <span class="k">if</span> random.random() &lt; <span class="n">0.3</span>:
+        <span class="k">raise</span> RateLimitError(<span class="s">"429"</span>)
+    <span class="k">return</span> <span class="s">f"answer to {prompt!r}"</span>
+
+<span class="k">@</span>dataclass(frozen=<span class="k">True</span>)
+<span class="k">class</span> Chunk:                       <span class="c"># plain container: fast, no validation</span>
+    doc_id: str
+    text: str
+    tags: list[str] = field(default_factory=list)   <span class="c"># never tags=[]</span>
+
+<span class="k">class</span> Answer(BaseModel):           <span class="c"># validated at the boundary (LLM output, API input)</span>
+    label: Literal[<span class="s">"refund"</span>, <span class="s">"shipping"</span>, <span class="s">"other"</span>]
+    confidence: float = Field(ge=<span class="n">0</span>, le=<span class="n">1</span>)
+
+<span class="k">class</span> Embedder(Protocol):          <span class="c"># any object with this method fits; no inheritance needed</span>
+    <span class="k">def</span> embed(self, texts: list[str]) -&gt; list[list[float]]: ...
+
+print(ask_llm(<span class="s">"hi"</span>))
+print(Answer.model_validate_json(<span class="s">'{"label": "refund", "confidence": "0.9"}'</span>))  <span class="c"># "0.9" → 0.9</span>
+<span class="k">try</span>:
+    Answer.model_validate_json(<span class="s">'{"label": "refunds", "confidence": 1.4}'</span>)
+<span class="k">except</span> ValidationError <span class="k">as</span> e:
+    print(e.error_count(), <span class="s">"validation errors"</span>)          <span class="c"># 2: bad label, confidence &gt; 1</span>
+
+<span class="k">def</span> describe(block: dict) -&gt; str:  <span class="c"># match (3.10+) on a response content block</span>
+    <span class="k">match</span> block:
+        <span class="k">case</span> {<span class="s">"type"</span>: <span class="s">"text"</span>, <span class="s">"text"</span>: str(t)}:
+            <span class="k">return</span> <span class="s">f"text: {t}"</span>
+        <span class="k">case</span> {<span class="s">"type"</span>: <span class="s">"tool_use"</span>, <span class="s">"name"</span>: name, <span class="s">"input"</span>: {**args}}:
+            <span class="k">return</span> <span class="s">f"call {name}({args})"</span>
+        <span class="k">case</span> _:
+            <span class="k">return</span> <span class="s">"unknown block"</span></code></pre>
+    <p class="hint">In production, catch the SDK's own error classes (for example <code>anthropic.RateLimitError</code>) rather than a home-made one, and remember the SDKs already retry twice: your decorator's attempts multiply with theirs unless you set <code>max_retries=0</code> on the client.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Pydantic everywhere</td><td>Bad data fails loudly and early; free JSON schemas</td><td>Validation cost on hot paths; heavier objects than a dataclass</td></tr>
+      <tr><td>Plain dicts</td><td>Zero ceremony, JSON-native</td><td>Typos in keys fail at 3 a.m.; no editor help</td></tr>
+      <tr><td>Strict type checking in CI</td><td>Safe refactors, fewer runtime surprises</td><td>Up-front effort; untyped third-party libraries need stubs or ignores</td></tr>
+      <tr><td>Custom decorators</td><td>One place for retries, timing, tracing</td><td>Hidden control flow; stacking order bugs; double retries with the SDK's own</td></tr>
+      <tr><td>Immutable data (<code>frozen=True</code>, tuples)</td><td>No shared-state bugs; hashable (can be cache keys)</td><td>Must build new objects to “change” them</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Type hints on every function signature, Pydantic models for anything that crosses a boundary (LLM output, request bodies), dataclasses inside, the SDK's built-in retries, and pyright or mypy in the editor. One <code>llm.py</code> module where every model call goes through a single decorated function, so adding timing or a fallback later is a one-line change.</p></div>
+      <div><h4>At scale</h4><p>Type checking in CI as a merge gate, shared typed client libraries owned by a platform team, retries and timeouts set centrally (often in an LLM gateway, Lesson 8.1), tracing decorators that emit spans with token counts, and lint rules that ban mutable defaults and bare <code>except:</code>.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Python questions in AI-engineer interviews are usually practical. Expect:</p>
+    <ul>
+      <li>“What's wrong with <code>def f(x, cache={})</code>?” Defaults are evaluated once at definition time; the dict is shared across calls. Use <code>None</code>.</li>
+      <li>“Write a retry decorator with exponential backoff for an LLM call.” Show <code>functools.wraps</code>, retry only retryable errors, jitter, a max attempt count, re-raise on the last attempt, and mention the SDK's built-in retries.</li>
+      <li>“Dataclass or Pydantic for the model's JSON output?” Pydantic: it's untrusted input and needs runtime validation; a dataclass won't check anything.</li>
+      <li>“<code>is</code> vs <code>==</code>?”, “shallow vs deep copy?”, “what does <code>@</code> desugar to?”, “how do context managers guarantee cleanup?” Short, precise answers with a concrete example win.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Type-checking millions of lines</b> <span class="tag co">🏢 Dropbox · 2019</span> <a href="https://dropbox.tech/application/our-journey-to-type-checking-4-million-lines-of-python" target="_blank" rel="noopener">Our journey to type checking 4 million lines of Python</a></div>
+      <p><b>How:</b> gradually added type hints and ran mypy (whose core team Dropbox employed) across 4 million lines of server and desktop code.</p>
+      <p><b>Why this method:</b> gradual typing let them add types file by file instead of a rewrite, and the payoff grows with codebase and team size.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>TypedDict in, Pydantic out</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/openai/openai-python" target="_blank" rel="noopener">openai-python README</a></div>
+      <p><b>How:</b> nested request parameters are typed as <code>TypedDict</code>s (you pass plain dicts, your editor checks the keys); responses come back as Pydantic models with helpers like <code>to_json()</code>.</p>
+      <p><b>Why this method:</b> requests stay cheap and JSON-native, while responses get validation, attribute access and autocomplete.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Type hints become tool schemas</b> <span class="tag oss">🧰 Open source</span> <a href="https://openai.github.io/openai-agents-python/tools/" target="_blank" rel="noopener">OpenAI Agents SDK: tools</a></div>
+      <p><b>How:</b> <code>@function_tool</code> reads the function signature with Python's <code>inspect</code> module, parses the docstring with griffe and builds the JSON schema with Pydantic.</p>
+      <p><b>Why this method:</b> one source of truth. The model sees exactly the argument names, types and descriptions your Python declares, and arguments are validated before your function runs.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A Rust core for validation</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.pydantic.dev/latest/why/" target="_blank" rel="noopener">Why use Pydantic?</a></div>
+      <p><b>How:</b> Pydantic's validation logic lives in <code>pydantic-core</code>, implemented mostly in Rust, and it parses and validates JSON in one step.</p>
+      <p><b>Why this method:</b> validating every model reply and request body stays cheap enough to do by default.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · it's not named after the snake</span>
+    <p>The official Python FAQ explains that Guido van Rossum named the language after the BBC comedy <i>Monty Python's Flying Circus</i>, wanting a name that was short, unique and a little mysterious. Do you have to like the show? The FAQ's answer: “No, but it helps. :)”</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Iteration protocols become generators and token streams in P.2; decorators and context managers get async versions in P.3; mutability and references come back as memory leaks and garbage collection in P.5; Pydantic powers FastAPI services in P.6. Outside this phase: structured output (1.3) and tool schemas (6.2) are Pydantic models in practice, and retries, timeouts and fallbacks move into a gateway in 8.1. The theory of retries, backoff and jitter is in the System Design course: <a href="../../system-design-course/phase4/4-resilience.html">resilience patterns</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/reference/datamodel.html" target="_blank" rel="noopener">Python data model</a>. The full list of special methods and what calls them.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/library/typing.html" target="_blank" rel="noopener">typing: support for type hints</a>. <code>Literal</code>, <code>TypedDict</code>, <code>Protocol</code>, generics.</li>
+      <li><span class="kind">Blog</span> <a href="https://dropbox.tech/application/our-journey-to-type-checking-4-million-lines-of-python" target="_blank" rel="noopener">Dropbox: type checking 4 million lines</a>. How gradual typing is rolled out in a real codebase.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A call fails with 429 on 20% of attempts, independently. You allow 3 attempts in total. Roughly what fraction of calls still fail?</div>
+    <div class="opts"><button class="opt">6.7%</button><button class="opt" data-ok>0.8%</button><button class="opt">20%</button></div>
+    <div class="explain">All three attempts must fail: 0.2³ = 0.008 = <b>0.8%</b>. Expected attempts per call are 1 + 0.2 + 0.04 = 1.24. (Real failures are often correlated, which is exactly why backoff and jitter matter: retrying instantly into the same rate-limit window fails far more often than 20%.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Users report that setting <code>temperature=0</code> in your API doesn't make answers deterministic. Your code has <code>t = req.temperature or 0.7</code>. What's going on?</div>
+    <div class="opts"><button class="opt">The model ignores temperature 0</button><button class="opt" data-ok>0 is falsy, so <code>or</code> replaces it with 0.7; use <code>0.7 if req.temperature is None else req.temperature</code></button><button class="opt">Floats can't be compared with <code>or</code></button></div>
+    <div class="explain"><code>a or b</code> returns <code>b</code> whenever <code>a</code> is falsy, and <code>0</code>, <code>0.0</code>, <code>""</code> and <code>[]</code> are all falsy. When zero or empty is a meaningful value, test for <code>None</code> explicitly. (Even at temperature 0, outputs aren't guaranteed identical, but this bug was sending 0.7.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. The model returns JSON like <code>{"label": "refund", "confidence": 0.93}</code>, and sometimes invents labels. Which Python type should hold it?</div>
+    <div class="opts"><button class="opt">A <code>@dataclass</code> with <code>label: str</code></button><button class="opt">A <code>TypedDict</code></button><button class="opt" data-ok>A Pydantic model with <code>label: Literal[...]</code> and <code>confidence: float = Field(ge=0, le=1)</code></button></div>
+    <div class="explain">Model output is untrusted input. Dataclasses and TypedDicts are only hints: nothing checks them at runtime. Pydantic validates on the way in, raises a <code>ValidationError</code> you can catch and retry on, and the same class can generate the JSON schema you send as a structured-output format.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Everything is an object; syntax calls dunder methods; variables are luggage tags, not boxes.</li>
+      <li>Mutable defaults, shallow copies, late-binding closures and <code>or</code>-defaults are the bugs that reach production. <code>None</code> sentinels and <code>is None</code> fix most of them.</li>
+      <li>Decorators wrap calls (retry, time, cache, trace): use <code>functools.wraps</code>, retry only retryable errors with backoff + jitter, mind the order, and remember the SDKs already retry twice.</li>
+      <li>Dataclasses inside, TypedDicts for request dicts, Pydantic at every boundary; run a type checker.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  /* ---------- Playground 1: guess the output (outputs verified on CPython 3.13) ---------- */
+  const PZ = [
+    { t: "Mutable default argument", code: `def add_message(msg, history=[]):
+    history.append(msg)
+    return history
+
+add_message('hi')            # user A
+print(add_message('there'))  # user B, new conversation`,
+      opts: ["['there']", "['hi', 'there']", "TypeError"], ok: 1,
+      why: "The default list is created once, when <code>def</code> runs, and reused by every call that doesn't pass <code>history</code>. User B sees user A's message: a real privacy bug in chat backends.",
+      fix: `def add_message(msg, history=None):
+    if history is None:
+        history = []          # a fresh list per call
+    history.append(msg)
+    return history` },
+    { t: "Late-binding closures", code: `handlers = [lambda: i for i in range(3)]   # one handler per tool
+print([h() for h in handlers])`,
+      opts: ["[0, 1, 2]", "[0, 0, 0]", "[2, 2, 2]"], ok: 2,
+      why: "Each lambda looks up <code>i</code> when it is <b>called</b>, and by then the loop has finished with <code>i = 2</code>. All three handlers dispatch to the last tool.",
+      fix: `handlers = [lambda i=i: i for i in range(3)]   # bind the current value as a default
+# or: functools.partial(handle, i)` },
+    { t: "is vs ==", code: `a = ['system', 'user']
+b = ['system', 'user']
+print(a == b, a is b)`,
+      opts: ["True False", "True True", "False False"], ok: 0,
+      why: "<code>==</code> compares values (equal lists), <code>is</code> compares identity (two different list objects). Use <code>is</code> only for <code>None</code> and sentinels; <code>x == None</code> and <code>s is 'text'</code> are both bugs waiting to happen.",
+      fix: `if reply is None: ...        # identity: correct for None
+if messages == expected: ... # value: correct for data` },
+    { t: "Shallow copy", code: `base = {'model': 'small', 'stop': ['\\n']}
+req = base.copy()
+req['stop'].append('END')
+print(base['stop'])`,
+      opts: ["['\\n']", "['\\n', 'END']", "KeyError"], ok: 1,
+      why: "<code>dict.copy()</code> is shallow: the new dict holds the <b>same</b> inner list. Appending through <code>req</code> changes the shared default config for every later request.",
+      fix: `import copy
+req = copy.deepcopy(base)                     # copy nested values too
+# or build a new value: req = {**base, 'stop': [*base['stop'], 'END']}` },
+    { t: "Truthiness default", code: `def call(temperature=None):
+    t = temperature or 0.7
+    return t
+
+print(call(0))`,
+      opts: ["0", "None", "0.7"], ok: 2,
+      why: "<code>0</code> is falsy, so <code>or</code> picks 0.7. Anyone asking for temperature 0 silently gets 0.7. Same trap with <code>max_tokens or 1024</code> and <code>stop or []</code>.",
+      fix: `def call(temperature=None):
+    return 0.7 if temperature is None else temperature` },
+    { t: "List multiplication", code: `batches = [[]] * 3          # three empty batches?
+batches[0].append('chunk-1')
+print(batches)`,
+      opts: ["[['chunk-1'], [], []]", "[['chunk-1'], ['chunk-1'], ['chunk-1']]", "[['chunk-1']]"], ok: 1,
+      why: "<code>[[]] * 3</code> makes a list of three references to <b>one</b> inner list: three luggage tags on one suitcase. Every “batch” gets every chunk.",
+      fix: `batches = [[] for _ in range(3)]   # three separate lists` },
+  ];
+  let pz = 0; const answered = new Map();
+  function showPz() {
+    const p = PZ[pz], a = answered.get(pz);
+    $("pzN").textContent = `Puzzle ${pz + 1} / ${PZ.length}:`;
+    $("pzT").textContent = p.t;
+    $("pzCode").textContent = p.code;
+    p.opts.forEach((o, i) => {
+      const b = $("pzo" + i);
+      b.textContent = o;
+      b.className = "btn" + (a === undefined ? "" : i === p.ok ? " right" : i === a ? " wrong" : "");
+    });
+    if (a === undefined) { $("pzV").innerHTML = ""; $("pzWhy").innerHTML = ""; $("pzFixWrap").style.display = "none"; }
+    else {
+      $("pzV").innerHTML = a === p.ok ? `<span class="ev">✅ Right: it prints ${esc(p.opts[p.ok])}</span>` : `<span class="rk">❌ It prints ${esc(p.opts[p.ok])}</span>`;
+      $("pzWhy").innerHTML = p.why + " <b>The fix:</b>";
+      $("pzFix").textContent = p.fix; $("pzFixWrap").style.display = "";
+    }
+    const right = [...answered].filter(([k, v]) => PZ[k].ok === v).length;
+    $("pzScore").textContent = `${right} / ${answered.size}`;
+  }
+  [0, 1, 2].forEach(i => ($("pzo" + i).onclick = () => { if (!answered.has(pz)) answered.set(pz, i); showPz(); }));
+  $("pz-next").onclick = () => { pz = (pz + 1) % PZ.length; showPz(); };
+  $("pz-prev").onclick = () => { pz = (pz + PZ.length - 1) % PZ.length; showPz(); };
+  showPz();
+
+  /* ---------- Playground 2: decorator stack around a simulated flaky LLM call ---------- */
+  const st = { ep: "rl", bo: "jit", ro: "safe", ord: "out" };
+  ["ep", "bo", "ro", "ord"].forEach(g => {
+    const bs = [...$(g).querySelectorAll("button")];
+    bs.forEach(b => (b.id = g + "-" + b.dataset.v));
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); st[g] = b.dataset.v; renderCode(); clearOut(); }));
+  });
+  ["dRetry", "dTo", "dTimed"].forEach(id => ($(id).onchange = () => { renderCode(); clearOut(); }));
+  $("dAtt").oninput = () => { renderCode(); clearOut(); };
+  const opts = () => ({ retry: $("dRetry").checked, att: +$("dAtt").value, to: $("dTo").checked, timed: $("dTimed").checked, ...st });
+
+  function renderCode() {
+    const o = opts();
+    $("dAttV").textContent = o.att;
+    const lines = [];
+    const retryLine = o.retry ? `@retry(max_attempts=${o.att}, backoff=${o.bo === "none" ? "None" : o.bo === "exp" ? "'exponential'" : "'exponential+jitter'"}, retry_on=${o.ro === "any" ? "Exception" : "(RateLimitError, ServerError, TimeoutError)"})` : null;
+    const toLine = o.to ? "@timeout(seconds=10)" : null;
+    if (o.timed && o.ord === "out") lines.push("@timed");
+    if (retryLine) lines.push(retryLine);
+    if (toLine) lines.push(toLine);
+    if (o.timed && o.ord === "in") lines.push("@timed");
+    lines.push("def ask_llm(prompt: str) -> str:", "    return client.call(prompt)   # simulated");
+    $("dCode").textContent = lines.join("\n");
+  }
+  function clearOut() { $("dTrace").innerHTML = '<span class="zz">Press “Call once”.</span>'; $("dVerdict").innerHTML = ""; ["dOk", "dMean", "dP95", "dReq"].forEach(id => ($(id).textContent = "–")); }
+
+  const HANG = 600; // seconds: the SDK default timeout (10 minutes)
+  function attempt(o, rng, prev) {
+    // returns {dur, err} for one API request; prev = {err, gap} of the previous attempt
+    const lat = 0.6 + 0.8 * rng();
+    if (o.ep === "bad") return { dur: 0.3, err: "BadRequestError (400)" };
+    if (o.ep === "hang") {
+      if (rng() < 0.2) return o.to ? { dur: 10, err: "TimeoutError (10 s)" } : { dur: HANG, err: "APITimeoutError (600 s SDK default)" };
+      return { dur: lat, err: null };
+    }
+    let p = 0.29;
+    if (prev && prev.err) p = prev.gap < 0.5 ? 0.8 : o.bo === "exp" ? 0.45 : 0.29;
+    return rng() < p ? { dur: 0.2, err: "RateLimitError (429)" } : { dur: lat, err: null };
+  }
+  const retryable = e => /429|Timeout/.test(e);
+  function simulate(o, rng, log) {
+    const maxA = o.retry ? o.att : 1;
+    let t = 0, prev = null, n = 0, res = null;
+    for (let a = 1; a <= maxA; a++) {
+      const r = attempt(o, rng, prev); n++;
+      t += r.dur;
+      if (log) log.push(r.err ? `<span class="bad">attempt ${a}: ✗ ${r.err}</span> after ${r.dur.toFixed(1)} s` : `<span class="ok">attempt ${a}: ✓ 200 OK</span> after ${r.dur.toFixed(2)} s`);
+      if (log && o.timed && o.ord === "in") log.push(`<span class="zz">  @timed: ask_llm took ${r.dur.toFixed(2)}s   (this attempt only)</span>`);
+      if (!r.err) { res = "ok"; break; }
+      const canRetry = o.retry && a < maxA && (o.ro === "any" || retryable(r.err));
+      if (!canRetry) { res = r.err; if (log && o.retry && a < maxA) log.push(`<span class="zz">  not retryable: re-raise immediately</span>`); break; }
+      let wait = o.bo === "none" ? 0 : 2 ** (a - 1);
+      if (o.bo === "jit") wait *= 0.5 + rng();
+      if (log) log.push(`<span class="zz">  sleep ${wait.toFixed(2)} s before retry</span>`);
+      t += wait; prev = { err: r.err, gap: wait };
+      res = r.err;
+    }
+    return { t, n, ok: res === "ok", err: res };
+  }
+  let seed = 7;
+  $("dec-run").onclick = () => {
+    const o = opts(), log = [];
+    const r = simulate(o, MX.seeded(seed++), log);
+    if (o.timed && o.ord === "out") log.push(`<span class="zz">@timed: ask_llm took ${r.t.toFixed(2)}s   (what the user waited, retries included)</span>`);
+    if (!r.ok) log.push(`<span class="bad">→ raises ${r.err} to the caller</span>`);
+    $("dTrace").innerHTML = log.join("\n");
+    $("dVerdict").innerHTML = r.ok ? `<span class="ev">Answer returned after ${r.t.toFixed(2)} s and ${r.n} API request${r.n > 1 ? "s" : ""}.</span>` : `<span class="rk">Call failed after ${r.t.toFixed(1)} s and ${r.n} API request${r.n > 1 ? "s" : ""}.</span>`;
+  };
+  $("dec-many").onclick = () => {
+    const o = opts(), rng = MX.seeded(42), runs = [];
+    for (let i = 0; i < 200; i++) runs.push(simulate(o, rng, null));
+    const ts = runs.map(r => r.t).sort((a, b) => a - b), ok = runs.filter(r => r.ok).length;
+    const fmtT = s => (s >= 60 ? (s / 60).toFixed(1) + " min" : s.toFixed(2) + " s");
+    $("dOk").textContent = (100 * ok / 200).toFixed(1) + "%";
+    $("dMean").textContent = fmtT(MX.mean(ts));
+    $("dP95").textContent = fmtT(ts[Math.floor(0.95 * ts.length) - 1]);
+    $("dReq").textContent = (MX.sum(runs.map(r => r.n)) / 200).toFixed(2);
+    let msg;
+    if (o.ep === "bad") msg = o.retry && o.ro === "any" ? `<span class="rk">Every call fails anyway, but now each one makes ${o.att} requests and sleeps first. Retry only errors that can succeed later.</span>` : `<span class="ev">A 400 fails fast and loudly: correct. Fix the request, don't retry it.</span>`;
+    else if (o.ep === "hang" && !o.to) msg = `<span class="rk">One call in five hangs until the 10-minute SDK timeout. Add a timeout under the retry.</span>`;
+    else if (!o.retry) msg = `<span class="rk">About ${Math.round(100 - 100 * ok / 200)}% of calls fail. Add @retry.</span>`;
+    else if (o.bo === "none" && o.ep === "rl") msg = `<span class="rk">Instant retries land in the same rate-limit window. Add backoff.</span>`;
+    else msg = `<span class="ev">${(100 * ok / 200).toFixed(1)}% succeed. The price is visible in p95 latency and extra requests.</span>`;
+    $("dVerdict").innerHTML = msg;
+    $("dTrace").innerHTML = `<span class="zz">200 simulated calls. Slowest: ${fmtT(ts[ts.length - 1])}. Fastest: ${fmtT(ts[0])}.</span>`;
+  };
+  renderCode(); clearOut();
+})();
+</script>
+</body>
+</html>

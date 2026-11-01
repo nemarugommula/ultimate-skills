@@ -1,0 +1,487 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.7 Design a payment system · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .states { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: .6em 0; font-size: .85rem; }
+  .states span { padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg2); font-family: var(--mono); transition: all .2s; }
+  .states span.cur { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .log { font-family: var(--mono); font-size: .82rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-height: 3.2em; max-height: 11em; overflow-y: auto; }
+  table.led input { width: 5.5em; font: inherit; font-family: var(--mono); padding: 2px 6px; border: 1px solid var(--line); border-radius: 6px; background: var(--bg); color: var(--text); }
+  table.led td, table.led th { padding: 4px 8px; }
+  .chal { font-weight: 600; margin: .4em 0; }
+</style>
+</head>
+<body data-lesson="s7-7" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 7</div>
+  <h1>Design a payment system</h1>
+  <p class="subtitle">Move money between a customer, your company and the people you pay, correctly every time, even when networks time out and messages arrive twice. The traffic is small; the cost of one bug is a real person charged twice.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Idempotency</b>: doing an operation twice has the same effect as doing it once; retries need it (Lesson 3.3).</li>
+      <li><b>Transactions</b>: several writes that all happen or none do (ACID, Lesson 2.5). <b>Sagas and the outbox</b> for steps across services (Lesson 3.5).</li>
+      <li><b>Timeouts and retries</b> with backoff, and why a timeout doesn't mean “it failed” (Lesson 4.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2019 Airbnb's payments engineers published <b>“Avoiding Double Payments in a Distributed Payments System”</b>. Their goal, in one phrase: the guest is <b>charged at most once</b>, however many retries happen across their payment microservices.</p>
+    <p>They built a shared idempotency library called <b>Orpheus</b> for every payments service, and one section of the post is titled, bluntly, “A duplicate payment created as a result from replica lag”. By the end of this lesson you'll be able to point at the exact moment a double charge happens, and the two ideas that stop it: <b>idempotency keys</b> and a <b>double-entry ledger</b>.</p>
+  </div>
+
+  <h2>Step 1 · Clarify the requirements</h2>
+  <p>Questions a senior candidate asks:</p>
+  <ul>
+    <li><b>Who's paying whom?</b> Let's design a marketplace (like the ride app in Lesson 7.6): riders pay, we keep a fee, drivers get paid out weekly.</li>
+    <li><b>Do we touch card numbers?</b> No. A <b>PSP</b> (payment service provider, such as Stripe, Adyen or Braintree) collects card details in its own form and gives us a token. That keeps us out of most <b>PCI DSS</b> scope (the card industry's security standard).</li>
+    <li><b>Charge now, or hold and charge later?</b> Hold at request, charge at trip end (authorize and capture, below).</li>
+    <li><b>Currencies, refunds, disputes?</b> One currency for now; refunds yes; disputes as a follow-up.</li>
+  </ul>
+  <table>
+    <tr><th>Functional</th><th>Non-functional</th></tr>
+    <tr><td>Charge a customer for an order; refund it</td><td><b>Exactly-once effect</b>: never double-charge, never lose a payment</td></tr>
+    <tr><td>Record every movement of money</td><td><b>Auditable</b>: every balance explainable from immutable history</td></tr>
+    <tr><td>Pay out sellers/drivers</td><td><b>Consistent</b> over availability: better to say “try again” than to guess</td></tr>
+    <tr><td>Know the status of every payment, even after a crash</td><td>Reconciled daily against the PSP and the bank</td></tr>
+  </table>
+
+  <h2>Step 2 · Numbers first (they're small)</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how big is “big” for payments?</span>
+    <ul>
+      <li><b>Volume:</b> 10,000,000 payments a day ÷ 86,400 s ≈ <b>116 per second</b> on average. Assume a 5× peak: about <b>580 per second</b>. One well-tuned Postgres primary can take that (Lesson 2.5).</li>
+      <li><b>Ledger rows:</b> each payment creates about 4 ledger lines (charge, fee, driver share, settlement) × 200 bytes = 800 B. 10,000,000 × 800 B = <b class="db">8 GB a day</b>, about <b>2.9 TB a year</b>. Big enough to plan partitioning, small next to video.</li>
+      <li><b>Latency:</b> a PSP call typically takes a few hundred milliseconds to a couple of seconds, because it goes to the card network and the customer's bank. Your own code is not the slow part.</li>
+    </ul>
+    <p>So the hard part isn't scale. It's <b>correctness under partial failure</b>: a call that times out after the money moved, a webhook delivered twice, a crash between “charged” and “recorded”.</p>
+  </div>
+
+  <h2>How a card payment actually flows</h2>
+  <table>
+    <tr><th>Step</th><th>What happens</th><th>Money moves?</th></tr>
+    <tr><td><b>1. Authorize</b></td><td>The PSP asks the card network and the <b>issuing bank</b> (the customer's bank) to approve and <b>hold</b> the amount</td><td>No, it's reserved. Stripe's docs list about 7 days for most online card holds</td></tr>
+    <tr><td><b>2. Capture</b></td><td>You tell the PSP to actually take the held amount (all of it or less)</td><td>Yes, it's now a charge</td></tr>
+    <tr><td><b>3. Settle</b></td><td>The PSP batches captured charges and pays your bank account, minus its fees</td><td>Yes, later (often days)</td></tr>
+    <tr><td><b>4. Payout</b></td><td>You pay sellers/drivers what you owe them</td><td>Yes, from your bank</td></tr>
+  </table>
+  <p>The PSP reports what happened by calling your server: a <b>webhook</b> (an HTTP POST to a URL you registered, like <code>payment_intent.succeeded</code>). Webhooks are <b>at-least-once</b>: Stripe's docs warn an endpoint may receive the same event more than once, retries for up to three days, and doesn't guarantee order.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A payment is a <b>state machine</b> you persist <b>before</b> every external call, and every external call carries an <b>idempotency key</b>. Then a timeout is not a mystery: it's the <b>UNKNOWN</b> state, and the fix is to ask again with the same key, never to charge again with a new one.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the cloakroom ticket</span>
+    <p>You hand over your coat and get ticket #47. If you come back and say “I gave you a coat”, the attendant might hand you any coat, or a second one. If you say “ticket #47”, they check: either your coat is on the hook (here it is) or it isn't. The ticket is the <b>idempotency key</b>: it turns a vague “do this” into “do <i>this specific</i> thing, once”. And the attendant's book where every coat in and out is written down, never erased, is the <b>ledger</b>.</p>
+  </div>
+
+  <h2>Step 3 · API and data model</h2>
+<pre><code>POST /v1/payments
+Idempotency-Key: ord_8812-attempt          <span class="c"># generated by the client, reused on every retry</span>
+{ "order_id": "ord_8812", "amount_cents": 5000, "currency": "usd", "payment_method": "pm_tok_…" }
+  → 201 { "payment_id": "pay_31", "status": "SUCCEEDED" }
+  → 202 { "payment_id": "pay_31", "status": "UNKNOWN" }   <span class="c"># we don't know yet; client polls or waits</span>
+
+GET  /v1/payments/pay_31                   <span class="c"># status for the client to poll</span>
+POST /v1/payments/pay_31/refunds  Idempotency-Key: …
+POST /webhooks/psp                         <span class="c"># PSP → us, signed; dedupe by event id</span></code></pre>
+  <table>
+    <tr><th>Table</th><th>Key columns</th><th>Rule</th></tr>
+    <tr><td><code>idempotency_keys</code></td><td>key (unique), request_hash, status, stored response</td><td>A retry with the same key returns the stored response; a different body with the same key is an error</td></tr>
+    <tr><td><code>payments</code></td><td>payment_id, order_id, amount_cents, status, psp_reference</td><td>Status only moves along allowed transitions</td></tr>
+    <tr><td><code>ledger_entries</code> + <code>ledger_lines</code></td><td>entry_id; lines: account, amount_cents (+ debit / − credit)</td><td><b>Append-only</b>; every entry's lines sum to zero</td></tr>
+    <tr><td><code>processed_events</code></td><td>psp_event_id (unique)</td><td>A webhook is handled only once</td></tr>
+  </table>
+  <p>Store money as <b>integer cents</b> (<code>BIGINT</code>), never floating point: in JavaScript <code>0.1 + 0.2</code> is <code>0.30000000000000004</code>.</p>
+
+  <h2>Step 4 · High-level design</h2>
+  <p>The <b class="sv">payment service</b> owns the state machine. It writes to its <b class="db">database</b> first, then calls the <b class="nw">PSP</b>, then records the answer. The PSP's webhook is a second, independent path to the same truth, so a lost response can still be resolved.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Where double charges come from</span>
+    <p class="hint">Each press of <b>Pay $50</b> is one new order. First inject <b>💥 response lost</b> with <b>client retries</b> on and <b>idempotency key</b> off: the customer is charged twice. Turn the key on and repeat. Then inject <b>💥 duplicate webhook</b> without dedupe and watch the ledger and the warehouse double-count. Press <b>Reconcile</b> to find the damage the way a finance team would.</p>
+    <svg id="payFlow"></svg>
+    <div class="states" id="states"><span data-s="CREATED">CREATED</span>→<span data-s="PROCESSING">PROCESSING</span>→<span data-s="UNKNOWN">UNKNOWN</span>→<span data-s="SUCCEEDED">SUCCEEDED</span><span data-s="FAILED">FAILED</span></div>
+    <div class="controls">
+      <label><input type="checkbox" id="fTimeout" checked> 💥 PSP response lost (charge went through)</label>
+      <label><input type="checkbox" id="fRetry" checked> client retries on timeout</label>
+      <label><input type="checkbox" id="fDup"> 💥 PSP sends the webhook twice</label>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="useKey"> 🔑 idempotency key</label>
+      <label><input type="checkbox" id="dedupe"> 🧾 dedupe webhooks by event id</label>
+      <button class="btn primary" id="payBtn">💳 Pay $50</button>
+      <button class="btn" id="recon">🔎 Reconcile with PSP report</button>
+      <button class="btn" id="payReset">↺ Reset</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">orders <b id="sOrders">0</b></div>
+      <div class="stat">customer charged <b id="sCharged">$0</b></div>
+      <div class="stat">ledger revenue <b id="sLedger">$0</b></div>
+      <div class="stat">items shipped <b id="sShipped">0</b></div>
+    </div>
+    <div class="log" id="payLog">Press Pay.</div>
+  </div>
+
+  <h2>Step 5 · Deep dives</h2>
+  <h3>Deep dive 1: idempotency keys, end to end</h3>
+  <p>The client creates a key once per <b>intent</b> (“pay for order 8812”), not per HTTP request, and sends it with every retry. The server does this, in one database transaction where possible:</p>
+  <ol>
+    <li><b>Claim the key</b>: <code>INSERT … ON CONFLICT DO NOTHING</code>. If the key already exists with a stored response, return that response. If it exists and is still in progress, return 409 “try again shortly”.</li>
+    <li><b>Record intent</b>: payment row in <code>PROCESSING</code>, committed <b>before</b> calling the PSP (Airbnb's Orpheus calls this the pre-RPC phase, RPC meaning remote procedure call: the network call to another service).</li>
+    <li><b>Call the PSP</b> with the same idempotency key (Stripe accepts an <code>Idempotency-Key</code> header), so even our retry can't create a second charge there.</li>
+    <li><b>Record the outcome</b> (post-RPC): SUCCEEDED / FAILED + the stored response. On a timeout: <b>UNKNOWN</b>, and a background job re-asks the PSP with the same key or looks the payment up.</li>
+  </ol>
+  <p>Read the keys from the <b>primary</b> database, never a replica: a lagging replica (Lesson 2.3) can say “never seen this key” for a payment that's already in flight. That's exactly the duplicate Airbnb describes.</p>
+
+  <h3>Deep dive 2: the double-entry ledger</h3>
+  <p>A single <code>balance</code> column that you <code>UPDATE</code> can't explain itself: when it's wrong, nobody knows why. Accountants solved this centuries ago. Every movement of money is a <b>journal entry</b> with at least two <b>lines</b>: <b>debits</b> on one side, <b>credits</b> on the other, and they must be <b>equal</b>. Money never appears or disappears; it moves between accounts. Balances are just sums of lines.</p>
+  <table>
+    <tr><th>Rider pays $20; driver earns $16; we keep $4</th><th class="mono">Debit</th><th class="mono">Credit</th></tr>
+    <tr><td>PSP receivable (the PSP owes us)</td><td class="mono">20.00</td><td></td></tr>
+    <tr><td>Driver payable (we owe the driver)</td><td></td><td class="mono">16.00</td></tr>
+    <tr><td>Platform revenue</td><td></td><td class="mono">4.00</td></tr>
+    <tr><td><b>Total</b></td><td class="mono"><b>20.00</b></td><td class="mono"><b>20.00</b> ✅</td></tr>
+  </table>
+  <p>Rules engineers add: lines are <b>append-only</b> (a mistake is fixed by a new reversing entry, never an edit), each entry is written in <b>one transaction</b>, and an hourly check asserts every entry sums to zero.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The ledger game</span>
+    <p class="hint">Record each event as a journal entry by typing amounts in the Debit or Credit column. The ledger rejects anything that doesn't balance. Use <b>Hint</b> if stuck, and try the <b>single-entry bug</b> to see what a plain <code>UPDATE balance</code> would do.</p>
+    <p class="chal" id="ledTask"></p>
+    <table class="led" id="ledTable"></table>
+    <div class="controls">
+      <button class="btn primary" id="ledCheck">✅ Post entry</button>
+      <button class="btn" id="ledHint">💡 Hint</button>
+      <button class="btn" id="ledBug">🐞 Single-entry bug</button>
+      <button class="btn" id="ledReset">↺ Start over</button>
+    </div>
+    <p class="hint" id="ledMsg"></p>
+    <div class="stat-row">
+      <div class="stat">entries posted <b id="ledN">0</b></div>
+      <div class="stat">total debits <b id="ledDr">$0.00</b></div>
+      <div class="stat">total credits <b id="ledCr">$0.00</b></div>
+      <div class="stat">cash in bank <b id="ledCash">$0.00</b></div>
+    </div>
+  </div>
+
+  <h3>Deep dive 3: reconciliation</h3>
+  <p>Even with perfect code, three records of the same money exist: <b>your ledger</b>, the <b>PSP's report</b>, and the <b>bank statement</b>. Every day a <b>reconciliation</b> job matches them line by line (by PSP reference and amount) and raises every mismatch: a charge the PSP has but you don't (a lost response you never resolved), one you have twice (a double-processed webhook), a settlement short by a fee you didn't expect. It's the safety net that catches whatever the state machine missed. Big companies have whole teams whose dashboards are reconciliation breaks.</p>
+
+  <h3>Webhooks, done safely</h3>
+  <ul>
+    <li><b>Verify the signature</b> (PSPs sign webhook bodies with a shared secret) so nobody can fake “payment succeeded”.</li>
+    <li><b>Dedupe by event id</b>: insert into <code>processed_events</code> first; a unique-key violation means “already handled, return 200”.</li>
+    <li><b>Don't assume order</b>: a refund event can arrive before the charge event. Apply events as state-machine transitions, and ignore ones that would move backwards.</li>
+    <li><b>Return 200 fast</b>, then do the work from a queue (Lesson 3.1), so the PSP doesn't time out and retry.</li>
+  </ul>
+
+  <h2>Step 6 · Bottlenecks and the scaling path</h2>
+  <table>
+    <tr><th>Stage</th><th>What you run</th><th>What breaks next</th></tr>
+    <tr><td><b>v1 · startup</b></td><td>Stripe/Adyen Checkout, one Postgres with idempotency keys + payments + a simple double-entry ledger table, webhook handler with dedupe</td><td>Finance asks “why doesn't this match the bank?”: build reconciliation</td></tr>
+    <tr><td><b>v2 · growing</b></td><td>Separate payments and ledger services, outbox pattern (Lesson 3.5) from payments to ledger, daily automated reconciliation, payouts as a batch saga</td><td>Ledger hot accounts (your own revenue account gets a line on every payment)</td></tr>
+    <tr><td><b>v3 · 100M users</b></td><td>Several PSPs with routing and failover, ledger sharded by account with periodic balance snapshots, multi-currency, risk/fraud scoring before authorize, regional data rules</td><td>Regulatory scope, audits, and the cost of every exception</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>PSPs: <b>Stripe</b>, <b>Adyen</b>, <b>Braintree</b>, <b>Checkout.com</b>; ledger products and open source: <b>Modern Treasury</b>, <b>TigerBeetle</b> (an open-source financial transactions database), <b>Formance</b>; plain <b>Postgres</b> for most companies. A charge with an idempotency key:</p>
+<pre><code>curl https://api.stripe.com/v1/payment_intents \
+  -u sk_test_…: \
+  -H "Idempotency-Key: ord_8812-attempt" \
+  -d amount=5000 -d currency=usd -d capture_method=manual   <span class="c"># authorize now, capture later</span></code></pre>
+<pre><code><span class="c">-- claim the key: exactly one request wins</span>
+INSERT INTO idempotency_keys (key, request_hash, status)
+VALUES ($1, $2, 'started') ON CONFLICT (key) DO NOTHING RETURNING key;
+
+<span class="c">-- every journal entry must balance: this query must always return zero rows</span>
+SELECT entry_id, SUM(amount_cents) FROM ledger_lines
+ GROUP BY entry_id HAVING SUM(amount_cents) &lt;&gt; 0;</code></pre>
+    <p class="hint">Try it locally: <code>docker run -e POSTGRES_PASSWORD=dev -p 5432:5432 postgres</code>, create the two tables, then run the same <code>INSERT … ON CONFLICT</code> twice: the second returns no row. Stripe test mode with <code>sk_test_</code> keys lets you replay the same Idempotency-Key and see the identical response.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Decision</th><th>Option A</th><th>Option B</th></tr>
+      <tr><td>Consistency</td><td><b>Strong</b> (one primary, transactions): correct, simpler; lower availability during failover</td><td><b>Eventual</b> across services with sagas: scales and isolates failures; needs reconciliation and careful compensations</td></tr>
+      <tr><td>On a timeout</td><td><b>Fail fast</b>: tell the user “pending” and resolve in the background</td><td><b>Block and retry</b> with the same key: a clearer answer, slower checkout</td></tr>
+      <tr><td>Ledger</td><td><b>Tables in your Postgres</b>: cheap, flexible, you own correctness</td><td><b>A ledger product/database</b>: guarantees built in; another vendor or system</td></tr>
+      <tr><td>One PSP or several</td><td><b>One</b>: simple integration and reporting</td><td><b>Several</b>: failover and better rates; routing logic and N-way reconciliation</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Use a PSP's hosted checkout; never store card numbers. On day one: idempotency keys on every money-moving endpoint, webhook dedupe, integer cents, and a double-entry ledger table even if it feels like overkill. Retrofitting a ledger onto years of <code>UPDATE balance</code> is one of the most painful migrations there is.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>A payments platform team: multiple PSPs and acquirers with smart routing, a dedicated ledger service, automated reconciliation and break dashboards, fraud models before authorization, payouts in dozens of currencies, and regulators and auditors as stakeholders in every design review.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <ul>
+      <li>Say early that the problem is <b>correctness, not QPS</b> (show the small numbers).</li>
+      <li>Explain <b>authorize vs capture</b> and the role of the PSP; keep card data out of your systems.</li>
+      <li>Draw the <b>state machine</b>, including <b>UNKNOWN</b>, and how it's resolved.</li>
+      <li><b>Idempotency keys</b> from client to your service to the PSP; storage on the primary.</li>
+      <li><b>Double-entry ledger</b>, append-only, plus <b>reconciliation</b>; webhooks deduped and order-independent.</li>
+    </ul>
+    <p><b>Common mistakes:</b> “retry on timeout” with no key; treating a timeout as a failure and asking the user to pay again; a mutable balance column; floats for money; trusting webhook order. <b>Likely follow-ups:</b> “The PSP is down: what does checkout do?”, “How do you pay out 1 million drivers every Monday?” (a batch saga with per-payout idempotency), “How do refunds and partial captures fit the ledger?”, “How do you handle a currency conversion?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Idempotency keys in a public API</b> <span class="tag co">🏢 Stripe · 2017</span> <a href="https://stripe.com/blog/idempotency" target="_blank" rel="noopener">Designing robust and predictable APIs with idempotency</a></div>
+      <p><b>How:</b> clients send a unique <code>Idempotency-Key</code> header; the server recognises retries of the same request. The post pairs this with exponential backoff and random jitter for client retries.</p>
+      <p><b>Why this method:</b> after a dropped connection the outcome is ambiguous to the client; the key makes retrying safe instead of risky.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A shared idempotency library</b> <span class="tag co">🏢 Airbnb · 2019</span> <a href="https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb" target="_blank" rel="noopener">Avoiding Double Payments in a Distributed Payments System</a></div>
+      <p><b>How:</b> Orpheus splits every request into Pre-RPC (record the request), RPC (call the external service) and Post-RPC (record the response and whether an error is retryable), with leases on keys and reads from the primary only.</p>
+      <p><b>Why this method:</b> a library let every payments team get the same guarantees without each engineer becoming a distributed-systems expert.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>An immutable double-entry database</b> <span class="tag co">🏢 Square · 2019</span> <a href="https://developer.squareup.com/blog/books-an-immutable-double-entry-accounting-database-service/" target="_blank" rel="noopener">Books: an immutable double-entry accounting database service</a></div>
+      <p><b>How:</b> money moves between “books” only through journal entries that must balance to zero, so each cent lost is matched by a cent gained; books are immutable except through those entries.</p>
+      <p><b>Why this method:</b> the ledger records not just what changed but why, which is what finance and auditors need.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Accounting explained for engineers</b> <span class="tag co">🏢 Modern Treasury · 2022</span> <a href="https://www.moderntreasury.com/journal/accounting-for-developers-part-i" target="_blank" rel="noopener">Accounting for Developers, Part I</a></div>
+      <p><b>How:</b> walks through accounts, debits and credits with a Venmo-style transfer; the power of double entry is that the sum of debit-normal balances always equals the sum of credit-normal balances.</p>
+      <p><b>Why this method:</b> engineers building money movement need the accountant's invariants, not just database ones.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>At-least-once webhooks</b> <span class="tag prod">🏭 In production · Stripe docs</span> <a href="https://docs.stripe.com/webhooks" target="_blank" rel="noopener">Receive Stripe events in your webhook endpoint</a></div>
+      <p><b>How:</b> endpoints may receive the same event more than once (log processed event ids), events aren't guaranteed in order, and failed deliveries are retried for up to three days with exponential backoff.</p>
+      <p><b>Why this method:</b> at-least-once with dedupe on the receiver is far easier to make reliable than exactly-once delivery over the internet (Lesson 3.3).</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · even the errors are idempotent</span>
+    <p>Stripe's API docs say that it saves the status code and body of the first request made with an idempotency key, and retries with the same key return that saved response, <b>including 500 errors</b>. That sounds odd until you think like a payments engineer: a retry must never be a second roll of the dice. (The same docs say keys can be removed automatically once they're at least 24 hours old, so a key is a safety window, not forever.)</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This lesson is Lesson 3.3 (idempotency) and Lesson 3.5 (sagas, outbox) applied to money, with Lesson 2.5's transactions underneath and Lesson 4.4's timeouts as the trigger. The state machine + conditional write pattern is the same as ride dispatch (Lesson 7.6). Notifications (Lesson 7.8) send the receipts, idempotently. In AI products, the same design meters and bills token usage: usage events are deduped, then posted to a ledger and reconciled against invoices.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener">Stripe: idempotent requests</a>. The exact server behaviour: stored responses, parameter checks, key expiry.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.stripe.com/payments/place-a-hold-on-a-payment-method" target="_blank" rel="noopener">Stripe: place a hold on a payment method</a>. Authorize and capture separately, with each card brand's hold window.</li>
+      <li><span class="kind">Blog</span> <a href="https://www.moderntreasury.com/journal/accounting-for-developers-part-i" target="_blank" rel="noopener">Modern Treasury: Accounting for Developers</a>. The friendliest introduction to debits and credits for programmers.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A marketplace processes 50 million payments a day, with a peak of 5× the average. Roughly what peak rate must the payment service handle?</div>
+    <div class="opts"><button class="opt">About 290 per second</button><button class="opt" data-ok>About 2,900 per second</button><button class="opt">About 29,000 per second</button></div>
+    <div class="explain">50,000,000 ÷ 86,400 ≈ 579 per second on average; × 5 ≈ <b>2,900 per second</b>. Busy, but well within a sharded SQL setup. The difficulty in payments is correctness under failure, not raw throughput.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your call to the PSP times out after 10 seconds. You don't know whether the card was charged. What should the payment service do?</div>
+    <div class="opts"><button class="opt">Mark it FAILED and ask the customer to pay again</button><button class="opt" data-ok>Mark it UNKNOWN, then retry or look it up with the same idempotency key until the PSP gives a definite answer</button><button class="opt">Immediately send a new charge request with a fresh key</button></div>
+    <div class="explain">A timeout means “I don't know”, not “no”. Asking the customer to pay again or sending a fresh key are both how double charges happen. The same key makes the retry safe: the PSP returns the original result.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A <code>payment_intent.succeeded</code> webhook arrives twice and your handler shipped the order twice. What's the fix?</div>
+    <div class="opts"><button class="opt" data-ok>Record each event id in a table with a unique constraint and skip events already processed</button><button class="opt">Ask the PSP to switch to exactly-once delivery</button><button class="opt">Process webhooks only during business hours</button></div>
+    <div class="explain">Webhooks are at-least-once by design, so the receiver must be idempotent. A unique <code>processed_events(event_id)</code> row, inserted in the same transaction as the side effects, makes the second delivery a harmless no-op.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Payments are low QPS, high stakes: design for correctness under timeouts, retries and duplicate messages.</li>
+      <li>Persist a state machine before every external call; a timeout is UNKNOWN, resolved by retrying with the same idempotency key.</li>
+      <li>Record money in an append-only, double-entry ledger in integer cents: every entry's debits equal its credits.</li>
+      <li>Webhooks are at-least-once and unordered: verify, dedupe by event id, apply as state transitions. Reconcile daily against the PSP and bank.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const usd = c => "$" + (c / 100).toFixed(2);
+
+  // ---------- payment state machine simulator ----------
+  const F = new Flow($("payFlow"), { width: 720, height: 230 });
+  F.node("client", { x: 75, y: 60, label: "🛒 Checkout", sub: "client", kind: "cl" })
+   .node("pay", { x: 270, y: 60, label: "Payment service", sub: "state machine", kind: "sv", w: 130 })
+   .node("db", { x: 270, y: 180, label: "🗄️ Payments DB", sub: "keys + ledger", kind: "db", w: 130 })
+   .node("psp", { x: 480, y: 60, label: "PSP", sub: "Stripe / Adyen", kind: "nw" })
+   .node("bank", { x: 650, y: 60, label: "🏦 Card bank", sub: "issuer", kind: "lt" })
+   .node("ship", { x: 480, y: 180, label: "📦 Fulfilment", sub: "0 shipped", kind: "sv" })
+   .edge("client", "pay").edge("pay", "db").edge("pay", "psp").edge("psp", "bank")
+   .edge("psp", "pay", { dashed: true }).edge("pay", "ship").render();
+  let S;
+  const reset = () => {
+    S = { orders: 0, pspCharges: [], ledger: 0, shipped: 0, processed: new Set(), keys: new Map(), evtN: 0, perOrderShip: {} };
+    $("payLog").innerHTML = "Press Pay."; paint(); setState(null);
+    F.set("ship", { sub: "0 shipped", down: false }).set("db", { down: false, sub: "keys + ledger" });
+  };
+  const log = t => { $("payLog").innerHTML = t + "<br>" + $("payLog").innerHTML; };
+  const setState = s => document.querySelectorAll("#states span").forEach(e => e.classList.toggle("cur", e.dataset.s === s));
+  const paint = () => {
+    const charged = S.pspCharges.reduce((a, c) => a + c.amt, 0);
+    $("sOrders").textContent = S.orders; $("sCharged").textContent = usd(charged);
+    $("sLedger").textContent = usd(S.ledger); $("sShipped").textContent = S.shipped;
+    $("sCharged").style.color = charged > S.orders * 5000 ? MX.css("--c-er") : "";
+    $("sLedger").style.color = S.ledger !== charged ? MX.css("--c-er") : "";
+    $("sShipped").style.color = S.shipped > S.orders ? MX.css("--c-er") : "";
+    F.set("ship", { sub: S.shipped + " shipped" });
+  };
+  const handleWebhook = async (evt, order) => {
+    await F.packet(["psp", "pay"], { color: "--c-nw", dur: 450 });
+    if ($("dedupe").checked && S.processed.has(evt)) { log(`🧾 Webhook ${evt} again → already in processed_events, return 200 and do nothing.`); return; }
+    S.processed.add(evt);
+    S.ledger += 5000; S.shipped++; S.perOrderShip[order] = (S.perOrderShip[order] || 0) + 1;
+    log(`Webhook ${evt}: ledger +$50 (Dr PSP receivable / Cr revenue), ship order ${order}.`);
+    await F.packet(["pay", "db"], { color: "--c-db", dur: 300 });
+    await F.packet(["pay", "ship"], { color: "--c-sv", dur: 300 });
+    paint();
+  };
+  const pspCharge = async (key, order) => {
+    // the PSP honours its own idempotency key: same key → same charge, no new money movement
+    if (key && S.keys.has(key)) { log(`PSP: Idempotency-Key ${key} seen before → returns the original charge ${S.keys.get(key)}. No new charge.`); return { id: S.keys.get(key), fresh: false }; }
+    await F.packet(["psp", "bank"], { color: "--c-lt", dur: 350, back: true });
+    const id = "ch_" + (S.pspCharges.length + 1);
+    S.pspCharges.push({ id, amt: 5000, order });
+    if (key) S.keys.set(key, id);
+    paint();
+    return { id, fresh: true };
+  };
+  let busy = false;
+  $("payBtn").onclick = async () => {
+    if (busy) return; busy = true;
+    const order = "ord_" + (8811 + ++S.orders), useKey = $("useKey").checked, key = useKey ? order + "-k" : null;
+    const lost = $("fTimeout").checked, retry = $("fRetry").checked, dup = $("fDup").checked;
+    log(`— ${order}: POST /v1/payments $50 ${useKey ? "(Idempotency-Key " + key + ")" : "(no key)"}`);
+    paint(); setState("CREATED");
+    await F.packet(["client", "pay", "db"], { color: "--c-cl", dur: 450 });
+    setState("PROCESSING");
+    log("Payment row saved as PROCESSING before calling the PSP.");
+    await F.packet(["pay", "psp"], { color: "--c-cl", dur: 400 });
+    const c1 = await pspCharge(key, order);
+    const events = [];
+    if (c1.fresh) events.push("evt_" + (++S.evtN));
+    if (lost) {
+      F.edgeStyle("pay", "psp", { color: "--c-er", dashed: true });
+      setState("UNKNOWN");
+      log(`💥 Charge ${c1.id} succeeded at the bank, but the response was lost. Status UNKNOWN; client gets a timeout.`);
+      await sleep(500);
+      F.edgeStyle("pay", "psp", { color: "--line", dashed: false });
+      if (retry) {
+        log(`Client retries ${useKey ? "with the SAME key" : "(a brand-new request: nothing links it to the first)"}.`);
+        await F.packet(["client", "pay", "db"], { color: "--c-lt", dur: 450 });
+        if (useKey) log(`Payment service: key ${key} exists in UNKNOWN → re-ask the PSP with the same key instead of creating a new payment.`);
+        else log("Payment service: no key, so this looks like a new payment → new row, new PSP call.");
+        await F.packet(["pay", "psp"], { color: "--c-lt", dur: 400 });
+        const c2 = await pspCharge(key, order);
+        if (c2.fresh) { events.push("evt_" + (++S.evtN)); log(`💥 Second charge ${c2.id}: the customer has now paid twice for ${order}.`); }
+        await F.packet(["psp", "pay"], { color: "--c-db", dur: 350 });
+      } else log("No retry. The status stays UNKNOWN until the webhook (or a reconciliation job) resolves it.");
+    } else await F.packet(["psp", "pay"], { color: "--c-db", dur: 350 });
+    setState("SUCCEEDED");
+    for (const e of events) {
+      await handleWebhook(e, order);
+      if (dup) { log(`💥 PSP delivers ${e} a second time (at-least-once).`); await handleWebhook(e, order); }
+    }
+    const charged = S.pspCharges.filter(c => c.order === order).length;
+    log(charged > 1 ? `❌ ${order}: charged ${charged}×. Fix: turn on 🔑 idempotency key.` :
+      (S.perOrderShip[order] || 0) > 1 ? `❌ ${order}: charged once but shipped and booked ${S.perOrderShip[order]}×. Fix: 🧾 dedupe webhooks.` : `✅ ${order}: charged once, booked once, shipped once.`);
+    busy = false;
+  };
+  $("recon").onclick = () => {
+    const charged = S.pspCharges.reduce((a, c) => a + c.amt, 0), issues = [];
+    if (S.ledger !== charged) issues.push(`ledger says ${usd(S.ledger)} but the PSP report says ${usd(charged)} (${S.ledger > charged ? "double-booked webhooks" : "charges we never recorded"})`);
+    const by = {}; S.pspCharges.forEach(c => (by[c.order] = (by[c.order] || 0) + 1));
+    const dbl = Object.entries(by).filter(([, n]) => n > 1);
+    if (dbl.length) issues.push(`${dbl.length} order(s) charged more than once (${dbl.map(([o, n]) => o + " ×" + n).join(", ")}) → refund the extras`);
+    const over = Object.entries(S.perOrderShip).filter(([, n]) => n > 1);
+    if (over.length) issues.push(`${over.length} order(s) shipped more than once`);
+    log(issues.length ? "🔎 Reconciliation breaks: " + issues.join("; ") + "." : `🔎 Reconciliation clean: ${S.pspCharges.length} PSP charges match ${S.orders} orders and ${usd(S.ledger)} in the ledger.`);
+  };
+  $("payReset").onclick = reset;
+  reset();
+
+  // ---------- ledger game ----------
+  const ACC = [
+    { id: "psp", name: "PSP receivable (the PSP owes us)", type: "asset" },
+    { id: "cash", name: "Cash in our bank", type: "asset" },
+    { id: "drv", name: "Driver payable (we owe the driver)", type: "liability" },
+    { id: "rev", name: "Platform revenue", type: "income" },
+    { id: "fee", name: "PSP fees (expense)", type: "expense" },
+  ];
+  const TASKS = [
+    { text: "1 · A rider pays $20 for a trip through the PSP (it pays us later). The driver earns $16; we keep $4.",
+      want: { psp: [2000, 0], drv: [0, 1600], rev: [0, 400] }, hint: "Debit what we're now owed (PSP receivable 20). Credit what we owe the driver (16) and what we earned (4)." },
+    { text: "2 · The PSP settles: $19 lands in our bank. It kept a $1 fee.",
+      want: { cash: [1900, 0], fee: [100, 0], psp: [0, 2000] }, hint: "The PSP no longer owes us $20 (credit PSP receivable 20). Cash went up 19 (debit) and the fee is an expense (debit 1)." },
+    { text: "3 · Payday: we send the driver their $16.",
+      want: { drv: [1600, 0], cash: [0, 1600] }, hint: "We owe the driver less (debit Driver payable 16) and have less cash (credit Cash 16)." },
+    { text: "4 · A second rider pays $10 (driver gets $8, we keep $2)… then the trip is cancelled before settlement and fully refunded. Record the refund as a reversing entry.",
+      pre: { psp: [1000, 0], drv: [0, 800], rev: [0, 200] },
+      want: { psp: [0, 1000], drv: [800, 0], rev: [200, 0] }, hint: "Never edit the old entry. Post its mirror image: credit PSP receivable 10, debit Driver payable 8, debit revenue 2." },
+  ];
+  let step = 0, lines = [];
+  const cents = v => Math.round((parseFloat(v) || 0) * 100);
+  function renderTable() {
+    const t = TASKS[step];
+    $("ledTask").textContent = t ? t.text : "🎉 All four entries posted. Every one balanced, and the books explain every cent.";
+    $("ledTable").innerHTML = "<tr><th>Account</th><th>Debit $</th><th>Credit $</th><th>Balance</th></tr>" + ACC.map(a => {
+      const dr = lines.filter(l => l.acc === a.id).reduce((s, l) => s + l.dr, 0), cr = lines.filter(l => l.acc === a.id).reduce((s, l) => s + l.cr, 0);
+      const bal = a.type === "asset" || a.type === "expense" ? dr - cr : cr - dr;
+      return `<tr><td>${a.name}</td><td><input id="dr-${a.id}" inputmode="decimal" ${t ? "" : "disabled"}></td><td><input id="cr-${a.id}" inputmode="decimal" ${t ? "" : "disabled"}></td><td class="mono">${usd(bal)}</td></tr>`;
+    }).join("");
+    const DR = lines.reduce((s, l) => s + l.dr, 0), CR = lines.reduce((s, l) => s + l.cr, 0);
+    $("ledN").textContent = new Set(lines.map(l => l.e)).size; $("ledDr").textContent = usd(DR); $("ledCr").textContent = usd(CR);
+    const cashA = lines.filter(l => l.acc === "cash").reduce((s, l) => s + l.dr - l.cr, 0);
+    $("ledCash").textContent = usd(cashA);
+    $("ledDr").style.color = $("ledCr").style.color = DR !== CR ? MX.css("--c-er") : "";
+  }
+  const post = (entry, e) => Object.entries(entry).forEach(([acc, [dr, cr]]) => lines.push({ e, acc, dr, cr }));
+  $("ledCheck").onclick = () => {
+    const t = TASKS[step]; if (!t) return;
+    const got = {}; let DR = 0, CR = 0;
+    ACC.forEach(a => { const d = cents($("dr-" + a.id).value), c = cents($("cr-" + a.id).value); if (d || c) got[a.id] = [d, c]; DR += d; CR += c; });
+    if (!DR && !CR) { $("ledMsg").textContent = "Type amounts first (for example 20 in a Debit box)."; return; }
+    if (DR !== CR) { $("ledMsg").innerHTML = `<span class="er">❌ Rejected: debits ${usd(DR)} ≠ credits ${usd(CR)}.</span> An entry that doesn't balance would create or destroy money; the ledger refuses it.`; return; }
+    const ok = Object.keys(t.want).length === Object.keys(got).length && Object.entries(t.want).every(([k, [d, c]]) => got[k] && got[k][0] === d && got[k][1] === c);
+    if (!ok) { $("ledMsg").innerHTML = `<span class="lt">⚠️ It balances (${usd(DR)} each side), but it's not the right accounts or sides.</span> A balanced wrong entry is still wrong; that's what reconciliation catches. Try the hint.`; return; }
+    if (t.pre) post(t.pre, "pre" + step);
+    post(t.want, "e" + step);
+    step++;
+    $("ledMsg").innerHTML = `<span class="db">✅ Posted.</span> Debits ${usd(DR)} = credits ${usd(CR)}. The entry is now immutable.`;
+    renderTable();
+  };
+  $("ledHint").onclick = () => { const t = TASKS[step]; $("ledMsg").textContent = t ? "💡 " + t.hint : "Done! Press Start over to play again."; };
+  $("ledBug").onclick = () => {
+    $("ledMsg").innerHTML = `<span class="er">🐞 Single-entry: <code>UPDATE accounts SET balance = balance + 20 WHERE id = 'revenue'</code>.</span> Revenue went up $20, but nothing says where the money came from or who's owed what. Debits ≠ credits, so a double-entry ledger would reject it; a balance column silently accepts it, and months later nobody can explain the number.`;
+  };
+  $("ledReset").onclick = () => { step = 0; lines = []; $("ledMsg").textContent = ""; renderTable(); };
+  renderTable();
+})();
+</script>
+</body>
+</html>

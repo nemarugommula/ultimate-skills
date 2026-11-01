@@ -1,0 +1,340 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.5 Numbers on computers: floats, log-sum-exp, bf16 · Math for AI</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📐</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg-btns .btn.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .bits { display: flex; flex-wrap: wrap; gap: 2px; justify-content: center; margin: 10px 0; font-family: var(--mono); font-size: .8rem; }
+  .bits span { display: inline-block; width: 17px; text-align: center; padding: 3px 0; border-radius: 3px; color: #fff; }
+  .bits .sb { background: var(--c-gr); } .bits .eb { background: var(--c-w); } .bits .mb { background: var(--c-x); }
+  .bits .gap { width: 8px; background: none; }
+  .numin { font: inherit; font-family: var(--mono); width: 160px; padding: 4px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); }
+  table.fmt td, table.fmt th { text-align: center; }
+  table.sm td, table.sm th { text-align: center; font-family: var(--mono); font-size: .85rem; padding: 4px 6px; }
+  .bad { color: var(--bad); font-weight: 700; } .good { color: var(--good); font-weight: 700; }
+  canvas.chart.small { height: 190px; }
+</style>
+</head>
+<body data-lesson="m8-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8 · Lesson 5</div>
+  <h1>Numbers on computers: floats, log-sum-exp, bf16</h1>
+  <p class="subtitle">Computers store numbers in a fixed number of bits, so they round, overflow and underflow. Knowing how is what lets LLMs train in 16 bits, run in 4, and never compute e<sup>1000</sup>.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Powers of 2 and scientific notation</b>: 6.5 = 1.625 × 2², just like 6,500 = 6.5 × 10³ (Lesson 0.3).</li>
+      <li><b>e<sup>x</sup> and log</b> undo each other, and log turns products into sums: log(a·b) = log a + log b (Lessons 0.3–0.4).</li>
+      <li><b>Softmax</b> doesn't change if you subtract the same number from every score (Lesson 8.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Type <code>0.1 + 0.2</code> into Python or a browser console. You get <b>0.30000000000000004</b>. Type <code>math.exp(1000)</code> in Python: <b>OverflowError</b>. In NumPy: <b>inf</b>, with a warning.</p>
+    <p>Meanwhile, LLMs with hundreds of billions of weights are trained with 16-bit numbers and often served with 8 or even 4 bits per weight. This lesson shows how numbers are really stored, and the handful of tricks that keep all that from blowing up.</p>
+  </div>
+
+  <h2>Numbers first: scientific notation in binary</h2>
+  <p>A computer stores a “floating-point” number the way you'd write 6,500 as 6.5 × 10³, but in base 2. Take <b>6.5</b>. It's 1.625 × 2². So the computer keeps three things:</p>
+  <ul>
+    <li>a <span class="gr">sign</span> bit: 0 for +, 1 for −;</li>
+    <li>an <span class="w">exponent</span>: here 2 (stored with a fixed <b>exponent offset</b> added, so negative exponents fit too; the official name is the “bias”, which has nothing to do with the b of Lessons 8.1–8.3);</li>
+    <li>a <span class="x">mantissa</span>: the digits after “1.”, here .625 = .101 in binary.</li>
+  </ul>
+  <div class="eq">
+    value = (−1)<sup><span class="gr">s</span></sup> × 1.<span class="x">m</span> × 2<sup><span class="w">e</span> − offset</sup>
+    <span class="say">“Minus one to the sign, times one-point-mantissa, times two to the (stored exponent minus the offset).” For fp32 the offset is 127, so 6.5's exponent 2 is stored as 129. The exponent sets the <b>range</b> (how big or small). The mantissa sets the <b>precision</b> (how many digits).</span>
+  </div>
+  <p>The catch: each part gets a <b>fixed</b> number of bits. 0.1 in binary is 0.000110011001100… forever, like 1/3 = 0.333… in decimal. It gets chopped, so the computer's 0.1 is really 0.100000001490116… (in 32 bits). Add two chopped numbers and the error shows.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A float has a <b>huge range</b> but only a <b>few significant digits</b>, and the gap between neighbouring numbers grows with their size. ML numerics is about three dangers: <b>overflow</b> (too big → ∞), <b>underflow</b> (too small → 0) and <b>rounding</b> (small changes vanish).
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a calculator with only 3 digits</span>
+    <p>Imagine a calculator that shows 3 significant digits and an exponent. It can show 1.23 × 10<sup>−30</sup> and 9.99 × 10<sup>30</sup>, a huge range. But 1,000 + 1 = 1.00 × 10³ again: the +1 falls below the third digit and vanishes. That's fp16 at 2,048: 2,048 + 1 = 2,048.</p>
+  </div>
+
+  <h2>The formats ML uses</h2>
+  <table class="fmt">
+    <tr><th>format</th><th>bits: sign / exponent / mantissa</th><th>largest</th><th>smallest at full precision</th><th>gap just above 1</th></tr>
+    <tr><td><b>fp32</b> (float)</td><td>1 / 8 / 23</td><td>3.4 × 10³⁸</td><td>1.2 × 10⁻³⁸</td><td>1.2 × 10⁻⁷ (~7 digits)</td></tr>
+    <tr><td><b>fp16</b> (half)</td><td>1 / 5 / 10</td><td>65,504</td><td>6.1 × 10⁻⁵</td><td>9.8 × 10⁻⁴ (~3 digits)</td></tr>
+    <tr><td><b>bf16</b> (brain float)</td><td>1 / 8 / 7</td><td>3.4 × 10³⁸</td><td>1.2 × 10⁻³⁸</td><td>7.8 × 10⁻³ (~2 digits)</td></tr>
+    <tr><td><b>int8</b></td><td>8-bit whole numbers</td><td>127</td><td>−128 is the lowest</td><td>1 (times a scale factor)</td></tr>
+  </table>
+  <p class="muted">“Smallest at full precision” (officially the smallest <i>normal</i> number): below it, numbers can still be stored but keep fewer and fewer digits (“subnormal”) until they round to 0.</p>
+  <p>Read the table like a trade-off. fp16 keeps more digits but tops out at 65,504. bf16 keeps fp32's 8 exponent bits, so it has the <b>same range</b> as fp32, but only 7 mantissa bits. For training, range turns out to matter more than digits.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Float explorer</span>
+    <p class="hint">Type a number (or pick one) and a format. You'll see the bits (<span class="gr">sign</span>, <span class="w">exponent</span>, <span class="x">mantissa</span>), the value actually stored, the rounding error and the gap to the next number. Try 0.1 in all three formats, then 70000 in fp16, then 1e-8 in fp16 vs bf16.</p>
+    <div class="controls seg-btns">
+      <button class="btn small on" id="fmt32">fp32</button><button class="btn small" id="fmt16">fp16</button><button class="btn small" id="fmtB">bf16</button>
+      <span class="spacer"></span>
+      <label>number <input class="numin" id="flIn" value="0.1"></label>
+    </div>
+    <div class="controls">
+      <span class="hint">try:</span>
+      <button class="btn small" id="p01">0.1</button><button class="btn small" id="pPi">3.14159265</button><button class="btn small" id="p2049">2049</button>
+      <button class="btn small" id="p16M">16777217</button><button class="btn small" id="p70k">70000</button><button class="btn small" id="pTiny">1e-8</button>
+    </div>
+    <div class="bits" id="flBits"></div>
+    <div class="calc" id="flCalc"></div>
+  </div>
+
+  <h2>Overflow, underflow and the log-sum-exp trick</h2>
+  <p>Softmax needs e<sup>z</sup>. In fp32, e<sup>89</sup> is already too big (∞). In fp16, e<sup>12</sup> ≈ 162,755 is too big. And LLM logits can easily be in the tens. So naive softmax of [1000, 999] computes ∞ / ∞ = <b>NaN</b> (“not a number”), and one NaN spreads through the whole network.</p>
+  <p>The fix uses Lesson 8.2's fact: subtracting the same number from every score changes nothing. Subtract the <b>max</b>. Now the biggest exponent is e⁰ = 1 and nothing can overflow:</p>
+  <div class="calc">softmax([1000, 999]) = softmax([0, −1]) = [1, 0.368] / 1.368 = <b>[0.731, 0.269]</b></div>
+  <p>Cross-entropy needs the <b>log</b> of a probability, and log p<sub>k</sub> = z<sub>k</sub> − log Σ<sub>j</sub> e<sup>z<sub>j</sub></sup>. That last piece is called <b>log-sum-exp</b>, and it gets the same trick:</p>
+  <div class="eq">
+    log Σ<sub>j</sub> e<sup>z<sub>j</sub></sup> = <span class="w">m</span> + log Σ<sub>j</sub> e<sup>z<sub>j</sub> − <span class="w">m</span></sup>, &nbsp; <span class="w">m</span> = max<sub>j</sub> z<sub>j</sub>
+    <span class="say">“The log of the sum of e to each score equals the biggest score, plus the log of the sum of e to each (score minus the biggest).” Example: log(e<sup>1000</sup> + e<sup>999</sup>) = 1000 + log(1 + e<sup>−1</sup>) = 1000.313, with no ∞ anywhere.</span>
+  </div>
+  <p>This is why PyTorch has <code>log_softmax</code> and why <code>cross_entropy</code> takes raw logits. Its documentation warns that computing log(softmax(x)) in two steps is “slower and numerically unstable”.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Break softmax, then fix it</span>
+    <p class="hint">Three logits [z, z − 1, z − 3]. Slide the top logit up and compare the naive softmax with the subtract-the-max version. Then switch on <b>fp16</b> and see how early the naive one dies.</p>
+    <div class="controls">
+      <label>top logit z = <input type="range" id="bzZ" min="0" max="8" step="1" value="2"> <b class="mono" id="bzZv"></b></label>
+      <label><input type="checkbox" id="bz16"> compute in fp16</label>
+    </div>
+    <div style="overflow-x:auto"><table class="sm" id="bzTab"></table></div>
+    <p class="hint" id="bzMsg" style="font-weight:700"></p>
+  </div>
+
+  <h2>Quantization: storing weights in 8 or 4 bits</h2>
+  <p>A 7-billion-weight model takes 28 GB in fp32, 14 GB in bf16, 7 GB in int8 and 3.5 GB in 4 bits. To squeeze weights into a few bits, pick a <b>scale</b> so the largest weight maps to the largest integer, round, and multiply back when you need the number:</p>
+  <div class="eq" style="font-size:1.2rem">
+    <span class="w">s</span> = max|<span class="w">w</span>| / (2<sup>k−1</sup> − 1) &nbsp;&nbsp; <span class="w">q</span> = round(<span class="w">w</span> / <span class="w">s</span>) &nbsp;&nbsp; <span class="w">ŵ</span> = <span class="w">q</span> × <span class="w">s</span>
+    <span class="say">“The scale is the biggest absolute weight divided by the biggest k-bit integer. Store the rounded integer q. To use it, multiply back: w-hat ≈ w.” For k = 8 the biggest integer is 127, for k = 4 it's 7.</span>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: 4 weights to int8 and int4</span>
+    <ul>
+      <li>Weights [0.5, −1.27, 0.03, 0.9]. Largest |w| = 1.27.</li>
+      <li><b>int8</b>: s = 1.27 / 127 = 0.01. q = round(w / 0.01) = [50, −127, 3, 90]. Multiply back: exactly [0.5, −1.27, 0.03, 0.9]. (Lucky numbers; usually the error is up to s/2 = 0.005.)</li>
+      <li><b>int4</b>: s = 1.27 / 7 = 0.181. w / s = [2.76, −7, 0.17, 4.96] → q = [3, −7, 0, 5] → ŵ = [0.544, −1.27, 0, 0.907]. Errors [0.044, 0, 0.03, 0.007]: the small weight 0.03 became 0.</li>
+    </ul>
+    <p>Now imagine one weight is 8.0, an <b>outlier</b>. The scale grows to 8/7 ≈ 1.14 and every normal weight rounds to −1, 0 or 1. That's the problem LLM.int8() solved (below).</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Quantize a layer's weights</span>
+    <p class="hint">48 weights drawn from a bell curve (dots) and their quantized versions (line). Slide the bits down and watch the staircase appear. Add an outlier, then turn on per-group scales (one scale per 8 weights) to protect the rest.</p>
+    <div class="controls">
+      <label>bits k = <input type="range" id="qBits" min="2" max="8" step="1" value="4"> <b class="mono" id="qBitsV"></b></label>
+      <label><input type="checkbox" id="qOut"> add an outlier (w = 8)</label>
+      <label><input type="checkbox" id="qGroup"> per-group scales</label>
+      <button class="btn small" id="qNew">🎲 New weights</button>
+    </div>
+    <canvas class="chart small" id="qChart"></canvas>
+    <div class="calc" id="qCalc"></div>
+  </div>
+
+  <div class="box code">
+    <span class="label">🐍 In code</span>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np
+<span class="n">0.1</span> + <span class="n">0.2</span>                                <span class="c"># 0.30000000000000004</span>
+np.float32(<span class="n">16777216</span>) + np.float32(<span class="n">1</span>)        <span class="c"># 16777216.0: the +1 is below the gap</span>
+np.finfo(np.float16).max                 <span class="c"># 65504.0</span>
+z = np.array([<span class="n">1000.</span>, <span class="n">999.</span>])
+np.exp(z) / np.exp(z).sum()              <span class="c"># [nan, nan] with an overflow warning</span>
+m = z.max(); m + np.log(np.exp(z - m).sum())  <span class="c"># log-sum-exp = 1000.313, safe</span>
+
+<span class="k">import</span> torch
+torch.log_softmax(torch.tensor(z), dim=<span class="n">0</span>)  <span class="c"># tensor([-0.3133, -1.3133]): does the trick for you</span>
+torch.finfo(torch.bfloat16).max             <span class="c"># about 3.39e38, same range as float32</span></code></pre>
+  </div>
+
+  <div class="box watch">
+    <span class="label">📺 Watch</span>
+    <ul>
+      <li><a href="https://www.youtube.com/watch?v=PZRI1IfStY0" target="_blank" rel="noopener">Computerphile: Floating Point Numbers</a> (about 9 min). Why 0.1 can't be stored exactly, told with scientific notation, like this lesson.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🌍 Where it's used</span>
+    <div class="use">
+      <div class="use-head"><b>Mixed-precision training</b> <span class="tag dl">🖼️ Deep learning · 2017</span> <a href="https://arxiv.org/abs/1710.03740" target="_blank" rel="noopener">Micikevicius et al., Mixed Precision Training</a></div>
+      <p><b>How:</b> weights, activations and gradients are stored in fp16, while a master copy of the weights stays in fp32 to accumulate the small updates. The loss is multiplied by a scale factor before the backward pass, so tiny gradients (like 10⁻⁸, which fp16 rounds to 0) are pushed up into fp16's range, then divided back.</p>
+      <p><b>Why this method:</b> 16-bit numbers halve memory (the paper reports nearly 2× savings) and run faster on hardware built for them. The fp32 copy and loss scaling fix exactly the rounding and underflow you saw in the explorer.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>bfloat16: fp32's range in 16 bits</b> <span class="tag prod">🏭 In production · 2017</span> <a href="https://en.wikipedia.org/wiki/Bfloat16_floating-point_format" target="_blank" rel="noopener">bfloat16 (Google Brain, TPU v2)</a></div>
+      <p><b>How:</b> keep fp32's 8 exponent bits, cut the mantissa to 7. Google Brain designed it for its TPU v2 chips (2017), and it's now widely used for training on GPUs too.</p>
+      <p><b>Why this method:</b> an Intel/Facebook study (<a href="https://arxiv.org/abs/1905.12322" target="_blank" rel="noopener">arXiv 1905.12322</a>) found bf16 training matches fp32 results with no hyper-parameter changes, because it has the same range; fp16 needs tuning such as loss scaling.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>8-bit LLMs without the outlier problem</b> <span class="tag llm">🧠 LLMs · 2022</span> <a href="https://arxiv.org/abs/2208.07339" target="_blank" rel="noopener">Dettmers et al., LLM.int8()</a></div>
+      <p><b>How:</b> quantize with a separate scale for each row and column of the matrix multiply (like the per-group toggle), and keep the few “emergent outlier” feature dimensions in 16 bits. More than 99.9% of the values are still multiplied in 8 bits.</p>
+      <p><b>Why this method:</b> one scale for everything lets a few huge values wreck the precision of all the others (the outlier toggle). With this split, a 175B-parameter model runs in int8 “without performance degradation”, using half the memory.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>4-bit fine-tuning</b> <span class="tag llm">🧠 LLMs · 2023</span> <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">Dettmers et al., QLoRA</a></div>
+      <p><b>How:</b> the frozen model is stored in 4 bits with a new data type, 4-bit NormalFloat (NF4), whose 16 levels are placed for bell-curve-shaped weights. Small LoRA adapters (Lesson 2.4) are trained on top in higher precision.</p>
+      <p><b>Why this method:</b> it cut memory enough to fine-tune a 65B-parameter model on a single 48 GB GPU while matching 16-bit fine-tuning performance, according to the paper.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a $370-million overflow</span>
+    <p>On 4 June 1996, the first Ariane 5 rocket veered off course 37 seconds after launch and self-destructed. The cause: code reused from Ariane 4 converted a 64-bit floating-point number (a horizontal velocity value) into a 16-bit signed integer. Ariane 5 flew faster, the number didn't fit, and the conversion overflowed. The loss was more than US$370 million.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 AI bridge · logs everywhere</span>
+    <p><b>LLMs:</b> the probability of a 1,000-token answer is a product of 1,000 probabilities. If each is 0.5, that's 0.5<sup>1000</sup> ≈ 10<sup>−301</sup>: fp32 rounds it to 0. So models only ever work with <b>log</b>-probabilities and sums (Lessons 4.5, 6.3), computed with log-sum-exp.</p>
+    <p><b>RL:</b> policy gradients and PPO are written in terms of log π, for exactly this reason. The RL course makes the same point in <a href="../../rl-course/phase5/2-reinforce.html">Lesson 5.2's log refresher</a>. Next lesson: that math, start to finish.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/tutorial/floatingpoint.html" target="_blank" rel="noopener">Python tutorial: Floating-Point Arithmetic, Issues and Limitations</a>. Short and friendly, starring 0.1 + 0.2.</li>
+      <li><span class="kind">Book</span> <a href="https://www.deeplearningbook.org/contents/numerical.html" target="_blank" rel="noopener">Deep Learning book, ch. 4: Numerical Computation</a>. Section 4.1 stabilizes softmax with exactly the subtract-the-max trick.</li>
+      <li><span class="kind">Blog</span> <a href="https://floating-point-gui.de/" target="_blank" rel="noopener">The Floating-Point Guide</a>. “What every programmer should know”, with answers to the usual surprises.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. The largest fp16 number is 65,504 and e<sup>11</sup> ≈ 59,874. What happens when you compute e<sup>12</sup> in fp16?</div>
+    <div class="opts"><button class="opt">You get 65,504</button><button class="opt" data-ok>It overflows to ∞ (infinity)</button><button class="opt">It underflows to 0</button></div>
+    <div class="explain">e<sup>12</sup> ≈ 162,755, far above 65,504, so it rounds to ∞. That's why naive softmax in fp16 dies with logits above about 11, and why everyone subtracts the max first.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Compute log(e<sup>100</sup> + e<sup>100</sup>) safely with the log-sum-exp trick.</div>
+    <div class="opts"><button class="opt">200</button><button class="opt">∞</button><button class="opt" data-ok>100 + log 2 ≈ 100.69</button></div>
+    <div class="explain">m = 100. Then 100 + log(e⁰ + e⁰) = 100 + log 2 ≈ 100.693. You never had to store e<sup>100</sup> (about 2.7 × 10⁴³, which would overflow fp16).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Why do most LLMs train in bf16 rather than fp16, even though fp16 has more digits?</div>
+    <div class="opts"><button class="opt" data-ok>bf16 has the same exponent range as fp32, so values rarely overflow or underflow and no loss scaling or tuning is needed</button><button class="opt">bf16 uses fewer bits than fp16</button><button class="opt">bf16 is more precise than fp32</button></div>
+    <div class="explain">Both use 16 bits. bf16 spends 8 of them on the exponent (fp16: 5), trading digits for range. Training cares more about not hitting ∞ or 0 than about the 3rd digit.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Float = <span class="gr">sign</span> × 1.<span class="x">mantissa</span> × 2<sup><span class="w">exponent</span></sup>: exponent bits give range, mantissa bits give precision.</li>
+      <li>fp32 (8/23), fp16 (5/10, max 65,504), bf16 (8/7, fp32's range). Gaps between numbers grow with size.</li>
+      <li>Never compute e<sup>big</sup>: subtract the max; use log-sum-exp, log_softmax, and log-probabilities.</li>
+      <li>Quantization: q = round(w / s), ŵ = q·s. Outliers hurt; per-group scales and outlier handling fix it.</li>
+      <li>Used in mixed-precision training, bf16 TPUs/GPUs, LLM.int8() and QLoRA's 4-bit NF4.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const f = (v, d) => MX.fmt(v, d);
+  const css = MX.css.bind(MX);
+
+  // ---------- round x to a float with E exponent bits and M mantissa bits (round to nearest even) ----------
+  const rne = x => { const fl = Math.floor(x), d = x - fl; return d > 0.5 ? fl + 1 : d < 0.5 ? fl : (fl % 2 === 0 ? fl : fl + 1); };
+  const exp2 = v => { let e = Math.floor(Math.log2(v)); if (2 ** e > v) e--; if (2 ** (e + 1) <= v) e++; return e; };
+  function toFloat(x, E, M) {
+    const bias = 2 ** (E - 1) - 1, emin = 1 - bias, maxv = (2 - 2 ** -M) * 2 ** bias;
+    const sign = x < 0 ? 1 : 0, a = Math.abs(x);
+    if (!isFinite(a)) return { v: x, sign, exp: 2 ** E - 1, man: isNaN(a) ? 1 : 0, kind: isNaN(a) ? "NaN" : "infinity", gap: NaN };
+    if (a === 0) return { v: 0, sign, exp: 0, man: 0, kind: "zero", gap: 2 ** (emin - M) };
+    const e = exp2(a), sp = 2 ** (Math.max(e, emin) - M), r = rne(a / sp) * sp;
+    if (r > maxv) return { v: sign ? -Infinity : Infinity, sign, exp: 2 ** E - 1, man: 0, kind: "overflow", gap: NaN };
+    if (r === 0) return { v: 0, sign, exp: 0, man: 0, kind: "underflow", gap: 2 ** (emin - M) };
+    const e2 = exp2(r), v = sign ? -r : r;
+    if (e2 < emin) return { v, sign, exp: 0, man: Math.round(r / 2 ** (emin - M)), kind: "subnormal", gap: 2 ** (emin - M) };
+    return { v, sign, exp: e2 + bias, man: Math.round((r / 2 ** e2 - 1) * 2 ** M), kind: "normal", gap: 2 ** (e2 - M), e: e2 - bias + bias, bias };
+  }
+  const FMT = { fmt32: [8, 23, "fp32"], fmt16: [5, 10, "fp16"], fmtB: [8, 7, "bf16"] };
+  let fmt = "fmt32";
+  const sci = v => (v === 0 ? "0" : !isFinite(v) ? (v > 0 ? "∞" : "−∞") : Math.abs(v) >= 1e6 || Math.abs(v) < 1e-3 ? v.toExponential(6) : (+v.toPrecision(12)).toString());
+  function render1() {
+    const [E, M, name] = FMT[fmt], x = Number($("flIn").value.replace(/[, ]/g, ""));
+    Object.keys(FMT).forEach(k => $(k).classList.toggle("on", k === fmt));
+    if ($("flIn").value.trim() === "" || isNaN(x)) { $("flBits").innerHTML = ""; $("flCalc").textContent = "Type a number like 0.1, 1e-8 or 70000."; return; }
+    const r = toFloat(x, E, M);
+    const bin = (n, w) => n.toString(2).padStart(w, "0");
+    $("flBits").innerHTML = `<span class="sb">${r.sign}</span><span class="gap"></span>` +
+      [...bin(r.exp, E)].map(b => `<span class="eb">${b}</span>`).join("") + `<span class="gap"></span>` +
+      [...bin(r.man, M)].map(b => `<span class="mb">${b}</span>`).join("");
+    const err = r.v - x, rel = x ? Math.abs(err / x) : 0;
+    let line2 = "";
+    if (r.kind === "normal") line2 = `= (−1)<sup>${r.sign}</sup> × (1 + ${r.man}/2<sup>${M}</sup>) × 2<sup>${r.exp} − ${2 ** (E - 1) - 1}</sup>`;
+    else if (r.kind === "subnormal") line2 = `a <b>subnormal</b> number: below the smallest full-precision (“normal”) ${name} value, so it keeps fewer digits: precision is draining away`;
+    const msg = { overflow: `<span class="bad">overflow: too big for ${name} → stored as ∞</span>`, underflow: `<span class="bad">underflow: too small for ${name} → stored as 0</span>` }[r.kind] || "";
+    $("flCalc").innerHTML = `${name}: <span class="gr">sign</span> 1 bit · <span class="w">exponent</span> ${E} bits · <span class="x">mantissa</span> ${M} bits<br>` +
+      `you typed <b>${x}</b> → stored <b>${r.kind === "overflow" || r.kind === "underflow" ? sci(r.v) : r.v.toPrecision(17).replace(/\.?0+$/, "")}</b> ${line2}<br>` +
+      (msg || `rounding error ${err === 0 ? "<span class='good'>0 (exact!)</span>" : sci(err)} (relative ${rel ? rel.toExponential(2) : 0}) · gap to the next ${name} number: <b>${sci(r.gap)}</b>` +
+        (r.gap >= 1 ? ` <span class="bad">(adding 1 can do nothing here!)</span>` : ""));
+  }
+  Object.keys(FMT).forEach(k => ($(k).onclick = () => { fmt = k; render1(); }));
+  $("flIn").oninput = render1;
+  const pick = v => () => { $("flIn").value = v; render1(); };
+  $("p01").onclick = pick("0.1"); $("pPi").onclick = pick("3.14159265"); $("p2049").onclick = pick("2049");
+  $("p16M").onclick = pick("16777217"); $("p70k").onclick = pick("70000"); $("pTiny").onclick = pick("1e-8");
+  render1();
+
+  // ---------- break softmax ----------
+  const ZS = [1, 5, 10, 11, 12, 50, 88, 89, 1000];
+  function render2() {
+    const z = ZS[+$("bzZ").value], half = $("bz16").checked, R = v => (half ? toFloat(v, 5, 10).v : toFloat(v, 8, 23).v);
+    $("bzZv").textContent = z;
+    const L = [z, z - 1, z - 3], e = L.map(v => R(Math.exp(v))), S = R(e.reduce((a, b) => a + b, 0)), p = e.map(v => R(v / S));
+    const m = Math.max(...L), e2 = L.map(v => R(Math.exp(v - m))), S2 = R(e2.reduce((a, b) => a + b)), p2 = e2.map(v => R(v / S2));
+    const show = v => (isNaN(v) ? `<span class="bad">NaN</span>` : !isFinite(v) ? `<span class="bad">∞</span>` : v >= 1e5 ? v.toExponential(2) : f(v, 3));
+    $("bzTab").innerHTML = `<tr><th></th><th>z</th><th>e<sup>z</sup> (naive)</th><th>p naive</th><th>z − max</th><th>e<sup>z − max</sup></th><th>p safe</th></tr>` +
+      L.map((v, i) => `<tr><td>${i + 1}</td><td>${v}</td><td>${show(e[i])}</td><td>${show(p[i])}</td><td>${v - m}</td><td>${show(e2[i])}</td><td>${show(p2[i])}</td></tr>`).join("") +
+      `<tr><td>Σ</td><td></td><td>${show(S)}</td><td></td><td></td><td>${show(S2)}</td><td></td></tr>`;
+    const broke = p.some(v => !isFinite(v));
+    $("bzMsg").innerHTML = broke ? `💥 Naive softmax broke: e<sup>${z}</sup> overflows ${half ? "fp16 (max 65,504)" : "fp32 (max 3.4 × 10³⁸)"}, and ∞ / ∞ = NaN. The safe version is fine: its biggest exponent is e⁰ = 1.` :
+      `Both versions agree. Keep sliding${half ? "" : " (or switch on fp16)"}.`;
+  }
+  $("bzZ").oninput = render2; $("bz16").onchange = render2;
+  render2();
+
+  // ---------- quantize ----------
+  let base = [];
+  const fresh = () => { base = Array.from({ length: 48 }, () => MX.randn() * 0.6); };
+  function render3() {
+    const k = +$("qBits").value, out = $("qOut").checked, grp = $("qGroup").checked, Qmax = 2 ** (k - 1) - 1;
+    $("qBitsV").textContent = k;
+    const w = base.slice(); if (out) w[20] = 8;
+    const G = grp ? 8 : w.length, scales = [];
+    for (let g = 0; g < w.length; g += G) scales.push(Math.max(...w.slice(g, g + G).map(Math.abs)) / Qmax);
+    const q = w.map((v, i) => Math.round(v / scales[Math.floor(i / G)])), wh = q.map((v, i) => v * scales[Math.floor(i / G)]);
+    const errs = w.map((v, i) => Math.abs(v - wh[i])).filter((_, i) => !(out && i === 20));
+    const shownY = v => MX.clamp(v, -2.6, 2.6);
+    Plot.line($("qChart"), {
+      series: [
+        { label: "original w", color: css("--c-w"), data: w.map((v, i) => [i + 1, shownY(v)]), dots: true, width: 1, dash: [2, 4] },
+        { label: `quantized ŵ (${k} bits)`, color: css("--c-x"), data: wh.map((v, i) => [i + 1, shownY(v)]), width: 2 },
+      ], yMin: -2.6, yMax: 2.6, xLabel: "weight #", yLabel: "value",
+    });
+    const i0 = 0, s0 = scales[0];
+    $("qCalc").innerHTML = `levels: integers −${Qmax} … ${Qmax} · ${grp ? `${scales.length} scales (one per 8 weights)` : "one scale for all"}: s = max|w| / ${Qmax} = <span class="w">${f(s0, 4)}</span>${grp ? " (group 1)" : ""}<br>` +
+      `weight #1: w = ${f(w[i0], 3)} → w / s = ${f(w[i0] / s0, 2)} → q = ${q[i0]} → ŵ = ${q[i0]} × ${f(s0, 4)} = <b>${f(wh[i0], 3)}</b><br>` +
+      `average error on the normal weights: <span class="ls">${f(MX.mean(errs), 4)}</span> · weights rounded to 0: ${q.filter(v => v === 0).length} of 48${out ? " (dots above 2.6 are clipped on the chart)" : ""}<br>` +
+      `memory: ${k} bits per weight vs 32 → ${f(32 / k, 1)}× smaller (a 7B model: ${f(7 * k / 8, 1)} GB${grp ? " + a little for the scales" : ""})`;
+  }
+  $("qBits").oninput = render3; $("qOut").onchange = render3; $("qGroup").onchange = render3;
+  $("qNew").onclick = () => { fresh(); render3(); };
+  fresh(); render3();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.6 Batch & stream processing (Spark, Flink) · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .btn.tog.on { background: var(--c-er); border-color: var(--c-er); color: #fff; }
+  .btn.tog.good.on { background: var(--c-db); border-color: var(--c-db); }
+  .wc { font-family: var(--mono); font-size: .85rem; margin: 6px 0; min-height: 1.4em; }
+</style>
+</head>
+<body data-lesson="s3-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 6</div>
+  <h1>Batch & stream processing (Spark, Flink)</h1>
+  <p class="subtitle">Turning raw events into answers: crunch yesterday's terabytes in one big job (batch), or keep a running answer that updates every second (streaming). Dashboards, recommendations, fraud checks and billing all run on one or both.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Kafka</b>: an ordered, replayable log of events, split into partitions (Lesson 3.2).</li>
+      <li><b>Sharding by key</b>: spread data over machines with hash(key) mod N (Lesson 2.4).</li>
+      <li><b>Object storage</b> (S3, GCS): cheap, huge storage for files (Lesson 2.7).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2004 two Google engineers, Jeffrey Dean and Sanjay Ghemawat, described MapReduce: a way to write a function that runs over thousands of machines without thinking about failures. Within Google, they wrote, hundreds of MapReduce programs had been written and <b>upwards of one thousand MapReduce jobs ran on Google's clusters every day</b>.</p>
+    <p>They'd also rewritten Google's production indexing system on it, a job taking in more than 20 TB of crawled documents. One phase of it shrank from about 3,800 lines of C++ to about 700. Open-source Hadoop MapReduce, and later Spark, took the same model to everyone else.</p>
+  </div>
+
+  <h2>Numbers first: why one machine isn't enough</h2>
+  <p>Your app writes <b>1 TB of logs a day</b>. You want daily stats. One machine reads from disk at about <b>200 MB/s</b> (typical for a fast disk).</p>
+  <table>
+    <tr><th></th><th>One machine</th><th>100 machines in parallel</th></tr>
+    <tr><td>Just reading 1 TB</td><td class="lt">1,000,000 MB ÷ 200 MB/s = <b>5,000 s ≈ 83 min</b></td><td class="ca">≈ <b>50 s</b> (plus a little coordination)</td></tr>
+    <tr><td>A machine dies halfway</td><td class="er">Start over</td><td class="db">Rerun only that machine's piece</td></tr>
+  </table>
+  <p>And the same 1 TB/day as a stream is only 1,000,000 MB ÷ 86,400 s ≈ <b>11.6 MB/s</b>, easy for a few machines, if you process it as it arrives. That's the two styles of data processing:</p>
+  <table>
+    <tr><th></th><th>Batch</th><th>Stream</th></tr>
+    <tr><td>Input</td><td>A bounded dataset: “all of yesterday”</td><td>An unbounded flow: “every event, forever”</td></tr>
+    <tr><td>Freshness</td><td>Minutes to hours old</td><td>Seconds old</td></tr>
+    <tr><td>Hard part</td><td>Scale, cost, scheduling</td><td>Time: late and out-of-order events, state</td></tr>
+    <tr><td>Tools</td><td>Spark, Hadoop MapReduce, dbt + a warehouse</td><td>Flink, Kafka Streams, Spark Structured Streaming</td></tr>
+    <tr><td>Use for</td><td>Billing, reports, ML training data, backfills</td><td>Fraud checks, live dashboards, alerts, recommendations</td></tr>
+  </table>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Big data processing is <b>split, process in parallel, regroup by key, combine</b>. Batch does it over a finished pile of data; streaming does it continuously over <b>windows</b> of time. The new problem streaming brings is time itself: events arrive late and out of order, so you must decide <b>how long to wait</b> before answering.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: counting votes</span>
+    <p><b>Batch</b> is election night: lock the doors, split the ballots among many counting tables (map), gather each candidate's piles together (shuffle), add them up (reduce). <b>Streaming</b> is a live tally that updates as ballots arrive. Postal ballots arrive days late, so at some point the officials must say “we're calling this district now”. That cut-off is a <b>watermark</b>: call too early and the tally is wrong; wait too long and nobody gets a result tonight.</p>
+  </div>
+
+  <h2>MapReduce: the pattern under everything</h2>
+  <ol>
+    <li><b>Map:</b> each worker reads one chunk (a <b>split</b>) and emits key-value pairs: for word count, <code>("the", 1)</code> for every word.</li>
+    <li><b>Shuffle:</b> pairs are sent to reducers by key, using hash(key) mod R, so all <code>"the"</code> pairs meet at one reducer.</li>
+    <li><b>Reduce:</b> each reducer combines the values for its keys: <code>("the", 6)</code>.</li>
+  </ol>
+  <p>The framework handles the hard parts. If a worker stops answering the master's pings, its tasks are rerun elsewhere. Near the end, slow machines (“stragglers”) get <b>backup copies</b> of their tasks, and whichever finishes first wins: the paper reports a sort taking 44% longer with backups turned off. A <b>combiner</b> pre-adds counts on each mapper, so less data crosses the network.</p>
+
+  <div class="playground" id="pg1">
+    <span class="label">🎮 Playground · MapReduce word count</span>
+    <p class="hint">Three input splits, three mappers plus one spare worker, and R reducers. Run it, then kill a mapper, add a straggler, and turn the combiner and backup tasks on and off. Job time is simulated: a map task takes 10 s.</p>
+    <svg id="mf"></svg>
+    <div class="controls">
+      <span class="seg" id="mr"><button id="mr2" data-v="2" class="on">2 reducers</button><button id="mr3" data-v="3">3 reducers</button></span>
+      <button class="btn tog good" id="mcomb">➕ Combiner</button>
+      <button class="btn tog" id="mkill">💀 Kill mapper 2 mid-task</button>
+      <button class="btn tog" id="mslow">🐢 Mapper 3 is a straggler</button>
+      <button class="btn tog good on" id="mback">🪞 Backup tasks</button>
+      <button class="btn primary" id="mrun">▶ Run job</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">map output pairs <b id="mp">–</b></div>
+      <div class="stat">pairs shuffled <b id="ms">–</b></div>
+      <div class="stat">tasks rerun <b id="mt">–</b></div>
+      <div class="stat">job time <b id="mj">–</b></div>
+    </div>
+    <div class="wc" id="mout"></div>
+    <p class="hint" id="mmsg"></p>
+  </div>
+
+  <h2>Streaming: windows and time</h2>
+  <p>A stream never ends, so “count the clicks” has to become “count the clicks <i>per window</i>”. The three common windows (all built into Flink):</p>
+  <table>
+    <tr><th>Window</th><th>What it is</th><th>Example</th></tr>
+    <tr><td><b>Tumbling</b></td><td>Fixed size, no overlap: 12:00–12:10, 12:10–12:20…</td><td>Orders per minute on a dashboard</td></tr>
+    <tr><td><b>Sliding</b> (hopping)</td><td>Fixed size, overlapping: a 10-minute window every 5 minutes</td><td>“Logins in the last 10 minutes” for fraud rules</td></tr>
+    <tr><td><b>Session</b></td><td>Closes after a gap of inactivity; different length per user</td><td>One user's browsing session</td></tr>
+  </table>
+  <p>Which time? <b>Event time</b> is when it happened (the timestamp on the phone). <b>Processing time</b> is when your server sees it. They differ: a phone in a tunnel uploads its clicks 20 seconds late. Counting by processing time is simple but wrong; counting by event time is right but needs to know when a window is “complete”.</p>
+  <p>A <b>watermark</b> is the stream processor's estimate of event-time progress: “I don't expect any more events older than t.” A common rule is watermark = largest event time seen − a delay. When the watermark passes a window's end, the window fires. Events that show up after that are <b>late</b>: dropped, sent to a side output, or used to update the result if you allow some lateness.</p>
+  <div class="eq">
+    watermark = <span class="lt">max event time seen</span> − <span class="lt">delay</span>
+    <span class="say">“The watermark trails the newest event by a fixed delay.” A bigger delay catches more stragglers but makes every result later.</span>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: picking a watermark delay</span>
+    <p>Clicks are counted in 10-second tumbling windows. About 88% of events arrive within 2 s; 12% come from phones that were offline and arrive 5–25 s late.</p>
+    <ul>
+      <li><b>Delay 2 s:</b> the 12:00:00–12:00:10 window fires once an event stamped 12:00:12 or later arrives, roughly 2–4 s after the window ends. Fast, but most offline clicks miss their window.</li>
+      <li><b>Delay 20 s:</b> nearly every click makes it in, but each count appears about 20 s after its window ends, too slow for a live dashboard, fine for billing.</li>
+      <li>Typical fix: a short delay for the dashboard <b>plus</b> allowed lateness or a nightly batch job that corrects the totals.</li>
+    </ul>
+  </div>
+
+  <div class="playground" id="pg2">
+    <span class="label">🎮 Playground · Windows, late data and the watermark</span>
+    <p class="hint">One minute of a user's clicks. Each dot is placed at its <b>event time</b>; a faint tail shows how late it arrived. <span class="db">Green</span> dots were counted, <span class="er">red</span> dots arrived after their window had fired and were dropped. Each window shows <b>counted / true</b>.</p>
+    <canvas id="wc" style="width:100%;height:270px;display:block;background:var(--bg2);border:1px solid var(--line);border-radius:10px"></canvas>
+    <div class="controls">
+      <span class="seg" id="wtype"><button id="w-tum" data-v="tumble" class="on">Tumbling</button><button id="w-sli" data-v="slide">Sliding (slide = size/2)</button><button id="w-ses" data-v="session">Session</button></span>
+    </div>
+    <div class="controls">
+      <label><span id="wsl">window size</span> <input type="range" id="wsz" min="4" max="20" step="1" value="10"> <b class="mono" id="wszv"></b></label>
+      <label>watermark delay <input type="range" id="wd" min="0" max="25" step="1" value="2"> <b class="mono" id="wdv"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">events <b id="wn">–</b></div>
+      <div class="stat">dropped as late <b id="wl">–</b></div>
+      <div class="stat">accuracy <b id="wa">–</b></div>
+      <div class="stat">typical result delay <b id="wr">–</b></div>
+    </div>
+    <p class="hint" id="wmsg"></p>
+  </div>
+
+  <h2>Putting it together: lambda, kappa and where the data lands</h2>
+  <ul>
+    <li><b>Lambda architecture:</b> run a batch pipeline (correct, slow) and a streaming pipeline (fast, approximate) side by side and merge their results. Downside: the same logic written twice, in two systems.</li>
+    <li><b>Kappa architecture:</b> streaming only. Keep the raw events in Kafka long enough, and when the logic changes, start a second copy of the job reading from the beginning, then switch over. Jay Kreps proposed it in 2014 as a simpler alternative.</li>
+    <li><b>Warehouse vs lake:</b> a <b>data warehouse</b> (Snowflake, BigQuery, Redshift) stores cleaned tables for SQL; a <b>data lake</b> stores raw files cheaply in object storage (S3 + Parquet). Table formats like Apache Iceberg and Delta Lake add tables on top of the lake (a “lakehouse”).</li>
+    <li><b>ETL vs ELT:</b> Extract-Transform-Load cleans data before loading it; Extract-Load-Transform loads raw data first and transforms it inside the warehouse with SQL (often with dbt). ELT is the common modern default because warehouse compute is cheap and raw data stays available.</li>
+  </ul>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Batch:</b> <b>Apache Spark</b> (Databricks, AWS EMR, Google Dataproc), warehouse SQL with <b>dbt</b>, orchestrated by <b>Airflow</b> or <b>Dagster</b>. <b>Streaming:</b> <b>Apache Flink</b> (Amazon Managed Service for Apache Flink, Confluent), <b>Kafka Streams</b>, <b>Spark Structured Streaming</b>, Google <b>Dataflow</b> (Apache Beam). Word count in PySpark:</p>
+<pre><code><span class="k">from</span> pyspark.sql <span class="k">import</span> SparkSession, functions <span class="k">as</span> F
+
+spark = SparkSession.builder.appName(<span class="s">"wordcount"</span>).getOrCreate()
+lines = spark.read.text(<span class="s">"s3://my-logs/2026-10-30/*.txt"</span>)            <span class="c"># each file is split across workers</span>
+counts = (lines
+    .select(F.explode(F.split(F.lower(<span class="s">"value"</span>), <span class="s">r"\s+"</span>)).alias(<span class="s">"word"</span>))   <span class="c"># map</span>
+    .groupBy(<span class="s">"word"</span>).count())                                        <span class="c"># shuffle + reduce</span>
+counts.write.mode(<span class="s">"overwrite"</span>).parquet(<span class="s">"s3://my-reports/wordcount/2026-10-30/"</span>)</code></pre>
+    <p>A 10-second tumbling window with a 5-second watermark in Flink SQL:</p>
+<pre><code><span class="k">CREATE TABLE</span> clicks (
+  user_id    BIGINT,
+  url        STRING,
+  event_time TIMESTAMP(<span class="n">3</span>),
+  <span class="k">WATERMARK FOR</span> event_time <span class="k">AS</span> event_time - <span class="k">INTERVAL</span> <span class="s">'5'</span> <span class="k">SECOND</span>   <span class="c">-- wait 5 s for stragglers</span>
+) <span class="k">WITH</span> (<span class="s">'connector'</span> = <span class="s">'kafka'</span>, <span class="s">'topic'</span> = <span class="s">'clicks'</span>, ...);
+
+<span class="k">SELECT</span> window_start, window_end, <span class="k">COUNT</span>(*) <span class="k">AS</span> clicks
+<span class="k">FROM</span> TUMBLE(<span class="k">TABLE</span> clicks, DESCRIPTOR(event_time), <span class="k">INTERVAL</span> <span class="s">'10'</span> <span class="k">SECONDS</span>)
+<span class="k">GROUP BY</span> window_start, window_end;</code></pre>
+    <p class="hint">Try it locally: <code>pip install pyspark</code> and run the word count on a folder of text files (use a local path instead of <code>s3://</code>). For Flink, the official “Flink Operations Playground” runs a small Flink cluster with Kafka using Docker Compose.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>✅ Batch is better when…</th><th>✅ Streaming is better when…</th></tr>
+      <tr><td>Hourly or daily freshness is fine (reports, billing, ML training sets)</td><td>The value is in reacting now (fraud, alerts, live pricing)</td></tr>
+      <tr><td>You need exact, reproducible answers over all the data</td><td>Approximate-then-corrected is OK</td></tr>
+      <tr><td>The team is small: batch jobs are easier to test, rerun and debug</td><td>You already have events in Kafka and a team to run long-lived jobs</td></tr>
+    </table>
+    <p class="hint">Streaming costs: always-on jobs, state that must be checkpointed and restored, watermark tuning, and on-call for a pipeline instead of a cron job. Many “real-time” needs are really “every 5 minutes”, which a small batch job does fine.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Copy the production database into a managed warehouse (BigQuery, Snowflake) with an off-the-shelf connector, transform with SQL/dbt, run it hourly or nightly. That's ELT, and it covers analytics for a long time. Add streaming only for one clear real-time need.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>A data platform: Kafka as the event backbone, CDC from every database, Flink jobs for real-time features and fraud, Spark on a lakehouse (Iceberg/Delta) for petabyte batch, a scheduler for thousands of jobs, data quality checks, and lineage so you know which dashboard breaks when a column changes.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Data pipelines show up in “design a metrics dashboard”, “top-K trending” or “ad click counting”. A senior answer covers:</p>
+    <ul>
+      <li><b>Freshness requirement</b> first: seconds (stream), minutes (micro-batch), or daily (batch).</li>
+      <li><b>Event time vs processing time</b>, the window type, and a watermark delay with a reason.</li>
+      <li><b>Late and duplicate events</b>: allowed lateness, dedupe by event ID, exactly-once sinks (Lesson 3.3).</li>
+      <li><b>Reprocessing</b>: how you fix a bug and recompute (replay Kafka, or a batch backfill).</li>
+      <li><b>Hot keys</b> in the shuffle (one huge key overloads one reducer) and how to split them.</li>
+    </ul>
+    <p class="hint">Common follow-ups: “A user's phone was offline for an hour; what happens to their clicks?” “How do you count unique users per day without storing every ID?” (Approximate counting, e.g. HyperLogLog.) “Lambda or kappa?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The paper that started big data</b> <span class="tag hist">📜 Google · 2004</span> <a href="https://static.googleusercontent.com/media/research.google.com/en//archive/mapreduce-osdi04.pdf" target="_blank" rel="noopener">MapReduce: Simplified Data Processing on Large Clusters (OSDI)</a></div>
+      <p><b>How:</b> users write map and reduce functions; the library splits input, partitions intermediate keys with hash(key) mod R, reruns tasks from failed workers, and runs backup tasks for stragglers. The paper's experiments ran on a cluster of about 1,800 machines.</p>
+      <p><b>Why this method:</b> hiding distribution and failure behind two functions let many engineers write large-scale jobs, including Google's rewritten indexing system.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A faster engine on the same idea</b> <span class="tag co">🏢 Databricks · 2014</span> <a href="https://www.databricks.com/blog/2014/11/05/spark-officially-sets-a-new-record-in-large-scale-sorting.html" target="_blank" rel="noopener">Spark officially sets a new record in large-scale sorting</a></div>
+      <p><b>How:</b> Spark sorted 100 TB on 206 EC2 machines in 23 minutes. The previous record, set with Hadoop MapReduce, sorted 102.5 TB in 72 minutes on 2,100 machines.</p>
+      <p><b>Why this method:</b> the same map-shuffle-reduce model, with a better engine: the post credits a sort-based shuffle, a new Netty-based network module and an external shuffle service. The sort ran on disk, without Spark's in-memory cache.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Event time, windows and watermarks</b> <span class="tag oss">🧰 Open source</span> <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/concepts/time/" target="_blank" rel="noopener">Apache Flink: timely stream processing</a></div>
+      <p><b>How:</b> Flink defines a watermark(t) as a declaration that event time has reached t, so no more elements with timestamps ≤ t are expected. Windows (tumbling, sliding, session, global) fire when the watermark passes their end, plus any allowed lateness.</p>
+      <p><b>Why this method:</b> counting by event time gives correct answers even when events arrive out of order, and the watermark makes the speed-versus-completeness trade-off an explicit setting.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One pipeline instead of two</b> <span class="tag co">🏢 LinkedIn / O'Reilly · 2014</span> <a href="https://www.oreilly.com/radar/questioning-the-lambda-architecture/" target="_blank" rel="noopener">Jay Kreps: Questioning the Lambda Architecture</a></div>
+      <p><b>How:</b> keep the full event log in Kafka; to reprocess, start a new instance of the stream job from the beginning of the log with more parallelism, write to a new output table, then switch readers over.</p>
+      <p><b>Why this method:</b> in his words, maintaining code that must produce the same result in two complex distributed systems is as painful as it sounds.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the accidental Greek letter</span>
+    <p>“Kappa architecture” was named almost as a joke. In the same 2014 post, Kreps suggested the name while adding that it “may be too simple of an idea to merit a Greek letter”. The name stuck anyway.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>MapReduce's shuffle is sharding by key (Lesson 2.4). Streams usually start in Kafka (Lesson 3.2) and often from CDC (Lessons 3.2 and 3.5); exactly-once results need idempotent sinks (Lesson 3.3). Metrics pipelines feed observability (Lesson 6.3), and cost planning for big jobs comes in Lesson 6.5. In AI systems, batch jobs build training sets and embeddings, while streaming jobs compute fresh features for real-time models.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://static.googleusercontent.com/media/research.google.com/en//archive/mapreduce-osdi04.pdf" target="_blank" rel="noopener">MapReduce (2004)</a>. Short and readable; sections 3.3 (fault tolerance) and 3.6 (backup tasks) are gold.</li>
+      <li><span class="kind">Docs</span> <a href="https://nightlies.apache.org/flink/flink-docs-stable/docs/dev/datastream/operators/windows/" target="_blank" rel="noopener">Flink windows</a>. Every window type with diagrams, plus allowed lateness and side outputs.</li>
+      <li><span class="kind">Blog</span> <a href="https://www.oreilly.com/radar/questioning-the-lambda-architecture/" target="_blank" rel="noopener">Questioning the Lambda Architecture</a>. The argument for streaming-only pipelines.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A nightly job must read 6 TB. Each worker reads about 200 MB/s. Roughly how many workers do you need to finish the reading in about 5 minutes?</div>
+    <div class="opts"><button class="opt">10</button><button class="opt" data-ok>100</button><button class="opt">1,000</button></div>
+    <div class="explain">One worker: 6,000,000 MB ÷ 200 MB/s = 30,000 s. To get to 300 s you need 30,000 ÷ 300 = <b>100</b> workers. Real jobs need a bit more for the shuffle and stragglers.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A live dashboard counts purchases per minute by event time. Mobile clients often send events up to 30 s late. Results must appear within 10 s of each minute ending. What's the best design?</div>
+    <div class="opts"><button class="opt">Count by processing time; it's always on time</button><button class="opt" data-ok>A short watermark delay (a few seconds) for the dashboard, plus allowed lateness or a periodic batch job that corrects the counts</button><button class="opt">A 30-second watermark delay so every event is counted before showing anything</button></div>
+    <div class="explain">Processing time puts late purchases in the wrong minute. A 30 s delay breaks the 10 s requirement. The usual answer is fast-and-approximate first, then corrected: Flink's allowed lateness updates the result, or a batch job reconciles it.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. In a word-count MapReduce job, one reducer takes 10× longer than the others. What's the most likely cause?</div>
+    <div class="opts"><button class="opt">Too many mappers</button><button class="opt" data-ok>A hot key: a very common word (like “the”) sends a huge share of pairs to one reducer</button><button class="opt">The combiner is turned on</button></div>
+    <div class="explain">hash(key) mod R sends every pair for a key to the same reducer, so skewed keys create skewed reducers. Combiners help (they pre-add counts on each mapper); for extreme skew, split the hot key into sub-keys and combine afterwards.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Batch = bounded data, big parallel jobs, hours-fresh. Stream = unbounded data, windows, seconds-fresh.</li>
+      <li>MapReduce: map → shuffle by hash(key) mod R → reduce, with reruns for failures and backup tasks for stragglers.</li>
+      <li>Windows: tumbling, sliding, session. Use event time; a watermark (max seen − delay) decides when a window fires.</li>
+      <li>Bigger watermark delay = more complete, later results. Combine fast streaming with correction (lateness or batch).</li>
+      <li>Startups: ELT into a warehouse first. Kappa (replayable stream) beats running two codebases (lambda).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const isOn = id => $(id).classList.contains("on");
+
+  // ---------- MapReduce ----------
+  const SPLITS = ["the cat sat on the mat", "the dog sat on the log", "the cat and the dog"];
+  const hash = s => { let h = 0; for (const ch of s) h = (h * 31 + ch.charCodeAt(0)) >>> 0; return h; };
+  let M, mbusy = false;
+  const getR = seg("mr", () => drawM());
+  function drawM() {
+    const R = +getR();
+    M = new Flow($("mf"), { width: 720, height: 250 });
+    SPLITS.forEach((s, i) => M.node("s" + i, { x: 70, y: 40 + i * 75, w: 110, h: 40, label: `Split ${i + 1}`, sub: s.split(" ").length + " words", kind: "db" }));
+    for (let i = 0; i < 4; i++) M.node("m" + i, { x: 255, y: 30 + i * 62, w: 130, h: 40, label: i < 3 ? `Mapper ${i + 1}` : "Spare worker", sub: "", kind: "sv" });
+    for (let r = 0; r < R; r++) M.node("r" + r, { x: 470, y: 125 + (r - (R - 1) / 2) * 75, w: 130, h: 40, label: `Reducer ${r + 1}`, sub: "", kind: "sv" });
+    M.node("out", { x: 650, y: 125, w: 110, h: 44, label: "📄 Output", sub: "", kind: "db" });
+    SPLITS.forEach((_, i) => M.edge("s" + i, "m" + i));
+    for (let i = 0; i < 4; i++) for (let r = 0; r < R; r++) M.edge("m" + i, "r" + r, { noArrow: true });
+    for (let r = 0; r < R; r++) M.edge("r" + r, "out");
+    M.render();
+  }
+  function mapOut(text, comb) {
+    const words = text.split(" ");
+    if (!comb) return words.map(w => [w, 1]);
+    const c = {}; words.forEach(w => (c[w] = (c[w] || 0) + 1)); return Object.entries(c);
+  }
+  $("mrun").onclick = async () => {
+    if (mbusy) return; mbusy = true;
+    drawM();
+    const R = +getR(), comb = isOn("mcomb"), kill = isOn("mkill"), slow = isOn("mslow"), backup = isOn("mback");
+    $("mout").textContent = ""; $("mmsg").textContent = "";
+    // simulated timing (seconds): a map task takes 10 s; the spare worker runs reruns and backups one after another
+    let spareFree = 0, reruns = 0;
+    const finish = [10, 10, 10], runner = [0, 1, 2];
+    if (kill) { finish[1] = Math.max(spareFree, 5) + 10; spareFree = finish[1]; runner[1] = 3; reruns++; }
+    if (slow) {
+      if (backup) { const start = Math.max(spareFree, 15); finish[2] = Math.min(40, start + 10); spareFree = finish[2]; runner[2] = finish[2] < 40 ? 3 : 2; reruns++; }
+      else finish[2] = 40;
+    }
+    const mapDone = Math.max(...finish), jobTime = mapDone + 2 + 5;
+    // map phase animation
+    SPLITS.forEach((s, i) => M.set("m" + i, { sub: "mapping…" }));
+    await Promise.all(SPLITS.map((_, i) => M.packet(["s" + i, "m" + i], { color: "--c-db", dur: 500 })));
+    if (kill) { M.set("m1", { down: true, sub: "💀 no reply to pings" }); await wait(500); M.edge("s1", "m3"); M.render(); M.set("m1", { down: true, sub: "💀 dead" }); M.set("m3", { sub: "rerunning split 2" }); await M.packet(["s1", "m3"], { color: "--c-lt", dur: 500 }); }
+    if (slow) {
+      M.set("m2", { sub: "🐢 still at 25%…", hot: true });
+      await wait(600);
+      if (backup) { if (!M.edges.find(e => e.a === "s2" && e.b === "m3")) { M.edge("s2", "m3"); M.render(); if (kill) M.set("m1", { down: true, sub: "💀 dead" }); } M.set("m3", { sub: "backup of split 3" }); M.set("m2", { sub: "🐢 slow (backup won)", hot: true }); await M.packet(["s2", "m3"], { color: "--c-lt", dur: 500 }); }
+      else { M.set("m2", { sub: "🐢 everyone waits…", hot: true }); await wait(900); }
+    }
+    let pairs = 0, shuffled = 0;
+    const byR = Array.from({ length: R }, () => ({}));
+    SPLITS.forEach((s, i) => {
+      pairs += s.split(" ").length;
+      const out = mapOut(s, comb); shuffled += out.length;
+      out.forEach(([w, n]) => { const r = hash(w) % R; byR[r][w] = (byR[r][w] || 0) + n; });
+      M.set("m" + runner[i], { sub: `${out.length} pairs emitted` });
+    });
+    // shuffle
+    const sends = [];
+    SPLITS.forEach((s, i) => {
+      const out = mapOut(s, comb);
+      for (let r = 0; r < R; r++) if (out.some(([w]) => hash(w) % R === r)) sends.push(M.packet(["m" + runner[i], "r" + r], { color: "--c-nw", dur: 700 }));
+    });
+    await Promise.all(sends);
+    byR.forEach((m, r) => M.set("r" + r, { sub: Object.keys(m).length + " words" }));
+    await Promise.all(byR.map((_, r) => M.packet(["r" + r, "out"], { color: "--c-db", dur: 500 })));
+    const all = Object.assign({}, ...byR);
+    const sorted = Object.entries(all).sort((a, b) => b[1] - a[1]);
+    M.set("out", { sub: sorted.length + " words" });
+    $("mout").textContent = sorted.map(([w, n]) => `${w} ${n}`).join(" · ");
+    $("mp").textContent = pairs; $("ms").textContent = shuffled; $("mt").textContent = reruns; $("mj").textContent = jobTime + " s";
+    const busiest = byR.map(m => Object.values(m).reduce((a, b) => a + b, 0));
+    $("mmsg").textContent = (slow && !backup ? "The straggler held the whole job hostage: nothing can finish until its map task does. Turn on backup tasks. " : "")
+      + (slow && backup ? "The backup copy of split 3 finished first, so the straggler's result was simply ignored. " : "")
+      + (kill ? "Mapper 2 stopped answering pings, so its task ran again on the spare worker. Nobody restarted the job. " : "")
+      + (comb ? `The combiner pre-added counts on each mapper: ${shuffled} pairs crossed the network instead of ${pairs}. ` : `${pairs} pairs crossed the network. Try the combiner. `)
+      + `Reducer loads: ${busiest.join(" / ")} counts (“the” alone is 6 of 17).`;
+    mbusy = false;
+  };
+  ["mcomb", "mkill", "mslow", "mback"].forEach(id => ($(id).onclick = () => $(id).classList.toggle("on")));
+  drawM();
+
+  // ---------- windows & watermarks ----------
+  const rng = MX.seeded(9), EV = [];
+  { let t = 0.5;
+    while (t < 58) {
+      const burst = 4 + Math.floor(rng() * 7);
+      for (let i = 0; i < burst && t < 58; i++) { const late = rng() < 0.12; EV.push({ t: +t.toFixed(2), d: late ? 5 + rng() * 20 : 0.2 + rng() * 1.8, y: rng() }); t += 0.2 + rng() * 0.4; }
+      t += 1 + rng() * 3;
+    } }
+  EV.forEach(e => (e.a = e.t + e.d));
+  const BY_A = EV.slice().sort((x, y) => x.a - y.a), LAST_A = BY_A[BY_A.length - 1].a;
+  const getW = seg("wtype", () => windowsRun());
+  const fireAt = (end, D) => { let mx = -1e9; for (const x of BY_A) { mx = Math.max(mx, x.t); if (mx - D >= end) return x.a; } return LAST_A; };
+  function windowsRun() {
+    const type = getW(), S = +$("wsz").value, D = +$("wd").value;
+    $("wsl").textContent = type === "session" ? "session gap" : "window size";
+    $("wszv").textContent = S + " s"; $("wdv").textContent = D + " s";
+    let wins = [];
+    const dropped = new Set();
+    if (type !== "session") {
+      const starts = [];
+      if (type === "tumble") for (let s = 0; s < 60; s += S) starts.push(s);
+      else for (let s = -S / 2; s < 60; s += S / 2) if (s + S > 0) starts.push(s);
+      wins = starts.map((s, k) => {
+        const e = s + S, f = fireAt(e, D), mem = EV.filter(x => x.t >= s && x.t < e);
+        mem.forEach(x => { if (x.a > f) dropped.add(x); });
+        return { s, e, f, tru: mem.length, got: mem.filter(x => x.a <= f).length, row: type === "slide" ? k % 2 : 0 };
+      });
+    } else {
+      // true sessions on event time
+      const byT = EV.slice().sort((x, y) => x.t - y.t), truth = [];
+      byT.forEach(x => { const last = truth[truth.length - 1]; if (last && x.t - last.e < S) { last.e = x.t; last.n++; } else truth.push({ s: x.t, e: x.t, n: 1 }); });
+      // what the stream processor builds, in arrival order, dropping events whose session already closed
+      let mx = -1e9, open = [], closed = [];
+      for (const x of BY_A) {
+        mx = Math.max(mx, x.t); const wm = mx - D;
+        if (x.t + S <= wm) { dropped.add(x); }
+        else {
+          let s = { s: x.t, e: x.t, n: 1, f: null };
+          open = open.filter(o => { if (x.t >= o.s - S && x.t <= o.e + S) { s = { s: Math.min(s.s, o.s), e: Math.max(s.e, o.e), n: s.n + o.n }; return false; } return true; });
+          open.push(s);
+        }
+        open = open.filter(o => { if (o.e + S <= wm) { o.f = x.a; closed.push(o); return false; } return true; });
+      }
+      open.forEach(o => { o.f = LAST_A; closed.push(o); });
+      wins = truth.map(tr => {
+        const got = closed.filter(c => c.s <= tr.e && c.e >= tr.s).reduce((a, c) => a + c.n, 0);
+        const f = Math.max(...closed.filter(c => c.s <= tr.e && c.e >= tr.s).map(c => c.f), tr.e + S);
+        return { s: tr.s, e: tr.e + S, f, tru: tr.n, got: Math.min(got, tr.n), row: 0 };
+      });
+    }
+    const T = wins.reduce((a, w) => a + w.tru, 0), G = wins.reduce((a, w) => a + w.got, 0);
+    const L = wins.map(w => Math.max(0, w.f - w.e)).sort((a, b) => a - b), lat = L[Math.floor(L.length / 2)];
+    $("wn").textContent = EV.length; $("wl").textContent = dropped.size;
+    $("wa").textContent = (100 * G / T).toFixed(1) + "%"; $("wr").textContent = lat.toFixed(1) + " s after window end";
+    $("wmsg").textContent = D <= 1 ? "Tiny delay: results come almost instantly, but every slightly late event is dropped."
+      : D >= 15 ? `With a ${D} s delay almost every straggler is counted, but each result waits about ${lat.toFixed(0)} s. Fine for billing, too slow for a live dashboard.`
+      : `${dropped.size} late events (mostly phones that were offline) missed their window. Raise the delay to catch them, at the cost of slower results.`;
+    draw(wins, dropped, type);
+  }
+  function draw(wins, dropped, type) {
+    const c = $("wc"), dpr = window.devicePixelRatio || 1, w = c.clientWidth || 700, h = c.clientHeight || 270;
+    c.width = w * dpr; c.height = h * dpr;
+    const ctx = c.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    const css = MX.css, X = t => 30 + (t / 60) * (w - 45);
+    ctx.font = "11px " + (css("--font") || "sans-serif");
+    // axis
+    ctx.strokeStyle = css("--line"); ctx.fillStyle = css("--muted"); ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(X(0), h - 22); ctx.lineTo(X(60), h - 22); ctx.stroke();
+    ctx.textAlign = "center";
+    for (let t = 0; t <= 60; t += 10) { ctx.fillText(t + " s", X(t), h - 8); ctx.beginPath(); ctx.moveTo(X(t), h - 25); ctx.lineTo(X(t), h - 19); ctx.stroke(); }
+    ctx.textAlign = "left"; ctx.fillText("event time →", X(0), 12);
+    // windows
+    wins.forEach(win => {
+      const y = 22 + win.row * 44, x0 = X(Math.max(0, win.s)), x1 = X(Math.min(60, win.e));
+      const ok = win.got === win.tru;
+      ctx.globalAlpha = 0.18; ctx.fillStyle = css(ok ? "--c-db" : "--c-er"); ctx.fillRect(x0 + 1, y, x1 - x0 - 2, 36);
+      ctx.globalAlpha = 1; ctx.strokeStyle = css(ok ? "--c-db" : "--c-er"); ctx.strokeRect(x0 + 1, y, x1 - x0 - 2, 36);
+      ctx.fillStyle = css("--text"); ctx.textAlign = "center";
+      if (x1 - x0 > 26) ctx.fillText(`${win.got}/${win.tru}`, (x0 + x1) / 2, y + 22);
+    });
+    // events
+    const top = type === "slide" ? 120 : 76, bot = h - 34;
+    EV.forEach(e => {
+      const y = top + e.y * (bot - top), x = X(e.t), late = dropped.has(e);
+      if (e.d > 3) { ctx.globalAlpha = 0.35; ctx.strokeStyle = css(late ? "--c-er" : "--c-lt"); ctx.beginPath(); ctx.moveTo(x, y); ctx.lineTo(X(Math.min(60, e.a)), y); ctx.stroke(); ctx.globalAlpha = 1; }
+      ctx.fillStyle = css(late ? "--c-er" : "--c-db");
+      ctx.beginPath(); ctx.arc(x, y, late ? 4.5 : 3.5, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+  $("wsz").oninput = windowsRun; $("wd").oninput = windowsRun;
+  window.addEventListener("resize", windowsRun);
+  window.addEventListener("themechange", windowsRun);
+  windowsRun();
+})();
+</script>
+</body>
+</html>

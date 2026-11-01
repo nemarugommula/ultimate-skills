@@ -1,0 +1,435 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.3 GraphRAG & knowledge graphs · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .triples { font-family: var(--mono); font-size: .8rem; columns: 2 260px; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+  .triples div { break-inside: avoid; }
+  .triples .on { color: var(--c-ev); font-weight: 700; }
+  .calcgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 6px 16px; }
+  .calcgrid label { display: flex; justify-content: space-between; gap: 8px; align-items: center; font-size: .88rem; }
+  .calcgrid input[type=range] { width: 120px; }
+</style>
+</head>
+<body data-lesson="a4-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 3</div>
+  <h1>GraphRAG & knowledge graphs</h1>
+  <p class="subtitle">Some answers aren't inside any chunk. They live in the connections between chunks: who owns what, who reports to whom, what depends on what. Graphs make those connections searchable.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Top-k vector retrieval</b> finds the k chunks most similar to the question (Lessons 2.2 and 3.4).</li>
+      <li><b>Structured output</b>: an LLM can return JSON in a schema you define, such as a list of entities and relations (Lesson 1.3).</li>
+      <li><b>Hierarchical summaries</b> answer broad questions no single chunk answers (Lesson 4.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>LinkedIn's customer-service team had years of support tickets. Plain RAG chunked them like any text, losing which section of which ticket a sentence came from, and how tickets linked to each other. In 2024 they rebuilt the index as a <b>knowledge graph</b>: each ticket a small tree of sections, tickets connected by explicit links (“clone of”) and by similarity. At question time an LLM finds the relevant ticket and translates the question into a graph query (Cypher, for the Neo4j database).</p>
+    <p>Retrieval quality (MRR, mean reciprocal rank) rose <b>77.6%</b> over the baseline. Deployed for about six months, it cut the team's median per-issue resolution time by <b>28.6%</b>.</p>
+  </div>
+
+  <h2>Numbers first: the question top-k can't answer</h2>
+  <p>Twelve short internal docs. One says “The Payments API is owned by the Ledger team.” Another says “Priya Nair manages the Ledger team.” Ask: <b>“Who manages the team that owns the Payments API?”</b></p>
+  <table>
+    <tr><th>Retriever</th><th>What it returns (top-3)</th><th>Can it answer?</th></tr>
+    <tr><td>Vector search</td><td>Three chunks that mention the <i>Payments API</i>: owner, an outage, what it does</td><td class="rk">No: the chunk naming Priya never mentions the Payments API, so it never scores high</td></tr>
+    <tr><td>Graph traversal</td><td>Payments API → <span class="mono">OWNED_BY</span> → Ledger team ← <span class="mono">MANAGES</span> ← Priya Nair</td><td class="ev">Yes, with both source chunks as citations</td></tr>
+  </table>
+  <p>Similarity search ranks chunks by how much they look like the question. A <b>multi-hop</b> question needs a chunk that looks nothing like the question, reachable only through an intermediate fact. The cost of fixing it with a graph is paid at indexing: an LLM call per chunk to extract the facts, which is typically hundreds of times the cost of just embedding the corpus (worked out below).</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A <b>knowledge graph</b> stores facts as <b>entities</b> (nodes: people, teams, services, products) and <b>relations</b> (typed edges: <span class="mono">OWNS</span>, <span class="mono">MANAGES</span>, <span class="mono">CALLS</span>). An LLM can read your documents and extract them. Then two new kinds of question become answerable: <b>multi-hop</b> (follow edges: owner → manager → their boss) and <b>global</b> (summarise clusters of the graph: “what are the main themes across all of this?”).
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the detective's corkboard</span>
+    <p>A detective doesn't solve the case by rereading the one witness statement that sounds most like the question. They pin every person and place on a board and connect them with string. The answer is a <i>path</i>: the car belongs to the cousin, the cousin works at the warehouse, the warehouse is next to the bank. Vector search reads statements; a graph follows the string.</p>
+  </div>
+
+  <h2>How GraphRAG builds its index</h2>
+  <svg id="pipe" style="width:100%;max-height:220px"></svg>
+  <ol>
+    <li><b>Chunk</b> the documents (Microsoft's GraphRAG paper used 600-token chunks with 100 tokens of overlap).</li>
+    <li><b>Extract</b>: an LLM reads each chunk and outputs entities (name, type, description) and relations (source, target, description). Optional extra “gleaning” passes ask “did you miss any?” to catch more.</li>
+    <li><b>Merge</b> duplicates (“Priya”, “P. Nair”) and summarise each entity's descriptions.</li>
+    <li><b>Detect communities</b>: an algorithm (Leiden) groups densely connected entities into nested clusters: teams within orgs within the company.</li>
+    <li><b>Summarise communities</b>: an LLM writes a report for every cluster at every level. These are pre-computed answers to “what's going on in this part of the corpus?”.</li>
+  </ol>
+  <p>Then there are two main ways to query:</p>
+  <table>
+    <tr><th>Query mode</th><th>How it works</th><th>For questions like</th></tr>
+    <tr><td><b>Local search</b></td><td>Find the entities named in the question, pull their neighbours, relations, and source chunks</td><td>“Who manages the team that owns the Payments API?”</td></tr>
+    <tr><td><b>Global search</b></td><td>Map-reduce over community reports: each report produces a partial answer; an LLM merges them</td><td>“What are the main risks across all incident reports?”</td></tr>
+  </table>
+  <p>In the paper, on two corpora of about 1 million tokens each, global search beat plain vector RAG on <b>comprehensiveness in 72–83%</b> of head-to-head comparisons for podcast transcripts and 72–80% for news articles, judged by an LLM. Using only the top-level community summaries needed <b>over 97% fewer</b> tokens than summarising the source text directly.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Multi-hop: vector top-k vs the graph</span>
+    <p class="hint">Twelve docs about a company's services and teams. The triples (subject–relation–object facts) were extracted from them (<b>simulated LLM extraction</b>; a real pipeline asks a model for JSON). Pick a question and a retriever. For the graph, the question is turned into a graph query (simulated, shown in Cypher) and actually executed on the graph below.</p>
+    <div class="controls">
+      <label>question <select id="gq" class="btn small"></select></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="gmode"><button data-v="vec" class="on" id="g-vec">Vector top-k</button><button data-v="iter" id="g-iter">Vector + follow-up searches</button><button data-v="graph" id="g-graph">Graph traversal</button></span>
+      <label>top-k <input type="range" id="gk" min="1" max="6" value="3"> <b class="mono" id="gkv"></b></label>
+      <button class="btn small" id="grun">▶ Run</button>
+    </div>
+    <svg id="kg" style="width:100%"></svg>
+    <div id="gplan"></div>
+    <div class="verdict" id="gverdict"></div>
+    <div id="ghits"></div>
+    <div class="stat-row">
+      <div class="stat">LLM calls at query time <b id="gcalls">–</b></div>
+      <div class="stat">chunks read <b id="gchunks">–</b></div>
+      <div class="stat">questions answerable (this mode) <b id="gscore">–</b></div>
+    </div>
+    <details class="mathbox"><summary>Show all extracted triples</summary><div class="inner"><div class="triples" id="triples"></div></div></details>
+  </div>
+  <p>What you should see: vector top-k answers the one-hop question, and even question 4 (both facts mention the Payments API, so both score high). It fails questions 2, 3 and 5, where a needed chunk never mentions the question's entity; raising k sometimes rescues one by luck. <b>Follow-up searches</b> (an LLM reads round one and writes the next query) answer everything, but pay one LLM call per hop at question time: that's the agentic RAG of Lesson 4.4. The <b>graph</b> answers everything with one query, because the hops were paid for at indexing.</p>
+
+  <h2>The cost: extraction isn't free</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: indexing 10,000 documents</span>
+    <p>10,000 docs × 1,000 tokens. Chunks of 600 with 100 overlap → ⌈(1,000 − 600) ÷ 500⌉ + 1 = 2 chunks per doc → <b>20,000 chunks</b>.</p>
+    <ul>
+      <li><b>Vector RAG:</b> embed 20,000 × 600 = 12M tokens × $0.02 per million = <b>$0.24</b>.</li>
+      <li><b>GraphRAG extraction</b>, with 1 gleaning pass: 40,000 LLM calls. Each sends the chunk plus a long instruction-and-examples prompt (assume 1,500 tokens) and returns ≈ 400 tokens of entities and relations: 40,000 × 2,100 = <b>84M input</b> and 40,000 × 400 = <b>16M output</b> tokens.</li>
+      <li>With a small model at an illustrative $0.50 / $2 per million in/out: 84 × 0.5 + 16 × 2 = <b>$74</b>; add ≈ 25% for entity and community summaries → <b>≈ $93</b>, about <b>385×</b> the embedding cost. With a frontier model at $5 / $25: <b>≈ $1,025</b>.</li>
+    </ul>
+    <p>Not ruinous for 10,000 documents. But it scales with every re-index, and with 10 million documents it's a project with a budget. That's why Microsoft built cheaper variants: <b>FastGraphRAG</b> (noun-phrase extraction with classic NLP instead of an LLM; only community reports use the LLM) and <b>LazyGraphRAG</b>, which defers summarisation to query time and reports indexing costs identical to vector RAG and 0.1% of full GraphRAG.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Graph extraction cost estimator</span>
+    <p class="hint">Every default is an illustrative assumption: check your provider's prices and measure your prompt's real token counts on 50 chunks before trusting a budget.</p>
+    <div class="calcgrid">
+      <label>documents <input type="range" id="cDocs" min="3" max="7" step="0.25" value="4"> <b class="mono" id="cDocsV"></b></label>
+      <label>tokens per doc <input type="range" id="cTpd" min="200" max="20000" step="100" value="1000"> <b class="mono" id="cTpdV"></b></label>
+      <label>chunk size <input type="range" id="cCs" min="200" max="2000" step="100" value="600"> <b class="mono" id="cCsV"></b></label>
+      <label>gleaning passes <input type="range" id="cGl" min="0" max="3" value="1"> <b class="mono" id="cGlV"></b></label>
+      <label>prompt overhead (tokens) <input type="range" id="cPr" min="300" max="4000" step="100" value="1500"> <b class="mono" id="cPrV"></b></label>
+      <label>output per call (tokens) <input type="range" id="cOut" min="100" max="1500" step="50" value="400"> <b class="mono" id="cOutV"></b></label>
+      <label>$ per M input <input type="range" id="cPin" min="0.05" max="10" step="0.05" value="0.5"> <b class="mono" id="cPinV"></b></label>
+      <label>$ per M output <input type="range" id="cPout" min="0.2" max="40" step="0.2" value="2"> <b class="mono" id="cPoutV"></b></label>
+      <label>requests per minute limit <input type="range" id="cRpm" min="100" max="10000" step="100" value="1000"> <b class="mono" id="cRpmV"></b></label>
+    </div>
+    <canvas class="chart" id="costchart" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">chunks <b id="cChunks">–</b></div>
+      <div class="stat">extraction LLM calls <b id="cCalls">–</b></div>
+      <div class="stat">GraphRAG indexing <b id="cGraph">–</b></div>
+      <div class="stat">vector RAG (embeddings) <b id="cVec">–</b></div>
+      <div class="stat">wall-clock at rate limit <b id="cTime">–</b></div>
+    </div>
+    <p class="hint" id="cmsg"></p>
+  </div>
+
+  <h2>The family of graph RAG methods</h2>
+  <table>
+    <tr><th>Method</th><th>Idea</th><th>Trade-off</th></tr>
+    <tr><td><b>Microsoft GraphRAG</b> (2024)</td><td>LLM-extracted entity graph + Leiden communities + community reports; local, global and DRIFT (a hybrid) search</td><td>Best for global “sensemaking” questions; most expensive indexing</td></tr>
+    <tr><td><b>LightRAG</b> (HKU, 2024)</td><td>Graph + vectors with dual-level retrieval: low-level (specific entities) and high-level (broad themes); incremental updates</td><td>Cheaper and easier to update; modes <span class="mono">local / global / hybrid / naive / mix</span></td></tr>
+    <tr><td><b>HippoRAG</b> (Ohio State, 2024)</td><td>Knowledge graph + Personalized PageRank from the question's entities, inspired by how the hippocampus indexes memories</td><td>Multi-hop in one retrieval step; reported 10–30× cheaper than iterative retrieval</td></tr>
+    <tr><td><b>Hand-built knowledge graph</b> (Neo4j etc.)</td><td>Your schema (teams, services, owners) from systems of record, queried with Cypher; LLM translates questions (text-to-Cypher)</td><td>Most precise when the data is already structured; no extraction errors, but someone owns the schema</td></tr>
+  </table>
+  <p>Notice the last row: if “who owns which service” already lives in a service catalogue or HR system, <b>load it</b>, don't extract it from prose. LLM extraction is for knowledge that only exists as text.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Microsoft GraphRAG</b> (<code>pip install graphrag</code>, CLI-driven), <b>LightRAG</b> (<code>lightrag-hku</code>), <b>Neo4j</b> with the <code>neo4j-graphrag</code> package (KG-building pipeline, vector and text-to-Cypher retrievers), and graph databases such as Neo4j, Amazon Neptune or Memgraph.</p>
+<pre><code><span class="c"># Microsoft GraphRAG, from the official getting-started guide</span>
+pip install graphrag
+graphrag init                      <span class="c"># writes settings.yaml + .env; pick chat and embedding models</span>
+graphrag index                     <span class="c"># or: graphrag index --method fast  (FastGraphRAG, cheaper)</span>
+graphrag query <span class="s">"What are the top themes in this story?"</span>                  <span class="c"># global (default)</span>
+graphrag query <span class="s">"Who is Scrooge and what are his main relationships?"</span> --method local</code></pre>
+<pre><code><span class="c"># A multi-hop question as one Cypher query (Neo4j Python driver)</span>
+<span class="k">from</span> neo4j <span class="k">import</span> GraphDatabase
+driver = GraphDatabase.driver(<span class="s">"neo4j://localhost:7687"</span>, auth=(<span class="s">"neo4j"</span>, password))
+records, _, _ = driver.execute_query(<span class="s">"""
+    MATCH (s:Service {name: $service})-[:OWNED_BY]->(t:Team)<-[:MANAGES]-(m:Person)
+    OPTIONAL MATCH (m)-[:REPORTS_TO]->(boss:Person)
+    RETURN t.name AS team, m.name AS manager, boss.name AS boss"""</span>,
+    service=<span class="s">"Payments API"</span>, database_=<span class="s">"neo4j"</span>)
+<span class="c"># Text-to-Cypher: an LLM writes the MATCH from the question + the graph schema.</span>
+<span class="c"># Run it with a read-only user, exactly like text-to-SQL (Lesson 4.6).</span></code></pre>
+    <p class="hint">GraphRAG's own docs warn that indexing “can consume a lot of LLM resources” and suggest starting with the tutorial dataset and a fast, inexpensive model.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Vector RAG only</td><td>Cheap, simple, incremental</td><td>Fails multi-hop and corpus-wide questions</td></tr>
+      <tr><td>Iterative retrieval (agentic)</td><td>No new index; handles multi-hop</td><td>One LLM call per hop at question time; slower, can wander</td></tr>
+      <tr><td>LLM-extracted graph</td><td>Multi-hop in one query; global questions via communities</td><td>Hundreds of × indexing cost; extraction errors and duplicate entities; updates re-run extraction and communities</td></tr>
+      <tr><td>Curated knowledge graph</td><td>Exact, explainable, cheap queries</td><td>Schema design and ownership; only covers what's modelled</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Don't start with GraphRAG. Check your eval: are failures really multi-hop or global? Try metadata (owner, team fields on chunks) and an iterative two-step search first. If relationships already live in a database, give the model a SQL or Cypher tool instead.</p></div>
+      <div><h4>At scale</h4><p>A knowledge graph built from systems of record, enriched by LLM extraction from documents, with entity resolution as a dedicated pipeline. Graph and vector indexes are queried together, community summaries are refreshed on a schedule, and extraction quality has its own eval.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“When would you use GraphRAG instead of vector RAG?” A senior answer:</p>
+    <ul>
+      <li>Names the two question types vectors fail: <b>multi-hop</b> (answer is a path through facts) and <b>global</b> (answer is a summary of the whole corpus).</li>
+      <li>Compares the options: iterative retrieval (query-time cost), LLM-extracted graph (index-time cost, ~hundreds of × embedding), curated graph from systems of record.</li>
+      <li>Mentions local vs global search, community summaries, and cheaper variants (LazyGraphRAG, LightRAG).</li>
+      <li>Wants evidence first: a labelled set showing which question types fail, and the cost of re-indexing as documents change.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Support tickets as a knowledge graph</b> <span class="tag co">🏢 LinkedIn · 2024</span> <a href="https://arxiv.org/abs/2404.17723" target="_blank" rel="noopener">RAG with Knowledge Graphs for Customer Service QA</a></div>
+      <p><b>How:</b> each ticket is parsed into a tree of sections; tickets link by explicit relations and by embedding similarity; an LLM translates questions into Cypher queries over Neo4j.</p>
+      <p><b>Why this method:</b> chunking threw away ticket structure and cross-ticket links. MRR rose 77.6%, and median per-issue resolution time fell 28.6% after about six months in production.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>From local to global</b> <span class="tag co">🏢 Microsoft Research · 2024</span> <a href="https://arxiv.org/abs/2404.16130" target="_blank" rel="noopener">GraphRAG: A Graph RAG Approach to Query-Focused Summarization</a></div>
+      <p><b>How:</b> LLM-extracted entity graph, Leiden communities, pre-generated community summaries, map-reduce answers.</p>
+      <p><b>Why this method:</b> “what are the main themes?” is summarisation, not retrieval. Global search won 72–83% of comprehensiveness comparisons against vector RAG on a 1M-token podcast corpus.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Graph RAG without the indexing bill</b> <span class="tag co">🏢 Microsoft Research · 2024</span> <a href="https://www.microsoft.com/en-us/research/blog/lazygraphrag-setting-a-new-standard-for-quality-and-cost/" target="_blank" rel="noopener">LazyGraphRAG</a></div>
+      <p><b>How:</b> no up-front LLM summarisation; lightweight indexing, with graph-style exploration and summarisation done at query time.</p>
+      <p><b>Why this method:</b> full GraphRAG's indexing cost was prohibitive for some uses; LazyGraphRAG's indexing costs are reported identical to vector RAG and 0.1% of full GraphRAG.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Graph + vectors, dual-level</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://github.com/HKUDS/LightRAG" target="_blank" rel="noopener">LightRAG (HKU)</a></div>
+      <p><b>How:</b> extracts entities and relations into a graph, indexes them with vectors, and retrieves at a specific-entity level and a broad-theme level, with incremental updates for new documents.</p>
+      <p><b>Why this method:</b> keeps graph benefits while making updates cheap; its docs recommend a fast, non-reasoning model for extraction because it runs on every chunk.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · Google said it in 2012</span>
+    <p>When Google launched its <a href="https://blog.google/products/search/introducing-knowledge-graph-things-not/" target="_blank" rel="noopener">Knowledge Graph</a> in 2012, the slogan was “things, not strings”: search should understand entities and their relationships, not just match words. It started with more than 500 million objects and 3.5 billion facts, drawn from sources such as Freebase and Wikipedia. GraphRAG is the same idea, except the graph is extracted from your own documents by an LLM.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Extraction is structured output (Lesson 1.3) at scale; community summaries are a cousin of RAPTOR's tree (4.2). Iterative multi-hop retrieval becomes an agent loop in 4.4, and text-to-Cypher is text-to-SQL's sibling (4.6), with the same read-only guardrails. Graph databases as a storage choice are covered in the System Design course: <a href="../../system-design-course/phase2/7-specialized-stores.html">specialized stores</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://microsoft.github.io/graphrag/get_started/" target="_blank" rel="noopener">GraphRAG: getting started</a>. Index a sample book and try local vs global search.</li>
+      <li><span class="kind">Blog</span> <a href="https://www.microsoft.com/en-us/research/blog/graphrag-unlocking-llm-discovery-on-narrative-private-data/" target="_blank" rel="noopener">GraphRAG: Unlocking LLM discovery on narrative private data</a>. Where baseline RAG fails to “connect the dots”.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2405.14831" target="_blank" rel="noopener">HippoRAG</a>. Knowledge graph + Personalized PageRank for one-step multi-hop retrieval.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 50,000 chunks, extraction with no gleaning, 2,000 input and 500 output tokens per call, at $1 / $4 per million tokens. Roughly what does extraction cost?</div>
+    <div class="opts"><button class="opt">$10</button><button class="opt" data-ok>$200</button><button class="opt">$2,000</button></div>
+    <div class="explain">Input: 50,000 × 2,000 = 100M tokens × $1/M = $100. Output: 50,000 × 500 = 25M × $4/M = $100. Total ≈ <b>$200</b>, before summaries, and each gleaning pass roughly adds another round.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your engineering assistant answers “who owns service X?” well, but not “who should I page if the service behind the checkout page is down?” What's the best first step?</div>
+    <div class="opts"><button class="opt">Increase top-k to 50</button><button class="opt" data-ok>Load the service catalogue (dependencies, owners, on-call) as a graph or tables and let the model query it, instead of extracting it from prose</button><button class="opt">Fine-tune the embedding model on service names</button></div>
+    <div class="explain">It's a multi-hop question (checkout → depends on → service → owned by → team → on-call), and the relationships already exist as structured data. Querying the system of record is cheaper and exact; LLM extraction is for knowledge that only exists as text.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Which question benefits most from GraphRAG's global search?</div>
+    <div class="opts"><button class="opt">“What is the refund window for Plus members?”</button><button class="opt">“What did the 3 May incident report say caused the outage?”</button><button class="opt" data-ok>“Across two years of incident reports, what are the recurring root-cause themes?”</button></div>
+    <div class="explain">Global search answers corpus-wide sensemaking questions from pre-computed community summaries. The first two are single-chunk lookups, which plain vector retrieval handles well and cheaply.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Vector search fails when an answer is a path through facts (multi-hop) or a summary of everything (global).</li>
+      <li>GraphRAG: LLM extracts entities and relations, Leiden finds communities, LLM summarises them; local search follows edges, global search maps over summaries.</li>
+      <li>The cost is at indexing: typically hundreds of times the embedding cost. Cheaper variants: FastGraphRAG, LazyGraphRAG, LightRAG.</li>
+      <li>If the relationships already live in a system of record, load them into a graph or SQL and query them; extract only what exists only as text.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const fmt$ = v => v >= 1000 ? "$" + Math.round(v).toLocaleString("en-US") : v >= 10 ? "$" + v.toFixed(0) : "$" + v.toFixed(2);
+
+  // ---------- index pipeline diagram ----------
+  const P = new Flow($("pipe"), { width: 760, height: 150 });
+  P.node("docs", { x: 55, y: 45, w: 90, h: 44, label: "Documents", sub: "chunks", kind: "cl" })
+   .node("ext", { x: 195, y: 45, w: 120, h: 44, label: "LLM extract", sub: "entities + relations", kind: "nw" })
+   .node("graph", { x: 345, y: 45, w: 110, h: 44, label: "Graph", sub: "merge duplicates", kind: "db" })
+   .node("comm", { x: 490, y: 45, w: 120, h: 44, label: "Leiden", sub: "communities", kind: "sv" })
+   .node("rep", { x: 650, y: 45, w: 140, h: 44, label: "LLM summaries", sub: "community reports", kind: "nw" })
+   .node("local", { x: 345, y: 118, w: 150, h: 40, label: "Local search", sub: "follow edges", kind: "ca" })
+   .node("global", { x: 650, y: 118, w: 150, h: 40, label: "Global search", sub: "map-reduce reports", kind: "ca" })
+   .edge("docs", "ext").edge("ext", "graph").edge("graph", "comm").edge("comm", "rep")
+   .edge("graph", "local", { dashed: true }).edge("rep", "global", { dashed: true }).render();
+
+  // ---------- knowledge graph ----------
+  const D = [
+    "The Payments API is owned by the Ledger team.",
+    "The Payments API had a 40-minute outage on 3 May after a bad config push.",
+    "The Payments API handles card refunds and payouts for checkout.",
+    "Priya Nair manages the Ledger team.",
+    "The Ledger team sits in the Money platform group.",
+    "Priya Nair reports to Tomás Reyes, VP of Platform.",
+    "The Search API is owned by the Discovery team.",
+    "Dan Okafor manages the Discovery team.",
+    "The Search API had an outage on 12 June during a reindex.",
+    "Tomás Reyes leads the Platform org from Lisbon.",
+    "The Checkout web app calls the Payments API for every order.",
+    "The Ledger team is on call for payouts during holidays.",
+  ];
+  const ENT = {
+    checkout: ["Checkout app", 65, 50, "cl"], pay: ["Payments API", 265, 50, "sv"], ledger: ["Ledger team", 480, 50, "db"],
+    priya: ["Priya Nair", 690, 50, "ca"], tomas: ["Tomás Reyes", 690, 160, "ca"], platform: ["Platform org", 690, 265, "db"],
+    money: ["Money platform", 480, 160, "db"], may: ["3 May outage", 265, 160, "er"], search: ["Search API", 265, 265, "sv"],
+    june: ["12 June outage", 65, 265, "er"], disc: ["Discovery team", 480, 265, "db"], dan: ["Dan Okafor", 65, 160, "ca"],
+  };
+  // [subject, relation, object, source doc]
+  const TR = [
+    ["pay", "OWNED_BY", "ledger", 0], ["pay", "HAD_OUTAGE", "may", 1], ["priya", "MANAGES", "ledger", 3], ["ledger", "PART_OF", "money", 4],
+    ["priya", "REPORTS_TO", "tomas", 5], ["search", "OWNED_BY", "disc", 6], ["dan", "MANAGES", "disc", 7], ["search", "HAD_OUTAGE", "june", 8],
+    ["tomas", "LEADS", "platform", 9], ["checkout", "CALLS", "pay", 10],
+  ];
+  const G = new Flow($("kg"), { width: 760, height: 310 });
+  Object.entries(ENT).forEach(([id, [label, x, y, kind]]) => G.node(id, { x, y, w: 112, h: 38, label, kind }));
+  TR.forEach(([a, r, b]) => G.edge(a, b, { label: r }));
+  G.render();
+  $("triples").innerHTML = TR.map(([a, r, b, d], i) => `<div id="tr${i}">(${ENT[a][0]}) -[${r}]→ (${ENT[b][0]}) <span class="muted">· doc ${d}</span></div>`).join("");
+
+  // questions: needed docs, a graph plan (hops) and a scripted Cypher, follow-up queries for iterative search
+  const GQ = [
+    { q: "Which team owns the Payments API?", need: [0], cy: "MATCH (s {name:'Payments API'})-[:OWNED_BY]->(t) RETURN t",
+      plan: [["pay"], ["OWNED_BY", "out"]], follow: [], ans: ids => ENT[ids[0]][0] },
+    { q: "Who manages the team that owns the Payments API?", need: [0, 3], cy: "MATCH (s {name:'Payments API'})-[:OWNED_BY]->(t)<-[:MANAGES]-(m) RETURN m",
+      plan: [["pay"], ["OWNED_BY", "out"], ["MANAGES", "in"]], follow: ["Who manages the Ledger team?"] },
+    { q: "Who does the manager of the team behind the Payments API report to?", need: [0, 3, 5], cy: "MATCH (s {name:'Payments API'})-[:OWNED_BY]->(t)<-[:MANAGES]-(m)-[:REPORTS_TO]->(b) RETURN b",
+      plan: [["pay"], ["OWNED_BY", "out"], ["MANAGES", "in"], ["REPORTS_TO", "out"]], follow: ["Who manages the Ledger team?", "Who does Priya Nair report to?"] },
+    { q: "If the team that owns the Payments API has an outage, which app breaks?", need: [0, 10], cy: "MATCH (a)-[:CALLS]->(s {name:'Payments API'})-[:OWNED_BY]->(t) RETURN a, t",
+      plan: [["pay"], ["CALLS", "in"]], extra: [["pay"], ["OWNED_BY", "out"]], follow: ["Which app calls the Payments API?"] },
+    { q: "Which APIs had outages, and which teams own them?", need: [1, 8, 0, 6], cy: "MATCH (o)<-[:HAD_OUTAGE]-(s)-[:OWNED_BY]->(t) RETURN s, o, t",
+      plan: [["pay", "search"], ["HAD_OUTAGE", "out"]], extra: [["pay", "search"], ["OWNED_BY", "out"]], follow: ["Which APIs had an outage?", "Which team owns the Search API?"] },
+  ];
+  $("gq").innerHTML = GQ.map((g, i) => `<option value="${i}">${i + 1}. ${g.q}</option>`).join("");
+  function traverse(plan) { // returns {nodes path list, used triple indexes, final ids}
+    let cur = plan[0].slice(); const used = [], path = [cur.slice()];
+    plan.slice(1).forEach(([rel, dir]) => {
+      const next = [];
+      TR.forEach(([a, r, b], i) => {
+        if (r !== rel) return;
+        if (dir === "out" && cur.includes(a)) { next.push(b); used.push(i); }
+        if (dir === "in" && cur.includes(b)) { next.push(a); used.push(i); }
+      });
+      cur = [...new Set(next)]; path.push(cur.slice());
+    });
+    return { used, final: cur, path };
+  }
+  const ranked = (q, k) => AI.search(D, q, { mode: "hybrid", k }).map(r => r.i);
+  function answer(g, mode, k) {
+    if (mode === "vec") { const ids = ranked(g.q, k); return { docs: ids, calls: 0, rounds: [[g.q, ids]] }; }
+    if (mode === "iter") {
+      const rounds = [[g.q, ranked(g.q, k)]]; g.follow.forEach(f => rounds.push([f, ranked(f, k)]));
+      const docs = []; rounds.forEach(([, ids]) => ids.forEach(i => { if (!docs.includes(i)) docs.push(i); }));
+      return { docs, calls: g.follow.length + 1, rounds };
+    }
+    const t = traverse(g.plan), t2 = g.extra ? traverse(g.extra) : { used: [], final: [] };
+    const used = [...new Set([...t.used, ...t2.used])];
+    return { docs: used.map(i => TR[i][3]), calls: 1, used, final: t.final, final2: t2.final, path: t.path };
+  }
+  const solved = (g, r) => g.need.every(d => r.docs.includes(d));
+  let gmode = "vec";
+  const gBtns = [...$("gmode").querySelectorAll("button")];
+  gBtns.forEach(b => (b.onclick = () => { gBtns.forEach(x => x.classList.toggle("on", x === b)); gmode = b.dataset.v; renderG(true); }));
+  function paint(r) {
+    Object.keys(ENT).forEach(id => G.set(id, { hot: false }));
+    TR.forEach(([a, , b]) => G.edgeStyle(a, b, { color: "--line", width: 2 }));
+    TR.forEach((_, i) => $("tr" + i).classList.remove("on"));
+    if (r.used) r.used.forEach(i => { const [a, , b] = TR[i]; G.edgeStyle(a, b, { color: "--c-ev", width: 4 }); G.set(a, { hot: true }).set(b, { hot: true }); $("tr" + i).classList.add("on"); });
+  }
+  async function renderG(animate) {
+    const g = GQ[+$("gq").value], k = +$("gk").value; $("gkv").textContent = gmode === "graph" ? k + " (not used)" : k;
+    const r = answer(g, gmode, k), ok = solved(g, r);
+    paint(r);
+    if (gmode === "graph") {
+      $("gplan").innerHTML = `<div class="prompt"><span class="md">simulated LLM: question → Cypher</span>\n${esc(g.cy)}</div>`;
+      const names = ids => ids.map(i => ENT[i][0]).join(", ");
+      $("ghits").innerHTML = `<div class="hit"><span class="sc">graph result</span><b>${names(r.final)}</b>${r.final2 && r.final2.length ? " · " + names(r.final2) : ""}</div>` +
+        r.docs.map(d => `<div class="hit"><span class="sc">source doc ${d}</span>${esc(D[d])}</div>`).join("");
+      if (animate && r.used.length) {
+        const hops = r.path.map(p => p[0]).filter(Boolean);
+        if (hops.length > 1) await G.packet(hops, { color: "--c-ev", dur: 500 * hops.length });
+      }
+    } else {
+      $("gplan").innerHTML = gmode === "iter" ? `<div class="prompt"><span class="md">simulated LLM reads each round and writes the next query</span>\n${r.rounds.map(([q], i) => `round ${i + 1}: ${esc(q)}`).join("\n")}</div>` : "";
+      $("ghits").innerHTML = r.rounds.map(([q, ids], n) => (gmode === "iter" ? `<div class="muted">round ${n + 1}</div>` : "") +
+        ids.map(i => `<div class="hit${g.need.includes(i) ? "" : " miss"}"><span class="sc">doc ${i}${g.need.includes(i) ? " · needed" : ""}</span>${esc(D[i])}</div>`).join("")).join("");
+    }
+    $("gverdict").innerHTML = ok ? `<span class="ev">✅ Every fact the answer needs was found (docs ${g.need.join(", ")}).</span>`
+      : `<span class="rk">❌ Missing needed doc${g.need.filter(d => !r.docs.includes(d)).length > 1 ? "s" : ""} ${g.need.filter(d => !r.docs.includes(d)).join(", ")}: the model can't connect the dots.</span>`;
+    $("gcalls").textContent = r.calls + (gmode === "graph" ? " (question → query)" : "");
+    $("gchunks").textContent = r.docs.length;
+    $("gscore").textContent = GQ.filter(x => solved(x, answer(x, gmode, k))).length + " / " + GQ.length;
+  }
+  $("gq").oninput = () => renderG(true); $("gk").oninput = () => renderG(false); $("grun").onclick = () => renderG(true);
+  renderG(false);
+
+  // ---------- cost estimator ----------
+  const ids = ["cDocs", "cTpd", "cCs", "cGl", "cPr", "cOut", "cPin", "cPout", "cRpm"];
+  function calc() {
+    const v = Object.fromEntries(ids.map(i => [i, +$(i).value]));
+    const docs = Math.round(Math.pow(10, v.cDocs)), ov = Math.round(v.cCs / 6);
+    const cpd = v.cTpd <= v.cCs ? 1 : Math.ceil((v.cTpd - v.cCs) / (v.cCs - ov)) + 1;
+    const chunks = docs * cpd, calls = chunks * (1 + v.cGl);
+    const tin = calls * (Math.min(v.cCs, v.cTpd) + v.cPr), tout = calls * v.cOut;
+    const ext = tin / 1e6 * v.cPin + tout / 1e6 * v.cPout, graph = ext * 1.25;
+    const embTok = chunks * Math.min(v.cCs, v.cTpd), vec = embTok / 1e6 * 0.02;
+    const fast = 0.25 * ext + vec; // FastGraphRAG: only community reports use the LLM (assumed ≈ the 25% summary share)
+    const mins = calls / v.cRpm;
+    $("cDocsV").textContent = docs.toLocaleString("en-US"); $("cTpdV").textContent = v.cTpd.toLocaleString("en-US");
+    $("cCsV").textContent = v.cCs + " (overlap " + ov + ")"; $("cGlV").textContent = v.cGl; $("cPrV").textContent = v.cPr;
+    $("cOutV").textContent = v.cOut; $("cPinV").textContent = "$" + v.cPin.toFixed(2); $("cPoutV").textContent = "$" + v.cPout.toFixed(1);
+    $("cRpmV").textContent = v.cRpm.toLocaleString("en-US");
+    $("cChunks").textContent = chunks.toLocaleString("en-US"); $("cCalls").textContent = calls.toLocaleString("en-US");
+    $("cGraph").textContent = fmt$(graph); $("cVec").textContent = fmt$(vec);
+    $("cTime").textContent = mins < 60 ? Math.ceil(mins) + " min" : mins < 2880 ? (mins / 60).toFixed(1) + " h" : (mins / 1440).toFixed(1) + " days";
+    Plot.bars($("costchart"), { bars: [
+      { label: "Vector RAG", value: vec, color: MX.css("--c-cx") },
+      { label: "LazyGraphRAG (≈ vector)", value: vec, color: MX.css("--c-ev") },
+      { label: "FastGraphRAG (est.)", value: fast, color: MX.css("--c-tl") },
+      { label: "GraphRAG standard", value: graph, color: MX.css("--c-rk") },
+    ], yMin: 0, yLabel: "indexing cost ($)" });
+    $("cmsg").textContent = `GraphRAG ≈ ${Math.round(graph / vec).toLocaleString("en-US")}× the embedding cost. Assumptions: chunk overlap = 1/6 of chunk size, summaries add 25% to extraction, FastGraphRAG pays only for community reports (≈ that 25%), embeddings at $0.02 per million tokens. LazyGraphRAG's indexing is reported identical to vector RAG.`;
+  }
+  ids.forEach(i => ($(i).oninput = calc));
+  calc();
+})();
+</script>
+</body>
+</html>

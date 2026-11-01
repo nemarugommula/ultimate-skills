@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.3 Caching · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+</style>
+</head>
+<body data-lesson="s1-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 1 · Lesson 3</div>
+  <h1>Caching: the fastest request is the one you don't make</h1>
+  <p class="subtitle">Keep a copy of popular answers somewhere fast, so most requests never reach the slow database. It's the single biggest lever for scaling reads, and the source of some famous outages.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Latency</b> = how long one request takes. Memory is roughly 100× faster than a disk-backed database query (Lesson 0.3).</li>
+      <li><b>Stateless app servers</b> behind a load balancer, so you can add more of them (Lessons 1.1 and 1.2).</li>
+      <li><b>QPS</b> = queries per second, how much load a component sees (Lesson 0.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>One day in February 2016, Stack Overflow served <b>505 million SQL queries</b>. Those took 168 hours of combined database time. The same day it served <b>5.8 billion</b> reads from its Redis cache, more than 11× as many, and those took <b>2.8 hours</b> in total.</p>
+    <p>Most of the site's reads never touched the database. That's caching, and by the end of this lesson you'll be able to size a cache, pick its rules, and explain how it can take a whole site down.</p>
+  </div>
+
+  <h2>Numbers first: what a cache buys you</h2>
+  <p>Your product page reads from Postgres. A query takes about <b>10 ms</b>, and the database starts to struggle above <b>2,000 queries per second</b>. Traffic is <b>10,000 reads per second</b>. Without help, the database melts.</p>
+  <p>Now put a Redis cache in front. Asking Redis takes about <b>1 ms</b>. Suppose <b>90%</b> of requests find their answer there (a <b>hit</b>) and 10% don't (a <b>miss</b>, so we also ask the database):</p>
+  <table>
+    <tr><th></th><th>No cache</th><th>Cache with 90% hit rate</th></tr>
+    <tr><td>Database load</td><td class="er">10,000 QPS (melts)</td><td class="db">10% × 10,000 = 1,000 QPS ✅</td></tr>
+    <tr><td>Average latency</td><td>10 ms</td><td>0.9 × 1 ms + 0.1 × (1 + 10) ms = <b>2 ms</b></td></tr>
+  </table>
+  <p>Five times faster, and the database does a tenth of the work. Every extra point of hit rate counts: at 99% the database sees only 100 QPS.</p>
+  <div class="eq">
+    avg latency = <span class="ca">h</span> × <span class="lt">t<sub>cache</sub></span> + (1 − <span class="ca">h</span>) × (<span class="lt">t<sub>cache</sub></span> + <span class="lt">t<sub>db</sub></span>)
+    <span class="say">“The average time is: hit rate h times the cache time, plus the miss rate (1 − h) times the cache time plus the database time.” On a miss you pay for both trips.</span>
+  </div>
+  <div class="legend"><span class="ca">h: hit rate (share of requests answered by the cache)</span><span class="lt">t: time for one trip</span></div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A cache keeps <b>copies of popular answers</b> somewhere much faster than where they really live. Because real traffic is lopsided (a few items get most of the requests), a small cache can absorb most of the load.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the kitchen counter</span>
+    <p>Your pantry (the database) has everything, but it's a walk away. So you keep salt, oil and coffee on the counter (the cache). Most of the time what you need is right there. The counter is small, so when something new goes on it, something you haven't used lately goes back (that's <b>eviction</b>). And if you refill the oil bottle in the pantry, the one on the counter is now old (that's <b>invalidation</b>, the hard part).</p>
+  </div>
+
+  <h2>Where caches live</h2>
+  <p>Caches sit at every layer between the user and the data. The closer to the user, the faster, but the harder to keep fresh:</p>
+  <table>
+    <tr><th>Layer</th><th>Example</th><th>Typical speed</th><th>Who controls freshness</th></tr>
+    <tr><td><span class="cl">Browser / app</span></td><td>HTTP <code>Cache-Control</code> headers</td><td>0 ms (no network)</td><td>Your headers; you can't “recall” it</td></tr>
+    <tr><td><span class="ca">CDN edge</span></td><td>Cloudflare, CloudFront, Fastly (Lesson 1.4)</td><td>~10–30 ms (nearby city)</td><td>TTL + purge API</td></tr>
+    <tr><td><span class="sv">In-process</span></td><td>A dictionary / LRU inside each app server</td><td>microseconds</td><td>Each server separately (copies drift)</td></tr>
+    <tr><td><span class="ca">Distributed cache</span></td><td>Redis, Memcached, Netflix EVCache</td><td>~0.5–1 ms</td><td>Your code (shared by all servers)</td></tr>
+    <tr><td><span class="db">Inside the database</span></td><td>Postgres buffer pool, MySQL InnoDB buffer</td><td>automatic</td><td>The database itself</td></tr>
+  </table>
+
+  <h2>The rules of the cache</h2>
+  <p>Three decisions define any cache: <b>how data gets in</b>, <b>what gets thrown out when it's full</b>, and <b>how long a copy is trusted</b>.</p>
+  <h3>1. How data gets in: the four patterns</h3>
+  <table>
+    <tr><th>Pattern</th><th>How it works</th><th>Good for</th></tr>
+    <tr><td><b>Cache-aside</b> (lazy loading)</td><td>App checks the cache; on a miss it reads the DB and writes the answer into the cache.</td><td>The default. Only caches what's actually asked for. A cache crash just means more misses.</td></tr>
+    <tr><td><b>Read-through</b></td><td>Same, but the cache library fetches from the DB for you.</td><td>Cleaner app code (e.g. a caching layer in front of DynamoDB).</td></tr>
+    <tr><td><b>Write-through</b></td><td>Every write goes to the cache and the DB together.</td><td>Data that's read right after it's written. Writes get slower.</td></tr>
+    <tr><td><b>Write-behind</b> (write-back)</td><td>Write to the cache now, flush to the DB later in batches.</td><td>Very write-heavy counters (likes, views). Risk: lose recent writes if the cache dies.</td></tr>
+  </table>
+  <h3>2. What gets thrown out: eviction</h3>
+  <ul>
+    <li><b>LRU</b> (least recently used): evict whatever hasn't been touched for longest. The usual default.</li>
+    <li><b>LFU</b> (least frequently used): evict whatever is used least often. Better when popularity is stable; slow to react when it changes.</li>
+    <li><b>FIFO</b>: evict the oldest entry, however popular. Simple, usually worse.</li>
+  </ul>
+  <p class="muted">Fun detail: Redis doesn't track exact LRU order, which would cost memory. It samples a handful of random keys and evicts the best candidate among them, which is close enough and much cheaper.</p>
+  <h3>3. How long a copy is trusted: TTL</h3>
+  <p>A <b>TTL</b> (time to live) says “throw this copy away after 60 seconds”. Short TTL = fresher data, more misses. Long TTL = more hits, staler data. Many systems also <b>delete the key on write</b> so the next read fetches the new value.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: sizing a cache</span>
+    <p>An online shop has 1,000,000 products, each cached as a 2 KB JSON blob. Analytics show the top 5% of products get 80% of views.</p>
+    <ul>
+      <li>Caching the hot 5% = 50,000 × 2 KB = <b>100 MB</b>. That fits in the smallest Redis instance, and gives roughly an 80% hit rate.</li>
+      <li>Caching everything = 1,000,000 × 2 KB = <b>2 GB</b>. Still small, but the last 95% of products only add the remaining 20% of hits.</li>
+      <li>At 5,000 reads/s and 80% hits, the database sees 1,000 QPS instead of 5,000.</li>
+    </ul>
+    <p>This is why caches work: <b>popularity is lopsided</b>. Try it below.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Run a cache</span>
+    <p class="hint">10,000 different keys, 20,000 requests at 1,000 per second. “Traffic skew” controls how lopsided popularity is (higher = a few keys get almost everything). Press <b>Run</b>, then <b>Send 8 requests</b> to watch hits bounce back from the cache and misses travel to the database.</p>
+    <svg id="fl"></svg>
+    <div class="controls">
+      <label>cache size <input type="range" id="cs" min="0" max="5" step="1" value="3"> <b class="mono" id="csv"></b></label>
+      <label>traffic skew <input type="range" id="sk" min="0.5" max="1.3" step="0.1" value="1.1"> <b class="mono" id="skv"></b></label>
+      <label>TTL <input type="range" id="tt" min="0" max="4" step="1" value="0"> <b class="mono" id="ttv"></b></label>
+    </div>
+    <div class="controls">
+      <span class="hint">Eviction:</span>
+      <span class="seg" id="ev"><button data-v="lru" class="on">LRU</button><button data-v="lfu">LFU</button><button data-v="fifo">FIFO</button></span>
+      <button class="btn primary" id="run">▶ Run 20,000 requests</button>
+      <button class="btn" id="send">Send 8 requests</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">hit rate <b id="hr">–</b></div>
+      <div class="stat">database load <b id="dq">–</b></div>
+      <div class="stat">avg latency <b id="al">–</b></div>
+      <div class="stat">cache memory <b id="mem">–</b></div>
+    </div>
+    <canvas class="chart" id="hc" style="height:200px"></canvas>
+    <p class="hint" id="hmsg">Hit rate each second of the run. The first seconds are a “cold” cache: empty, so everything misses.</p>
+  </div>
+  <p>Things to try: set the cache to 1% of keys and the skew to 1.3 (very lopsided, like a viral feed). A cache holding 100 of the 10,000 keys still catches nearly 80% of requests, because the popular keys fit. Now drop the skew to 0.5 (everyone wants something different) and the same cache catches under 10%. Then add a 5-second TTL: freshness costs hits. Finally compare LRU vs FIFO with a small cache.</p>
+
+  <h2>The hard part: when the cache bites back</h2>
+  <p>Caches fail in famous ways. Three to know cold:</p>
+  <ul>
+    <li><b>Stale data:</b> the database changed but the cache still holds the old copy. Fix: delete or update the key on every write, plus a TTL as a safety net.</li>
+    <li><b>Hot key:</b> one key (a celebrity's profile, a viral product) gets so much traffic that the single cache server holding it melts. Fix: copy the hot key to several servers, or keep a tiny in-process cache in each app server.</li>
+    <li><b>Cache stampede</b> (thundering herd): a hot key expires, and in that instant thousands of requests all miss and all hit the database at once. Try it:</li>
+  </ul>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The cache stampede</span>
+    <p class="hint">A hot key gets 2,000 requests per second. At t = 1 s its TTL expires. Rebuilding it takes the database a while. Compare what the database sees with no protection, with a lock (only one request rebuilds, the rest wait), and with “serve stale while one request refreshes”.</p>
+    <div class="controls">
+      <label>rebuild time <input type="range" id="rb" min="100" max="1000" step="50" value="400"> <b class="mono" id="rbv"></b></label>
+      <span class="seg" id="mode"><button data-v="none" class="on">No protection</button><button data-v="lock">Lock (single-flight)</button><button data-v="stale">Serve stale</button></span>
+    </div>
+    <canvas class="chart" id="sc" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">DB queries for this key <b id="sq">–</b></div>
+      <div class="stat">peak at once <b id="sp">–</b></div>
+      <div class="stat">users who waited <b id="sw">–</b></div>
+      <div class="stat">users who got stale data <b id="ss">–</b></div>
+    </div>
+    <p class="hint" id="smsg"></p>
+  </div>
+  <p>With no protection, every request that arrives during the rebuild also rebuilds: hundreds of identical queries at once. That's exactly the spike that knocks over a database right when traffic is highest. A lock turns it into one query. Serving the old copy for a moment costs a little freshness but nobody waits.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Redis</b> (the most common choice; also does counters, queues, rate limits), <b>Memcached</b> (simpler, multi-threaded, pure cache), managed versions like <b>AWS ElastiCache</b>, <b>Google Memorystore</b> or <b>Upstash</b>. Cache-aside in Python with <code>redis-py</code>:</p>
+<pre><code><span class="k">import</span> json, redis
+r = redis.Redis(host=<span class="s">"localhost"</span>, port=<span class="n">6379</span>)
+
+<span class="k">def</span> get_product(pid):
+    key = <span class="s">f"product:{pid}"</span>
+    cached = r.get(key)                          <span class="c"># 1. ask the cache (~1 ms)</span>
+    <span class="k">if</span> cached:
+        <span class="k">return</span> json.loads(cached)                <span class="c">#    hit: done</span>
+    row = db.query(<span class="s">"SELECT * FROM products WHERE id=%s"</span>, pid)  <span class="c"># 2. miss: ask the DB (~10 ms)</span>
+    r.set(key, json.dumps(row), ex=<span class="n">300</span>)      <span class="c"># 3. store a copy for 5 minutes (TTL)</span>
+    <span class="k">return</span> row
+
+<span class="k">def</span> update_product(pid, fields):
+    db.update(pid, fields)
+    r.delete(<span class="s">f"product:{pid}"</span>)                  <span class="c"># invalidate: next read fetches the new value</span></code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 6379:6379 redis</code>, then <code>redis-cli SET greeting hi EX 10</code> and <code>redis-cli TTL greeting</code>. For browsers and CDNs, the equivalent knob is the HTTP header <code>Cache-Control: public, max-age=300</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs: when a cache helps and when it hurts</span>
+    <table>
+      <tr><th>✅ Add a cache when…</th><th>❌ Think twice when…</th></tr>
+      <tr><td>Reads far outnumber writes (10:1 or more)</td><td>Data changes on almost every read</td></tr>
+      <tr><td>Popularity is lopsided (a few hot items)</td><td>Every request wants something different (low skew)</td></tr>
+      <tr><td>Slightly stale data is fine (product pages, feeds, profiles)</td><td>Staleness is dangerous (account balances, stock levels at checkout)</td></tr>
+      <tr><td>The answer is expensive to compute (joins, rankings, ML scores)</td><td>The database is already fast enough. A cache is one more system to run, monitor and keep consistent.</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Don't add a cache on day one. Add database indexes first (Lesson 2.2). When the DB CPU runs hot on reads, add one managed Redis with cache-aside and short TTLs. Cache whole API responses for anonymous users and let a CDN do the rest.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Several cache layers: CDN, regional Redis/Memcached clusters spread with consistent hashing (Lesson 2.4), copies of hot keys, leases or locks against stampedes, and invalidation driven by database change streams (Lesson 3.2). Teams track hit rate as a key metric (Lesson 6.3).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Saying “add a cache” earns nothing. What a senior answer covers:</p>
+    <ul>
+      <li><b>What</b> exactly you cache (key and value), and an estimated <b>hit rate</b> from the access pattern.</li>
+      <li>The <b>pattern</b> (cache-aside is the safe default) and the <b>invalidation</b> plan: delete on write + TTL.</li>
+      <li>What happens when the cache <b>dies or restarts cold</b>: can the database survive the full load for a few minutes?</li>
+      <li><b>Hot keys and stampedes</b>, and how you'd prevent them.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>A cache in front of everything</b> <span class="tag co">🏢 Facebook · 2013</span> <a href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala" target="_blank" rel="noopener">Scaling Memcache at Facebook (NSDI)</a></div>
+      <p><b>How:</b> web servers use cache-aside against huge Memcached pools; the paper reports billions of requests per second and trillions of items. It also introduces <b>leases</b>: the cache hands out a token so only one client refills a missing key, which stops stampedes and stale writes.</p>
+      <p><b>Why this method:</b> the social graph is read far more than it's written, so serving reads from memory let the databases handle a fraction of the traffic.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Redis absorbing most reads</b> <span class="tag co">🏢 Stack Overflow · 2016</span> <a href="https://nickcraver.com/blog/2016/02/17/stack-overflow-the-architecture-2016-edition/" target="_blank" rel="noopener">Stack Overflow: The Architecture, 2016 Edition</a></div>
+      <p><b>How:</b> on the day the post measured, Redis served 5.8 billion hits against 505 million SQL queries, and the Redis hits took 2.8 hours of combined time against 168 hours for SQL.</p>
+      <p><b>Why this method:</b> a small number of servers could handle one of the busiest sites on the web, because most reads never reached SQL Server.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A distributed cache built for the cloud</b> <span class="tag co">🏢 Netflix · 2013</span> <a href="https://netflixtechblog.com/announcing-evcache-distributed-in-memory-datastore-for-cloud-c26a698c27f7" target="_blank" rel="noopener">Announcing EVCache</a></div>
+      <p><b>How:</b> EVCache is a distributed in-memory cache based on Memcached, integrated with Netflix's AWS setup, with copies of the data kept in multiple zones.</p>
+      <p><b>Why this method:</b> keeping copies in several availability zones means losing one zone doesn't turn into a cold cache and a database overload.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Caching in the browser and at the edge</b> <span class="tag oss">🧰 Web standard</span> <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Headers/Cache-Control" target="_blank" rel="noopener">HTTP Cache-Control (MDN)</a></div>
+      <p><b>How:</b> one response header tells browsers and CDNs how long they may reuse a response (<code>max-age</code>), and whether shared caches may store it (<code>public</code> vs <code>private</code>).</p>
+      <p><b>Why this method:</b> a request answered by the browser or a CDN never reaches your servers at all, which is the cheapest request there is.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the most quoted line in software</span>
+    <p>“There are only two hard things in Computer Science: cache invalidation and naming things.” It's attributed to Phil Karlton, an engineer at Netscape. After this lesson you know why the first one is on the list: keeping copies in sync with the truth, across many machines, at high speed, is genuinely hard.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Caching shows up everywhere in this course: <b>CDNs</b> are caches spread around the world (Lesson 1.4), a <b>read replica</b> is a whole database used as a cache (Lesson 2.3), <b>consistent hashing</b> spreads cache keys over servers (Lesson 2.4), and the <b>news feed</b> design stores precomputed timelines in Redis (Lesson 7.3). In AI systems, the same idea saves money: LLM providers cache repeated prompt prefixes so they don't recompute them.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://www.usenix.org/conference/nsdi13/technical-sessions/presentation/nishtala" target="_blank" rel="noopener">Scaling Memcache at Facebook</a>. Read section 3 for leases, stale sets and thundering herds.</li>
+      <li><span class="kind">Docs</span> <a href="https://redis.io/docs/latest/develop/reference/eviction/" target="_blank" rel="noopener">Redis key eviction</a>. Every eviction policy, and how its approximate LRU works.</li>
+      <li><span class="kind">Guide</span> <a href="https://aws.amazon.com/caching/best-practices/" target="_blank" rel="noopener">AWS: caching best practices</a>. Cache-aside, write-through and TTLs in plain language.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A cache takes 1 ms, the database 20 ms, and the hit rate is 95%. What's the average latency?</div>
+    <div class="opts"><button class="opt">1 ms</button><button class="opt" data-ok>2 ms</button><button class="opt">20 ms</button></div>
+    <div class="explain">0.95 × 1 + 0.05 × (1 + 20) = 0.95 + 1.05 = <b>2 ms</b>. Misses pay for both trips, which is why the last few percent of hit rate matter so much.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A celebrity posts and their profile key expires at peak traffic. Thousands of requests miss at once and the database falls over. What's the best fix?</div>
+    <div class="opts"><button class="opt">A longer TTL for every key</button><button class="opt" data-ok>Let one request rebuild the key (a lock or lease) while the others wait or get the old copy</button><button class="opt">Remove the cache so the database sees steady traffic</button></div>
+    <div class="explain">This is a cache stampede. Single-flight locks (Facebook calls theirs leases) or serve-stale-while-revalidate turn hundreds of identical rebuild queries into one. A longer TTL only delays the problem.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Which data is the worst fit for a cache with a 5-minute TTL?</div>
+    <div class="opts"><button class="opt">A product's description</button><button class="opt">A user's public profile</button><button class="opt" data-ok>A bank account balance used to approve a payment</button></div>
+    <div class="explain">A 5-minute-old balance could approve a payment the account can't cover. Data where staleness causes real harm should be read from the source of truth (Lesson 2.5 covers transactions).</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>A cache keeps copies of popular answers in fast memory. Lopsided traffic means a small cache can catch most reads.</li>
+      <li>avg latency = <span class="ca">h</span>·t<sub>cache</sub> + (1 − <span class="ca">h</span>)·(t<sub>cache</sub> + t<sub>db</sub>); database load = (1 − <span class="ca">h</span>) × QPS.</li>
+      <li>Defaults: cache-aside, LRU eviction, delete-on-write + a TTL safety net.</li>
+      <li>Know the failure modes: stale data, hot keys and stampedes (fix with locks/leases or serve-stale).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- flow diagram ----------
+  const F = new Flow($("fl"), { width: 720, height: 210 });
+  F.node("cl", { x: 70, y: 105, label: "👤 Users", sub: "1,000 req/s", kind: "cl" })
+   .node("app", { x: 260, y: 105, label: "App servers", sub: "cache-aside", kind: "sv" })
+   .node("ca", { x: 460, y: 50, label: "⚡ Redis", sub: "~1 ms", kind: "ca" })
+   .node("db", { x: 460, y: 165, label: "🗄️ Postgres", sub: "~10 ms", kind: "db" })
+   .edge("cl", "app").edge("app", "ca").edge("app", "db").render();
+
+  // ---------- cache simulation ----------
+  const N = 10000, REQ = 20000, RPS = 1000, T_CACHE = 1, T_DB = 10;
+  const SIZES = [0.005, 0.01, 0.02, 0.05, 0.2, 0.5], TTLS = [0, 2, 5, 10, 30];
+  let cdf = null, cdfS = null, lastCache = null;
+  const buildCdf = s => {
+    let tot = 0; const w = new Float64Array(N);
+    for (let k = 0; k < N; k++) { w[k] = 1 / Math.pow(k + 1, s); tot += w[k]; }
+    let acc = 0; const c = new Float64Array(N);
+    for (let k = 0; k < N; k++) { acc += w[k] / tot; c[k] = acc; }
+    return c;
+  };
+  const sampleKey = rng => { // binary search in the popularity CDF
+    const u = rng(); let lo = 0, hi = N - 1;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (cdf[m] < u) lo = m + 1; else hi = m; }
+    return lo;
+  };
+  class Cache {
+    constructor(cap, policy, ttl) { this.cap = cap; this.policy = policy; this.ttl = ttl; this.m = new Map(); this.keys = []; this.pos = new Map(); }
+    get(k, now) {
+      const e = this.m.get(k);
+      if (!e) return false;
+      if (this.ttl && now > e.exp) { this.remove(k); return false; }
+      e.n++;
+      if (this.policy === "lru") { this.m.delete(k); this.m.set(k, e); } // move to the "recent" end
+      return true;
+    }
+    remove(k) {
+      this.m.delete(k);
+      const i = this.pos.get(k), last = this.keys.pop();
+      if (last !== k) { this.keys[i] = last; this.pos.set(last, i); }
+      this.pos.delete(k);
+    }
+    put(k, now, rng) {
+      if (this.cap <= 0) return;
+      if (this.m.size >= this.cap) {
+        let victim;
+        if (this.policy === "lfu") { // like Redis: sample 5 random keys, evict the least used
+          let best = Infinity;
+          for (let i = 0; i < 5; i++) { const c = this.keys[Math.floor(rng() * this.keys.length)], n = this.m.get(c).n; if (n < best) { best = n; victim = c; } }
+        } else victim = this.m.keys().next().value; // LRU and FIFO: the oldest end of the Map
+        this.remove(victim);
+      }
+      this.m.set(k, { n: 1, exp: now + this.ttl });
+      this.pos.set(k, this.keys.length); this.keys.push(k);
+    }
+  }
+  const getEv = seg("ev", () => run());
+  const paintLabels = () => {
+    $("csv").textContent = (SIZES[+$("cs").value] * 100) + "% of keys";
+    $("skv").textContent = (+$("sk").value).toFixed(1);
+    const t = TTLS[+$("tt").value]; $("ttv").textContent = t ? t + " s" : "none";
+  };
+  function run() {
+    paintLabels();
+    const s = +$("sk").value;
+    if (cdfS !== s) { cdf = buildCdf(s); cdfS = s; }
+    const cap = Math.round(SIZES[+$("cs").value] * N), ttl = TTLS[+$("tt").value];
+    const rng = MX.seeded(7), cache = new Cache(cap, getEv(), ttl);
+    let hits = 0; const perSec = [];
+    let secHits = 0;
+    for (let i = 0; i < REQ; i++) {
+      const now = i / RPS, k = sampleKey(rng);
+      if (cache.get(k, now)) { hits++; secHits++; } else cache.put(k, now, rng);
+      if ((i + 1) % RPS === 0) { perSec.push(100 * secHits / RPS); secHits = 0; }
+    }
+    lastCache = { cache, rng, t: REQ / RPS };
+    const h = hits / REQ, lat = h * T_CACHE + (1 - h) * (T_CACHE + T_DB);
+    $("hr").textContent = (100 * h).toFixed(1) + "%";
+    $("dq").textContent = Math.round((1 - h) * RPS) + " QPS";
+    $("al").textContent = lat.toFixed(1) + " ms";
+    $("mem").textContent = (cap * 2 / 1024).toFixed(1) + " MB";
+    F.set("db", { sub: Math.round((1 - h) * RPS) + " QPS", load: (1 - h) }).set("ca", { sub: (100 * h).toFixed(0) + "% hits", load: Math.min(1, h) });
+    Plot.line($("hc"), { series: [{ label: "hit rate %", color: MX.css("--c-ca"), data: perSec, fill: true }], xLabel: "second", yMin: 0, yMax: 100 });
+    $("hmsg").textContent = h > 0.9 ? "Over 90% hits: the database barely notices the traffic." :
+      h > 0.6 ? "A decent hit rate. A bigger cache or more skewed traffic would push it higher." :
+      "Low hit rate: requests are spread too evenly, or the cache is too small (or TTLs too short).";
+  }
+  let sending = false;
+  $("send").onclick = async () => {
+    if (sending) return;
+    if (!lastCache) run();
+    sending = true;
+    for (let i = 0; i < 8; i++) {
+      const k = sampleKey(lastCache.rng), now = lastCache.t += 0.001;
+      const hit = lastCache.cache.get(k, now);
+      if (!hit) lastCache.cache.put(k, now, lastCache.rng);
+      F.set("app", { sub: `key #${k + 1}: ${hit ? "HIT" : "MISS"}` });
+      await (hit ? F.packet(["cl", "app", "ca"], { color: "--c-ca", dur: 450, back: true })
+                 : F.packet(["cl", "app", "db"], { color: "--c-er", dur: 650, back: true }));
+    }
+    F.set("app", { sub: "cache-aside" });
+    sending = false;
+  };
+  ["cs", "sk", "tt"].forEach(id => ($(id).oninput = paintLabels));
+  $("run").onclick = run;
+  run();
+
+  // ---------- stampede simulation ----------
+  const getMode = seg("mode", () => stamp());
+  function stamp() {
+    const R = +$("rb").value, mode = getMode(), TICK = 10, PER_TICK = 20, END = 2500, EXP = 1000;
+    $("rbv").textContent = R + " ms";
+    let validUntil = EXP, rebuilding = false, rebuildDone = 0, inflight = [], queries = 0, peak = 0, waited = 0, stale = 0;
+    const series = [];
+    for (let t = 0; t <= END; t += TICK) {
+      inflight = inflight.filter(f => f > t);
+      if (rebuilding && t >= rebuildDone) { rebuilding = false; validUntil = t + 60000; }
+      const fresh = t < validUntil;
+      if (!fresh) {
+        for (let r = 0; r < PER_TICK; r++) {
+          if (mode === "none") { queries++; inflight.push(t + R); if (!rebuilding) { rebuilding = true; rebuildDone = t + R; } waited++; }
+          else if (!rebuilding) { rebuilding = true; rebuildDone = t + R; queries++; inflight.push(t + R); mode === "lock" ? waited++ : stale++; }
+          else mode === "lock" ? waited++ : stale++;
+        }
+      }
+      peak = Math.max(peak, inflight.length);
+      series.push([t / 1000, inflight.length]);
+    }
+    Plot.line($("sc"), { series: [{ label: "DB queries in flight for this key", color: MX.css(mode === "none" ? "--c-er" : "--c-db"), data: series, fill: true }], xLabel: "seconds", yMin: 0, yMax: Math.max(5, peak * 1.1) });
+    $("sq").textContent = queries; $("sp").textContent = peak; $("sw").textContent = waited; $("ss").textContent = stale;
+    $("smsg").textContent = mode === "none" ? `Every request during the ${R} ms rebuild ran the same query: ${queries} copies of one query, ${peak} at once.` :
+      mode === "lock" ? `One query rebuilt the key. ${waited} users waited up to ${R} ms for it.` :
+      `One query rebuilt the key in the background; ${stale} users got the slightly old copy instantly.`;
+  }
+  $("rb").oninput = stamp;
+  stamp();
+})();
+</script>
+</body>
+</html>

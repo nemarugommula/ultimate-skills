@@ -1,0 +1,521 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.3 Kubernetes in production: autoscaling, config, ingress · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+</style>
+</head>
+<body data-lesson="s5-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 5 · Lesson 3</div>
+  <h1>Kubernetes in production: autoscaling, config, ingress</h1>
+  <p class="subtitle">The settings that separate a demo cluster from one that survives real traffic: how much CPU and memory each pod gets, how it scales itself, how Kubernetes knows a pod is healthy, and how traffic gets in. Most Kubernetes outages are one of these set wrong.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Pods, Deployments, Services</b> and the scheduler placing pods by their CPU/memory requests (Lesson 5.2).</li>
+      <li><b>cgroups</b>: the Linux feature that limits a container's CPU and memory (Lesson 5.1).</li>
+      <li><b>Health checks</b>: a load balancer only sends traffic to servers that answer “I'm OK” (Lesson 1.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Airbnb moved almost all of its online services from hand-managed EC2 servers to Kubernetes, and by 2022 ran <b>thousands of nodes across nearly a hundred clusters</b>. Their engineers wrote that traffic “fluctuates heavily every day”, and that the cloud bill should follow it, up and down, automatically.</p>
+    <p>That's the job of this lesson's machinery: pods that scale with load, clusters that add and remove machines, and health checks that keep traffic away from pods that can't serve it. Set them well and you pay for what you use. Set them badly and the same features take your site down.</p>
+  </div>
+
+  <h2>Numbers first: requests, limits and the money in between</h2>
+  <p>Each container declares two numbers per resource:</p>
+  <ul>
+    <li>A <b>request</b>: what the scheduler <i>reserves</i> on a node. <code>cpu: 500m</code> means half a CPU core (“m” = millicores, 1000m = 1 core).</li>
+    <li>A <b>limit</b>: the most it may <i>use</i>. Over the CPU limit, the kernel <b>throttles</b> it (it just runs slower). Over the memory limit, the kernel kills it: the pod shows <code>OOMKilled</code> (OOM = out of memory) with exit code 137, and restarts.</li>
+  </ul>
+  <p>Now the money. 50 pods each request <b>1 CPU</b> “to be safe” but actually use about <b>0.2</b>. The cluster reserves 50 CPUs and uses 10: <b>80% of what you pay for sits idle</b>, about 10 four-core machines' worth. Set requests too low instead and the scheduler crams too many pods onto a node; under load they fight for CPU and everything slows down.</p>
+  <table>
+    <tr><th></th><th>Request too high</th><th>Request ≈ real use (p90-ish)</th><th>Request too low / no limit</th></tr>
+    <tr><td>Cost</td><td class="er">Idle reserved capacity</td><td class="db">Paid ≈ used</td><td>Cheap… until it isn't</td></tr>
+    <tr><td>Under load</td><td>Fine</td><td>Fine; autoscaler adds pods</td><td class="er">Noisy neighbours, throttling, OOM kills</td></tr>
+  </table>
+  <p class="muted">A common pattern: set memory request = memory limit (memory can't be throttled, so surprises mean kills), set a CPU request from measured usage, and be careful with tight CPU limits, which throttle bursty apps even when the node has spare CPU.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Kubernetes automates decisions <b>from the numbers you give it</b>. Requests drive scheduling and autoscaling, probes decide which pods get traffic and which get restarted. The automation is only as good as those numbers: a wrong request wastes money, a wrong probe can restart every pod at the worst moment.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the restaurant</span>
+    <p>Requests are <b>table reservations</b>: the host (scheduler) won't seat more parties than tables. Limits are the <b>kitchen's rule</b> that one table can't order more than it can eat. The autoscaler is the manager calling in more waiters as the queue grows. Probes are the manager checking on staff: a <b>readiness</b> check asks “can you take customers right now?” (if not, stop seating people in your section), a <b>liveness</b> check asks “are you completely stuck?” (if so, send you home and call in someone fresh). Mix those two up and you send home a waiter who was just busy.</p>
+  </div>
+
+  <h2>The Horizontal Pod Autoscaler</h2>
+  <p>The <b>HPA</b> (Horizontal Pod Autoscaler) changes a Deployment's replica count based on a metric, usually average CPU <b>as a percentage of the request</b>. Every <b>15 seconds</b> by default it computes:</p>
+  <div class="eq">
+    desiredReplicas = ⌈ <span class="sv">currentReplicas</span> × <span class="lt">currentMetric</span> ÷ <span class="ca">targetMetric</span> ⌉
+    <span class="say">“The new replica count is the current count, times how far the metric is from its target, rounded up.” Twice the target load means twice the pods.</span>
+  </div>
+  <div class="legend"><span class="sv">replicas now</span><span class="lt">measured average (e.g. 90% CPU)</span><span class="ca">your target (e.g. 60%)</span></div>
+  <p>Three details from the docs that matter in practice:</p>
+  <ul>
+    <li><b>Tolerance</b>: if the ratio is within 10% of 1.0, it does nothing (no flapping over small wiggles).</li>
+    <li><b>Scale up fast</b>: by default it may add up to 100% more pods or 4 pods (whichever is more) every 15 seconds.</li>
+    <li><b>Scale down slowly</b>: it uses the highest recommendation of the last <b>300 seconds</b> (the stabilization window), so a brief dip doesn't remove pods you'll need again in a minute.</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the HPA by hand</span>
+    <p>Target: 60% CPU. Each pod requests 1 CPU.</p>
+    <ul>
+      <li>4 pods at an average of <b>90%</b>: ⌈4 × 90 ÷ 60⌉ = ⌈6⌉ = <b>6 pods</b>.</li>
+      <li>Load drops, 6 pods now average <b>40%</b>: ⌈6 × 40 ÷ 60⌉ = <b>4 pods</b>, but only after the 5-minute window shows nothing higher.</li>
+      <li>6 pods at <b>63%</b>: ratio 63 ÷ 60 = 1.05, inside the 10% tolerance, so <b>no change</b>.</li>
+    </ul>
+    <p>Why target 60% and not 95%? New pods take time to start (often 30 s to several minutes, plus new nodes if the cluster is full). The gap between your target and 100% is the <b>headroom that absorbs traffic while help is on the way</b>.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The HPA simulator</span>
+    <p class="hint">Three hours of traffic (requests per second, with some noise). Each pod requests 1 CPU and handles <b>100 req/s</b> at 100% of it; anything beyond what the ready pods can handle is dropped. The HPA runs every 15 s with the real formula, tolerance, scale-up policy and stabilization window. “Startup lag” is the time from deciding to add a pod to that pod serving.</p>
+    <div class="controls">
+      <span class="seg" id="tr"><button data-v="day" class="on">Daily peak</button><button data-v="spike" id="trspike">Flash crowd</button></span>
+      <label>target CPU <input type="range" id="tg" min="30" max="95" step="5" value="60"> <b class="mono" id="tgv"></b></label>
+      <label>startup lag <input type="range" id="lag" min="15" max="300" step="15" value="60"> <b class="mono" id="lagv"></b></label>
+    </div>
+    <div class="controls">
+      <label>min replicas <input type="range" id="mn" min="1" max="10" step="1" value="2"> <b class="mono" id="mnv"></b></label>
+      <label>max replicas <input type="range" id="mx" min="4" max="80" step="1" value="50"> <b class="mono" id="mxv"></b></label>
+      <span class="hint">scale-down window</span><span class="seg" id="sw"><button data-v="300" class="on">300 s (default)</button><button data-v="0" id="sw0">0 s</button></span>
+    </div>
+    <div class="stat-row">
+      <div class="stat">requests dropped <b id="hd">–</b></div>
+      <div class="stat">peak pods <b id="hp">–</b></div>
+      <div class="stat">pod-hours (cost) <b id="hh">–</b></div>
+      <div class="stat">avg CPU of ready pods <b id="hu">–</b></div>
+      <div class="stat">scaling events <b id="he">–</b></div>
+    </div>
+    <canvas class="chart" id="hch" style="height:230px"></canvas>
+    <canvas class="chart" id="hch2" style="height:150px"></canvas>
+    <p class="hint" id="hmsg"></p>
+  </div>
+  <p>Things to try: switch to the flash crowd and drag the target to 90%: pods run “efficiently” right up until the spike, then thousands of requests are dropped while new pods start. Now set the target to 50% and the lag to 30 s: almost nothing is dropped, for more pod-hours. Set max replicas to 10 to see the autoscaler hit its ceiling. Finally set the scale-down window to 0 s and count the scaling events: the replica count chases every wiggle of noise.</p>
+
+  <h3>When there's no room: the cluster autoscaler</h3>
+  <p>The HPA adds <i>pods</i>. If no node has room for them they sit <b>Pending</b> (Lesson 5.2). A <b>node autoscaler</b> watches for that. The Kubernetes <b>Cluster Autoscaler</b> checks for unschedulable pods every 10 seconds by default, asks the cloud for more machines, and removes nodes that stay unneeded. <b>Karpenter</b> is the other node autoscaler sponsored by Kubernetes' autoscaling group; both provision nodes for pending pods and consolidate underused ones to save cost. A new node typically takes a minute or more to boot and join, so that time adds to your startup lag. Some teams keep a few low-priority “placeholder” pods running as spare room that real pods can push out instantly.</p>
+
+  <h2>Probes: how Kubernetes knows a pod is OK</h2>
+  <p>The kubelet runs up to three kinds of <b>probe</b> on each container (an HTTP request, a TCP connect, or a command). Defaults: every <b>10 s</b>, <b>1 s</b> timeout, <b>3 failures</b> in a row to count as failed.</p>
+  <table>
+    <tr><th>Probe</th><th>Question</th><th>When it fails</th><th>Typical check</th></tr>
+    <tr><td><b>Readiness</b></td><td>Can you take traffic <i>right now</i>?</td><td class="nw">Pod is removed from the Service's endpoints. Not restarted.</td><td><code>/ready</code>: warmed up, can reach what it needs</td></tr>
+    <tr><td><b>Liveness</b></td><td>Are you stuck beyond repair?</td><td class="er">Container is <b>killed and restarted</b>.</td><td><code>/healthz</code>: the process itself responds. Nothing else.</td></tr>
+    <tr><td><b>Startup</b></td><td>Have you finished starting?</td><td>Killed after its own budget. Until it passes, the other two don't run.</td><td>Same as liveness, with a long budget: 30 × 10 s = 5 minutes</td></tr>
+  </table>
+  <p>The Kubernetes docs warn that liveness probes “must be configured carefully” to indicate truly unrecoverable failure, because a bad one causes <b>cascading failures</b>: restarts under high load, failed requests, and more load on the pods that are left. And a container that keeps dying waits longer each time before restarting: 10 s, 20 s, 40 s… capped at 5 minutes. That's the famous <code>CrashLoopBackOff</code>.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Break it with probes</span>
+    <p class="hint">3 pods behind a Service, 240 req/s. Each pod handles up to 150 req/s and needs <b>40 s to warm up</b> after starting (loading caches, a slow framework). Probes use the defaults: every 10 s, 3 failures. Pick a scenario and a probe setup, then press Run. Drag the time slider to see each pod at that moment.</p>
+    <div class="controls">
+      <span class="seg" id="sc"><button data-v="deploy" class="on">Rolling deploy at t=20 s</button><button data-v="spike" id="scspike">Traffic doubles t=30–90 s</button><button data-v="db" id="scdb">Database down t=30–60 s</button></span>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="prd" checked> readiness probe</label>
+      <label><input type="checkbox" id="pst" checked> startup probe</label>
+      <span class="hint">liveness</span><span class="seg" id="lv"><button data-v="off">off</button><button data-v="shallow" class="on">/healthz (process only)</button><button data-v="deep" id="lvdeep">deep (checks the DB)</button></span>
+      <span class="hint">liveness timeout</span><span class="seg" id="lto"><button data-v="1" class="on">1 s</button><button data-v="5" id="lto5">5 s</button></span>
+      <button class="btn primary" id="prun">▶ Run 180 s</button>
+    </div>
+    <svg id="pfl"></svg>
+    <div class="controls"><label>time <input type="range" id="pt" min="0" max="180" step="1" value="0"> <b class="mono" id="ptv"></b></label> <button class="btn" id="preplay">⏵ Replay</button></div>
+    <div class="stat-row">
+      <div class="stat">requests failed <b id="pf">–</b></div>
+      <div class="stat">container restarts <b id="pr">–</b></div>
+      <div class="stat">seconds with no pod serving <b id="pz">–</b></div>
+    </div>
+    <canvas class="chart" id="pch" style="height:200px"></canvas>
+    <p class="hint" id="pmsg"></p>
+  </div>
+  <p>Things to try, one change at a time from the defaults:</p>
+  <ul>
+    <li><b>Rolling deploy, no readiness probe:</b> the Deployment thinks each new pod is ready the moment its process starts, replaces all three within seconds, and every request fails for about 40 s while they warm up.</li>
+    <li><b>Rolling deploy, no startup probe:</b> the liveness probe kills each new pod before its 40 s warm-up finishes. It never gets ready: CrashLoopBackOff. (With readiness on, the old pods keep serving and the rollout just stalls.)</li>
+    <li><b>Traffic doubles, 1 s liveness timeout:</b> overloaded pods answer <code>/healthz</code> slowly, get killed, and the survivors take even more load. Switch the timeout to 5 s.</li>
+    <li><b>Database down, deep liveness:</b> the DB outage “fails” every pod's liveness check, so all of them restart, and you stay down long after the database is back. A shallow check would have kept them alive.</li>
+  </ul>
+
+  <h2>The rest of the production kit</h2>
+  <table>
+    <tr><th>Object</th><th>What it does</th><th>Gotcha</th></tr>
+    <tr><td><b>ConfigMap</b></td><td>Non-secret settings (URLs, feature flags) given to pods as environment variables or files. Same image, different config per environment.</td><td>Changing it doesn't restart pods; env vars are read at start. Roll the Deployment.</td></tr>
+    <tr><td class="er"><b>Secret</b></td><td>Passwords, tokens, keys, delivered the same way.</td><td>The docs warn they're <b>stored unencrypted in etcd by default</b>. Turn on encryption at rest, restrict access, or sync from a vault (AWS Secrets Manager, HashiCorp Vault).</td></tr>
+    <tr><td class="nw"><b>Ingress</b> / <b>Gateway API</b></td><td>One entry point routing HTTP by host and path (<code>api.example.com/v1</code> → service A) with TLS, instead of one cloud load balancer per Service.</td><td>The Ingress API is frozen; Kubernetes recommends the <b>Gateway API</b> (v1.0, generally available since October 2023). The popular Ingress NGINX controller was retired, with best-effort maintenance only until March 2026.</td></tr>
+    <tr><td><b>Namespace</b></td><td>A folder for objects: per team or per environment, with its own access rules and <b>ResourceQuota</b>.</td><td>Not a security boundary on its own: add network policies and access control.</td></tr>
+    <tr><td><b>PodDisruptionBudget</b> (PDB)</td><td>“Never take more than 1 of my pods down at once <i>voluntarily</i>” (node drains, upgrades, autoscaler scale-down).</td><td>Doesn't protect against crashes or a node dying, only planned evictions.</td></tr>
+    <tr><td class="db"><b>StatefulSet</b></td><td>For databases and queues: each pod gets a <b>sticky identity</b> (<code>db-0</code>, <code>db-1</code>) and its own persistent disk.</td><td>Running databases on Kubernetes is possible but hard; a managed database is usually the better start (Lesson 5.5).</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>metrics-server</b> (feeds CPU/memory to the HPA and <code>kubectl top</code>), <b>Cluster Autoscaler</b> or <b>Karpenter</b>, <b>KEDA</b> (scale on queue length or any metric, even to zero), <b>VPA</b> (suggests requests), Gateway API implementations (Envoy Gateway, Istio, Cilium, cloud gateways), <b>External Secrets Operator</b>. Probes, resources, an HPA and a PDB:</p>
+<pre><code><span class="c"># in the Deployment's container spec</span>
+resources:
+  requests: { cpu: <span class="s">"500m"</span>, memory: <span class="s">"512Mi"</span> }
+  limits:   { memory: <span class="s">"512Mi"</span> }        <span class="c"># memory limit = request; no tight CPU limit</span>
+startupProbe:                          <span class="c"># up to 30 × 10 s = 5 min to boot</span>
+  httpGet: { path: /healthz, port: <span class="n">3000</span> }
+  failureThreshold: <span class="n">30</span>
+  periodSeconds: <span class="n">10</span>
+livenessProbe:                         <span class="c"># "is the process stuck?" only, no dependencies</span>
+  httpGet: { path: /healthz, port: <span class="n">3000</span> }
+  periodSeconds: <span class="n">10</span>
+  timeoutSeconds: <span class="n">5</span>
+  failureThreshold: <span class="n">3</span>
+readinessProbe:                        <span class="c"># "send me traffic?": warmed up, deps reachable</span>
+  httpGet: { path: /ready, port: <span class="n">3000</span> }
+  periodSeconds: <span class="n">5</span>
+---
+<span class="k">apiVersion:</span> autoscaling/v2
+<span class="k">kind:</span> HorizontalPodAutoscaler
+<span class="k">metadata:</span> { name: api }
+<span class="k">spec:</span>
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: api }
+  minReplicas: <span class="n">3</span>
+  maxReplicas: <span class="n">50</span>
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target: { type: Utilization, averageUtilization: <span class="n">60</span> }   <span class="c"># % of the CPU request</span>
+  behavior:
+    scaleDown: { stabilizationWindowSeconds: <span class="n">300</span> }
+---
+<span class="k">apiVersion:</span> policy/v1
+<span class="k">kind:</span> PodDisruptionBudget
+<span class="k">metadata:</span> { name: api }
+<span class="k">spec:</span>
+  maxUnavailable: <span class="n">1</span>
+  selector: { matchLabels: { app: api } }</code></pre>
+<pre><code>kubectl top pods -l app=api            <span class="c"># live CPU / memory per pod (needs metrics-server)</span>
+kubectl get hpa api -w                 <span class="c"># current vs target metric, replicas</span>
+kubectl describe hpa api               <span class="c"># why it did (or didn't) scale</span>
+kubectl get pod api-7d9c-xk2p -o jsonpath='{.status.containerStatuses[0].lastState}'   <span class="c"># OOMKilled?</span></code></pre>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>Upside</th><th>Downside</th></tr>
+      <tr><td>Low HPA target (40–50%)</td><td>Absorbs spikes while new pods start</td><td>More idle capacity, higher bill</td></tr>
+      <tr><td>High HPA target (80–90%)</td><td>Cheaper steady state</td><td>Drops or slows requests during sudden spikes</td></tr>
+      <tr><td>Scale on CPU</td><td>Built in, simple</td><td>Lags for I/O-bound apps; queue depth or req/s (via KEDA or custom metrics) is often a better signal</td></tr>
+      <tr><td>Liveness probe at all</td><td>Recovers deadlocked processes automatically</td><td>A wrong one is worse than none. Many teams start with readiness only, and add a shallow liveness probe later.</td></tr>
+      <tr><td>Big min replicas</td><td>Instant capacity, survives a zone loss</td><td>You pay for it all night</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>If you're on Kubernetes at all: requests from real measurements, memory limit = request, a readiness probe on every service, a startup probe for slow boots, an HPA on CPU with min 2–3 replicas, and one Gateway or managed load balancer. On Cloud Run or Fargate most of this is a few settings (Lesson 5.5).</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Autoscaling on business metrics (queue lag, req/s), node autoscaling with spare headroom, PDBs everywhere so cluster upgrades never take a service below quorum, request right-sizing reports that save real money, and policies that reject pods without requests or probes. SRE reviews probes during launches (Lesson 6.4).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>When you say “it autoscales”, interviewers ask “on what, how fast, and what happens in the meantime?”. Cover:</p>
+    <ul>
+      <li>The <b>metric</b> and <b>target</b>, and the headroom it leaves for the startup lag (pod start + node start).</li>
+      <li><b>min/max replicas</b>: min for availability across zones, max to protect downstream databases from your own autoscaler.</li>
+      <li><b>Readiness vs liveness</b>: readiness gates traffic, liveness restarts; never put dependencies in liveness.</li>
+      <li>How config and secrets are injected, and how traffic enters (Gateway/Ingress + TLS).</li>
+    </ul>
+    <p>Common follow-ups: “Your pods keep getting OOMKilled, what do you check?” (limit vs real usage, memory leaks, JVM heap vs container limit). “Traffic triples in 30 seconds: will the HPA save you?” (not alone: headroom, pre-scaling, queueing, load shedding from Lesson 4.4).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Clusters that follow the traffic</b> <span class="tag co">🏢 Airbnb · 2022</span> <a href="https://medium.com/airbnb-engineering/dynamic-kubernetes-cluster-scaling-at-airbnb-d79ae3afa132" target="_blank" rel="noopener">Dynamic Kubernetes Cluster Scaling at Airbnb</a></div>
+      <p><b>How:</b> thousands of nodes in nearly a hundred clusters, sized by the Kubernetes Cluster Autoscaler, to which Airbnb contributed a custom gRPC “expander” to choose which node group to grow.</p>
+      <p><b>Why this method:</b> traffic swings every day, and cloud spend should scale with demand both up and down without humans resizing clusters.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The HPA algorithm</b> <span class="tag oss">🧰 Kubernetes docs</span> <a href="https://kubernetes.io/docs/concepts/workloads/autoscaling/horizontal-pod-autoscale/" target="_blank" rel="noopener">Horizontal Pod Autoscaling</a></div>
+      <p><b>How:</b> desired = ⌈current × metric ÷ target⌉, every 15 s, with a 0.1 tolerance, fast default scale-up policies and a 300 s scale-down stabilization window.</p>
+      <p><b>Why this method:</b> a proportional rule is simple to reason about; the tolerance and window stop it from oscillating.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Probes and their failure modes</b> <span class="tag oss">🧰 Kubernetes docs</span> <a href="https://kubernetes.io/docs/concepts/configuration/liveness-readiness-startup-probes/" target="_blank" rel="noopener">Liveness, Readiness, and Startup Probes</a></div>
+      <p><b>How:</b> readiness removes a pod from Service endpoints; liveness restarts it; a startup probe holds the other two off until the app has started.</p>
+      <p><b>Why this method:</b> separating “not ready now” from “broken forever” lets Kubernetes route around slow pods without killing them, which is exactly what the docs' cascading-failure warning is about.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>From Ingress to Gateway API</b> <span class="tag hist">📜 Kubernetes · 2023–2026</span> <a href="https://kubernetes.io/blog/2023/10/31/gateway-api-ga/" target="_blank" rel="noopener">Gateway API v1.0: GA Release</a> · <a href="https://kubernetes.io/blog/2025/11/11/ingress-nginx-retirement/" target="_blank" rel="noopener">Ingress NGINX retirement</a></div>
+      <p><b>How:</b> Gateway, GatewayClass and HTTPRoute reached v1 in October 2023, written by engineers from Kong, Isovalent and Google; in November 2025 Kubernetes announced the retirement of Ingress NGINX.</p>
+      <p><b>Why this method:</b> one standard, role-oriented API for traffic entry (platform team owns the Gateway, app teams own their routes) instead of controller-specific annotations.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the back-off resets</span>
+    <p>A crash-looping container waits 10 s, 20 s, 40 s… up to 5 minutes between restarts. But once it runs for <b>10 minutes</b> without trouble, the kubelet forgets its history and the next crash starts from 10 s again.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Readiness probes are the in-cluster version of load-balancer health checks (Lesson 1.2), and cascading restarts are the same death spiral as retry storms (Lesson 4.4). The HPA's lag is why you also need queues to absorb bursts (Lesson 3.1). Lesson 5.4 puts all this YAML in git so nobody edits it by hand, and Lesson 6.3 gives you the metrics to choose targets. AI inference services often scale on GPU utilization or queue length instead of CPU, and their startup lag (loading a model) can be minutes, so headroom matters even more.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/" target="_blank" rel="noopener">Resource management for pods and containers</a>. Requests, limits, throttling and the OOMKilled example.</li>
+      <li><span class="kind">Docs</span> <a href="https://kubernetes.io/docs/concepts/workloads/pods/disruptions/" target="_blank" rel="noopener">Disruptions and PodDisruptionBudgets</a>. Voluntary vs involuntary disruptions, with examples.</li>
+      <li><span class="kind">Blog</span> <a href="https://medium.com/airbnb-engineering/dynamic-kubernetes-cluster-scaling-at-airbnb-d79ae3afa132" target="_blank" rel="noopener">Airbnb: dynamic cluster scaling</a>. How a big company's cluster setup evolved in three stages.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. An HPA targets 50% CPU. There are 8 pods averaging 85%. How many pods will it ask for?</div>
+    <div class="opts"><button class="opt">12</button><button class="opt" data-ok>14</button><button class="opt">17</button></div>
+    <div class="explain">⌈8 × 85 ÷ 50⌉ = ⌈13.6⌉ = <b>14</b>. The ratio 1.7 is far outside the 10% tolerance, and the default scale-up policy allows doubling every 15 s, so it can jump straight there.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Every time the database has a hiccup, all your API pods restart at once and the site stays down for minutes after the DB recovers. What's the most likely cause?</div>
+    <div class="opts"><button class="opt">The readiness probe period is too long</button><button class="opt" data-ok>The liveness probe checks the database, so a DB problem restarts every pod</button><button class="opt">The HPA's max replicas is too low</button></div>
+    <div class="explain">Liveness should only ask “is this process stuck?”. Put dependency checks in readiness (stop sending traffic) or nowhere. Restarting healthy pods can't fix a database, and it adds warm-up time to the outage.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A pod requests 256Mi of memory with a 256Mi limit. Under load it needs 400Mi. What happens?</div>
+    <div class="opts"><button class="opt">It's throttled and runs slower</button><button class="opt">The scheduler moves it to a bigger node</button><button class="opt" data-ok>The kernel kills it (OOMKilled, exit code 137) and it restarts</button></div>
+    <div class="explain">CPU over the limit is throttled, but memory can't be taken back, so going over the memory limit gets the container killed. Raise the limit to real peak usage (and the request with it), or fix the memory use.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li><b>Requests</b> = reserved (scheduling, cost, HPA %); <b>limits</b> = maximum (CPU throttled, memory OOMKilled). Size requests from real usage.</li>
+      <li>HPA: desired = ⌈current × metric ÷ target⌉ every 15 s; 10% tolerance; 300 s scale-down window. Target below 100% = headroom for startup lag.</li>
+      <li>HPA adds pods; a node autoscaler (Cluster Autoscaler, Karpenter) adds machines when pods are Pending.</li>
+      <li>Readiness gates traffic, liveness restarts, startup protects slow boots. Never put dependencies in liveness.</li>
+      <li>ConfigMaps/Secrets for config (Secrets unencrypted in etcd by default), Gateway API for traffic in, PDBs for safe maintenance, StatefulSets for sticky identity.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- HPA simulator ----------
+  const STEP = 15, DUR = 180 * 60, CAPP = 100; // seconds per HPA sync, 3 hours, req/s per pod at 100% of its CPU request
+  const getTr = seg("tr", () => hpa()), getSw = seg("sw", () => hpa());
+  function traffic(kind) {
+    const rng = MX.seeded(11), out = [];
+    for (let t = 0; t <= DUR; t += STEP) {
+      const m = t / 60;
+      let v = 200 + 1100 * Math.exp(-Math.pow((m - 100) / 38, 2));
+      if (kind === "spike" && m >= 60 && m < 75) v += 1500 * Math.min(1, (m - 60) / 1);   // a viral moment ramps up in about a minute
+      out.push(Math.max(0, v * (1 + 0.15 * (rng() * 2 - 1))));
+    }
+    return out;
+  }
+  function hpa() {
+    const target = +$("tg").value / 100, lag = +$("lag").value, mn = +$("mn").value, mx = Math.max(+$("mx").value, mn), win = +getSw();
+    $("tgv").textContent = Math.round(target * 100) + "%"; $("lagv").textContent = lag + " s";
+    $("mnv").textContent = mn; $("mxv").textContent = mx;
+    const load = traffic(getTr());
+    let pods = []; for (let i = 0; i < mn; i++) pods.push(-1e9);       // ready times
+    const recs = [];
+    let dropped = 0, total = 0, podSec = 0, utilSum = 0, utilN = 0, events = 0, peak = mn;
+    const sLoad = [], sCap = [], sRep = [];
+    load.forEach((L, i) => {
+      const t = i * STEP;
+      const ready = pods.filter(r => r <= t).length;
+      const cap = ready * CAPP, served = Math.min(L, cap);
+      dropped += (L - served) * STEP; total += L * STEP; podSec += pods.length * STEP;
+      const util = ready ? L / cap : 10;                              // average CPU as a fraction of the request (can exceed 1 = saturated)
+      if (ready) { utilSum += Math.min(util, 1); utilN++; }
+      // HPA: desired = ceil(current * metric / target), skip within 10% tolerance
+      const cur = pods.length;
+      const ratio = Math.min(util, 1.5) / target;                     // a saturated pod can't report much above 100%
+      let desired = Math.abs(ratio - 1) <= 0.1 ? cur : Math.ceil(Math.max(ready, 1) * ratio);
+      if (desired < cur && ready < cur) desired = cur;               // pods still starting: the HPA won't reverse direction
+      desired = Math.min(mx, Math.max(mn, desired));
+      recs.push([t, desired]);
+      if (desired > cur) {
+        const allowed = Math.max(cur * 2, cur + 4);                   // default scale-up policy: +100% or +4 pods per 15 s
+        const n = Math.min(desired, allowed) - cur;
+        for (let k = 0; k < n; k++) pods.push(t + lag);
+        events++;
+      } else if (desired < cur) {
+        const windowMax = Math.max(...recs.filter(r => r[0] > t - win - 1e-9).map(r => r[1]));
+        const to = Math.max(desired, windowMax);
+        if (to < cur) { pods.sort((a, b) => b - a); pods = pods.slice(cur - to); events++; }   // remove the newest first
+      }
+      peak = Math.max(peak, pods.length);
+      sLoad.push([t / 60, L]); sCap.push([t / 60, cap]); sRep.push([t / 60, pods.length]);
+    });
+    const dPct = 100 * dropped / total;
+    $("hd").textContent = dPct < 0.05 ? "≈ 0%" : dPct.toFixed(1) + "% (" + Math.round(dropped / 1000) + "k)";
+    $("hp").textContent = peak;
+    $("hh").textContent = (podSec / 3600).toFixed(0);
+    $("hu").textContent = Math.round(100 * utilSum / Math.max(utilN, 1)) + "%";
+    $("he").textContent = events;
+    Plot.line($("hch"), { series: [
+      { label: "traffic (req/s)", color: MX.css("--c-cl"), data: sLoad },
+      { label: "capacity of ready pods", color: MX.css("--c-db"), data: sCap, fill: true },
+    ], xLabel: "minutes", yMin: 0, yMax: Math.max(...load, ...sCap.map(c => c[1])) * 1.08 });
+    Plot.line($("hch2"), { series: [{ label: "replicas", color: MX.css("--c-sv"), data: sRep }], xLabel: "minutes", yMin: 0, yMax: mx + 2, hlines: [{ y: mx, label: "max", color: MX.css("--c-er") }] });
+    $("hmsg").textContent = peak >= mx && dPct > 0.5 ? `The HPA hit max replicas (${mx}) and traffic kept growing: ${dPct.toFixed(1)}% of requests dropped. Raise the max, or make sure something downstream can't take more anyway.` :
+      dPct > 0.3 ? `${dPct.toFixed(1)}% dropped: whenever traffic rises faster than pods arrive (${lag} s lag), the gap between your ${Math.round(target * 100)}% target and 100% isn't enough headroom.` :
+      win === 0 && events > 60 ? `${events} scaling events: with no stabilization window the replica count chases noise, and every new pod pays the startup lag again.` :
+      `Healthy: ${dPct.toFixed(2)}% dropped for ${(podSec / 3600).toFixed(0)} pod-hours. Try a higher target to see how much cheaper it gets, and what it costs in drops.`;
+  }
+  ["tg", "lag", "mn", "mx"].forEach(id => ($(id).oninput = hpa));
+  hpa();
+
+  // ---------- probe simulator ----------
+  const T = 180, TRAFFIC = 240, PODCAP = 150, WARM = 40, BOOT = 2;
+  const getSc = seg("sc", () => prun()), getLv = seg("lv", () => prun()), getTo = seg("lto", () => prun());
+  ["prd", "pst"].forEach(id => ($(id).onchange = prun));
+  const F = new Flow($("pfl"), { width: 720, height: 220 });
+  F.node("cl", { x: 70, y: 110, label: "👤 Users", sub: "240 req/s", kind: "cl" })
+   .node("svc", { x: 250, y: 110, label: "Service", sub: "endpoints", kind: "nw" });
+  [0, 1, 2].forEach(i => F.node("p" + i, { x: 520, y: 40 + i * 70, w: 230, h: 50, label: "pod " + (i + 1), sub: "", kind: "sv" }).edge("svc", "p" + i));
+  F.edge("cl", "svc").render();
+  let frames = [];
+  function prun() {
+    const sc = getSc(), lv = getLv(), to = +getTo(), rd = $("prd").checked, st = $("pst").checked;
+    const pods = [0, 1, 2].map(i => ({ i, start: -1000, dead: false, until: 0, restarts: 0, lf: 0, ready: true, started: true, off: i * 3 + 1 }));
+    const startPod = (p, t) => { p.start = t; p.dead = false; p.lf = 0; p.ready = false; p.started = false; };
+    let failed = 0, total = 0, zero = 0, deployIdx = sc === "deploy" ? 0 : 99, nextDeploy = 20;
+    frames = []; const sOk = [], sServ = [];
+    for (let t = 0; t <= T; t++) {
+      const mult = sc === "spike" && t >= 30 && t < 90 ? 2 : 1;
+      const dbDown = sc === "db" && t >= 30 && t < 60;
+      // the rolling deploy: replace one pod; move on when the Deployment thinks it's available
+      if (deployIdx < 3 && t >= nextDeploy) {
+        const prev = deployIdx > 0 ? pods[deployIdx - 1] : null;
+        const prevOk = !prev || (rd ? prev.ready && !prev.dead : !prev.dead && t - prev.start >= BOOT);
+        if (prevOk) { startPod(pods[deployIdx], t); deployIdx++; nextDeploy = t + 1; }
+      }
+      pods.forEach(p => {
+        if (p.dead && t >= p.until) startPod(p, t);
+        p.up = !p.dead && t - p.start >= WARM;           // warmed up and serving
+        p.running = !p.dead && t - p.start >= BOOT;      // process started (container running)
+      });
+      // which pods get traffic
+      const eps = pods.filter(p => (rd ? p.ready && !p.dead : p.running));
+      const L = TRAFFIC * mult, share = eps.length ? L / eps.length : 0;
+      let ok = 0;
+      pods.forEach(p => { p.load = eps.includes(p) ? share : 0; });
+      eps.forEach(p => {
+        if (!p.up) return;                              // still warming: connection refused / 503
+        const served = Math.min(p.load, PODCAP);
+        if (!dbDown) ok += served;
+      });
+      pods.forEach(p => {
+        const rho = p.load / PODCAP;
+        p.lat = !p.up ? 0 : rho >= 0.97 ? 3000 : 100 / (1 - rho);
+      });
+      total += L; failed += L - ok;
+      const serving = eps.filter(p => p.up).length;
+      if (!serving) zero++;
+      // probes every 10 s (staggered per pod)
+      pods.forEach(p => {
+        if (p.dead || (t - p.off) % 10 !== 0) return;
+        if (st && !p.started) {                       // startup probe: 30 x 10 s budget; holds off the others
+          if (p.up) p.started = true;
+          else if (t - p.start >= 300) kill(p, t);
+          return;
+        }
+        if (!st) p.started = true;
+        if (rd) p.ready = p.up;                        // readiness: warmed up? (cheap endpoint)
+        if (lv !== "off") {
+          const pass = p.up && p.lat <= to * 1000 && !(lv === "deep" && dbDown);
+          p.lf = pass ? 0 : p.lf + 1;
+          if (p.lf >= 3) kill(p, t);
+        }
+      });
+      if (!rd) pods.forEach(p => (p.ready = p.running));
+      sOk.push([t, total ? 100 * ok / L : 100]); sServ.push([t, serving]);
+      frames.push(pods.map(p => ({ dead: p.dead, until: p.until, up: p.up, running: p.running, start: p.start, ep: eps.includes(p), load: p.load, restarts: p.restarts, lat: p.lat })));
+    }
+    function kill(p, t) {
+      p.dead = true; p.restarts++; p.ready = false; p.lf = 0;
+      p.until = t + Math.min(300, 10 * Math.pow(2, p.restarts - 1));   // 10 s, 20 s, 40 s… capped at 5 min
+    }
+    const rs = pods.reduce((s, p) => s + p.restarts, 0), fPct = 100 * failed / total;
+    $("pf").textContent = fPct.toFixed(1) + "%";
+    $("pr").textContent = rs;
+    $("pz").textContent = zero + " s";
+    Plot.line($("pch"), { series: [
+      { label: "requests succeeding %", color: MX.css(fPct > 5 ? "--c-er" : "--c-db"), data: sOk, fill: true },
+      { label: "pods serving (100 = all 3)", color: MX.css("--c-sv"), data: sServ.map(([t, v]) => [t, v * 33.3]), dash: [5, 4] },
+    ], xLabel: "seconds", yMin: 0, yMax: 105 });
+    const crash = pods.some(p => p.restarts >= 3);
+    $("pmsg").textContent =
+      sc === "deploy" && !rd ? "No readiness probe: the rollout counted each pod as ready as soon as its process started, swapped all three in seconds, and traffic hit pods that were still warming up." :
+      sc === "deploy" && crash ? `The liveness probe killed new pods before their ${WARM} s warm-up finished: CrashLoopBackOff (restarts so far: ${rs}). ${rd ? "Readiness kept traffic on the old pods, so the rollout stalled instead of failing users." : ""} A startup probe fixes this.` :
+      sc === "spike" && rs > 0 ? `Overloaded pods answered /healthz in about 3 s, over the ${to} s timeout, so liveness restarted them, and the survivors got even more traffic. ${rs} restarts turned a slowdown into an outage.` :
+      sc === "db" && rs > 0 ? `The deep liveness check failed while the DB was down, so every pod restarted. The DB came back at 60 s, but the pods needed ${WARM} s more to warm up: ${zero} s with nothing serving.` :
+      sc === "db" ? "Requests failed while the database was down (nothing probes can fix), but the pods stayed up and recovered the moment it came back." :
+      sc === "spike" ? "Some requests were dropped at the peak (each pod maxes out at 150 req/s), but no pod was restarted: the HPA from the first playground would add pods here." :
+      "Smooth rollout: each new pod only got traffic after its readiness probe passed, and the startup probe gave it time to warm up.";
+    $("pt").value = Math.min(+$("pt").value || 0, T);
+    show(+$("pt").value);
+  }
+  function show(t) {
+    $("ptv").textContent = t + " s";
+    const fr = frames[t]; if (!fr) return;
+    fr.forEach((p, i) => {
+      const sub = p.dead ? `restarting in ${p.until - t} s (restart #${p.restarts})` :
+        !p.running ? "container starting" :
+        !p.up ? `warming up ${t - p.start}/${WARM} s` + (p.ep ? " ⚠️ gets traffic" : "") :
+        p.ep ? `serving ${Math.round(p.load)} req/s · ${Math.round(p.lat)} ms` : "up, not in endpoints";
+      F.set("p" + i, { sub, down: p.dead, hot: p.ep && p.up && p.lat >= 1000, load: p.up ? Math.min(1, p.load / PODCAP) : 0 });
+      F.edgeStyle("svc", "p" + i, { hidden: !p.ep, color: p.ep && !p.up ? "--c-er" : "--line", dashed: p.ep && !p.up });
+    });
+    const eps = fr.filter(p => p.ep).length;
+    F.set("svc", { sub: eps + " endpoint" + (eps === 1 ? "" : "s") });
+  }
+  $("pt").oninput = () => show(+$("pt").value);
+  $("prun").onclick = () => { prun(); $("pt").value = T; show(T); };
+  let playing = null;
+  $("preplay").onclick = () => {
+    if (playing) { clearInterval(playing); playing = null; return; }
+    let t = 0;
+    playing = setInterval(() => {
+      $("pt").value = t; show(t);
+      const fr = frames[t];
+      if (t % 4 === 0 && fr) {
+        const eps = fr.map((p, i) => ({ p, i })).filter(x => x.p.ep);
+        if (eps.length) { const x = eps[t % eps.length]; F.packet(["cl", "svc", "p" + x.i], { color: x.p.up ? "--c-db" : "--c-er", dur: 350 }); }
+      }
+      if (++t > T) { clearInterval(playing); playing = null; }
+    }, 50);
+  };
+  prun(); $("pt").value = 60; show(60);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,537 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.5 Domain adaptation: making an LLM an expert in your domain · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .rung { border: 1px solid var(--line); border-left: 6px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 6px 0; background: var(--bg2); }
+  .rung h5 { margin: 0 0 2px; font-size: .98rem; }
+  .rung p { margin: 2px 0; font-size: .9rem; }
+  .rung.use { border-left-color: var(--good); }
+  .rung.maybe { border-left-color: var(--c-tk); }
+  .rung.skip { opacity: .62; }
+  .rung.no { border-left-color: var(--bad); }
+  .rung .st { float: right; font-size: .78rem; font-weight: 800; text-transform: uppercase; letter-spacing: .05em; }
+  .pairs { display: grid; gap: 8px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); margin: 8px 0; }
+  .pair { border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bg2); font-size: .88rem; }
+  .pair.on { border-color: var(--c-ev); box-shadow: 0 0 0 1px var(--c-ev) inset; }
+  .pair .btn { margin-top: 6px; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .tokbox span { display: inline-block; padding: 1px 3px; margin: 1px; border-radius: 4px; font-family: var(--mono); font-size: .85rem; }
+  .tokbox span:nth-child(odd) { background: color-mix(in srgb, var(--c-tk) 28%, transparent); }
+  .tokbox span:nth-child(even) { background: color-mix(in srgb, var(--c-in) 22%, transparent); }
+  .warnline { color: var(--bad); font-size: .9rem; }
+</style>
+</head>
+<body data-lesson="a7-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 5</div>
+  <h1>Domain adaptation: making an LLM an expert in your domain</h1>
+  <p class="subtitle">“Make the model understand our domain” is the most common request an AI engineer gets. There's a ladder of answers, from a glossary in the prompt to training your own model. Each rung costs roughly ten times the one below it. Climb only as high as your evals say you must.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>RAG</b> (retrieval-augmented generation) = look up relevant passages from your documents and put them in the prompt (Lesson 3.1).</li>
+      <li><b>Embeddings</b> turn text into vectors so that similar meanings land close together, which is how search finds passages (Lesson 2.1).</li>
+      <li><b>Fine-tuning</b> with <b>SFT</b> (supervised fine-tuning on input → ideal output examples) and <b>LoRA</b> (training small add-on matrices instead of all the weights) teaches behaviour and format (Lesson 7.1).</li>
+      <li><b>Evals</b> = a fixed set of test cases you score every change against (Lesson 5.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In March 2023 Bloomberg published <b>BloombergGPT</b>: a 50.6-billion-parameter model trained from scratch on <b>363 billion tokens of financial data</b> plus 345 billion tokens of general text. Training took about <b>53 days on 512 A100 GPUs</b>. It outperformed existing models on financial tasks by significant margins without losing general ability.</p>
+    <p>Six weeks later, a team of researchers ran OpenAI's general-purpose ChatGPT and GPT-4 on eight financial benchmarks. Both did better than BloombergGPT on almost every dataset except named-entity recognition; on one financial question-answering set, ChatGPT scored 59.9% to BloombergGPT's 43.4%. GPT-4 is a much bigger model, so this isn't a fair fight, and that's the point: <b>a better general model plus your data in the prompt often beats a specialist you trained</b>, and it keeps improving without you retraining anything.</p>
+  </div>
+
+  <h2>Numbers first: what each rung costs</h2>
+  <p>You want a model that's good at, say, insurance claims. Here are the five ways to get there, cheapest first. The figures are typical orders of magnitude for one team and one use case, not quotes.</p>
+  <table>
+    <tr><th>Rung</th><th>What you give it</th><th>Data you need</th><th>Typical cost</th><th>Typical time</th></tr>
+    <tr><td><b>1. Prompt</b> with domain instructions + glossary</td><td>Rules, definitions, examples in the prompt</td><td>A glossary, 5–20 examples, a 50-case eval set</td><td class="tk">≈ $0 to build; extra prompt tokens per call</td><td>Days</td></tr>
+    <tr><td><b>2. RAG</b> over domain sources</td><td>The right passages at question time</td><td>Your documents (any amount), kept up to date</td><td class="tk">$100s–$1,000s to build; index upkeep</td><td>1–4 weeks</td></tr>
+    <tr><td><b>3. Fine-tune</b> (SFT / LoRA) for format and behaviour</td><td>Examples of the ideal output</td><td>500–10,000 labelled examples</td><td class="tk">$10s–$1,000s of compute; labelling dominates</td><td>2–6 weeks</td></tr>
+    <tr><td><b>4. Continued pretraining</b> on domain text</td><td>Billions of words of the domain's language</td><td>1–100 billion tokens of clean domain text, plus general text mixed in</td><td class="tk">$1,000s–$100,000s; data work dominates</td><td>1–3 months</td></tr>
+    <tr><td><b>5. Train a domain model</b> from scratch</td><td>Everything</td><td>Hundreds of billions of tokens</td><td class="rk">$1M+ and a dedicated team</td><td>6–12 months</td></tr>
+  </table>
+  <p>Notice what changes as you climb: not just cost, but <b>what kind of thing you're changing</b>. Rungs 1–2 change what the model <i>sees</i>. Rungs 3–5 change what the model <i>is</i>. Seeing is cheap to update tomorrow; being is not.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    “Domain expertise” isn't one thing. It's at least five: <b>vocabulary</b>, <b>facts</b>, <b>formats</b>, <b>reasoning conventions</b> and <b>risk tolerance</b>. Each has a cheapest fix, and most of them live on the bottom two rungs. Diagnose which of the five is actually failing (with an eval) before you pick a rung.
+  </div>
+
+  <h2>The five things “domain expertise” means</h2>
+  <table>
+    <tr><th>Dimension</th><th>Example</th><th>What failure looks like</th><th>Cheapest fix that works</th></tr>
+    <tr><td><b>Vocabulary</b></td><td>Clinicians write “SOB” (shortness of breath), bankers say “bps” (basis points), your company says “Project Falcon”.</td><td>Search can't find documents written with different words; the model misreads an abbreviation.</td><td>Glossary in the prompt; query expansion; <b>fine-tune the embedding model</b> (below).</td></tr>
+    <tr><td><b>Facts</b></td><td>This year's policy limits, a drug's interactions, a client's contract terms.</td><td>Confident, outdated or invented answers.</td><td><b>RAG</b> with citations. Facts change; weights don't.</td></tr>
+    <tr><td><b>Formats</b></td><td>SOAP notes (Subjective, Objective, Assessment, Plan), a legal memo, an equity research note.</td><td>Right content, wrong structure; experts reject it on sight.</td><td>Examples in the prompt, structured output (Lesson 1.3), then <b>SFT</b> if it must be exact.</td></tr>
+    <tr><td><b>Reasoning conventions</b></td><td>Differential diagnosis, “issue → rule → application → conclusion” in law, GAAP accounting treatment.</td><td>Plausible answers that skip the step an expert always does.</td><td>Spell the procedure out in the prompt; reasoning models (Lesson 1.2); SFT on expert-written worked answers.</td></tr>
+    <tr><td><b>Risk tolerance</b></td><td>A doctor says “seek urgent care” early; a lawyer hedges; a trader never rounds.</td><td>Too casual or too cautious for the domain; missing escalation.</td><td>Explicit rules + guardrails (Lesson 8.3) + expert-graded evals; preference tuning if needed (7.2).</td></tr>
+  </table>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: hiring a brilliant generalist doctor for your hospital</span>
+    <p>You've hired a doctor who aced medical school but has never worked here. First you hand them the <b>house rules and a list of local abbreviations</b> (rung 1). Then you give them <b>access to the patient records and protocols</b> so they look things up instead of guessing (rung 2). After a few supervised shifts they learn <b>how this hospital writes notes</b> (rung 3). If they'll work in a specialty whose language they've never read, they do a <b>residency</b> (rung 4). Raising your own doctor from childhood (rung 5) is something almost no hospital does. And notice: you'd never ask a doctor to <i>memorise</i> today's bed list. That's what the records system is for.</p>
+  </div>
+
+  <h2>Rungs 1–2: most domain problems are context problems</h2>
+  <p>Three results to keep in your pocket when someone proposes training a domain model:</p>
+  <ul>
+    <li><b>Prompting can beat domain training.</b> Microsoft's Medprompt (2023) used only general prompting techniques (picking similar solved examples, chain-of-thought, shuffled-answer ensembles) and took GPT-4 past 90% on MedQA (US medical licensing exam questions), beating Google's medically fine-tuned Med-PaLM 2 (86.5%).</li>
+    <li><b>RAG beats fine-tuning for facts.</b> A 2023 Microsoft study compared the two for teaching models knowledge: RAG consistently won, both for facts the model had seen before and for brand-new ones. Models struggled to learn new facts from unsupervised fine-tuning at all.</li>
+    <li><b>Raw domain text can make a model worse at following instructions.</b> A 2023 study found that continued pretraining on raw domain corpora added knowledge but “drastically” hurt prompting ability, and fixed it by turning the raw text into reading-comprehension exercises.</li>
+  </ul>
+  <p>So the first two rungs are where you start: a <b>system prompt</b> that states the domain's rules and risk posture, a <b>glossary</b> (as data you version, not prose you forget), and <b>RAG</b> over the sources experts actually trust. That leaves one gap that's easy to miss: if your users search in jargon and your documents are written differently, <b>retrieval fails before the LLM ever sees the answer</b>. That's a vocabulary problem in the embedding model, and it has its own cheap fix.</p>
+
+  <h2>Domain embeddings and rerankers: the cheapest training you'll ever do</h2>
+  <p>General embedding models are trained on web text. They know “heart attack”. They may not know that in your hospital “MI” means the same thing, or that “pressure” in “pressure area care” is about skin, not blood. Fixing this doesn't need a GPU cluster:</p>
+  <ul>
+    <li><b>Collect (query, passage) pairs</b>: a real question and the passage that answers it. Sources: search logs with clicks, support tickets linked to articles, or an LLM writing questions for each passage (then an expert spot-checks a sample).</li>
+    <li><b>Train contrastively</b>: pull each query's vector toward its passage and push it away from the other passages in the batch. In sentence-transformers this is <code>MultipleNegativesRankingLoss</code>: every other passage in the batch acts as a free “wrong answer”.</li>
+    <li><b>Add hard negatives</b>: passages that look similar but are wrong (“pressure ulcer” for a blood-pressure query). Random negatives are too easy; hard negatives teach the fine distinctions your experts care about.</li>
+    <li><b>Do the same for the reranker</b> (the cross-encoder that rescores the top results, Lesson 3.4) if you use one: it reads query and passage together, so it learns domain distinctions even better.</li>
+  </ul>
+  <p>How cheap? In one public walkthrough, fine-tuning the open <code>BAAI/bge-base-en-v1.5</code> model on <b>6,300 synthetic question–passage pairs</b> from a company's SEC filing took about <b>3.5 minutes on one 24 GB GPU</b> (about $0.07 of cloud time) and improved retrieval NDCG@10 (a ranking-quality score from 0 to 1) from 0.768 to 0.825, about <b>7.4%</b>.</p>
+
+  <div class="playground" id="pgEmb">
+    <span class="label">🎮 Playground · Fine-tune a (toy) embedding model on clinical jargon</span>
+    <p class="hint">A hospital's protocol library is written in plain words; clinicians search in abbreviations. Below are 8 held-out test queries. First look at the “before” scores. Then add training pairs one at a time and watch which test queries start working. Finally, untick <b>mine hard negatives</b>, reset, and add the HTN pair again: watch what happens to the “pressure area care” query.</p>
+    <p class="hint"><b>This is a toy.</b> “Training” here adds a learned synonym group to this course's tiny offline embedding (<code>AI.addConcept</code>). A real fine-tune adjusts millions of weights, but the behaviour is the same in kind: it learns what your pairs teach, generalises to new queries that use the same terms, and nothing else.</p>
+    <div class="pairs" id="pairs"></div>
+    <div class="controls">
+      <label><input type="checkbox" id="hardneg" checked> mine hard negatives</label>
+      <button class="btn" id="addAll">Add all pairs</button>
+      <button class="btn" id="resetFt">↺ Reset to the base model</button>
+    </div>
+    <div class="controls"><label>test query <select id="evq" class="btn small"></select></label></div>
+    <div class="verdict" id="embVerdict"></div>
+    <div id="embHits"></div>
+    <div class="stat-row">
+      <div class="stat">pairs trained <b id="nPairs">0</b></div>
+      <div class="stat">recall@1 before <b id="r1b">–</b></div>
+      <div class="stat">recall@1 now <b id="r1a">–</b></div>
+      <div class="stat">recall@3 now <b id="r3a">–</b></div>
+    </div>
+    <canvas class="chart" id="embChart" style="height:200px"></canvas>
+    <p class="hint" id="embMsg"></p>
+  </div>
+  <p>What you should see: before training, the base model gets only the plain-language queries right. Each pair fixes the queries that share its abbreviation, including ones it never saw (“MI follow-up appointment” after training on “post-MI discharge meds”). <b>PRN</b> stays broken until you add a PRN pair: fine-tuning can't teach what your data doesn't contain, which is why pairs should come from real query logs. Without hard negatives, the HTN pair teaches the over-broad lesson “pressure ≈ hypertension” and the skin-care query starts retrieving the blood-pressure protocol. A real fine-tune makes the same mistake for the same reason.</p>
+
+  <h2>Rung 3: fine-tune for format and behaviour, not facts</h2>
+  <p>Lesson 7.1 covers the mechanics. For domain work the rule is simple: fine-tune when the failing dimension is <b>format, conventions or style</b> and you have (or can get experts to write) a few hundred to a few thousand gold examples. Keep the facts in RAG and train the model to <b>use retrieved context the way an expert would</b>: quote the clause, cite the guideline, flag what's missing. Fine-tuning a model on this month's policy table means it's wrong next month and you can't tell which answers came from stale weights.</p>
+
+  <h2>Rungs 4–5: continued pretraining and domain models</h2>
+  <p><b>Continued pretraining</b> (also called domain-adaptive pretraining) means taking an open base model and continuing its original training, predicting the next token, on a large pile of raw domain text. The classic evidence is <i>Don't Stop Pretraining</i> (2020): a second phase of pretraining on 2–8 billion tokens of in-domain text (biomedical papers, computer-science papers, news, reviews) improved results in all four domains, and the gains were biggest where the domain was most different from the model's original training data.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what does continued pretraining cost in compute?</span>
+    <p>Rule of thumb: training costs about <b>6 × parameters × tokens</b> floating-point operations (FLOPs): roughly 2 for the forward pass and 4 for the backward pass, per parameter, per token.</p>
+    <ul>
+      <li>A 7B model, 10B tokens of domain text: 6 × 7×10⁹ × 10×10⁹ = <b>4.2 × 10²⁰ FLOPs</b>.</li>
+      <li>One H100 GPU peaks near 1,000 TFLOP/s (10¹⁵ per second) in bf16; real training typically achieves about 40% of peak, so about 4 × 10¹⁴ FLOP/s.</li>
+      <li>4.2 × 10²⁰ ÷ 4 × 10¹⁴ ≈ 1.06 × 10⁶ seconds ≈ <b>295 GPU-hours</b>: about $900 at an illustrative $3 per GPU-hour, or under two days on 8 GPUs.</li>
+      <li>BloombergGPT for comparison: 6 × 50.6×10⁹ × 569×10⁹ tokens ≈ <b>1.7 × 10²³ FLOPs</b>, about 400× more; 53 days × 512 GPUs ≈ <b>651,000 GPU-hours</b>.</li>
+    </ul>
+    <p>The lesson: at small scale, <b>compute is not the expensive part</b>. Collecting and cleaning billions of tokens, mixing in general text so the model doesn't forget how to follow instructions, re-doing SFT afterwards, evaluating, and <b>repeating all of it when a better base model ships next quarter</b> are what cost you.</p>
+  </div>
+  <p>When does rung 4 earn its keep? When the domain's <b>language itself</b> is foreign to general models (a proprietary codebase or query language, a low-resource language, dense chemistry or patent text), you have billions of tokens of it, and you must self-host an open model anyway (Lesson 7.3) for privacy, cost or latency. Rung 5, a model from scratch, is for organisations whose data is the moat, whose scale justifies a research team, and who accept that general models may overtake them, as the hook showed.</p>
+
+  <h3>Tokenizers and domain jargon</h3>
+  <p>A model's tokenizer is fixed when it's trained. General tokenizers chop rare domain words into many small pieces, which costs tokens and can make the words harder for the model to use. When AllenAI built SciBERT, they trained a new vocabulary on scientific papers and found it shared only <b>42%</b> of its tokens with the original general vocabulary. Toy illustration (this course's approximate tokenizer, not a real one):</p>
+  <div class="tokbox" id="toks"></div>
+  <p class="hint">In practice: count tokens on your real documents with the provider's tokenizer before estimating costs; changing a model's vocabulary is a rung-4/5 project; for rungs 1–3, a glossary that expands abbreviations does most of the good.</p>
+
+  <h2>Pick your rung</h2>
+  <div class="playground" id="pgLadder">
+    <span class="label">🎮 Playground · The adaptation-ladder chooser</span>
+    <p class="hint">Describe your situation. The chooser applies the rules of this lesson and marks each rung <b class="ev">use</b>, <b class="tk">maybe</b>, skip or <b class="rk">don't</b>, with rough cost and time. Try a scenario, then break it: set freshness to daily and tick only “wrong or outdated facts”, or give it 100 billion tokens and a $1M budget.</p>
+    <div class="controls">
+      <button class="btn small" id="sc1">Scenario: discharge-summary assistant</button>
+      <button class="btn small" id="sc2">Scenario: bank acronym search</button>
+      <button class="btn small" id="sc3">Scenario: on-prem patent drafting</button>
+    </div>
+    <div class="controls">
+      <label>domain <select id="dom" class="btn small">
+        <option value="clinical">Clinical / health</option><option value="legal">Legal</option><option value="finance">Finance</option>
+        <option value="enterprise">Internal company jargon</option><option value="science">Scientific / patents</option></select></label>
+      <label>freshness <select id="fresh" class="btn small"><option value="static">rarely changes</option><option value="monthly">changes monthly</option><option value="daily">changes daily</option></select></label>
+      <label>budget <select id="bud" class="btn small"><option value="1000">≈ $1k</option><option value="10000" selected>≈ $10k</option><option value="100000">≈ $100k</option><option value="1000000">$1M+</option></select></label>
+    </div>
+    <div class="controls">
+      <span class="muted">what fails in your eval:</span>
+      <label><input type="checkbox" id="f_facts" checked> wrong or outdated facts</label>
+      <label><input type="checkbox" id="f_format"> wrong format / style</label>
+      <label><input type="checkbox" id="f_jargon"> misses jargon (search or reading)</label>
+      <label><input type="checkbox" id="f_reason"> skips expert reasoning steps</label>
+    </div>
+    <div class="controls">
+      <label>labelled examples <select id="lab" class="btn small"><option value="0">none</option><option value="100">≈ 100</option><option value="1000">≈ 1,000</option><option value="10000">10,000+</option></select></label>
+      <label>raw domain text <select id="raw" class="btn small"><option value="0">little</option><option value="1e8">≈ 100M tokens</option><option value="1e9">≈ 1B tokens</option><option value="1e10">≈ 10B tokens</option><option value="1e11">100B+ tokens</option></select></label>
+      <label><input type="checkbox" id="selfhost"> must self-host an open model</label>
+      <button class="btn primary" id="recommend">▶ Recommend</button>
+    </div>
+    <div id="ladder"></div>
+    <div class="stat-row">
+      <div class="stat">rungs to build <b id="lrungs">–</b></div>
+      <div class="stat">rough build cost <b id="lcost">–</b></div>
+      <div class="stat">rough time <b id="ltime">–</b></div>
+    </div>
+    <p class="hint" id="ladv"></p>
+    <p class="hint">Costs and times are illustrative ranges for one use case (cloud GPU at $3/hour; continued-pretraining compute from 6 × parameters × tokens for a 7B model at 40% of an H100's peak). Your real numbers come from your eval and your vendor quotes.</p>
+  </div>
+
+  <h2>Domain evals: built with experts, not by you</h2>
+  <p>Every rung decision above depends on an eval set, and in a domain you are <b>not qualified to write it alone</b>. What works:</p>
+  <ul>
+    <li><b>Experts write the cases</b>: 50–200 real tasks (de-identified), each with what a good answer must contain, what it must never say, and how bad each mistake is. Harvey's legal benchmark, for example, uses lawyer-written rubrics that give points for each requirement and <b>negative points for hallucinations</b>, plus a separate “source score”: the share of correct statements backed by an accurate source.</li>
+    <li><b>Score along the axes the domain cares about.</b> Google's Med-PaLM work had clinicians rate answers on factuality, precision, possible harm and bias, not just “correct or not”.</li>
+    <li><b>Calibrate an LLM judge against experts</b> (Lesson 5.3): experts grade 50 answers, the judge grades the same 50, and you only automate once they agree well enough. Re-check agreement each quarter.</li>
+    <li><b>Weight by severity.</b> One harmful dosage error matters more than ten clumsy sentences; report severe-error rate separately from average score.</li>
+  </ul>
+
+  <h2>Keeping domain knowledge fresh</h2>
+  <p>Domains change: new regulations, new drugs, new products, new internal acronyms. Design for it from day one. Keep <b>facts in the index</b> with source dates and versions, re-ingested on a schedule (Lesson 4.7). Keep the <b>glossary as versioned data</b> that experts can edit. Keep <b>trained artifacts about behaviour</b>, so they age slowly. Re-run the domain eval on every base-model upgrade: often the new general model plus your context beats your old fine-tune, and you can delete a rung.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>sentence-transformers</b> (v6 as of late 2026) for embedding and reranker fine-tuning, <b>Hugging Face TRL</b> + <b>PEFT</b> for SFT/LoRA (Lesson 7.1), and for continued pretraining at scale, training frameworks such as the Hugging Face Trainer or NVIDIA NeMo on open base models. Below: a domain embedding fine-tune with mined hard negatives (imports follow the v6 docs), then a plain-Python domain eval harness.</p>
+<pre><code><span class="k">from</span> datasets <span class="k">import</span> Dataset
+<span class="k">from</span> sentence_transformers <span class="k">import</span> SentenceTransformer, SentenceTransformerTrainer, SentenceTransformerTrainingArguments
+<span class="k">from</span> sentence_transformers.sentence_transformer.losses <span class="k">import</span> MultipleNegativesRankingLoss
+<span class="k">from</span> sentence_transformers.sentence_transformer.training_args <span class="k">import</span> BatchSamplers
+<span class="k">from</span> sentence_transformers.sentence_transformer.evaluation <span class="k">import</span> InformationRetrievalEvaluator
+<span class="k">from</span> sentence_transformers.util.hard_negatives <span class="k">import</span> mine_hard_negatives
+
+model = SentenceTransformer(<span class="s">"BAAI/bge-base-en-v1.5"</span>)
+<span class="c"># (query, passage) pairs from search logs / tickets / LLM-written questions checked by experts</span>
+pairs = Dataset.from_list([{<span class="s">"anchor"</span>: q, <span class="s">"positive"</span>: p} <span class="k">for</span> q, p <span class="k">in</span> load_pairs()])
+
+<span class="c"># hard negatives: similar-looking passages that are NOT the answer (skip the top ranks: they may be true positives)</span>
+train = mine_hard_negatives(pairs, model, num_negatives=<span class="n">1</span>, range_min=<span class="n">10</span>, range_max=<span class="n">50</span>,
+                            sampling_strategy=<span class="s">"top"</span>, output_format=<span class="s">"triplet"</span>)
+
+<span class="c"># held-out eval: {qid: query}, {doc_id: passage}, {qid: {relevant doc_ids}}</span>
+ir_eval = InformationRetrievalEvaluator(queries=test_queries, corpus=corpus, relevant_docs=relevant, name=<span class="s">"clinical"</span>)
+<span class="k">print</span>(<span class="s">"before:"</span>, ir_eval(model))                       <span class="c"># recall@k, MRR@10, NDCG@10 ...</span>
+
+args = SentenceTransformerTrainingArguments(
+    output_dir=<span class="s">"models/bge-clinical"</span>, num_train_epochs=<span class="n">3</span>, per_device_train_batch_size=<span class="n">32</span>,
+    learning_rate=<span class="n">2e-5</span>, warmup_steps=<span class="n">0.1</span>, bf16=<span class="k">True</span>,
+    batch_sampler=BatchSamplers.NO_DUPLICATES,                 <span class="c"># in-batch negatives must not be duplicates</span>
+)
+trainer = SentenceTransformerTrainer(model=model, args=args, train_dataset=train,
+                                     loss=MultipleNegativesRankingLoss(model), evaluator=ir_eval)
+trainer.train()
+<span class="k">print</span>(<span class="s">"after:"</span>, ir_eval(model))
+model.save_pretrained(<span class="s">"models/bge-clinical/final"</span>)</code></pre>
+<pre><code><span class="c"># Domain eval harness: expert-written cases, severity-weighted, run on every change</span>
+<span class="k">import</span> json, re
+<span class="k">from</span> collections <span class="k">import</span> defaultdict
+
+<span class="c"># cases.jsonl: {"id", "category", "input", "must_include": [...], "must_not": [...], "severity": 1-3}</span>
+cases = [json.loads(l) <span class="k">for</span> l <span class="k">in</span> open(<span class="s">"cases.jsonl"</span>)]
+
+<span class="k">def</span> grade(case, answer):
+    missing = [m <span class="k">for</span> m <span class="k">in</span> case[<span class="s">"must_include"</span>] <span class="k">if</span> m.lower() <span class="k">not in</span> answer.lower()]
+    banned  = [m <span class="k">for</span> m <span class="k">in</span> case[<span class="s">"must_not"</span>] <span class="k">if</span> re.search(m, answer, re.I)]
+    <span class="k">return</span> {<span class="s">"pass"</span>: <span class="k">not</span> missing <span class="k">and not</span> banned, <span class="s">"severe"</span>: bool(banned) <span class="k">and</span> case[<span class="s">"severity"</span>] == <span class="n">3</span>,
+            <span class="s">"missing"</span>: missing, <span class="s">"banned"</span>: banned}
+
+<span class="k">def</span> run(system, label):                                  <span class="c"># system: input -> answer (prompt, RAG, fine-tune...)</span>
+    by_cat, severe = defaultdict(list), <span class="n">0</span>
+    <span class="k">for</span> c <span class="k">in</span> cases:
+        g = grade(c, system(c[<span class="s">"input"</span>]))
+        by_cat[c[<span class="s">"category"</span>]].append(g[<span class="s">"pass"</span>]); severe += g[<span class="s">"severe"</span>]
+    <span class="k">print</span>(label, {k: f<span class="s">"{sum(v)}/{len(v)}"</span> <span class="k">for</span> k, v <span class="k">in</span> by_cat.items()}, <span class="s">"severe errors:"</span>, severe)
+
+<span class="c"># Compare rungs on the SAME cases; string checks catch the basics, an expert-calibrated judge grades the rest (5.3)</span>
+run(prompt_only, <span class="s">"rung 1"</span>); run(with_rag, <span class="s">"rung 2"</span>); run(with_rag_and_lora, <span class="s">"rung 3"</span>)</code></pre>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Rung</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Prompt + glossary</td><td>Instant, cheap, auditable, survives model upgrades</td><td>Tokens per call; limited by what fits and what the model already knows</td></tr>
+      <tr><td>RAG</td><td>Fresh, citable facts; permissions per document</td><td>Retrieval can miss (jargon!); index pipeline to run</td></tr>
+      <tr><td>Embedding / reranker fine-tune</td><td>Fixes jargon retrieval for minutes of GPU time</td><td>Needs pairs; re-embed the whole corpus after each change</td></tr>
+      <tr><td>SFT / LoRA</td><td>Exact formats, house style, shorter prompts, smaller models</td><td>Labelled data; facts go stale inside it; must redo on base-model upgrades</td></tr>
+      <tr><td>Continued pretraining</td><td>Real fluency in a foreign-to-the-model language</td><td>Billions of clean tokens; forgetting; open weights and your own serving</td></tr>
+      <tr><td>Domain model from scratch</td><td>Full control, data moat</td><td>$1M+, months, and general models may overtake it</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Startup</h4><p>Live on rungs 1–2 plus an embedding fine-tune, and spend the saved money on <b>experts writing evals</b>. Your edge is the workflow and the data pipeline, not weights. Re-run evals on every new frontier model: you get its gains for free. Fine-tune (often by distilling, Lesson 7.2) when cost or latency forces a small model.</p></div>
+      <div><h4>Big tech / large enterprise</h4><p>May own billions of tokens of proprietary text and need self-hosting for regulation, so continued pretraining of open models becomes rational, run as a platform that other teams build on. Even then, most product teams ship rungs 1–3 on top of it, and the build-vs-wait decision is revisited with every major base-model release.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Our model doesn't understand our legal domain. Should we fine-tune or train our own?” A senior answer:</p>
+    <ul>
+      <li><b>Asks what fails</b>, with examples: vocabulary, facts, format, reasoning or risk posture? Proposes building a 50–100 case expert eval first.</li>
+      <li>Walks the <b>ladder bottom-up</b>: prompt + glossary, RAG with citations, embedding fine-tune if retrieval misses jargon, SFT only for format/behaviour.</li>
+      <li>Keeps <b>facts out of weights</b> because they change, and names freshness, citations and permissions as reasons.</li>
+      <li>Knows when rung 4 is justified (foreign language of the domain, billions of tokens, must self-host) and can estimate it (6 × N × D).</li>
+      <li>Cites evidence: general models + prompting/RAG matching domain models (Medprompt, BloombergGPT vs GPT-4).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>A finance model trained from scratch</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2303.17564" target="_blank" rel="noopener">BloombergGPT (arXiv 2303.17564)</a></div>
+      <p><b>How:</b> a 50.6B model trained on a mix of 363B tokens of Bloomberg's financial data and 345B general tokens, about 53 days on 512 A100s, with a public “training chronicles” appendix.</p>
+      <p><b>Why this method:</b> Bloomberg owns one of the largest financial text archives, and the mix kept general ability while lifting financial tasks. A follow-up study (<a href="https://arxiv.org/abs/2305.05862" target="_blank" rel="noopener">arXiv 2305.05862</a>) then found general GPT-4 ahead on most financial benchmarks it tested.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Domain-adaptive pretraining</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/2004.10964" target="_blank" rel="noopener">Don't Stop Pretraining (arXiv 2004.10964)</a></div>
+      <p><b>How:</b> continued pretraining of RoBERTa on 2–8B tokens per domain, then on the task's own unlabelled text, across four domains and eight tasks.</p>
+      <p><b>Why this method:</b> gains in every domain, largest where the domain was furthest from the original training data, and adapting to an unrelated domain did clearly worse: the text has to be relevant.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Prompting beats a medical fine-tune</b> <span class="tag co">🏢 Microsoft · 2023</span> <a href="https://arxiv.org/abs/2311.16452" target="_blank" rel="noopener">Medprompt (arXiv 2311.16452)</a></div>
+      <p><b>How:</b> nearest-neighbour few-shot examples, self-generated chain-of-thought and choice-shuffle ensembling on general GPT-4, with no medical training.</p>
+      <p><b>Why this method:</b> topped all nine MultiMedQA benchmarks and passed 90% on MedQA, beating Med-PaLM 2, which had medical fine-tuning; the same recipe helped on law, accounting and nursing exams.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>RAG vs fine-tuning for knowledge</b> <span class="tag co">🏢 Microsoft · 2023</span> <a href="https://arxiv.org/abs/2312.05934" target="_blank" rel="noopener">Fine-Tuning or Retrieval? (arXiv 2312.05934)</a></div>
+      <p><b>How:</b> compared unsupervised fine-tuning with RAG on knowledge-intensive tasks, for facts the model had and hadn't seen.</p>
+      <p><b>Why this method:</b> RAG consistently outperformed fine-tuning; models struggled to absorb new facts through fine-tuning unless shown many variations of each fact.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A $0.07 domain embedding fine-tune</b> <span class="tag oss">🧰 Open source · 2024</span> <a href="https://www.philschmid.de/fine-tune-embedding-model-for-rag" target="_blank" rel="noopener">Phil Schmid: Fine-tune Embedding models for RAG</a></div>
+      <p><b>How:</b> 6.3k synthetic question–passage pairs from an SEC filing, <code>MultipleNegativesRankingLoss</code> with Matryoshka dimensions, bge-base, 4 epochs, one 24 GB GPU.</p>
+      <p><b>Why this method:</b> about 3.5 minutes of training lifted NDCG@10 by ~7.4% (0.768 → 0.825); retrieval quality is often the cheapest domain win.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 58% new words</span>
+    <p>When AllenAI trained a tokenizer vocabulary on scientific papers for SciBERT, only 42% of its tokens overlapped with the general BERT vocabulary of the same size. Science and the web are, at the token level, more than half different languages.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Rungs 1–2 are Phases 1 and 3 (prompting, RAG), and the jargon fix uses embeddings (2.1), hybrid search (2.4) and rerankers (3.4). Rung 3 is SFT/LoRA (7.1) and distillation (7.2); rung 4 needs open models you serve yourself (7.3, 7.4). Domain evals build on judges (5.3) and RAG evals (5.4); freshness is Lesson 4.7. Lesson 9.4 turns this into products for legal, health and finance. Why one vector can mix up “pressure” meanings is geometry: <a href="../../math-course/phase1/5-embeddings.html">embeddings as geometry</a> (Math for AI); expert rubrics as training signals appear in RL from Zero: <a href="../../rl-course/phase8/9-rubrics.html">rubrics as rewards</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2004.10964" target="_blank" rel="noopener">Don't Stop Pretraining</a>. The clearest experiments on when domain pretraining helps.</li>
+      <li><span class="kind">Docs</span> <a href="https://sbert.net/docs/sentence_transformer/training_overview.html" target="_blank" rel="noopener">sentence-transformers training overview</a>. Losses, hard negatives, evaluators.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2309.09530" target="_blank" rel="noopener">Adapting LLMs to Domains via Reading Comprehension</a>. Why raw domain text hurts prompting, and a fix.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You plan continued pretraining of an 8B open model on 5 billion tokens of domain text. Your GPUs achieve about 400 TFLOP/s (4 × 10¹⁴ FLOP/s) each. Roughly how many GPU-hours?</div>
+    <div class="opts"><button class="opt">≈ 17</button><button class="opt" data-ok>≈ 170</button><button class="opt">≈ 1,700</button></div>
+    <div class="explain">6 × 8×10⁹ × 5×10⁹ = 2.4 × 10²⁰ FLOPs. ÷ 4 × 10¹⁴ FLOP/s = 6 × 10⁵ seconds ≈ <b>167 GPU-hours</b>. Compute is affordable; curating 5B clean tokens, avoiding forgetting and redoing SFT afterwards are the real costs.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. An insurance assistant gives wrong coverage limits. The policy rules change every month. A colleague proposes fine-tuning on the policy documents. What do you do?</div>
+    <div class="opts"><button class="opt">Fine-tune monthly on the latest policies</button><button class="opt" data-ok>Put the policies in a versioned RAG index with effective dates and require cited answers; fine-tune later only if the format is wrong</button><button class="opt">Continued pretraining on all past policies so the model “knows insurance”</button></div>
+    <div class="explain">This is a <b>facts + freshness</b> failure. Facts in weights go stale and can't be cited or traced; retrieval updates the same day the document does, and the effective date lets the model pick the rule that applied. Fine-tuning is for behaviour and format.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your bank's internal search fails on queries like “RWA impact of the CRR3 change”: the right documents exist, but they rarely use those acronyms. Retrieval recall is the problem. What's the best first fix?</div>
+    <div class="opts"><button class="opt">Switch to a bigger generator LLM</button><button class="opt">Train a bank-specific LLM from scratch</button><button class="opt" data-ok>Add acronym expansion from a glossary, and fine-tune the embedding model (and reranker) on (query, passage) pairs from search logs with hard negatives</button></div>
+    <div class="explain">The generator never sees the answer if retrieval misses it. A glossary fixes known acronyms today; contrastive fine-tuning on real pairs teaches the embedding model your vocabulary in minutes of GPU time. Measure recall@k before and after on held-out queries.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Domain expertise = vocabulary, facts, formats, reasoning conventions, risk tolerance. Diagnose which fails with an expert-built eval.</li>
+      <li>Climb the ladder bottom-up: prompt + glossary → RAG → embedding/reranker fine-tune → SFT for format → continued pretraining → own model. Each rung costs ~10× more.</li>
+      <li>Facts belong in retrieval, behaviour in weights. General models + context often match domain models (Medprompt, BloombergGPT vs GPT-4).</li>
+      <li>Continued pretraining compute ≈ 6 × params × tokens; the real cost is data, forgetting and redoing it on every new base model.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  /* ---------- toy tokenizer illustration ---------- */
+  $("toks").innerHTML = AI.toyTokens("Pt on hydrochlorothiazide, hx of paroxysmal atrial fibrillation; start apixaban.").map(t => `<span>${esc(t)}</span>`).join("");
+
+  /* ---------- Playground 1: toy embedding fine-tuning ---------- */
+  const BASE = AI.concepts.length;
+  function setLearned(groups) { // rebuild the toy model with only the learned groups
+    AI.concepts.length = BASE; AI.addConcept(["zzreset"]); AI.concepts.length = BASE;
+    groups.forEach(g => AI.addConcept(g));
+  }
+  const DOCS = [
+    "After a heart attack, start aspirin and a beta blocker before discharge and book a cardiology review within two weeks.",
+    "For high blood pressure, recheck readings at home twice a day and start tablets if the average stays above 140 over 90.",
+    "Pressure ulcers: turn bed-bound patients every two hours and inspect the skin over the heels and lower back.",
+    "Patients who are short of breath at rest need oxygen saturation checked and a chest X-ray ordered the same day.",
+    "Nothing by mouth from midnight before an operation; small sips of water are allowed with morning tablets.",
+    "Take as needed medicines only when symptoms appear, and no more than four doses in a day.",
+    "Heart failure clinic: weigh yourself daily and report a gain of more than two kilograms in three days.",
+    "Visitor parking is free for the first hour; the car park closes at ten at night.",
+  ];
+  const TITLES = ["Heart attack discharge", "High blood pressure", "Pressure ulcer care", "Breathlessness", "Fasting before surgery", "As-needed medicines", "Heart failure clinic", "Visitor parking"];
+  const PAIRS = [
+    { id: "mi", q: "post-MI discharge meds", p: 0, g: ["mi", "myocardial infarction", "heart attack"] },
+    { id: "htn", q: "HTN home monitoring", p: 1, g: ["htn", "hypertension", "high blood pressure"], wide: ["htn", "hypertension", "high blood pressure", "pressure"] },
+    { id: "sob", q: "SOB at rest workup", p: 3, g: ["sob", "dyspnea", "dyspnoea", "short of breath"] },
+    { id: "npo", q: "NPO after midnight", p: 4, g: ["npo", "nil by mouth", "nothing by mouth"] },
+    { id: "prn", q: "PRN dosing limit", p: 5, g: ["prn", "as needed"] },
+  ];
+  const EVAL = [
+    ["MI follow-up appointment", 0], ["HTN treatment threshold", 1], ["new SOB in clinic", 3], ["NPO rules for the op", 4],
+    ["PRN painkiller max", 5], ["pressure area care", 2], ["preventing pressure damage", 2], ["is parking free", 7],
+  ];
+  let learned = []; // [{id, group}]
+  $("evq").innerHTML = EVAL.map((e, i) => `<option value="${i}">${i + 1}. ${esc(e[0])}</option>`).join("");
+
+  function scoreAll(groups) {
+    setLearned(groups);
+    const dv = DOCS.map(d => AI.embed(d));
+    return EVAL.map(([q, rel]) => {
+      const qv = AI.embed(q);
+      const ranked = dv.map((v, i) => ({ i, s: AI.cosine(qv, v) })).sort((a, b) => b.s - a.s);
+      return { ranked, rank: ranked.findIndex(r => r.i === rel) };
+    });
+  }
+  const before = scoreAll([]);
+  const r1 = res => res.filter(r => r.rank === 0).length, r3 = res => res.filter(r => r.rank < 3).length;
+
+  function renderPairs() {
+    $("pairs").innerHTML = PAIRS.map(p => {
+      const on = learned.some(l => l.id === p.id);
+      return `<div class="pair${on ? " on" : ""}"><b class="in">${esc(p.q)}</b> → <span class="cx">${esc(TITLES[p.p])}</span><br><span class="muted">${on ? "trained ✓" : "not trained"}</span><br>${on ? "" : `<button class="btn small" id="add_${p.id}">+ train on this pair</button>`}</div>`;
+    }).join("");
+    PAIRS.forEach(p => { const b = $("add_" + p.id); if (b) b.onclick = () => addPair(p); });
+  }
+  function addPair(p) {
+    if (learned.some(l => l.id === p.id)) return;
+    learned.push({ id: p.id, group: (!$("hardneg").checked && p.wide) ? p.wide : p.g, wide: !$("hardneg").checked && !!p.wide });
+    renderEmb();
+  }
+  function renderEmb() {
+    renderPairs();
+    const now = scoreAll(learned.map(l => l.group));
+    const i = +$("evq").value, e = EVAL[i], r = now[i], b = before[i];
+    $("embHits").innerHTML = r.ranked.slice(0, 3).map((h, n) => `<div class="hit${h.i === e[1] ? "" : " miss"}"><span class="sc">#${n + 1} · similarity ${h.s.toFixed(2)}</span><b>${esc(TITLES[h.i])}:</b> ${esc(DOCS[h.i])}</div>`).join("");
+    const moved = b.rank !== r.rank ? ` (base model: rank ${b.rank + 1})` : "";
+    $("embVerdict").innerHTML = r.rank === 0
+      ? `<span class="ev">✅ The right protocol (${esc(TITLES[e[1]])}) is the top result${moved}.</span>`
+      : `<span class="rk">❌ The right protocol (${esc(TITLES[e[1]])}) is at rank ${r.rank + 1}${moved}. The LLM would answer from the wrong document.</span>`;
+    $("nPairs").textContent = learned.length;
+    $("r1b").textContent = r1(before) + " / " + EVAL.length;
+    $("r1a").textContent = r1(now) + " / " + EVAL.length;
+    $("r3a").textContent = r3(now) + " / " + EVAL.length;
+    Plot.bars($("embChart"), {
+      bars: [
+        { label: "recall@1 base", value: 100 * r1(before) / EVAL.length, color: MX.css("--muted") },
+        { label: "recall@1 now", value: 100 * r1(now) / EVAL.length, color: MX.css("--c-ev") },
+        { label: "recall@3 base", value: 100 * r3(before) / EVAL.length, color: MX.css("--muted") },
+        { label: "recall@3 now", value: 100 * r3(now) / EVAL.length, color: MX.css("--c-cx") },
+      ], yMin: 0, yMax: 100, yLabel: "% of test queries",
+    });
+    const wide = learned.some(l => l.wide), pac = now[5].rank !== 0;
+    let msg = learned.length ? "" : "Base model: abbreviations are just unknown words to it, so only the plain-language queries work. Add a pair.";
+    if (learned.length && !learned.some(l => l.id === "prn")) msg = "PRN is still broken: none of your pairs mention it. Fine-tuning only learns what the pairs contain, so mine pairs from real query logs.";
+    if (learned.length === PAIRS.length && !wide) msg = "All pairs trained with hard negatives: every test query works, including ones the training pairs never contained word for word.";
+    if (wide && pac) msg = "Without hard negatives the model learned “pressure” ≈ hypertension, so “pressure area care” (skin care) now pulls the blood-pressure protocol. Reset, tick hard negatives, and train again.";
+    $("embMsg").textContent = msg;
+  }
+  $("evq").oninput = renderEmb;
+  $("addAll").onclick = () => { PAIRS.forEach(p => { if (!learned.some(l => l.id === p.id)) learned.push({ id: p.id, group: (!$("hardneg").checked && p.wide) ? p.wide : p.g, wide: !$("hardneg").checked && !!p.wide }); }); renderEmb(); };
+  $("resetFt").onclick = () => { learned = []; renderEmb(); };
+  $("hardneg").onchange = renderEmb;
+  renderEmb();
+
+  /* ---------- Playground 2: adaptation-ladder chooser ---------- */
+  const money = v => v >= 1e6 ? "$" + (v / 1e6).toFixed(v >= 1e7 ? 0 : 1) + "M" : v >= 1000 ? "$" + Math.round(v / 1000) + "k" : "$" + Math.round(v);
+  const SCEN = {
+    sc1: { dom: "clinical", fresh: "monthly", bud: "10000", f_facts: true, f_format: true, f_jargon: true, f_reason: false, lab: "1000", raw: "1e8", selfhost: false },
+    sc2: { dom: "finance", fresh: "daily", bud: "10000", f_facts: true, f_format: false, f_jargon: true, f_reason: false, lab: "100", raw: "1e9", selfhost: false },
+    sc3: { dom: "science", fresh: "static", bud: "100000", f_facts: false, f_format: true, f_jargon: true, f_reason: true, lab: "10000", raw: "1e10", selfhost: true },
+  };
+  Object.keys(SCEN).forEach(k => ($(k).onclick = () => {
+    const s = SCEN[k];
+    Object.entries(s).forEach(([id, v]) => { if (typeof v === "boolean") $(id).checked = v; else $(id).value = v; });
+    recommend();
+  }));
+  const DOMNOTE = {
+    clinical: "clinical answers need citations to the protocol, an escalation rule (“seek urgent care”) and clinician-graded evals",
+    legal: "legal answers need pinpoint citations to retrieved sources and lawyer-written rubrics",
+    finance: "financial answers need exact numbers from source filings, dated, with citations",
+    enterprise: "internal jargon changes as teams rename things, so the glossary must be editable data",
+    science: "scientific and patent text is dense with rare terms, so measure token counts on real documents",
+  };
+  function recommend() {
+    const o = {
+      dom: $("dom").value, fresh: $("fresh").value, bud: +$("bud").value, facts: $("f_facts").checked, format: $("f_format").checked,
+      jargon: $("f_jargon").checked, reason: $("f_reason").checked, lab: +$("lab").value, raw: +$("raw").value, selfhost: $("selfhost").checked,
+    };
+    const R = [];
+    R.push({ t: "1. Prompt: domain instructions + glossary + eval set", st: "use", why: `Always first: write the rules, the risk posture and a glossary, and build a 50–100 case expert eval. Here, ${DOMNOTE[o.dom]}.`, c: [0, 500], w: [0.5, 1] });
+    const ragNeed = o.facts || o.fresh !== "static";
+    R.push({ t: "2. RAG over trusted domain sources", st: ragNeed ? "use" : "maybe", why: ragNeed ? `Facts${o.fresh !== "static" ? " that change " + o.fresh : ""} belong in an index with source dates, not in weights. Require citations.` : "No fact failures yet, but retrieval still gives citations and audit trails; add it when the eval shows knowledge gaps.", c: [500, 5000], w: [1, 4] });
+    const pairsOk = o.lab >= 100 || o.raw >= 1e8;
+    R.push({ t: "2b. Fine-tune the embedding model / reranker on domain pairs", st: o.jargon ? (pairsOk ? "use" : "maybe") : "skip", why: o.jargon ? (pairsOk ? "Jargon breaks retrieval first. Mine (query, passage) pairs from logs or have an LLM write questions per passage, expert-check a sample, add hard negatives. Minutes of GPU time." : "Start with glossary-based query expansion; collect a few hundred real (query, passage) pairs, then fine-tune.") : "Retrieval isn't missing jargon in your eval, so the base embedding model is fine.", c: [50, 2000], w: [1, 2] });
+    const behaviour = o.format || o.reason;
+    let sft;
+    if (behaviour && o.lab >= 1000) sft = { st: "use", why: "Format / reasoning failures with enough gold examples: LoRA SFT on expert-written outputs, trained to use retrieved context (Lesson 7.1)." };
+    else if (behaviour && o.lab >= 100) sft = { st: "maybe", why: "About 100 examples: use them as few-shot examples first; grow to ~1,000 (or synthesize with expert review, Lesson 7.2) before fine-tuning." };
+    else if (behaviour) sft = { st: "maybe", why: "No labelled examples yet. Ask experts to write 50 ideal outputs; prompt with them; fine-tune once you have hundreds." };
+    else if (o.selfhost && o.lab >= 1000) sft = { st: "use", why: "Self-hosting a small open model: distil a strong model's outputs into it with SFT (Lesson 7.2)." };
+    else if (o.facts) sft = { st: "no", why: "Only facts are failing. Fine-tuning facts into weights makes them stale and uncitable; RAG wins for knowledge." };
+    else sft = { st: "skip", why: "No format or behaviour failure to fix." };
+    R.push(Object.assign({ t: "3. Fine-tune (SFT / LoRA) for format and behaviour", c: [200, 5000], w: [2, 6] }, sft));
+    const gpuH = 6 * 7e9 * Math.max(o.raw, 1) / (989e12 * 0.4) / 3600, cptCompute = gpuH * 3;
+    let cpt;
+    if (o.raw < 1e9) cpt = { st: "skip", why: "Too little raw text for continued pretraining to matter; spend it as RAG corpus and embedding pairs instead." };
+    else if (!o.jargon && !o.reason) cpt = { st: "skip", why: "The domain's language isn't the problem in your eval. General models already read it; context is cheaper." };
+    else if (o.bud < 10000) cpt = { st: "skip", why: "Budget too small for the data work, forgetting checks and re-doing SFT that continued pretraining needs." };
+    else if (o.selfhost) cpt = { st: "maybe", why: `Self-hosting + ${o.raw >= 1e10 ? "lots of" : "enough"} domain text + jargon failures: continued pretraining of a 7B open model is plausible. Compute ≈ ${Math.round(gpuH).toLocaleString()} H100-hours (${money(cptCompute)}); mix in general text, then redo SFT, and prove the gain over rungs 1–3 on your eval.` };
+    else cpt = { st: "skip", why: "Usually needs open weights you train and serve yourself (Lesson 7.3). With an API model, rungs 1–3 plus the next model upgrade are the cheaper path." };
+    R.push(Object.assign({ t: "4. Continued pretraining on raw domain text", c: [10000 + cptCompute, 50000 + 3 * cptCompute], w: [6, 12] }, cpt));
+    R.push(o.raw >= 1e11 && o.bud >= 1e6
+      ? { t: "5. Train a domain model from scratch", st: "maybe", why: "Only with a data moat at this scale, a research team, and a plan for when a general model overtakes you (BloombergGPT: ~651,000 A100-hours, then GPT-4 led on most finance benchmarks).", c: [1e6, 1e7], w: [26, 52] }
+      : { t: "5. Train a domain model from scratch", st: "no", why: "Hundreds of billions of tokens and $1M+ for something a general model plus your context will likely match. Not your rung.", c: [1e6, 1e7], w: [26, 52] });
+    const LBL = { use: "use", maybe: "maybe", skip: "skip", no: "don't" };
+    $("ladder").innerHTML = R.map(r => `<div class="rung ${r.st}"><span class="st ${r.st === "use" ? "ev" : r.st === "maybe" ? "tk" : r.st === "no" ? "rk" : "muted"}">${LBL[r.st]}</span><h5>${esc(r.t)}</h5><p>${esc(r.why)}</p>${r.st === "use" || r.st === "maybe" ? `<p class="muted">≈ ${money(r.c[0])}–${money(r.c[1])} · ${r.w[0]}–${r.w[1]} weeks</p>` : ""}</div>`).join("");
+    const used = R.filter(r => r.st === "use");
+    $("lrungs").textContent = used.length + (R.some(r => r.st === "maybe") ? ` (+${R.filter(r => r.st === "maybe").length} maybe)` : "");
+    $("lcost").textContent = money(used.reduce((s, r) => s + r.c[0], 0)) + "–" + money(used.reduce((s, r) => s + r.c[1], 0));
+    $("ltime").textContent = used.reduce((s, r) => s + r.w[0], 0) + "–" + used.reduce((s, r) => s + r.w[1], 0) + " weeks";
+    const warn = [];
+    if (o.fresh === "daily" && o.facts) warn.push("Daily-changing facts: anything trained into weights is stale tomorrow. Re-index, don't retrain.");
+    if (!o.facts && !o.format && !o.jargon && !o.reason) warn.push("Nothing is failing? Then don't climb at all: ship rung 1 and keep the eval running.");
+    if (o.lab === 0 && (o.format || o.reason)) warn.push("No labelled examples: expert-written examples are your critical path, not GPUs.");
+    $("ladv").innerHTML = warn.length ? warn.map(w => `<span class="warnline">⚠️ ${esc(w)}</span>`).join("<br>") : "Re-run your eval after each rung you add, and stop climbing as soon as it passes.";
+  }
+  ["dom", "fresh", "bud", "lab", "raw"].forEach(id => ($(id).oninput = recommend));
+  ["f_facts", "f_format", "f_jargon", "f_reason", "selfhost"].forEach(id => ($(id).onchange = recommend));
+  $("recommend").onclick = recommend;
+  recommend();
+})();
+</script>
+</body>
+</html>

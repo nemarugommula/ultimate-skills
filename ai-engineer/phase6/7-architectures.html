@@ -1,0 +1,624 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.7 Agent architectures · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .trace { font-family: var(--mono); font-size: .8rem; max-height: 240px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bg2); }
+  .trace .st { border-bottom: 1px dashed var(--line); padding: 3px 0; }
+  .trace .st:last-child { border-bottom: 0; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .presets { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  svg.tree { width: 100%; height: auto; display: block; border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); }
+  .legend-row { display: flex; flex-wrap: wrap; gap: 14px; font-size: .82rem; color: var(--muted); margin: 6px 0; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; vertical-align: middle; margin-right: 4px; }
+</style>
+</head>
+<body data-lesson="a6-7" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 7</div>
+  <h1>Agent architectures: planner–executor, DAGs, tree-of-thought, reflection</h1>
+  <p class="subtitle">ReAct decides one step at a time. Other shapes plan ahead, run steps in parallel, search over several lines of reasoning, or learn from their own failures. Each one buys something specific, and each one has a bill.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The agent loop and ReAct</b>: the model thinks, calls a tool, reads the observation, repeats; every turn re-reads the whole history (Lesson 6.1).</li>
+      <li><b>Workflow patterns</b>: chaining, parallel sectioning, orchestrator–workers and evaluator–optimizer, and why latency is the critical path (Lesson 6.3).</li>
+      <li><b>Tool errors as observations</b>: a failed call goes back into the context so the model can react (Lessons 6.1, 6.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>The <b>Game of 24</b>: use four numbers, say 4 9 10 13, with + − × ÷ to make exactly 24. In 2023, researchers at Princeton and Google DeepMind gave it to GPT-4. Reasoning step by step in one go (chain of thought), it solved <b>4%</b> of their puzzles. The reason is structural: one early wrong combination dooms the whole line of reasoning, and a single left-to-right pass never goes back.</p>
+    <p>Same model, different architecture: let it propose several next steps, judge which look promising, keep the best few and backtrack from dead ends. Their <b>Tree of Thoughts</b> solved <b>74%</b>. Nothing was trained. They changed the shape of the computation around the model, and that's what this lesson is about.</p>
+  </div>
+
+  <h2>Numbers first: one task, three shapes</h2>
+  <p>“Which of our three warehouses can ship 200 units of SKU-42 to Berlin cheapest by Friday?” That's 3 stock checks and up to 3 shipping quotes, then a comparison. Illustrative costs: each LLM call 1.5 s; a stock check 0.6 s; a quote 1.2 s (0.3 s when it fails fast for low stock); a fixed prompt of 1,800 tokens; each ReAct step adds 250 tokens of history.</p>
+  <table>
+    <tr><th></th><th>ReAct (one tool per turn)</th><th>Planner–executor</th><th>DAG (parallel plan)</th></tr>
+    <tr><td>LLM calls</td><td>6 (one per step + final)</td><td class="ev">2 (plan, then answer)</td><td class="ev">2</td></tr>
+    <tr><td>Input tokens</td><td class="tk">1,800 × 6 + 250 × (0+1+…+5) = 14,550</td><td>1,800 + 3,240 = 5,040</td><td>5,040</td></tr>
+    <tr><td>Wall-clock</td><td>6 × 1.5 + 3 × 0.6 + 2 × 1.2 = 13.2 s</td><td>1.5 + 3 × 0.6 + 2 × 1.2 + 0.3 + 1.5 = 7.5 s</td><td class="ev">1.5 + 0.6 + 1.2 + 1.5 = 4.8 s</td></tr>
+    <tr><td>If a tool fails mid-way</td><td class="ev">The model sees it next turn and adapts</td><td class="rk">Blind unless you add retries or a replan step</td><td>Retry that one branch; replan only if needed</td></tr>
+  </table>
+  <p class="muted">Illustrative numbers; the 3,240-token answer call reads the plan (300 tokens) plus six results (190 each). The pattern is what matters, and it matches the published results: ReWOO reported 5× fewer tokens than interleaved reasoning on HotpotQA, and LLMCompiler up to 3.7× lower latency than ReAct by running independent calls in parallel.</p>
+  <p>ReAct pays for flexibility: a full model call, re-reading everything, for every single step. Planning ahead removes most of those calls, and drawing the plan as a graph lets independent steps run at once. The price is that a plan made before seeing any results can be wrong, so the architecture must say what happens when reality disagrees.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    An agent architecture is a decision about <b>where the thinking happens</b>: before acting (plan), between every action (ReAct), across alternatives (search) or after failing (reflection). More up-front planning means fewer, cheaper calls but brittleness when the world surprises you; more search and reflection means higher quality on hard problems at a multiple of the cost. Pick the cheapest shape that handles the surprises your task actually has.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: four ways to cook dinner</span>
+    <p><b>ReAct</b> is cooking without a recipe: taste, decide, add something, taste again. Flexible, but you stop to think after every pinch. <b>Planner–executor</b> is writing the recipe first and then following it; fast, until the shop is out of basil and you're stuck mid-recipe unless you rewrite it (replanning). A <b>DAG</b> is the same recipe written so that the rice, the sauce and the salad cook at the same time on three burners. <b>Tree of Thoughts</b> is trying three versions of a sauce on the side, tasting each, and continuing only with the best. <b>Reflection</b> is writing on the recipe card “too salty last time, halve it” so the next attempt is better.</p>
+  </div>
+
+  <h2>The architectures</h2>
+  <table>
+    <tr><th>Architecture</th><th>Shape</th><th>LLM calls</th><th>Handles surprises by</th><th>Worth it when</th></tr>
+    <tr><td><b>ReAct</b> (Lesson 6.1)</td><td>think → act → observe, repeat</td><td>One per step, each re-reading the history</td><td>Reacting every turn (built in)</td><td>The next step depends on what you just saw; short tasks; unpredictable environments</td></tr>
+    <tr><td><b>Plan-and-execute</b> (planner–executor)</td><td>planner writes a step list → executor runs steps (code, a small model, or a mini-agent per step) → replanner checks progress</td><td>Plan + answer (+ a replan per surprise)</td><td>An explicit replan step that sees results and errors</td><td>Long tasks whose structure is predictable; the big model only plans, cheap ones execute</td></tr>
+    <tr><td><b>ReWOO</b> (Reasoning WithOut Observation)</td><td>planner writes the whole plan with placeholders (#E1, #E2) → workers fill them → solver answers</td><td>Exactly 2 big calls</td><td>Not much: the plan never sees results</td><td>Token-heavy multi-hop lookups where the plan rarely changes</td></tr>
+    <tr><td><b>DAG / LLMCompiler</b></td><td>planner emits tasks with dependencies → a scheduler runs every ready task in parallel → joiner answers or asks to replan</td><td>Plan + join (+ replans)</td><td>Per-node retries in code; replan from the joiner</td><td>Many independent tool calls (lookups, searches); latency matters</td></tr>
+    <tr><td><b>Graph / state machine</b> (LangGraph-style)</td><td>You draw explicit nodes, edges, loops and conditions; the model fills nodes; state is checkpointed</td><td>Whatever your graph says</td><td>Edges you wrote: retry, fallback, human approval, back to the planner</td><td>Production agents that need predictable control flow, resumability and audits</td></tr>
+    <tr><td><b>Tree of Thoughts</b> (ToT) / LATS</td><td>propose several next “thoughts” → evaluate each → keep the best b (breadth-first) or go deep and backtrack (depth-first); LATS uses Monte Carlo tree search with real environment feedback</td><td>Many: proposals + evaluations at every level</td><td>Exploring alternatives and pruning dead ends</td><td>Puzzles, planning and code where an early wrong choice is fatal and you can score partial progress</td></tr>
+    <tr><td><b>Reflexion</b> / self-critique</td><td>try → get feedback (tests, a checker, a judge) → write a short lesson to memory → try again</td><td>Attempts × (act + reflect)</td><td>Learning from the failed attempt</td><td>A reliable feedback signal exists (unit tests, a validator); retries are affordable</td></tr>
+  </table>
+  <p>Two clarifications. First, modern APIs let a ReAct model emit <b>several tool calls in one turn</b>, which is a tiny DAG inside ReAct: if all your parallel work is “look up these 3 things”, that alone may be enough. Second, evaluator–optimizer (Lesson 6.3) is reflection within one task; <b>Reflexion</b> adds a memory of past failures across attempts, the agent's own notes on what went wrong.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Same task, three architectures</span>
+    <p class="hint">The warehouse question from above. Pick an architecture, choose whether the Rotterdam carrier's quote API fails, and press Run to watch the calls. The “LLM” nodes are scripted stand-ins (a real model plans and decides in practice); timings and token counts are the illustrative ones from the table. Then press Compare to see all three side by side.</p>
+    <div class="controls">
+      <span class="seg" id="arch"><button id="a-react" data-v="react" class="on">ReAct</button><button id="a-pe" data-v="pe">Planner–executor</button><button id="a-dag" data-v="dag">DAG (LLMCompiler-style)</button></span>
+    </div>
+    <div class="controls">
+      <label>quote_shipping for warehouse B <select id="fail" class="btn small"><option value="none">works</option><option value="transient">fails once (timeout), then works</option><option value="permanent">is down for good</option></select></label>
+      <label><input type="checkbox" id="retry" checked> retry failed tools in code</label>
+      <label><input type="checkbox" id="replan" checked> replan on failure</label>
+    </div>
+    <div class="controls"><button class="btn primary" id="runArch">▶ Run</button> <button class="btn" id="cmpArch">⚖️ Compare all three</button></div>
+    <svg id="archFlow" aria-label="Agent architecture animation"></svg>
+    <div class="verdict" id="archVerdict"></div>
+    <div class="trace" id="archLog"></div>
+    <div class="stat-row">
+      <div class="stat">LLM calls <b id="aCalls">–</b></div>
+      <div class="stat">input tokens <b id="aTok">–</b></div>
+      <div class="stat">wall-clock <b id="aTime">–</b></div>
+      <div class="stat">answer <b id="aAns">–</b></div>
+    </div>
+    <div id="cmpOut"></div>
+  </div>
+  <p>What you should see: with everything working, the DAG answers in under 5 s with 2 LLM calls; ReAct takes 13 s and almost 3× the tokens. Now make B fail once and untick both recovery boxes: ReAct still gets it right (it simply retries, at the price of another full-context call), but planner–executor and the DAG execute their plan blindly and recommend the €410 warehouse instead of the €365 one. Tick “retry in code”: the DAG recovers by retrying only that branch, with no extra LLM call. Make B permanently down: every architecture ends up recommending A, but only if something (the model in ReAct, the joiner or replanner otherwise) notices and says so.</p>
+
+  <h2>Planner–executor and DAGs, precisely</h2>
+  <p>A planner writes a plan as data, not prose, so code can run it. LLMCompiler's planner emits a numbered task list where later tasks reference earlier results:</p>
+  <div class="prompt">1. check_stock("A")
+2. check_stock("B")
+3. check_stock("C")
+4. quote_shipping("A", "Berlin", 200, stock=$1)
+5. quote_shipping("B", "Berlin", 200, stock=$2)
+6. quote_shipping("C", "Berlin", 200, stock=$3)
+7. join()</div>
+  <p>The <code>$1</code> references are the edges of the graph. A small scheduler (plain code) starts every task whose inputs are ready: tasks 1–3 at once, then 4–6 as soon as their stock check returns. The <b>joiner</b> reads all results and either answers or says “replan”, and the planner gets another turn with the results so far. Three design rules make this robust:</p>
+  <ul>
+    <li><b>Retry in code, replan in the model.</b> A timeout is an infrastructure problem: retry the node (with backoff) without spending an LLM call. A result that invalidates the plan (“warehouse closed”, “no carrier serves Berlin”) is a reasoning problem: send it to the replanner.</li>
+    <li><b>Cap replans</b> (say 2), exactly like max steps in Lesson 6.1, or a stubborn failure turns into a planning loop.</li>
+    <li><b>Make the plan checkable.</b> Validate tool names and arguments before running anything; a plan that references a tool that doesn't exist should fail in milliseconds, not after three tool calls.</li>
+  </ul>
+  <p><b>Graph agents</b> take the last step: instead of a plan the model invents at run time, <i>you</i> draw the graph (plan node, parallel workers, join node, an edge back to the planner when the join says so, an approval node before anything risky) and the model only fills the nodes. That's what LangGraph's StateGraph is: nodes, edges, conditional edges, a typed shared state and checkpoints, so a run can pause for a human and resume (Lessons 6.5, 6.6).</p>
+
+  <h2>Tree of Thoughts: search over reasoning paths</h2>
+  <p>Chain of thought commits to the first idea. Tree of Thoughts treats each intermediate step (a “thought”) as a node in a search tree and needs three ingredients:</p>
+  <ul>
+    <li>A <b>generator</b> that proposes k candidate next thoughts (“4 + 9 = 13, left 10 13 13”, “13 − 9 = 4, left 4 4 10”…).</li>
+    <li>An <b>evaluator</b>, usually the model again, that scores each partial state (“sure / likely / impossible to reach 24”). In the paper's Game of 24 setup, each state's value was sampled 3 times.</li>
+    <li>A <b>search algorithm</b>: breadth-first with a beam (keep the best b states per level; the paper used b = 5) or depth-first with backtracking when a state scores below a threshold.</li>
+  </ul>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Tree-of-thought search</span>
+    <p class="hint">A Game of 24 solver. The generator and evaluator are scripted stand-ins for LLM calls: the generator samples k of the legal moves (slightly favouring good ones, as a model would), and the evaluator scores each state as good or bad plus random noise, an imperfect judge. Checking the final number is exact, done by code. Start with the chain-of-thought preset, then raise breadth and proposals, then try the presets that break it.</p>
+    <div class="presets">
+      <button class="btn small" id="pCot">Chain of thought (b=1, k=1, no judge)</button>
+      <button class="btn small" id="pTot">ToT like the paper (BFS, b=5)</button>
+      <button class="btn small" id="pPrune">Over-pruned</button>
+      <button class="btn small" id="pNoisy">Unreliable judge</button>
+    </div>
+    <div class="controls">
+      <label>puzzle <select id="puz" class="btn small"><option value="4,9,10,13">4 9 10 13</option><option value="4,5,6,10">4 5 6 10</option><option value="1,4,8,8">1 4 8 8</option><option value="2,5,7,8">2 5 7 8 (hard)</option></select></label>
+      <span class="seg" id="smode"><button id="m-bfs" data-v="bfs" class="on">Breadth-first (beam)</button><button id="m-dfs" data-v="dfs">Depth-first + backtrack</button></span>
+      <label><input type="checkbox" id="useEval"> use an evaluator (value prompt)</label>
+    </div>
+    <div class="controls">
+      <label>breadth b (kept per level) <input type="range" id="tb" min="1" max="8" step="1" value="1"> <b class="mono" id="tbv"></b></label>
+      <label>proposals k per node <input type="range" id="tk" min="1" max="10" step="1" value="1"> <b class="mono" id="tkv"></b></label>
+      <label>prune below <input type="range" id="tth" min="0" max="0.95" step="0.05" value="0.5"> <b class="mono" id="tthv"></b></label>
+      <label>judge noise <input type="range" id="tn" min="0" max="0.8" step="0.05" value="0.3"> <b class="mono" id="tnv"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="totRun">▶ Search (new seed)</button>
+      <button class="btn" id="totBatch">🎲 Run 200 seeds</button>
+      <button class="btn" id="totSweep">📈 Sweep breadth 1 → 8</button>
+    </div>
+    <svg class="tree" id="totTree" viewBox="0 0 720 250" aria-label="Search tree"></svg>
+    <div class="legend-row"><span><span class="dot" style="background:var(--c-cx)"></span>kept</span><span><span class="dot" style="background:var(--c-rk)"></span>pruned (score below threshold or outside the beam)</span><span><span class="dot" style="background:var(--c-tk)"></span>solution path</span><span>root = the four numbers; each level combines two of them</span></div>
+    <div class="verdict" id="totVerdict"></div>
+    <div class="stat-row">
+      <div class="stat">nodes explored <b id="tNodes">–</b></div>
+      <div class="stat">LLM calls <b id="tCalls">–</b></div>
+      <div class="stat">≈ tokens (200 per call) <b id="tTok">–</b></div>
+      <div class="stat">success over 200 seeds <b id="tRate">–</b></div>
+    </div>
+    <canvas class="chart" id="totChart" style="height:220px"></canvas>
+    <p class="hint" id="totMsg"></p>
+  </div>
+  <p>What you should see: chain of thought (one proposal, no judge) solves 4 9 10 13 in under 10% of seeds with 3 calls. ToT with b = 5 and a judge solves it about 3 times in 4, at roughly 7× the calls: the same shape as the paper's 4% → 74%, from a toy. Push the pruning threshold up and success collapses, because a noisy judge scores the one good branch below the cut. Crank the judge noise and success falls from about 80% towards 50% for the same number of calls: you pay for the search, but the judge can't steer it. On the hard puzzle (only 1 of 19 first moves can still reach 24), breadth alone doesn't help: if the generator never proposes the right move, the best evaluator can't keep it. Raise k too.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: when reflection pays</span>
+    <p>A coding agent passes the unit tests on its first try 60% of the time. Each attempt costs 8,000 tokens; after a failure, a reflection (“the test failed because I didn't handle empty input”) plus the next attempt cost 9,500. Allow up to 3 attempts.</p>
+    <ul>
+      <li>Success within 3 attempts, even if attempts were independent: 1 − 0.4³ = <b>93.6%</b> (reflection usually makes later attempts better than that).</li>
+      <li>Expected tokens: 8,000 + 0.4 × 9,500 + 0.4² × 9,500 = 8,000 + 3,800 + 1,520 = <b>13,320</b>, only 1.67× a single attempt, because most runs stop early.</li>
+      <li>Worst case: 8,000 + 2 × 9,500 = 27,000 tokens, so cap the attempts.</li>
+    </ul>
+    <p>The whole calculation rests on one thing: a <b>trustworthy signal</b> that says “failed”. Tests give you one. Without one, the model grades its own work, and a self-judge that wrongly passes bad answers or fails good ones turns reflection into an expensive coin flip (Lesson 5.3 on judges).</p>
+  </div>
+
+  <h2>Reflexion: learning without changing weights</h2>
+  <p>Reflexion (Shinn et al., 2023) adds three parts to an agent: an <b>evaluator</b> that turns the outcome into a signal (a test result, a success flag, a judge's score), a <b>self-reflection</b> step where the model writes a few sentences on why it failed and what to do differently, and an <b>episodic memory</b> that puts those notes into the next attempt's prompt. On the HumanEval coding benchmark it reached 91% pass@1 (correct on the first submitted answer), against 80% for GPT-4 alone. Self-Refine is the single-attempt cousin: generate, critique, revise, with the same model in all three roles. Both are evaluator–optimizer loops (Lesson 6.3) with memory; both need a round cap and a signal you trust.</p>
+
+  <h2>When each is worth its cost</h2>
+  <table>
+    <tr><th>Your task looks like…</th><th>Start with</th><th>Why</th></tr>
+    <tr><td>A few steps, each depending on the last result (debugging, support triage)</td><td>ReAct</td><td>A plan would be stale after step one</td></tr>
+    <tr><td>Many independent lookups, then a synthesis (comparisons, research fan-out)</td><td>DAG / parallel tool calls</td><td>Latency = longest branch, not the sum</td></tr>
+    <tr><td>A long but predictable procedure (migrations, report generation)</td><td>Planner–executor or an explicit graph</td><td>The big model plans once; cheap executors do the rest; checkpoints make it resumable</td></tr>
+    <tr><td>Hard reasoning where early mistakes are fatal and partial progress can be scored</td><td>Tree search (ToT, LATS) or several samples + a verifier</td><td>Exploring alternatives beats committing to the first idea</td></tr>
+    <tr><td>Retries are cheap and a checker exists (tests, schema validation, a linter)</td><td>Reflexion / evaluator loop</td><td>Failures turn into specific instructions for the next try</td></tr>
+  </table>
+  <p>Reasoning models (Lesson 1.2) already search and self-correct inside their hidden thinking, which shrinks the gap that ToT and Self-Refine filled in 2023. What stays valuable is everything a model can't do inside one call: running real tools in parallel, retrying in code, checking against real tests, and stopping at a budget.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>LangGraph</b> (1.x as of 2026) for explicit graphs: <code>StateGraph</code>, conditional edges, <code>Send</code> for dynamic parallel fan-out, per-node <code>RetryPolicy</code>, and checkpointers. LangChain publishes runnable plan-and-execute, ReWOO and LLMCompiler examples; the LLMCompiler authors' own code is on GitHub. Plain <code>asyncio.gather</code> is enough for a fixed fan-out. A plan-execute-join graph with parallel steps and a replan edge:</p>
+<pre><code><span class="k">import</span> operator
+<span class="k">from</span> typing <span class="k">import</span> Annotated, TypedDict
+<span class="k">from</span> langgraph.graph <span class="k">import</span> StateGraph, START, END
+<span class="k">from</span> langgraph.types <span class="k">import</span> Send, RetryPolicy
+
+<span class="k">class</span> State(TypedDict):
+    question: str
+    plan: list[dict]                              <span class="c"># [{"id": "q_B", "tool": "quote_shipping", "args": {...}}, ...]</span>
+    results: Annotated[list[dict], operator.add]  <span class="c"># parallel branches append here</span>
+    replans: int
+    answer: str
+
+<span class="k">def</span> planner(state):                 <span class="c"># LLM call: the whole plan, as data</span>
+    <span class="k">return</span> {<span class="s">"plan"</span>: llm_plan(state[<span class="s">"question"</span>], state.get(<span class="s">"results"</span>, [])),
+            <span class="s">"replans"</span>: state.get(<span class="s">"replans"</span>, -<span class="n">1</span>) + <span class="n">1</span>}
+
+<span class="k">def</span> fan_out(state):                 <span class="c"># every step not done yet runs in parallel</span>
+    done = {r[<span class="s">"id"</span>] <span class="k">for</span> r <span class="k">in</span> state[<span class="s">"results"</span>] <span class="k">if</span> r[<span class="s">"ok"</span>]}
+    <span class="k">return</span> [Send(<span class="s">"run_step"</span>, {<span class="s">"step"</span>: s}) <span class="k">for</span> s <span class="k">in</span> state[<span class="s">"plan"</span>] <span class="k">if</span> s[<span class="s">"id"</span>] <span class="k">not in</span> done]
+
+<span class="k">def</span> run_step(payload):              <span class="c"># plain code, no LLM</span>
+    s = payload[<span class="s">"step"</span>]
+    <span class="k">try</span>:
+        out = TOOLS[s[<span class="s">"tool"</span>]](**s[<span class="s">"args"</span>])   <span class="c"># transient errors raise → RetryPolicy retries</span>
+        <span class="k">return</span> {<span class="s">"results"</span>: [{<span class="s">"id"</span>: s[<span class="s">"id"</span>], <span class="s">"ok"</span>: True, <span class="s">"out"</span>: out}]}
+    <span class="k">except</span> PermanentToolError <span class="k">as</span> e:      <span class="c"># reasoning problem → let the joiner decide</span>
+        <span class="k">return</span> {<span class="s">"results"</span>: [{<span class="s">"id"</span>: s[<span class="s">"id"</span>], <span class="s">"ok"</span>: False, <span class="s">"out"</span>: str(e)}]}
+
+<span class="k">def</span> joiner(state):                  <span class="c"># LLM call: answer, or ask for a new plan</span>
+    <span class="k">return</span> {<span class="s">"answer"</span>: llm_join(state[<span class="s">"question"</span>], state[<span class="s">"results"</span>])}
+
+<span class="k">def</span> after_join(state):
+    wants_replan = state[<span class="s">"answer"</span>].startswith(<span class="s">"REPLAN"</span>)
+    <span class="k">return</span> <span class="s">"planner"</span> <span class="k">if</span> wants_replan <span class="k">and</span> state[<span class="s">"replans"</span>] &lt; <span class="n">2</span> <span class="k">else</span> END   <span class="c"># cap replans</span>
+
+g = StateGraph(State)
+g.add_node(<span class="s">"planner"</span>, planner)
+g.add_node(<span class="s">"run_step"</span>, run_step, retry_policy=RetryPolicy(max_attempts=<span class="n">3</span>))
+g.add_node(<span class="s">"joiner"</span>, joiner)
+g.add_edge(START, <span class="s">"planner"</span>)
+g.add_conditional_edges(<span class="s">"planner"</span>, fan_out, [<span class="s">"run_step"</span>])
+g.add_edge(<span class="s">"run_step"</span>, <span class="s">"joiner"</span>)               <span class="c"># joins after all parallel branches finish</span>
+g.add_conditional_edges(<span class="s">"joiner"</span>, after_join, [<span class="s">"planner"</span>, END])
+app = g.compile()</code></pre>
+    <p class="hint"><code>llm_plan</code>, <code>llm_join</code> and <code>TOOLS</code> are yours (one model call each; validate the plan's tool names and arguments before returning it). LangGraph's default retry policy doesn't retry <code>ValueError</code> or <code>TypeError</code>, which are usually bugs, not flakiness. This dependency-free version waits for the whole layer; LLMCompiler's scheduler starts each task the moment its own inputs are ready.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Plan up front instead of ReAct</td><td>Fewer big-model calls, cheaper executors, a plan you can show and approve</td><td>Stale plans; needs replanning logic and a replan cap</td></tr>
+      <tr><td>DAG / parallel execution</td><td>Latency of the longest branch</td><td>Rate limits and concurrency; partial failures to merge; harder traces</td></tr>
+      <tr><td>Explicit graph (state machine)</td><td>Predictable, testable, resumable, auditable</td><td>You write the control flow; less adaptive outside the paths you drew</td></tr>
+      <tr><td>Tree search (ToT, LATS)</td><td>Solves problems one pass can't</td><td>5–50× the calls; only as good as the evaluator and the proposals</td></tr>
+      <tr><td>Reflection loops</td><td>Big gains when a real checker exists</td><td>Extra rounds of tokens and latency; self-grading without a checker can make things worse</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>A ReAct loop with parallel tool calls enabled covers most needs. When traces show the same fixed sequence every time, freeze it into a plan or a small graph. Add a test-driven retry loop for code generation, capped at 2–3 attempts. Skip tree search unless a measured eval says one pass isn't enough.</p></div>
+      <div><h4>At scale</h4><p>Explicit graphs with checkpoints for every production flow, planners on the strongest model and executors on cheap ones, per-node retry and timeout policies, replan budgets, and dashboards of calls, latency and replans per architecture. Search and reflection are reserved for high-value tasks (code review, complex planning) where an eval proves the extra spend buys success.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Our ReAct agent is slow and expensive on comparison questions. What would you change?” A senior answer:</p>
+    <ul>
+      <li>Reads traces first: are the tool calls <b>independent</b>? If so, enable parallel tool calls or move to a plan → parallel execute → join graph (latency = longest branch).</li>
+      <li>Moves execution off the big model: code or a small model runs the steps; the big model plans and synthesises.</li>
+      <li>Designs failure handling explicitly: retries with backoff in code for transient errors, a capped replan for errors that change the plan, and partial answers that say what's missing.</li>
+      <li>Mentions when <i>not</i> to: if each step depends on the last, ReAct stays; tree search and reflection only with a scoring signal and a measured win. Measures success, latency and cost per task before and after (Lesson 5.5).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Search over thoughts</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2305.10601" target="_blank" rel="noopener">Tree of Thoughts (Yao et al.)</a></div>
+      <p><b>How:</b> the model proposes candidate intermediate steps, evaluates states (“sure / likely / impossible”), and a breadth-first search keeps the best 5 per level; depth-first search with backtracking was used for crosswords.</p>
+      <p><b>Why this method:</b> on Game of 24, GPT-4 with chain of thought solved 4% of tasks; with Tree of Thoughts, 74%, because the search can abandon bad early choices.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A compiler for tool calls</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2312.04511" target="_blank" rel="noopener">LLMCompiler (Kim et al.)</a></div>
+      <p><b>How:</b> a function-calling planner writes tasks with dependencies, a task-fetching unit dispatches whatever is ready, and an executor runs tasks in parallel, with replanning when needed.</p>
+      <p><b>Why this method:</b> compared with ReAct, up to 3.7× lower latency, up to 6.7× lower cost and up to about 9% higher accuracy, with open and closed models.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Plan once, observe later</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2305.18323" target="_blank" rel="noopener">ReWOO (Xu et al.)</a></div>
+      <p><b>How:</b> the planner writes every step with placeholders for evidence, workers fill them by calling tools, and a solver answers from the plan plus evidence, so the big model never re-reads observations step by step.</p>
+      <p><b>Why this method:</b> 5× token efficiency and 4% higher accuracy on HotpotQA (a multi-hop question benchmark), and more robust when tools fail.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Verbal reinforcement</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2303.11366" target="_blank" rel="noopener">Reflexion (Shinn et al.)</a></div>
+      <p><b>How:</b> after each failed trial, the agent writes a reflection on the feedback and stores it in an episodic memory that's added to the next trial's prompt; no weights change.</p>
+      <p><b>Why this method:</b> 91% pass@1 on HumanEval versus 80% for GPT-4, with gains across decision-making, coding and reasoning tasks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Plan-and-execute in a framework</b> <span class="tag co">🏢 LangChain · 2024</span> <a href="https://blog.langchain.com/planning-agents/" target="_blank" rel="noopener">Plan-and-Execute Agents</a></div>
+      <p><b>How:</b> LangGraph implementations of plan-and-execute, ReWOO and LLMCompiler as graphs of planner, executor and joiner nodes.</p>
+      <p><b>Why this method:</b> faster multi-step runs because the big model isn't consulted after every action, cheaper because sub-tasks can use smaller models, and often better completion because the planner must think through the whole task.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 74%, or was it 69%?</span>
+    <p>The Tree of Thoughts repository notes that when the authors re-ran their Game of 24 experiment after the paper, it scored 69% instead of the original 74%, purely from randomness in GPT-4's sampling. Search architectures are stochastic twice over (sampled proposals, sampled judgements), which is why you measure them over many runs, as the “Run 200 seeds” button does.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>ReAct is the loop from Lesson 6.1; plan → parallel → join is orchestrator–workers and sectioning (6.3) with the plan written at run time; multi-agent systems (6.5) are often these same graphs with an agent in each node; checkpoints and approval nodes come from 6.6. Lesson 6.8 builds the bare loop by hand, and Lesson 5.5 shows how to measure whether a fancier architecture actually helps. Tree search with a learned value function is the heart of game-playing AI: see <a href="../../rl-course/phase6/3b-mcts.html">Monte Carlo tree search</a> in the RL course, and <a href="../../rl-course/phase7/7-best-of-n.html">best-of-n sampling</a> for the simplest “try several, keep the best”.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2305.10601" target="_blank" rel="noopener">Tree of Thoughts</a>. The generator–evaluator–search framing with full prompts.</li>
+      <li><span class="kind">Blog</span> <a href="https://blog.langchain.com/planning-agents/" target="_blank" rel="noopener">LangChain: Plan-and-Execute Agents</a>. Plan-and-execute, ReWOO and LLMCompiler side by side, with code.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/SqueezeAILab/LLMCompiler" target="_blank" rel="noopener">LLMCompiler on GitHub</a>. The planner, task-fetching unit and parallel executor.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A question needs 8 independent lookups (1 s each). Each LLM call takes 1.5 s. A ReAct agent does one lookup per turn and then answers (9 calls); a DAG agent plans, runs all 8 in parallel, then joins. Roughly how long does the DAG take?</div>
+    <div class="opts"><button class="opt" data-ok>About 4 s</button><button class="opt">About 12 s</button><button class="opt">About 21.5 s</button></div>
+    <div class="explain">DAG: plan 1.5 + the slowest lookup 1 + join 1.5 = <b>4 s</b>. ReAct: 9 × 1.5 + 8 × 1 = 21.5 s, and it re-reads a growing history on every one of those 9 calls.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You're building an agent that debugs failing deployments: read logs, form a guess, run a command, read the output, refine. Which architecture fits best?</div>
+    <div class="opts"><button class="opt">A full plan up front, executed blindly by code</button><button class="opt" data-ok>A ReAct-style loop (maybe with an occasional replan or summary step), because each step depends on what the last one revealed</button><button class="opt">Tree of Thoughts with breadth 8</button></div>
+    <div class="explain">When the next action depends on the latest observation, a plan written in advance is stale after the first step. ReAct's per-step decisions are worth their cost here. Tree search multiplies calls without a clear way to score partial progress on a live system.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your Tree-of-Thoughts solver got worse after you raised the pruning threshold from 0.5 to 0.8 to “save calls”. What's the most likely reason?</div>
+    <div class="opts"><button class="opt">Higher thresholds always improve quality, so it must be a bug</button><button class="opt" data-ok>The evaluator is noisy, so the one good branch sometimes scores below 0.8 and is cut; lower the threshold, keep more breadth, or improve the evaluator</button><button class="opt">The generator ran out of tokens</button></div>
+    <div class="explain">Pruning is only as good as the scores it prunes on. With an imperfect judge, aggressive thresholds trade a few saved calls for losing the correct path. Calibrate the evaluator on known states, or sample its judgement several times (the paper used 3) before trusting it.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>ReAct thinks between every step: adaptive, but a full-context call per step. Planning first cuts calls; a DAG plan also cuts latency to the longest branch.</li>
+      <li>Plans go stale: retry transient errors in code, replan (capped) when results change the plan, and validate plans before running them.</li>
+      <li>Explicit graphs (LangGraph-style) give predictable, resumable, auditable control flow for production.</li>
+      <li>Tree of Thoughts searches over reasoning paths (4% → 74% on Game of 24) at many times the calls; it lives or dies by the proposals and the evaluator.</li>
+      <li>Reflexion turns failures into notes for the next try; worth it when a real checker (tests) exists, with a round cap.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = n => Math.round(n).toLocaleString("en-US");
+
+  /* ================= Playground 1: three architectures ================= */
+  const LLM = 1.5, ST = 0.6, QT = 1.2, QC = 0.3, TO = 3.0, FIX = 1800, STEP = 250, PLAN = 300, RES = 190;
+  let arch = "react";
+  const archBtns = [...$("arch").querySelectorAll("button")];
+  archBtns.forEach(b => (b.onclick = () => { archBtns.forEach(x => x.classList.toggle("on", x === b)); arch = b.dataset.v; running++; draw(); show(simulate(arch)); }));
+
+  function simulate(a, failMode, retry, replan) {
+    failMode = failMode ?? $("fail").value; retry = retry ?? $("retry").checked; replan = replan ?? $("replan").checked;
+    const ev = []; let calls = 0, tok = 0, t = 0, ctx = 0;
+    const llm = (inTok, log, paths, set) => { calls++; tok += inTok; t += LLM; ev.push({ paths, log: `t=${t.toFixed(1)} s · ${log} (${fmt(inTok)} input tokens)`, set }); };
+    const tool = (dt, log, paths, set) => { t += dt; ev.push({ paths, log: `t=${t.toFixed(1)} s · ${log}`, set }); };
+    let bFails = failMode === "none" ? 0 : failMode === "transient" ? 1 : 99;
+    const quoteB = () => { if (bFails > 0) { bFails--; return false; } return true; };
+    let answer, ok;
+    if (a === "react") {
+      const q = [["q", "llm"]];
+      let step = 0; const call = (log, paths) => { llm(FIX + STEP * step, log, paths); step++; };
+      call("LLM: “first, check stock at A”", [["q", "llm"]]);
+      tool(ST, "check_stock(A) → 340 units", [["llm", "stock"]]);
+      call("LLM reads it: “now B”", [["llm", "stock"]]); tool(ST, "check_stock(B) → 520 units", [["llm", "stock"]]);
+      call("LLM: “now C”", [["llm", "stock"]]); tool(ST, "check_stock(C) → 120 units (too few, skip its quote)", [["llm", "stock"]]);
+      call("LLM: “quote A”", [["llm", "quote"]]); tool(QT, "quote_shipping(A) → €410, arrives Thu", [["llm", "quote"]]);
+      call("LLM: “quote B”", [["llm", "quote"]]);
+      let got = quoteB(), tries = 1;
+      if (!got) {
+        tool(TO, "quote_shipping(B) → ❌ timeout after 3 s (observation goes back to the model)", [["llm", "quote"]], { quote: { down: true } });
+        call("LLM reads the error: “retry B once”", [["llm", "quote"]]); tries++;
+        got = quoteB();
+        if (!got) tool(TO, "quote_shipping(B) → ❌ timeout again", [["llm", "quote"]], { quote: { down: true } });
+        else tool(QT, "quote_shipping(B) → €365, arrives Fri", [["llm", "quote"]], { quote: { down: false } });
+      } else tool(QT, "quote_shipping(B) → €365, arrives Fri", [["llm", "quote"]]);
+      call(got ? "LLM: final answer" : "LLM: final answer, flags that B couldn't be quoted", [["llm", "ans"]]);
+      answer = got ? "B · €365 · Fri" : "A · €410 · Thu (B unavailable, flagged)"; ok = got ? "best" : "flagged";
+    } else {
+      const P = a === "dag";
+      let results = 0, replans = 0;
+      llm(FIX, P ? "Planner: 7 tasks with dependencies (3 stock checks → 3 quotes → join)" : "Planner: a 6-step plan (3 stock checks, then 3 quotes)", [["q", "plan"]]);
+      ctx = FIX + PLAN;
+      const runQuotes = (needB, needOthers) => {
+        // returns whether B succeeded; executes in sequence (pe) or parallel (dag)
+        let bOk = !needB; let bTime = 0;
+        if (needB) {
+          let attempt = 0;
+          while (true) {
+            attempt++;
+            if (quoteB()) { bTime += QT; bOk = true; break; }
+            bTime += TO;
+            if (!(retry && attempt < 2)) break;
+          }
+        }
+        if (P) {
+          const dt = Math.max(needOthers ? QT : 0, bTime);
+          const paths = [];
+          if (needOthers) paths.push(["sA", "qA"], ["sC", "qC"]);
+          if (needB) paths.push(["sB", "qB"]);
+          tool(dt, needB ? `quotes in parallel → ${needOthers ? "A €410 · C: too little stock · " : ""}B ${bOk ? "€365" + (bTime > QT ? " (after a retry in code)" : "") : "❌ failed" + (retry ? " (retried in code)" : "")}` : "quotes", paths, { qB: { down: !bOk } });
+        } else {
+          if (needOthers) tool(QT, "executor: quote_shipping(A) → €410", [["exec", "quote"]]);
+          if (needB) tool(bTime, `executor: quote_shipping(B) → ${bOk ? "€365" + (bTime > QT ? " (after a retry in code)" : "") : "❌ failed" + (retry ? " (retried in code)" : "")}`, [["exec", "quote"]], { quote: { down: !bOk } });
+          if (needOthers) tool(QC, "executor: quote_shipping(C) → error: only 120 in stock", [["exec", "quote"]]);
+        }
+        return bOk;
+      };
+      if (P) tool(ST, "3 stock checks in parallel → A 340 · B 520 · C 120", [["plan", "sA"], ["plan", "sB"], ["plan", "sC"]]);
+      else { tool(ST, "executor: check_stock(A) → 340", [["plan", "exec"], ["exec", "stock"]]); tool(ST, "executor: check_stock(B) → 520", [["exec", "stock"]]); tool(ST, "executor: check_stock(C) → 120", [["exec", "stock"]]); }
+      let bOk = runQuotes(true, true);
+      ctx += 6 * RES;
+      const J = P ? "join" : "solve", toJ = P ? [["qA", "join"], ["qB", "join"], ["qC", "join"]] : [["exec", "solve"]];
+      while (!bOk && replan && replans < 2 && failMode === "transient") {
+        replans++;
+        llm(ctx, `${P ? "Joiner" : "Replanner"}: B's quote failed and it matters (B may be cheaper) → replan`, toJ);
+        llm(ctx + 100, "Planner: new plan = [quote_shipping(B)]", [[J, "plan"]]);
+        ctx += 100 + RES;
+        if (!P) ev.push({ paths: [["plan", "exec"]], log: "executor runs the new plan" });
+        bOk = runQuotes(true, false);
+      }
+      if (!bOk && replan && failMode === "permanent") {
+        llm(ctx, `${P ? "Joiner" : "Replanner"}: B failed after retries → replan`, toJ);
+        llm(ctx + 100, "Planner: “B's carrier is down; answer with what we have”", [[J, "plan"]]);
+        ctx += 100;
+      }
+      llm(ctx, bOk ? `${P ? "Joiner" : "Solver"}: compare A and B → answer` : `${P ? "Joiner" : "Solver"}: answer from partial results`, [[J, "ans"]]);
+      if (bOk) { answer = "B · €365 · Fri"; ok = "best"; }
+      else if (failMode === "transient") { answer = "A · €410 · Thu"; ok = "worse"; }
+      else { answer = "A · €410 · Thu (B unavailable, flagged)"; ok = "flagged"; }
+    }
+    return { ev, calls, tok, t, answer, ok, a };
+  }
+
+  let F = null;
+  function draw() {
+    const svg = $("archFlow");
+    F = new Flow(svg, { width: 720, height: 290 });
+    if (arch === "react") {
+      F.node("q", { x: 70, y: 145, w: 110, label: "Question", kind: "cl" })
+        .node("llm", { x: 270, y: 145, w: 140, label: "LLM", sub: "ReAct loop", kind: "nw" })
+        .node("stock", { x: 480, y: 70, w: 130, label: "check_stock", kind: "sv" })
+        .node("quote", { x: 480, y: 220, w: 140, label: "quote_shipping", kind: "sv" })
+        .node("ans", { x: 650, y: 145, w: 100, label: "Answer", kind: "ca" })
+        .edge("q", "llm").edge("llm", "stock", { label: "call / observe" }).edge("llm", "quote", { label: "call / observe" }).edge("llm", "ans");
+    } else if (arch === "pe") {
+      F.node("q", { x: 60, y: 70, w: 100, label: "Question", kind: "cl" })
+        .node("plan", { x: 200, y: 70, w: 120, label: "Planner", sub: "LLM", kind: "nw" })
+        .node("exec", { x: 370, y: 70, w: 120, label: "Executor", sub: "code", kind: "sv" })
+        .node("stock", { x: 580, y: 40, w: 130, label: "check_stock", kind: "sv" })
+        .node("quote", { x: 580, y: 130, w: 140, label: "quote_shipping", kind: "sv" })
+        .node("solve", { x: 370, y: 230, w: 150, label: "Solver / replanner", sub: "LLM", kind: "nw" })
+        .node("ans", { x: 600, y: 240, w: 100, label: "Answer", kind: "ca" })
+        .edge("q", "plan").edge("plan", "exec").edge("exec", "stock").edge("exec", "quote").edge("exec", "solve")
+        .edge("solve", "plan", { dashed: true, label: "replan" }).edge("solve", "ans");
+    } else {
+      F.node("q", { x: 50, y: 145, w: 80, label: "Question", kind: "cl" })
+        .node("plan", { x: 160, y: 145, w: 100, label: "Planner", sub: "LLM", kind: "nw" })
+        .node("join", { x: 585, y: 145, w: 90, label: "Joiner", sub: "LLM", kind: "nw" })
+        .node("ans", { x: 680, y: 145, w: 70, label: "Answer", kind: "ca" });
+      ["A", "B", "C"].forEach((w, i) => {
+        F.node("s" + w, { x: 310, y: 50 + 95 * i, w: 110, label: "stock " + w, kind: "sv" })
+         .node("q" + w, { x: 450, y: 50 + 95 * i, w: 110, label: "quote " + w, kind: "sv" })
+         .edge("plan", "s" + w).edge("s" + w, "q" + w, { label: "$" + (i + 1) }).edge("q" + w, "join");
+      });
+      F.edge("q", "plan").edge("join", "ans");
+    }
+    F.render();
+  }
+
+  function show(r) {
+    $("aCalls").textContent = r.calls; $("aTok").textContent = fmt(r.tok); $("aTime").textContent = r.t.toFixed(1) + " s"; $("aAns").textContent = r.answer;
+    $("archVerdict").innerHTML = r.ok === "best" ? `<span class="ev">✅ Right answer: B is cheapest and arrives by Friday.</span>`
+      : r.ok === "flagged" ? `<span class="ev">✅ Graceful: B really is unavailable, so A is the best possible answer, and the reply says why.</span>`
+      : `<span class="rk">❌ Worse answer: B's failure was temporary, but this plan ran blind and nothing retried or replanned, so it recommends the €410 option instead of €365.</span>`;
+    $("archLog").innerHTML = r.ev.map(e => `<div class="st">${e.log}</div>`).join("");
+  }
+  let running = 0;
+  async function animate(r) {
+    const my = ++running; draw(); const f = F;
+    for (const e of r.ev) {
+      if (my !== running) return;
+      if (e.set) Object.entries(e.set).forEach(([id, o]) => f.set(id, o));
+      if (e.paths && e.paths.length) await Promise.all(e.paths.filter(p => p.every(id => f.nodes[id])).map(p => f.packet(p, { color: "--c-cl", dur: 420, back: false })));
+    }
+  }
+  $("runArch").onclick = () => { const r = simulate(arch); show(r); $("cmpOut").innerHTML = ""; animate(r); };
+  $("cmpArch").onclick = () => {
+    const names = { react: "ReAct", pe: "Planner–executor", dag: "DAG" };
+    const rows = ["react", "pe", "dag"].map(a => { const r = simulate(a); return `<tr><td>${names[a]}</td><td>${r.calls}</td><td>${fmt(r.tok)}</td><td>${r.t.toFixed(1)} s</td><td class="${r.ok === "worse" ? "rk" : "ev"}">${r.answer}</td></tr>`; });
+    $("cmpOut").innerHTML = `<table><tr><th>Architecture</th><th>LLM calls</th><th>input tokens</th><th>wall-clock</th><th>answer</th></tr>${rows.join("")}</table>`;
+  };
+  ["fail", "retry", "replan"].forEach(id => ($(id).onchange = () => { show(simulate(arch)); $("cmpOut").innerHTML = ""; }));
+  draw(); show(simulate(arch));
+
+  /* ================= Playground 2: Tree of Thoughts ================= */
+  const key = a => a.slice().sort((x, y) => x - y).join(",");
+  function moves(st) {
+    const out = new Map();
+    for (let i = 0; i < st.length; i++) for (let j = i + 1; j < st.length; j++) {
+      const a = st[i], b = st[j], rest = st.filter((_, k) => k !== i && k !== j), hi = Math.max(a, b), lo = Math.min(a, b);
+      const c = [[a + b, `${a}+${b}`], [a * b, `${a}×${b}`], [hi - lo, `${hi}−${lo}`]];
+      if (lo && hi % lo === 0) c.push([hi / lo, `${hi}÷${lo}`]);
+      for (const [v, lab] of c) { const ns = [...rest, v].sort((x, y) => x - y), k = key(ns); if (!out.has(k)) out.set(k, { st: ns, lab: `${lab}=${v}` }); }
+    }
+    return [...out.values()];
+  }
+  const memo = new Map();
+  function solvable(st) { if (st.length === 1) return st[0] === 24; const k = key(st); if (memo.has(k)) return memo.get(k); const r = moves(st).some(m => solvable(m.st)); memo.set(k, r); return r; }
+  function seeded(seed) { let s = seed >>> 0 || 1; return () => { s ^= s << 13; s >>>= 0; s ^= s >> 17; s ^= s << 5; s >>>= 0; return s / 4294967296; }; }
+  function gauss(r) { let u = 0, v = 0; while (!u) u = r(); while (!v) v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); }
+
+  function search(start, o, seed, record) {
+    const r = seeded(seed); let calls = 0; const nodes = [];
+    const propose = st => { calls++; const pool = moves(st).map(m => [m, solvable(m.st) ? 3 : 1]), pick = [];
+      for (let n = 0; n < o.k && pool.length; n++) { let x = r() * pool.reduce((s, p) => s + p[1], 0), i = 0; while (x > pool[i][1]) { x -= pool[i][1]; i++; } pick.push(pool[i][0]); pool.splice(i, 1); }
+      return pick; };
+    const value = st => { if (st.length === 1) return st[0] === 24 ? 1 : 0; if (!o.evalOn) return 0.5; calls++; return Math.max(0, Math.min(1, (solvable(st) ? 0.75 : 0.25) + o.noise * gauss(r))); };
+    const root = { id: 0, d: 0, st: start, parent: -1, status: "kept", lab: start.join(" ") };
+    nodes.push(root); let solved = null;
+    if (o.mode === "bfs") {
+      let frontier = [root];
+      for (let d = 1; d < start.length; d++) {
+        const kids = [];
+        for (const p of frontier) for (const m of propose(p.st)) {
+          const v = value(m.st), n = { id: nodes.length, d, st: m.st, parent: p.id, v, lab: m.lab, status: v < (o.evalOn ? o.th : 0) ? "pruned" : "cand" };
+          nodes.push(n); kids.push(n);
+        }
+        const alive = kids.filter(c => c.status === "cand").sort((a, b) => b.v - a.v);
+        alive.forEach((c, i) => (c.status = i < o.b ? "kept" : "pruned"));
+        frontier = alive.slice(0, o.b);
+        if (d === start.length - 1) solved = frontier.find(c => c.st[0] === 24) || null;
+        if (!frontier.length) break;
+      }
+    } else {
+      const budget = 120;
+      const dfs = p => {
+        if (solved || nodes.length >= budget) return;
+        if (p.st.length === 1) { if (p.st[0] === 24) solved = p; return; }
+        const kids = propose(p.st).map(m => { const v = value(m.st), n = { id: nodes.length, d: p.d + 1, st: m.st, parent: p.id, v, lab: m.lab, status: "pruned" }; nodes.push(n); return n; })
+          .filter(c => c.v >= (o.evalOn ? o.th : 0)).sort((a, b) => b.v - a.v).slice(0, o.b);
+        for (const c of kids) { if (solved) break; c.status = "kept"; dfs(c); }
+      };
+      dfs(root);
+    }
+    const path = new Set(); if (solved) { let n = solved; while (n) { path.add(n.id); n = nodes[n.parent]; } }
+    return { solved: !!solved, calls, nodes, path, sol: solved };
+  }
+
+  let smode = "bfs";
+  const mBtns = [...$("smode").querySelectorAll("button")];
+  mBtns.forEach(b => (b.onclick = () => { mBtns.forEach(x => x.classList.toggle("on", x === b)); smode = b.dataset.v; totRender(); }));
+  const opts = () => ({ mode: smode, b: +$("tb").value, k: +$("tk").value, th: +$("tth").value, noise: +$("tn").value, evalOn: $("useEval").checked });
+  const puzzle = () => $("puz").value.split(",").map(Number);
+  let seed = 1;
+  function labels() { const o = opts(); $("tbv").textContent = o.b; $("tkv").textContent = o.k; $("tthv").textContent = o.evalOn ? o.th.toFixed(2) : "(no judge)"; $("tnv").textContent = o.evalOn ? o.noise.toFixed(2) : "(no judge)"; }
+
+  function drawTree(res) {
+    const svg = $("totTree"), W = 720, H = 250, NS = "http://www.w3.org/2000/svg";
+    svg.innerHTML = "";
+    const levels = [[], [], [], []]; res.nodes.forEach(n => levels[n.d].push(n));
+    const pos = {};
+    levels.forEach((lv, d) => {
+      if (d > 0) lv.sort((a, b) => pos[a.parent][0] - pos[b.parent][0] || a.id - b.id);
+      lv.forEach((n, i) => (pos[n.id] = [lv.length === 1 ? W / 2 : 20 + (W - 40) * (i + 0.5) / lv.length, 25 + d * 68]));
+    });
+    const col = n => res.path.has(n.id) ? MX.css("--c-tk") : n.status === "pruned" ? MX.css("--c-rk") : MX.css("--c-cx");
+    const mk = (t, a) => { const e = document.createElementNS(NS, t); Object.entries(a).forEach(([k, v]) => e.setAttribute(k, v)); svg.appendChild(e); return e; };
+    res.nodes.forEach(n => { if (n.parent >= 0) { const [x1, y1] = pos[n.parent], [x2, y2] = pos[n.id]; mk("line", { x1, y1, x2, y2, stroke: res.path.has(n.id) ? MX.css("--c-tk") : MX.css("--line"), "stroke-width": res.path.has(n.id) ? 3 : 1 }); } });
+    res.nodes.forEach(n => { const [x, y] = pos[n.id]; const c = mk("circle", { cx: x, cy: y, r: n.d === 0 ? 9 : 5.5, fill: col(n), opacity: n.status === "pruned" && !res.path.has(n.id) ? 0.55 : 1 }); const t = document.createElementNS(NS, "title"); t.textContent = `${n.lab} → left: ${n.st.join(" ")}${n.v != null ? " · score " + n.v.toFixed(2) : ""}`; c.appendChild(t); });
+    mk("text", { x: W / 2, y: 12, "text-anchor": "middle", "font-size": 11, fill: MX.css("--muted") }).textContent = puzzle().join(" ");
+    ["", "level 1", "level 2", "level 3 (final number)"].forEach((s, d) => { if (s) mk("text", { x: 4, y: 25 + d * 68 - 9, "font-size": 10, fill: MX.css("--muted") }).textContent = s; });
+  }
+  function batch(o, p, n = 200) { let s = 0, c = 0; for (let i = 1; i <= n; i++) { const r = search(p, o, i * 7919); s += r.solved; c += r.calls; } return { rate: 100 * s / n, calls: c / n }; }
+  function totRender(newSeed) {
+    labels(); if (newSeed) seed = (seed * 48271) % 2147483647;
+    const o = opts(), p = puzzle(), r = search(p, o, seed);
+    drawTree(r);
+    $("tNodes").textContent = r.nodes.length - 1; $("tCalls").textContent = r.calls; $("tTok").textContent = fmt(r.calls * 200);
+    $("totVerdict").innerHTML = r.solved
+      ? `<span class="ev">✅ Solved: ${(() => { const steps = []; let n = r.sol; while (n && n.parent >= 0) { steps.unshift(n.lab); n = r.nodes[n.parent]; } return steps.join(", then "); })()}</span>`
+      : `<span class="rk">❌ No solution found this run. ${o.k === 1 && o.b === 1 ? "One proposal, no judge: a single line of reasoning that commits to its first idea." : "Hover the red nodes: the right branch was never proposed or was pruned."}</span>`;
+    $("tRate").textContent = "–";
+  }
+  ["tb", "tk", "tth", "tn"].forEach(id => ($(id).oninput = () => totRender()));
+  ["puz", "useEval"].forEach(id => ($(id).onchange = () => totRender()));
+  const setP = (b, k, th, noise, ev, mode) => { $("tb").value = b; $("tk").value = k; $("tth").value = th; $("tn").value = noise; $("useEval").checked = ev; mBtns.forEach(x => x.classList.toggle("on", x.dataset.v === mode)); smode = mode; totRender(); };
+  $("pCot").onclick = () => setP(1, 1, 0.5, 0.3, false, "bfs");
+  $("pTot").onclick = () => setP(5, 5, 0.5, 0.3, true, "bfs");
+  $("pPrune").onclick = () => setP(5, 5, 0.85, 0.3, true, "bfs");
+  $("pNoisy").onclick = () => setP(5, 5, 0.5, 0.75, true, "bfs");
+  $("totRun").onclick = () => totRender(true);
+  $("totBatch").onclick = () => { const b = batch(opts(), puzzle()); $("tRate").textContent = `${Math.round(b.rate)}% · ${b.calls.toFixed(0)} calls avg`; $("totMsg").textContent = `Over 200 seeds with these settings: ${Math.round(b.rate)}% solved, ${b.calls.toFixed(1)} LLM calls per puzzle on average.`; };
+  $("totSweep").onclick = () => {
+    const o = opts(), p = puzzle(), acc = [], cl = [];
+    for (let b = 1; b <= 8; b++) { const r = batch({ ...o, b }, p, 150); acc.push([b, r.rate]); cl.push([b, r.calls]); }
+    const maxC = Math.max(...cl.map(x => x[1]));
+    Plot.line($("totChart"), { series: [
+      { label: "solved %", color: MX.css("--c-ev"), data: acc, width: 3, dots: true },
+      { label: `LLM calls per puzzle (scaled, max ${maxC.toFixed(0)})`, color: MX.css("--c-tk"), data: cl.map(([x, y]) => [x, 100 * y / maxC]), dash: [6, 4] },
+    ], xLabel: "breadth b", yMin: 0, yMax: 100 });
+    const best = acc.reduce((m, x) => (x[1] > m[1] ? x : m), [0, -1]);
+    $("totMsg").textContent = o.evalOn
+      ? `With k = ${o.k} proposals and judge noise ${o.noise.toFixed(2)}, success tops out at about ${Math.round(best[1])}% (b = ${best[0]}). Beyond a few, extra breadth mostly buys calls: the limit is what the generator proposes and how well the judge scores it.`
+      : "Without a judge, extra breadth keeps random branches, so it helps far less. Tick “use an evaluator” and sweep again.";
+  };
+  totRender();
+  $("totSweep").onclick();
+})();
+</script>
+</body>
+</html>

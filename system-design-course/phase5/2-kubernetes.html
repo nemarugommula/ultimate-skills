@@ -1,0 +1,501 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.2 Kubernetes core: pods, deployments, services · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .nodes { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin: 10px 0; }
+  .knode { border: 2px solid var(--c-sv); border-radius: 12px; padding: 8px; background: var(--bg2); min-height: 92px; }
+  .knode.down { border-color: var(--c-er); opacity: .6; }
+  .knode h5 { margin: 0 0 4px; font-size: .85rem; display: flex; justify-content: space-between; }
+  .knode .cap { font-size: .72rem; color: var(--muted); font-family: var(--mono); }
+  .pod { display: inline-block; width: 22px; height: 22px; margin: 2px; border-radius: 6px; background: var(--c-db); font-size: .6rem; color: #fff; text-align: center; line-height: 22px; font-weight: 800; }
+  .pod.creating { background: var(--c-lt); } .pod.lost { background: var(--c-er); } .pod.pending { background: var(--muted); }
+  .pending-row { font-size: .85rem; min-height: 28px; }
+  .evlog { font-family: var(--mono); font-size: .75rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; min-height: 96px; white-space: pre-wrap; color: var(--muted); }
+</style>
+</head>
+<body data-lesson="s5-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 5 · Lesson 2</div>
+  <h1>Kubernetes core: pods, deployments, services</h1>
+  <p class="subtitle">You tell Kubernetes what you want running (“5 copies of this image, reachable at this name”), and it keeps making it true: placing containers on machines, replacing the ones that die, and rolling out new versions without downtime.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Images and containers</b>: an image is the packaged app, a container is one running copy of it (Lesson 5.1).</li>
+      <li><b>Load balancers and health checks</b>: spread requests over healthy servers only (Lesson 1.2).</li>
+      <li><b>etcd</b>: a small, strongly consistent key-value store kept in sync with the Raft consensus algorithm (Lesson 3.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Google's 2015 paper on <b>Borg</b>, its internal cluster manager, describes a system that runs “hundreds of thousands of jobs, from many thousands of different applications, across a number of clusters each with up to tens of thousands of machines”. Nobody places those by hand.</p>
+    <p>Engineers who knew Borg started an open-source cousin: the <b>first commit of Kubernetes</b> went to GitHub on June 6, 2014. Version 1.0 shipped on July 21, 2015, and Google donated it to the new Cloud Native Computing Foundation (<b>CNCF</b>). Ten years later the project counted over 88,000 contributors from more than 8,000 companies.</p>
+  </div>
+
+  <h2>Numbers first: why you need an orchestrator</h2>
+  <p>A mid-size company runs <b>30 services × 10 copies = 300 containers</b> on <b>40 machines</b>. Suppose each machine fails on average once every three years (an illustrative number). With 40 machines that's a failure every month or so. With 1,000 machines it's <b>about one a day</b> (1,000 ÷ 1,095 days).</p>
+  <p>Each failure means someone has to notice, pick a machine with spare CPU and memory, start the containers again, and tell the load balancer the new addresses. Plus about 30 deploys a day, each replacing 10 containers without dropping requests. Doing that by hand at 3 a.m. doesn't scale. An <b>orchestrator</b> does it for you, continuously.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea: desired state + reconciliation</span>
+    You don't tell Kubernetes <i>what to do</i> (“start a container on machine 7”). You tell it <i>what should be true</i> (“5 copies of <code>api:v2</code> should be running”). Small programs called <b>controllers</b> loop forever: <b>observe</b> what's actually running, <b>compare</b> it with what you asked for, <b>act</b> to close the gap. A crash, a dead machine, or a deleted pod is just another gap to close.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the thermostat</span>
+    <p>You don't switch the heater on and off yourself. You set the thermostat to 21 °C. It measures the room, compares, and switches the heater as needed, forever. Open a window (a machine dies) and it simply works harder. Kubernetes is a building full of thermostats: one for replica counts, one for node health, one for load-balancer endpoints, and so on.</p>
+  </div>
+
+  <h2>The parts of a cluster</h2>
+  <p>A <b>cluster</b> is a set of machines called <b>nodes</b>, plus a <b>control plane</b> that makes the decisions. Press the button to follow what happens when you run <code>kubectl apply</code>:</p>
+  <svg id="arch"></svg>
+  <div class="controls"><button class="btn primary" id="apply">▶ kubectl apply -f deployment.yaml</button> <span class="hint" id="amsg">Each step is a separate component reacting to a change it watches for.</span></div>
+  <table>
+    <tr><th>Component</th><th>Where</th><th>Its one job</th></tr>
+    <tr><td class="sv"><b>API server</b> (kube-apiserver)</td><td>Control plane</td><td>The front door. Every tool and component reads and writes cluster state through its HTTP API.</td></tr>
+    <tr><td class="db"><b>etcd</b></td><td>Control plane</td><td>The cluster's memory: a consistent, highly available key-value store holding every object. Usually 3 or 5 members, so a majority survives a failure (Lesson 3.4).</td></tr>
+    <tr><td class="sv"><b>Scheduler</b> (kube-scheduler)</td><td>Control plane</td><td>Finds pods with no node yet and picks one: first <b>filtering</b> (which nodes have enough free CPU and memory?), then <b>scoring</b> (which is best?).</td></tr>
+    <tr><td class="sv"><b>Controller manager</b></td><td>Control plane</td><td>Runs the reconcile loops: Deployments, ReplicaSets, nodes, endpoints…</td></tr>
+    <tr><td class="sv"><b>kubelet</b></td><td>Every node</td><td>The node's agent: starts the containers assigned to its node, runs their health checks, reports status.</td></tr>
+    <tr><td class="nw"><b>kube-proxy</b> (or a CNI like Cilium)</td><td>Every node</td><td>Programs the node's networking so a Service's stable address reaches its pods.</td></tr>
+  </table>
+
+  <h2>The objects you'll actually write</h2>
+  <table>
+    <tr><th>Object</th><th>What it is</th><th>You use it for</th></tr>
+    <tr><td><b>Pod</b></td><td>The smallest unit: one or a few containers that share a network address and are always placed together.</td><td>Almost never directly. Pods are disposable; something else creates them.</td></tr>
+    <tr><td><b>ReplicaSet</b></td><td>“Keep N pods matching this template running.”</td><td>Created for you by a Deployment.</td></tr>
+    <tr><td><b>Deployment</b></td><td>Manages ReplicaSets so you can change the image and roll out gradually, or roll back.</td><td>Every stateless service. This is your daily driver.</td></tr>
+    <tr><td class="nw"><b>Service</b></td><td>A stable name and virtual IP in front of a changing set of pods, chosen by <b>labels</b>.</td><td>How other services and load balancers find your pods.</td></tr>
+  </table>
+  <p><b>Labels</b> are key-value tags on objects (<code>app: api</code>, <code>tier: web</code>). A <b>selector</b> is a query over labels. A Deployment owns the pods whose labels match its selector; a Service sends traffic to the pods whose labels match <i>its</i> selector. Nothing is wired by name or IP: labels are the glue.</p>
+  <p>Services come in three main types:</p>
+  <ul>
+    <li><b>ClusterIP</b> (the default): a virtual IP reachable only inside the cluster. Service-to-service traffic.</li>
+    <li><b>NodePort</b>: also opens the same port (by default from the range 30000–32767) on every node.</li>
+    <li><b>LoadBalancer</b>: also asks your cloud for an external load balancer pointing at the nodes. The simplest way to expose one service to the internet (Lesson 5.3 shows the better way for many services).</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: will my pods fit?</span>
+    <p>3 nodes, each with <b>3.5 vCPU</b> and <b>15 GiB</b> left for pods after the system's own needs (typical numbers). Each pod <b>requests</b> 500m CPU (“m” = millicores, so 500m = half a CPU) and 1 GiB of memory. The scheduler only places a pod where its requests fit.</p>
+    <ul>
+      <li>Per node: CPU fits 3,500 ÷ 500 = <b>7 pods</b>; memory fits 15 ÷ 1 = 15. CPU is the limit: 7 per node, <b>21 in the cluster</b>.</li>
+      <li>You ask for 20 replicas: all run, with 1 slot spare.</li>
+      <li>One node dies: capacity drops to 2 × 7 = 14. The ReplicaSet recreates the lost pods, but 6 of them have nowhere to go and stay <b>Pending</b> until you add a node.</li>
+    </ul>
+    <p>Lesson: plan for losing a node. 20 replicas on 3 nodes needs a 4th node's worth of headroom (or a cluster autoscaler, Lesson 5.3).</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The reconcile loop</span>
+    <p class="hint">Each node has 3,500m CPU and 15 GiB for pods. Set the desired replicas and each pod's CPU request, then break things: kill a pod, take node 2 down, or pause the controllers to see what Kubernetes would be without reconciliation. Green = running, gold = starting, grey = Pending (no room), red = lost with its node.</p>
+    <div class="controls">
+      <label>desired replicas <input type="range" id="rep" min="0" max="30" step="1" value="12"> <b class="mono" id="repv"></b></label>
+      <label>CPU request per pod <input type="range" id="req" min="250" max="2000" step="250" value="500"> <b class="mono" id="reqv"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn" id="kpod">💥 Kill a pod</button>
+      <button class="btn" id="knode">🔌 Node 2 down / up</button>
+      <button class="btn" id="addn">➕ Add a node</button>
+      <label><input type="checkbox" id="pause"> pause the controllers</label>
+    </div>
+    <div class="nodes" id="nodes"></div>
+    <div class="pending-row" id="pend"></div>
+    <div class="stat-row">
+      <div class="stat">desired <b id="sd">–</b></div>
+      <div class="stat">running <b id="sr">–</b></div>
+      <div class="stat">pending <b id="sp">–</b></div>
+      <div class="stat">cluster CPU requested <b id="sc">–</b></div>
+    </div>
+    <canvas class="chart" id="rch" style="height:170px"></canvas>
+    <div class="evlog" id="ev"></div>
+    <p class="hint">Time is sped up: one tick here stands for a few seconds. In a real cluster, pods on an unreachable node are kept for <b>5 minutes</b> by default before they're evicted and replaced; here it takes 3 ticks.</p>
+  </div>
+  <p>Things to try: set 20 replicas with 500m requests, then take node 2 down. Watch the lost pods turn red, get replaced, and some stay Pending because the other two nodes are full. Add a node and they schedule instantly. Then tick “pause the controllers” and kill pods: nothing comes back. That's what a server without an orchestrator looks like. Finally raise the request to 2,000m: big pods leave gaps no other pod fits into.</p>
+
+  <h2>Rolling updates: new version, no downtime</h2>
+  <p>Change the image in a Deployment and it creates a <b>new ReplicaSet</b>, then shifts pods over step by step. Two knobs control the pace:</p>
+  <ul>
+    <li><b>maxSurge</b>: how many <i>extra</i> pods may exist above the desired count during the rollout (more speed, more temporary cost). Percentages <b>round up</b>.</li>
+    <li><b>maxUnavailable</b>: how many pods may be <i>missing</i> below the desired count (more speed, less capacity). Percentages <b>round down</b>.</li>
+  </ul>
+  <p>Both default to <b>25%</b>. With 10 replicas: surge = ⌈2.5⌉ = 3, unavailable = ⌊2.5⌋ = 2. So during the rollout there are always between <b>8 and 13 pods</b>. They can't both be 0, or the rollout could never move. A new pod only counts once its <b>readiness check</b> passes (Lesson 5.3), which is what keeps a broken version from taking all your traffic.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · A rolling update</span>
+    <p class="hint">Roll out v2 over v1. Pick the knobs and how long a new pod takes to become ready. Then flip v2 to “broken” (it never passes its readiness check) and see which settings protect your users.</p>
+    <div class="controls">
+      <label>replicas <input type="range" id="rn" min="2" max="20" step="1" value="10"> <b class="mono" id="rnv"></b></label>
+      <label>time to ready <input type="range" id="rs" min="5" max="60" step="5" value="20"> <b class="mono" id="rsv"></b></label>
+    </div>
+    <div class="controls">
+      <span class="hint">maxSurge</span><span class="seg" id="msu"><button data-v="0">0%</button><button data-v="25" class="on">25%</button><button data-v="50">50%</button><button data-v="100">100%</button></span>
+      <span class="hint">maxUnavailable</span><span class="seg" id="mun"><button data-v="0" id="mun0">0%</button><button data-v="25" class="on">25%</button><button data-v="50">50%</button><button data-v="100">100%</button></span>
+      <span class="seg" id="ver"><button data-v="ok" class="on">v2 works</button><button data-v="bad" id="vbad">v2 broken</button></span>
+    </div>
+    <div class="stat-row">
+      <div class="stat">rollout time <b id="ut">–</b></div>
+      <div class="stat">lowest ready pods <b id="umin">–</b></div>
+      <div class="stat">peak pods (cost) <b id="upk">–</b></div>
+      <div class="stat">status <b id="ust">–</b></div>
+    </div>
+    <canvas class="chart" id="uch" style="height:210px"></canvas>
+    <p class="hint" id="umsg"></p>
+  </div>
+  <p>The safe production setting for a service that must never lose capacity is <b>maxUnavailable: 0</b> with a small surge: a broken version just stalls, while every old pod keeps serving. Then you run <code>kubectl rollout undo</code>. Kubernetes won't roll back by itself: after <code>progressDeadlineSeconds</code> (600 s by default) it only marks the rollout as stuck. Automatic rollback is the job of your CD tooling (Lesson 6.2).</p>
+
+  <div class="box incident">
+    <span class="label">🔥 Real outage · Monzo, October 2017</span>
+    <p>UK bank Monzo ran several hundred microservices in Docker containers on Kubernetes. Their postmortem describes a chain: an etcd cluster change days earlier triggered a bug that made service-discovery updates time out. A routine deploy then left the service mesh (linkerd) routing to pod IPs that no longer existed, and payments started failing. Restarting every linkerd instance exposed a second bug: a version incompatibility made linkerd fail to parse a Service with <b>no endpoints</b> (one a team had scaled to 0 the day before). It became a full platform outage until engineers deleted that empty Service.</p>
+    <p><b>Lesson:</b> the control plane's data (etcd, endpoints) is on the critical path of every request routed by service discovery, and “restart everything” is a risky fix when you don't yet know the cause.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>kubectl</b> (the CLI), managed clusters (<b>Amazon EKS</b>, <b>Google GKE</b> including Autopilot, <b>Azure AKS</b>), local clusters (<b>kind</b>, <b>minikube</b>, <b>k3d</b>), and terminal UIs like <b>k9s</b>. A Deployment and its Service:</p>
+<pre><code><span class="c"># deployment.yaml</span>
+<span class="k">apiVersion:</span> apps/v1
+<span class="k">kind:</span> Deployment
+<span class="k">metadata:</span>
+  name: api
+<span class="k">spec:</span>
+  replicas: <span class="n">5</span>                        <span class="c"># desired state</span>
+  selector:
+    matchLabels: { app: api }        <span class="c"># "my pods are the ones labelled app=api"</span>
+  strategy:
+    type: RollingUpdate
+    rollingUpdate: { maxSurge: <span class="n">1</span>, maxUnavailable: <span class="n">0</span> }
+  template:                          <span class="c"># the pod to stamp out</span>
+    metadata:
+      labels: { app: api }
+    spec:
+      containers:
+        - name: api
+          image: registry.example.com/api:3f9c2e1   <span class="c"># an immutable tag (Lesson 5.1)</span>
+          ports: [{ containerPort: <span class="n">3000</span> }]
+          resources:
+            requests: { cpu: <span class="s">"500m"</span>, memory: <span class="s">"512Mi"</span> }   <span class="c"># what the scheduler reserves</span>
+---
+<span class="c"># service.yaml</span>
+<span class="k">apiVersion:</span> v1
+<span class="k">kind:</span> Service
+<span class="k">metadata:</span>
+  name: api                          <span class="c"># other pods call http://api (DNS)</span>
+<span class="k">spec:</span>
+  type: ClusterIP
+  selector: { app: api }             <span class="c"># send traffic to pods with this label</span>
+  ports: [{ port: <span class="n">80</span>, targetPort: <span class="n">3000</span> }]</code></pre>
+<pre><code>kubectl apply -f deployment.yaml -f service.yaml   <span class="c"># declare the desired state</span>
+kubectl get pods -l app=api -o wide                <span class="c"># which pods, on which nodes</span>
+kubectl describe pod api-7d9c-xk2p                 <span class="c"># events: scheduling, pulls, probe failures</span>
+kubectl logs -f deploy/api                         <span class="c"># follow logs</span>
+kubectl set image deploy/api api=registry.example.com/api:a81b7c0
+kubectl rollout status deploy/api                  <span class="c"># watch the rolling update</span>
+kubectl rollout undo deploy/api                    <span class="c"># back to the previous ReplicaSet</span>
+kubectl get events --sort-by=.lastTimestamp        <span class="c"># what the controllers have been doing</span></code></pre>
+    <p class="hint">Try it locally: <code>kind create cluster</code> (Kubernetes inside Docker), then <code>kubectl create deployment web --image=nginx --replicas=3</code>, delete a pod with <code>kubectl delete pod …</code>, and watch a new one appear with <code>kubectl get pods -w</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>✅ Kubernetes pays off when…</th><th>❌ Think twice when…</th></tr>
+      <tr><td>Many services and teams share infrastructure</td><td>You have one or two services: a PaaS or Cloud Run does the same with no cluster to run</td></tr>
+      <tr><td>You need portability across clouds or on-prem</td><td>Nobody on the team can own the cluster: upgrades every few months, networking, security, add-ons</td></tr>
+      <tr><td>You want one standard way to deploy, scale and observe everything</td><td>Your workload is mostly a managed database plus a few functions</td></tr>
+      <tr><td>The ecosystem matters (Helm, Argo CD, operators, autoscalers)</td><td>You'd be adopting it because big companies do: their scale isn't yours yet</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Don't run Kubernetes yourself on day one. Ship containers to <b>Cloud Run</b>, <b>ECS Fargate</b>, Render or Fly.io (Lesson 5.5). If you do pick Kubernetes, use a fully managed flavour (GKE Autopilot, EKS with managed nodes) and keep it boring: Deployments, Services, one ingress.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>A platform team runs many clusters (per region, per environment), upgrades them on a schedule, and gives product teams a paved road: templates, GitOps (Lesson 5.4), policies, quotas. Some run Kubernetes at extreme scale; others keep internal systems that predate it, like Google's Borg.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Deploy it on Kubernetes” is not a design. A senior answer says:</p>
+    <ul>
+      <li>The <b>shape</b>: Deployment + Service per stateless service, how many replicas, spread across nodes and zones (Lesson 5.5).</li>
+      <li><b>Capacity</b>: requests per pod × replicas vs. node size, and headroom for losing a node.</li>
+      <li><b>Rollouts</b>: maxSurge/maxUnavailable, readiness checks, and how you roll back.</li>
+      <li>What the <b>control plane</b> is (API server, etcd, scheduler, controllers) and that running pods keep serving if it's briefly down, but nothing new gets scheduled.</li>
+    </ul>
+    <p>Common follow-ups: “What happens when a node dies?” (pods are evicted after a timeout, recreated elsewhere if there's room). “Why is my pod Pending?” (no node has room for its requests, or constraints don't match). “Pod vs container?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Borg, the ancestor</b> <span class="tag co">🏢 Google · 2015</span> <a href="https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/" target="_blank" rel="noopener">Large-scale cluster management at Google with Borg (EuroSys)</a></div>
+      <p><b>How:</b> a cluster manager running hundreds of thousands of jobs across clusters of up to tens of thousands of machines, with admission control, efficient task-packing and over-commitment.</p>
+      <p><b>Why this method:</b> packing many workloads per machine gives high utilization; Kubernetes' pods, labels and controllers grew from these lessons.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>From one commit to a CNCF giant</b> <span class="tag hist">📜 History · 2014–2024</span> <a href="https://kubernetes.io/blog/2024/06/06/10-years-of-kubernetes/" target="_blank" rel="noopener">10 Years of Kubernetes (Kubernetes blog)</a></div>
+      <p><b>How:</b> first commit June 6, 2014; 1.0 on July 21, 2015, donated to the CNCF; over 88,000 contributors from 8,000+ companies a decade later.</p>
+      <p><b>Why this method:</b> a vendor-neutral foundation let competing clouds all offer the same API, which is why every cloud now has a managed Kubernetes.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One very big cluster</b> <span class="tag co">🏢 OpenAI · 2021</span> <a href="https://openai.com/index/scaling-kubernetes-to-7500-nodes/" target="_blank" rel="noopener">Scaling Kubernetes to 7,500 nodes</a></div>
+      <p><b>How:</b> OpenAI describes running Kubernetes clusters of 7,500 nodes for training large models like GPT-3, CLIP and DALL·E, and the API-server, networking and monitoring changes that size required.</p>
+      <p><b>Why this method:</b> one scheduler and one API for research jobs of every size; the post notes clusters this big are rarely run and need special tuning.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Hundreds of microservices on Kubernetes</b> <span class="tag co">🏢 Monzo · 2017</span> <a href="https://community.monzo.com/t/resolved-current-account-payments-may-fail-major-outage-27-10-2017/26296/95" target="_blank" rel="noopener">Monzo outage postmortem (27/10/2017)</a></div>
+      <p><b>How:</b> several hundred services in Docker containers on Kubernetes on AWS, with etcd spread over three zones and linkerd routing calls using Kubernetes' service discovery.</p>
+      <p><b>Why this method:</b> small, frequent deploys of many services, with automated reaction to node and app failures. The outage shows the cost: the control plane becomes critical infrastructure.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · K, eight letters, s</span>
+    <p>Kubernetes comes from the Greek word for <b>helmsman</b> or pilot (hence the ship's-wheel logo). “K8s” is just the word with its eight middle letters counted instead of written.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Services are the in-cluster version of the load balancer from Lesson 1.2 and the service discovery from Lesson 4.3. etcd is the Raft-based store from Lesson 3.4. Next, Lesson 5.3 makes this production-ready: requests and limits, autoscaling, health probes, config and ingress. Lesson 5.4 stops you typing <code>kubectl apply</code> by hand. AI training clusters run on the same scheduler ideas, with GPUs as the scarce resource instead of CPU.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://research.google/pubs/large-scale-cluster-management-at-google-with-borg/" target="_blank" rel="noopener">Borg (EuroSys 2015)</a>. Read the lessons-learned section: it explains why Kubernetes has pods and labels.</li>
+      <li><span class="kind">Docs</span> <a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/" target="_blank" rel="noopener">Kubernetes: Deployments</a>. Rolling updates, maxSurge/maxUnavailable rounding, rollbacks.</li>
+      <li><span class="kind">Docs</span> <a href="https://kubernetes.io/docs/concepts/overview/components/" target="_blank" rel="noopener">Kubernetes components</a>. One page on every control-plane and node component.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Nodes have 3,500m CPU free each. Pods request 700m. You want 24 replicas. What's the fewest nodes that still runs all 24 if any one node dies?</div>
+    <div class="opts"><button class="opt">5 nodes</button><button class="opt" data-ok>6 nodes</button><button class="opt">8 nodes</button></div>
+    <div class="explain">3,500 ÷ 700 = 5 pods per node. 24 pods need ⌈24 ÷ 5⌉ = 5 nodes, with no room to spare. To survive losing one node you need 5 nodes <i>after</i> the loss, so <b>6</b>. Always size for N + 1.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A payment service must never drop below full capacity during deploys, even if the new version is broken. Which rolling-update setting fits?</div>
+    <div class="opts"><button class="opt">maxSurge 0, maxUnavailable 25%</button><button class="opt" data-ok>maxSurge 1 (or 25%), maxUnavailable 0, plus a readiness check</button><button class="opt">maxSurge 100%, maxUnavailable 100%</button></div>
+    <div class="explain">With maxUnavailable 0, an old pod is removed only after a new one is ready. If v2 never becomes ready, the rollout stalls and all old pods keep serving. You pay for one or a few extra pods during the rollout.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You delete a pod by hand and a new one appears seconds later. Why?</div>
+    <div class="opts"><button class="opt">kubectl delete has an undo timer</button><button class="opt">The kubelet restarts deleted pods on the same node</button><button class="opt" data-ok>Its ReplicaSet saw fewer pods than desired and created a replacement</button></div>
+    <div class="explain">That's reconciliation: the controller compares actual (4 pods) with desired (5) and closes the gap. To really remove pods, change the desired state: scale the Deployment down or delete the Deployment.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Declare the desired state; controllers observe → compare → act, forever. Failures are just gaps to close.</li>
+      <li>Control plane: API server, etcd, scheduler, controller manager. Each node: kubelet + networking.</li>
+      <li>Deployment → ReplicaSet → Pods; a Service finds pods by labels. ClusterIP inside, LoadBalancer outside.</li>
+      <li>The scheduler places pods by their <b>requests</b>; size the cluster for N + 1 nodes.</li>
+      <li>Rolling updates: maxSurge rounds up, maxUnavailable rounds down, both default 25%; maxUnavailable 0 makes a broken release stall instead of hurting users.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // ---------- architecture walk-through ----------
+  const A = new Flow($("arch"), { width: 720, height: 250 });
+  A.node("you", { x: 70, y: 60, label: "👩‍💻 kubectl", sub: "you", kind: "cl" })
+   .node("api", { x: 250, y: 60, label: "API server", sub: "front door", kind: "sv" })
+   .node("etcd", { x: 250, y: 185, label: "🗄️ etcd", sub: "desired state", kind: "db" })
+   .node("cm", { x: 440, y: 60, label: "Controllers", sub: "Deployment, ReplicaSet", kind: "sv" })
+   .node("sch", { x: 440, y: 185, label: "Scheduler", sub: "picks a node", kind: "sv" })
+   .node("kl", { x: 640, y: 120, w: 120, label: "kubelet (node 3)", sub: "starts containers", kind: "nw" })
+   .edge("you", "api").edge("api", "etcd").edge("cm", "api", { dashed: true }).edge("sch", "api", { dashed: true }).edge("kl", "api", { dashed: true }).render();
+  let busy = false;
+  $("apply").onclick = async () => {
+    if (busy) return; busy = true;
+    const steps = [
+      [["you", "api", "etcd"], "1. The API server validates the Deployment and stores it in etcd.", "etcd"],
+      [["api", "cm"], "2. The Deployment controller sees it, creates a ReplicaSet, which creates 5 Pod objects (no node yet).", "cm"],
+      [["api", "sch"], "3. The scheduler sees 5 unscheduled pods, filters and scores nodes, and writes a node into each pod.", "sch"],
+      [["api", "kl"], "4. Each node's kubelet sees pods assigned to it, pulls the image and starts the containers.", "kl"],
+      [["kl", "api", "etcd"], "5. kubelets report status back. Actual state now matches desired state, until something changes.", "etcd"],
+    ];
+    for (const [path, msg, hot] of steps) {
+      $("amsg").textContent = msg;
+      A.set(hot, { hot: true });
+      await A.packet(path, { color: "--c-cl", dur: 700 });
+      await sleep(250);
+      A.set(hot, { hot: false });
+    }
+    busy = false;
+  };
+
+  // ---------- reconcile-loop simulator ----------
+  const CAP = 3500, MEMCAP = 15, MEM = 1;
+  let nodes = [1, 2, 3].map(i => ({ name: "node-" + i, up: true, downFor: 0 }));
+  let pods = [], seq = 0, tick = 0;
+  const hist = [], log = [];
+  const ev = s => { log.push(`t=${String(tick).padStart(3)}  ${s}`); if (log.length > 7) log.shift(); };
+  const used = n => pods.filter(p => p.node === n.name && p.state !== "lost");
+  const req = () => +$("req").value;
+  function step() {
+    tick++;
+    const desired = +$("rep").value, paused = $("pause").checked;
+    // kubelet: starting pods become running
+    pods.forEach(p => { if (p.state === "creating") p.state = "running"; });
+    // node lifecycle: pods on a down node are 'lost'; evicted after 3 ticks (5 minutes by default in a real cluster)
+    nodes.forEach(n => {
+      if (n.up) return;
+      n.downFor++;
+      pods.filter(p => p.node === n.name && p.state !== "lost").forEach(p => (p.state = "lost"));
+      if (n.downFor === 3 && !paused) {
+        const k = pods.filter(p => p.node === n.name).length;
+        if (k) ev(`node controller: ${n.name} unreachable too long, evicting ${k} pod(s)`);
+        pods = pods.filter(p => p.node !== n.name);
+      }
+    });
+    if (!paused) {
+      // ReplicaSet controller: count pods that aren't evicted yet
+      const live = pods.length;
+      if (live < desired) {
+        const k = desired - live;
+        for (let i = 0; i < k; i++) pods.push({ id: ++seq, node: null, state: "pending", cpu: req() });
+        ev(`replicaset: ${live}/${desired} pods, creating ${k}`);
+      } else if (live > desired) {
+        const k = live - desired;
+        // delete pending first, then newest
+        const order = pods.slice().sort((a, b) => (a.node === null ? -1 : 0) - (b.node === null ? -1 : 0) || b.id - a.id);
+        const kill = new Set(order.slice(0, k).map(p => p.id));
+        pods = pods.filter(p => !kill.has(p.id));
+        ev(`replicaset: ${live}/${desired} pods, deleting ${k}`);
+      }
+      // scheduler: filter nodes with room, score by most free CPU
+      let unsched = 0;
+      pods.filter(p => p.node === null).forEach(p => {
+        const fits = nodes.filter(n => n.up).map(n => {
+          const u = used(n); return { n, cpu: CAP - u.reduce((s, q) => s + q.cpu, 0), mem: MEMCAP - u.length * MEM };
+        }).filter(x => x.cpu >= p.cpu && x.mem >= MEM).sort((a, b) => b.cpu - a.cpu);
+        if (fits.length) { p.node = fits[0].n.name; p.state = "creating"; }
+        else unsched++;
+      });
+      if (unsched) ev(`scheduler: ${unsched} pod(s) Pending: 0/${nodes.length} nodes have ${req()}m CPU free`);
+    }
+    paint();
+  }
+  function paint() {
+    const desired = +$("rep").value;
+    $("repv").textContent = desired; $("reqv").textContent = req() + "m";
+    $("nodes").innerHTML = nodes.map(n => {
+      const u = used(n), cpu = u.reduce((s, q) => s + q.cpu, 0);
+      const chips = pods.filter(p => p.node === n.name).map(p => `<span class="pod ${p.state === "creating" ? "creating" : p.state === "lost" ? "lost" : ""}" title="pod ${p.id}">${p.id}</span>`).join("");
+      return `<div class="knode ${n.up ? "" : "down"}"><h5><span>${n.up ? "🖥️" : "🔌"} ${n.name}</span><span class="cap">${n.up ? cpu + "/" + CAP + "m" : "unreachable"}</span></h5>${chips}</div>`;
+    }).join("");
+    const pend = pods.filter(p => p.node === null);
+    $("pend").innerHTML = pend.length ? "⏳ Pending: " + pend.map(p => `<span class="pod pending">${p.id}</span>`).join("") : "";
+    const running = pods.filter(p => p.state === "running").length;
+    const reqd = pods.filter(p => p.node && p.state !== "lost").reduce((s, p) => s + p.cpu, 0);
+    const capUp = nodes.filter(n => n.up).length * CAP;
+    $("sd").textContent = desired; $("sr").textContent = running; $("sp").textContent = pend.length;
+    $("sc").textContent = capUp ? Math.round(100 * reqd / capUp) + "%" : "–";
+    hist.push([tick, desired, running]); if (hist.length > 60) hist.shift();
+    Plot.line($("rch"), { series: [
+      { label: "desired", color: MX.css("--c-cl"), data: hist.map(h => [h[0], h[1]]), dash: [6, 4] },
+      { label: "running", color: MX.css("--c-db"), data: hist.map(h => [h[0], h[2]]), fill: true },
+    ], xLabel: "tick", yMin: 0, yMax: Math.max(10, ...hist.map(h => Math.max(h[1], h[2]))) + 2 });
+    $("ev").textContent = log.join("\n") || "events will appear here";
+  }
+  $("kpod").onclick = () => {
+    const r = pods.filter(p => p.state === "running");
+    if (!r.length) return;
+    const p = r[Math.floor(Math.random() * r.length)];
+    pods = pods.filter(q => q !== p);
+    ev(`you: deleted pod ${p.id}`); paint();
+  };
+  $("knode").onclick = () => {
+    const n = nodes[1];
+    n.up = !n.up; n.downFor = 0;
+    ev(n.up ? `${n.name} is back and Ready` : `${n.name} stopped responding (power loss?)`); paint();
+  };
+  $("addn").onclick = () => {
+    if (nodes.length >= 6) return;
+    nodes.push({ name: "node-" + (nodes.length + 1), up: true, downFor: 0 });
+    ev(`node-${nodes.length} joined the cluster`); paint();
+  };
+  $("rep").oninput = paint;
+  $("req").oninput = () => {
+    // a new request size means a new pod template: replace all pods (like a rollout, but all at once)
+    pods = []; ev(`template changed to ${req()}m CPU: pods replaced`); paint();
+  };
+  $("pause").onchange = () => ev($("pause").checked ? "controllers paused: nobody is reconciling" : "controllers resumed");
+  for (let i = 0; i < 3; i++) step();
+  setInterval(step, 900);
+
+  // ---------- rolling update ----------
+  const getSu = seg("msu", () => roll()), getUn = seg("mun", () => roll()), getVer = seg("ver", () => roll());
+  function roll() {
+    const N = +$("rn").value, start = +$("rs").value;
+    $("rnv").textContent = N; $("rsv").textContent = start + " s";
+    const surge = Math.ceil(N * getSu() / 100), unav = Math.floor(N * getUn() / 100), broken = getVer() === "bad";
+    if (surge === 0 && unav === 0) {
+      $("ut").textContent = "–"; $("umin").textContent = "–"; $("upk").textContent = "–"; $("ust").textContent = "invalid";
+      Plot.line($("uch"), { series: [{ label: "", data: [0, 0] }], yMin: 0, yMax: N });
+      $("umsg").textContent = `With ${N} replicas these percentages give surge 0 and unavailable 0. Kubernetes rejects that: the rollout could never take a single step.`;
+      return;
+    }
+    let old = N; const newPods = []; let t = 0, minReady = N, peak = N, done = -1;
+    const sOld = [], sNew = [], sTot = [];
+    for (; t <= 300; t++) {
+      const newReady = newPods.filter(r => r <= t).length;
+      // scale down old pods while availability allows
+      const canKill = old + newReady - (N - unav);
+      if (canKill > 0) old -= Math.min(canKill, old);
+      // scale up new pods within the surge budget
+      const canMake = Math.min(N + surge - (old + newPods.length), N - newPods.length);
+      for (let i = 0; i < canMake; i++) newPods.push(broken ? Infinity : t + start);
+      const nr = newPods.filter(r => r <= t).length;
+      sOld.push([t, old]); sNew.push([t, nr]); sTot.push([t, old + newPods.length]);
+      minReady = Math.min(minReady, old + nr); peak = Math.max(peak, old + newPods.length);
+      if (nr === N && old === 0) { done = t; break; }
+    }
+    Plot.line($("uch"), { series: [
+      { label: "v1 ready", color: MX.css("--c-sv"), data: sOld },
+      { label: "v2 ready", color: MX.css(broken ? "--c-er" : "--c-db"), data: sNew },
+      { label: "all pods (you pay for these)", color: MX.css("--c-lt"), data: sTot, dash: [6, 4] },
+    ], xLabel: "seconds", yMin: 0, yMax: N + surge + 1, hlines: [{ y: N, label: "desired", color: MX.css("--muted") }] });
+    $("ut").textContent = done >= 0 ? done + " s" : "never";
+    $("umin").textContent = `${minReady}/${N} (${Math.round(100 * minReady / N)}%)`;
+    $("upk").textContent = `${peak} (+${peak - N})`;
+    $("ust").textContent = done >= 0 ? "complete ✅" : "stuck ⚠️";
+    $("umsg").textContent = `surge = ⌈${N} × ${getSu()}%⌉ = ${surge}, unavailable = ⌊${N} × ${getUn()}%⌋ = ${unav}. ` + (broken ?
+      (minReady === N ? "v2 never becomes ready, so no v1 pod is removed: users keep full capacity while you roll back." :
+        `v2 never becomes ready, but ${N - minReady} v1 pod(s) were already removed: users lost ${Math.round(100 * (N - minReady) / N)}% of capacity until someone rolls back.`) :
+      minReady < N ? `Fast, but capacity dipped to ${Math.round(100 * minReady / N)}% during the rollout: fine only if the others can absorb it.` :
+      "Capacity never dropped; the price is the extra pods during the rollout.");
+  }
+  ["rn", "rs"].forEach(id => ($(id).oninput = roll));
+  roll();
+})();
+</script>
+</body>
+</html>

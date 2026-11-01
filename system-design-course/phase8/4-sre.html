@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.4 SRE culture: error budgets & chaos engineering · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .advice { border-left: 4px solid var(--c-lt); background: var(--bg2); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: .92rem; }
+  .advice.bad { border-left-color: var(--c-er); } .advice.good { border-left-color: var(--good); }
+  .steps { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; margin: 8px 0; }
+  .steps div { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; font-size: .88rem; }
+  .steps b { display: block; font-size: .78rem; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); }
+</style>
+</head>
+<body data-lesson="s8-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8 · Lesson 4</div>
+  <h1>SRE culture: error budgets & chaos engineering</h1>
+  <p class="subtitle">Site reliability engineering turns reliability from a feeling into a number you can spend: an error budget that decides when to ship and when to fix, plus deliberate failure practice so real failures are boring.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>SLI and SLO</b>: an SLI (service level indicator) measures something users feel, like the share of successful requests; an SLO (objective) is the target for it, like 99.9% (Lesson 0.5).</li>
+      <li><b>Incidents and blameless postmortems</b> (Lesson 6.4), and <b>canary deploys</b> that expose a change to a few users first (Lesson 6.2).</li>
+      <li><b>Availability zones</b>: separate data centers within one cloud region (Lesson 5.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On 21 April 2011, a large Amazon Web Services outage in the US-East region took down or badly hampered a number of popular websites. Netflix ran in the same region. Its engineers wrote afterwards that the service “ran without intervention”, with higher error rates and latency than normal, and no noticeable increase in customer service calls.</p>
+    <p>Netflix had designed for failure: stateless services, data copied across zones, and <b>Chaos Monkey</b>, a service that deliberately kills its own production servers so teams get used to failure. They'd practised. This lesson is about building that culture.</p>
+  </div>
+
+  <h2>Numbers first: what “99.9%” lets you spend</h2>
+  <p>An SLO is also a budget. If 99.9% of minutes must be good, then 0.1% may be bad. Over a 30-day month (30 × 24 × 60 = 43,200 minutes):</p>
+  <table>
+    <tr><th>SLO</th><th>Allowed bad time per 30 days</th><th>That's about…</th></tr>
+    <tr><td>99%</td><td class="er">432 minutes</td><td>7.2 hours: a bad afternoon every month</td></tr>
+    <tr><td>99.5%</td><td class="er">216 minutes</td><td>3.6 hours</td></tr>
+    <tr><td>99.9%</td><td class="er">43.2 minutes</td><td>one slow rollback</td></tr>
+    <tr><td>99.95%</td><td class="er">21.6 minutes</td><td>one quick incident</td></tr>
+    <tr><td>99.99%</td><td class="er">4.32 minutes</td><td>barely time to get paged and open a laptop</td></tr>
+  </table>
+  <p>Partial outages count partially. A bad deploy that fails <b>5% of requests for 20 minutes</b> costs 0.05 × 20 = <b>1 full-outage minute</b>, or 1 ÷ 43.2 ≈ <b>2.3%</b> of a 99.9% budget. With request counts it's the same idea: at 1 billion requests a month, 99.9% allows <b>1 million</b> failed requests.</p>
+  <div class="eq">
+    <span class="er">error budget</span> = (1 − <span class="ca">SLO</span>) × <span class="lt">window</span> &nbsp;&nbsp;&nbsp; <span class="lt">burn rate</span> = (budget used ÷ budget) ÷ (time passed ÷ window)
+    <span class="say">“The error budget is the share of failures your SLO allows, over the window. The burn rate says how fast you're spending it: a burn rate of 1 uses exactly the whole budget by the end of the window; 2 runs out halfway.”</span>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    100% reliability is the wrong target: users can't tell the difference past a point, and chasing it stops all change. Pick an SLO users actually need, and treat the gap to 100% as a <b>budget to spend on shipping</b>. Budget left: ship faster. Budget gone: fix reliability first. The data decides, not the loudest person in the room.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a monthly allowance</span>
+    <p>You get an allowance at the start of each month. Spend it on fun things (new features, risky launches) as you like. If it runs out on the 10th, there are no more treats until the next refill, and you'd better work out why it went so fast. Nobody yells at you; the rule was agreed in advance. That's an error-budget policy.</p>
+  </div>
+
+  <h2>Error budgets in practice</h2>
+  <p>Google's SRE book describes the loop: product and SRE teams agree on a quarterly error budget from the SLO. As long as measured reliability is above the SLO, new releases can be pushed. If the budget is spent, releases are temporarily halted while effort goes into testing and resilience. Even outages that aren't your fault (a network failure, a data center problem) eat the budget, which keeps everyone honest.</p>
+  <p>The SRE Workbook publishes an example <b>error-budget policy</b> you can copy. Its key rules:</p>
+  <ul>
+    <li>If the service has exceeded its error budget over the preceding <b>four weeks</b>, halt all changes and releases except urgent (P0) fixes and security fixes, until it's back within its SLO.</li>
+    <li>If a <b>single incident</b> consumes more than <b>20%</b> of the budget over four weeks, the team must write a postmortem with at least one top-priority action item.</li>
+    <li>It's explicitly <b>not a punishment</b>: it gives teams permission to focus on reliability when the data says it matters most.</li>
+  </ul>
+  <p><b>Burn-rate alerts</b> turn the budget into pages. The Workbook's recommended starting point for a 99.9% SLO: page if you burn <b>2% of the 30-day budget in 1 hour</b>, a burn rate of 14.4 (because 0.02 × 720 hours = 14.4); page at 5% in 6 hours; open a ticket at 10% in 3 days.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: will we make it to the end of the month?</span>
+    <p>Day 10 of a 30-day window, and you've used <b>60%</b> of the budget.</p>
+    <ul>
+      <li>Time passed: 10 ÷ 30 = 33% of the window. Burn rate = 60% ÷ 33% = <b>1.8</b>.</li>
+      <li>At this pace you've used 6% per day, so the budget runs out at 100 ÷ 6 ≈ <b>day 16.7</b>, two weeks early.</li>
+      <li>Under the policy: you aren't frozen yet, but the team should look at what's burning (one big incident? a flaky dependency? risky deploys?), slow down risky launches, and expect a freeze around day 17 if nothing changes.</li>
+    </ul>
+  </div>
+
+  <div class="playground" id="pg1">
+    <span class="label">🎮 Playground · Run a quarter with an error budget</span>
+    <p class="hint">91 days of a real-shaped team. Each deploy may break something (the <b>change failure rate</b>); a broken deploy hurts users until it's detected and rolled back. A canary limits a bad deploy to 5% of traffic and catches it within 10 minutes. Random infrastructure blips happen too. The budget is measured over a rolling 4 weeks. Compare running with and without the policy.</p>
+    <div class="controls">
+      <span class="hint">SLO:</span>
+      <span class="seg" id="slo"><button id="slo-0" data-v="0.99">99%</button><button id="slo-1" data-v="0.995">99.5%</button><button id="slo-2" data-v="0.999" class="on">99.9%</button><button id="slo-3" data-v="0.9995">99.95%</button><button id="slo-4" data-v="0.9999">99.99%</button></span>
+      <span class="hint">Policy:</span>
+      <span class="seg" id="pol"><button id="pol-none" data-v="none">Ship no matter what</button><button id="pol-eb" data-v="eb" class="on">Freeze when budget is spent</button></span>
+    </div>
+    <div class="controls">
+      <label>deploys/week <input type="range" id="dpw" min="0" max="5" step="1" value="3"> <b class="mono" id="dpwv"></b></label>
+      <label>change failure rate <input type="range" id="cfr" min="0" max="5" step="1" value="2"> <b class="mono" id="cfrv"></b></label>
+      <label>time to roll back <input type="range" id="ttm" min="0" max="4" step="1" value="2"> <b class="mono" id="ttmv"></b></label>
+      <label><input type="checkbox" id="can"> canary deploys</label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="runq">▶ Run the quarter</button>
+      <button class="btn" id="luckq">🎲 New luck</button>
+    </div>
+    <canvas class="chart" id="eb" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">quarter availability <b id="av">–</b></div>
+      <div class="stat">deploys shipped <b id="dep">–</b></div>
+      <div class="stat">days frozen <b id="frz">–</b></div>
+      <div class="stat">postmortems required <b id="pm">–</b></div>
+      <div class="stat">without the policy <b id="cmp">–</b></div>
+    </div>
+    <div class="advice" id="qmsg"></div>
+  </div>
+  <p>Things to try: switch the policy to <b>Ship no matter what</b>: more deploys, but the budget goes deeply negative and you miss the SLO. Switch back: freezes appear, and during them the team fixes its process (failure rate and rollback time improve). Now try <b>99.99%</b>: with this process you're frozen most of the quarter. Either the SLO is stricter than users need, or you must invest: turn on <b>canary deploys</b> and watch velocity come back while the budget stays healthy. That's the real lesson: safer deploys buy speed.</p>
+
+  <h2>Toil: the work that eats SRE teams</h2>
+  <p>Google defines <b>toil</b> as operational work that's manual, repetitive, automatable, tactical, has no enduring value, and grows linearly with the service. Restarting a stuck job by hand every morning is toil. Writing the fix so it never gets stuck is engineering.</p>
+  <p>Google's SRE organisation has an advertised goal of keeping toil <b>below 50%</b> of each SRE's time, because toil left unchecked expands to fill everyone's week. The practical habit: track toil like a bug (“restarted the importer: 20 min, 4th time this month”) and automate the top item every sprint.</p>
+
+  <h2>Chaos engineering: break it on purpose</h2>
+  <p>Your system will lose a server, a zone, a dependency. The only question is whether you find out how it reacts during a calm Tuesday afternoon or at 3 a.m. during Black Friday. The <b>Principles of Chaos Engineering</b> describe the method:</p>
+  <div class="steps">
+    <div><b>1 · Steady state</b>Define a measurable output that means “normal”: e.g. 99.9% of requests succeed.</div>
+    <div><b>2 · Hypothesis</b>Predict that steady state will hold in both a control group and an experiment group.</div>
+    <div><b>3 · Inject real failures</b>Servers crashing, disks failing, network links cut, latency added.</div>
+    <div><b>4 · Try to disprove it</b>Compare the groups. A difference is a weakness to fix before it finds you.</div>
+  </div>
+  <p>Advanced principles: run in production when you can, automate experiments to run continuously, and <b>minimise the blast radius</b>: start with a tiny slice of traffic and a big red abort button.</p>
+
+  <div class="playground" id="pg2">
+    <span class="label">🎮 Playground · Run a chaos experiment</span>
+    <p class="hint">3,000 requests per second across 3 zones, 2 app instances each (each handles about 700 req/s), a cache, and a Postgres primary with a replica. Choose a failure to inject, the resilience features your system has, and how much traffic is in the experiment. Then run it: did the steady state (≥ 99.9% success) hold?</p>
+    <svg id="fl"></svg>
+    <div class="controls">
+      <span class="hint">Inject:</span>
+      <span class="seg" id="ft"><button id="ft-inst" data-v="inst" class="on">Kill 1 instance</button><button id="ft-zone" data-v="zone">Lose zone C</button><button id="ft-db" data-v="db">Kill DB primary</button><button id="ft-lat" data-v="lat">DB +300 ms latency</button><button id="ft-cache" data-v="cache">Kill the cache</button></span>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="r-hc" checked> LB health checks</label>
+      <label><input type="checkbox" id="r-n1"> N+1 capacity (survive a zone)</label>
+      <label><input type="checkbox" id="r-fo" checked> automatic DB failover</label>
+      <label><input type="checkbox" id="r-to"> timeouts + circuit breaker</label>
+      <label><input type="checkbox" id="r-cf"> cache-miss protection</label>
+    </div>
+    <div class="controls">
+      <span class="hint">Blast radius:</span>
+      <span class="seg" id="br"><button id="br-1" data-v="0.01" class="on">1% of traffic</button><button id="br-10" data-v="0.1">10%</button><button id="br-100" data-v="1">100%</button></span>
+      <label><input type="checkbox" id="abort" checked> auto-abort below 99%</label>
+      <button class="btn primary" id="chaos">💥 Run experiment</button>
+      <button class="btn" id="fix">🛠️ Apply the fix it found</button>
+    </div>
+    <canvas class="chart" id="cc" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">hypothesis (success during experiment) <b id="hyp">–</b></div>
+      <div class="stat">worst success rate <b id="worst">–</b></div>
+      <div class="stat">users' failed requests <b id="hurt">–</b></div>
+      <div class="stat">experiment length <b id="len">–</b></div>
+    </div>
+    <div class="advice" id="cmsg"></div>
+  </div>
+  <p>Things to try: kill one instance (it holds, thanks to health checks). Then lose zone C: the remaining 4 instances can't carry 3,000 req/s, and the experiment finds it at 1% of traffic, hurting very few users. Press <b>Apply the fix</b> and rerun. Then try DB latency without timeouts: a slow dependency is often worse than a dead one. Finally turn off auto-abort and set the blast radius to 100%: same lesson, thousands of times more users hurt.</p>
+
+  <h3>Game days and disaster recovery</h3>
+  <p>A <b>game day</b> (AWS's term) simulates a failure or event to test systems, processes <i>and</i> people: the team actually performs the actions it would take in a real emergency. Run one before every big launch.</p>
+  <p>Disaster recovery has two numbers. <b>RTO</b> (recovery time objective) is the longest acceptable time between the interruption and service being restored. <b>RPO</b> (recovery point objective) is the longest acceptable time since the last recovery point: how much recent data you can afford to lose. AWS groups strategies from cheapest to most expensive:</p>
+  <table>
+    <tr><th>Strategy</th><th>What's running in the backup region</th><th>Recovery</th><th>Cost</th></tr>
+    <tr><td><b>Backup & restore</b></td><td>Only backups</td><td class="lt">slowest: rebuild everything</td><td>lowest</td></tr>
+    <tr><td><b>Pilot light</b></td><td>Data replicated; core pieces ready but switched off</td><td class="lt">faster: turn things on, scale up</td><td>low</td></tr>
+    <tr><td><b>Warm standby</b></td><td>A smaller full copy, already running</td><td class="lt">fast: scale it up</td><td>medium</td></tr>
+    <tr><td><b>Multi-site active/active</b></td><td>Full copies serving users everywhere</td><td class="lt">near zero for most disasters</td><td>highest, most complex</td></tr>
+  </table>
+  <p>One catch: replication copies mistakes. A bad <code>DELETE</code> or corrupting bug reaches every replica in seconds, so even active/active still needs <b>point-in-time backups</b>, and backups only count once you've restored one.</p>
+
+  <div class="box incident">
+    <span class="label">🔥 Real outage · GitLab, 31 January 2017</span>
+    <p>While fighting a database replication problem, an engineer ran a deletion on the <b>primary</b> instead of the secondary. About <b>300 GB</b> of data was gone before they stopped it. Then they went looking for backups:</p>
+    <ul>
+      <li>The nightly <code>pg_dump</code> backups weren't there. The backup job used PostgreSQL 9.2 tools against a 9.6 database, so it failed every time.</li>
+      <li>The failure emails existed, but were rejected by the receiving mail server, so nobody knew.</li>
+      <li>Disk snapshots weren't enabled for the database servers, and the secondary had been wiped during the repair attempt.</li>
+    </ul>
+    <p>They restored from a copy an engineer had happened to make about <b>6 hours</b> earlier. GitLab estimated that roughly <b>5,000 projects, 5,000 comments and 700 new user accounts</b> were affected by the data loss. Their public postmortem is one of the most honest ever written, and its lesson is short: <b>test your restores</b>, and alert on backup failures through a channel you know works.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Templates & tools you'll actually use</span>
+    <p>SLOs: <b>Prometheus</b> + <b>Grafana</b> (Lesson 6.3) with <b>Sloth</b> or the <b>OpenSLO</b> spec to generate burn-rate alerts. Chaos: <b>Chaos Monkey</b> (Netflix, open source), <b>LitmusChaos</b> and <b>Chaos Mesh</b> (open source, for Kubernetes), <b>AWS Fault Injection Service</b>, and commercial tools like Gremlin. An error-budget policy fits on a page:</p>
+<pre><code><span class="c"># error-budget-policy.yaml: agreed by product, engineering and SRE, before you need it</span>
+<span class="k">service:</span> checkout-api
+<span class="k">slo:</span> 99.9% of requests succeed (non-5xx) over a rolling 28 days
+<span class="k">budget:</span> 0.1% of requests  <span class="c"># ≈ 40 minutes of full outage</span>
+<span class="k">when_budget_remaining:</span>
+  <span class="k">above_0:</span>  release normally
+  <span class="k">at_or_below_0:</span> freeze all releases except P0 bug fixes and security fixes
+                 until back within SLO; team works on reliability items
+<span class="k">single_incident_over_20pct:</span> postmortem with at least one P0 action item
+<span class="k">exceptions:</span> decided by the VP of engineering, in writing</code></pre>
+<pre><code><span class="c"># Prometheus alert: page on a fast burn (2% of a 30-day budget in 1 hour, SLO 99.9%)</span>
+- alert: CheckoutErrorBudgetFastBurn
+  expr: |
+    sum(rate(http_requests_total{job="checkout",code=~"5.."}[1h]))
+      / sum(rate(http_requests_total{job="checkout"}[1h]))
+    > (14.4 * 0.001)
+  labels: { severity: page }</code></pre>
+    <p class="hint">Try it locally: run a tiny game day on your laptop. Start your app with <code>docker compose up</code> (Lesson 8.3), then <code>docker compose stop redis</code> while you click around. Does the app degrade gracefully, or does every page error? That's your first chaos experiment.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Benefit</th><th>❌ Cost</th></tr>
+      <tr><td>Higher SLO (more nines)</td><td>Fewer user-visible failures</td><td>Each nine is roughly 10× smaller budget: slower releases, more redundancy, more cost</td></tr>
+      <tr><td>Strict release freezes</td><td>Protects users after a bad stretch</td><td>Delays features; bundled changes after a freeze can be riskier</td></tr>
+      <tr><td>Chaos in production</td><td>Finds the weaknesses that really exist</td><td>Some real users can be hurt: keep the blast radius tiny and an abort ready</td></tr>
+      <tr><td>Active/active DR</td><td>Near-zero recovery time</td><td>Highest cost and complexity; data conflicts across regions (Lesson 2.6)</td></tr>
+    </table>
+    <p>Also: a user on a 99%-reliable phone network can't tell 99.99% from 99.999%, a point the Google SRE book makes. Set SLOs from what users notice, not from pride.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>No SRE team, but the habits are free: one SLO on your most important user journey, an uptime check, a burn-rate alert, and a monthly restore drill. Your first “chaos experiment” is stopping Redis on staging. Pick backup & restore for DR, and practise it.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Dedicated SRE teams, written error-budget policies signed by leadership, automated chaos in production, regular game days, regional failover exercises, and the 50% toil cap. Senior engineers are judged on whether their systems keep their SLOs without heroics.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you make this reliable?” is not answered with “add redundancy”. A senior answer:</p>
+    <ul>
+      <li>Defines the <b>SLI and SLO</b> for the key user journey, and the error budget it implies.</li>
+      <li>Walks through <b>failure modes</b>: lose an instance, a zone, the database primary, a slow dependency, and how the design degrades for each.</li>
+      <li>Explains <b>how you'd prove it</b>: chaos experiments with a small blast radius, game days, restore drills, stated RPO and RTO.</li>
+      <li>Ties reliability to velocity: canaries and fast rollback shrink the cost of each bad deploy.</li>
+    </ul>
+    <p>Follow-ups: “Your SLO is 99.99% and you deploy 50 times a day. How?” “What's the difference between a replica and a backup?” “What would you alert on?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Error budgets</b> <span class="tag co">🏢 Google</span> <a href="https://sre.google/sre-book/embracing-risk/" target="_blank" rel="noopener">SRE book: Embracing Risk</a></div>
+      <p><b>How:</b> product and SRE teams jointly define a quarterly error budget from the SLO; releases continue while there's budget left and pause when it's spent.</p>
+      <p><b>Why this method:</b> it replaces an endless argument between “ship faster” and “be careful” with an objective metric both sides agreed on.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A written error-budget policy</b> <span class="tag co">🏢 Google</span> <a href="https://sre.google/workbook/error-budget-policy/" target="_blank" rel="noopener">SRE Workbook: Example Error Budget Policy</a></div>
+      <p><b>How:</b> halt changes except P0 and security fixes when the 4-week budget is exceeded; a postmortem with a P0 action item for any single incident using more than 20% of the budget.</p>
+      <p><b>Why this method:</b> agreeing the rules in advance makes the freeze a shared decision, not a punishment.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The Simian Army</b> <span class="tag co">🏢 Netflix · 2011</span> <a href="https://netflixtechblog.com/the-netflix-simian-army-16e57fbab116" target="_blank" rel="noopener">The Netflix Simian Army</a></div>
+      <p><b>How:</b> Chaos Monkey randomly disables production instances, run during the business day with engineers standing by; Chaos Gorilla simulates the loss of an entire availability zone.</p>
+      <p><b>Why this method:</b> failures happen anyway; practising them on purpose forces teams to build automatic recovery.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The method, written down</b> <span class="tag oss">🧰 Open community</span> <a href="https://principlesofchaos.org/" target="_blank" rel="noopener">Principles of Chaos Engineering</a></div>
+      <p><b>How:</b> define steady state, hypothesise it holds, inject real-world failures, try to disprove the hypothesis; prefer production, automate, minimise blast radius.</p>
+      <p><b>Why this method:</b> it turns “break things” into a controlled experiment with a measurable result.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Backups that weren't</b> <span class="tag co">🏢 GitLab · 2017</span> <a href="https://about.gitlab.com/blog/2017/02/10/postmortem-of-database-outage-of-january-31/" target="_blank" rel="noopener">Postmortem of database outage of January 31</a></div>
+      <p><b>How:</b> a public, detailed postmortem: an accidental deletion, backup jobs that had been failing silently, and a restore from a 6-hour-old copy.</p>
+      <p><b>Why this method:</b> publishing it openly turned a painful failure into one of the most-read lessons on restore testing.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the gorilla was named before it was born</span>
+    <p>In Netflix's post about the April 2011 AWS outage, the team wrote that it hadn't yet engineered for losing a whole zone, and that people were “already starting to call this service Chaos Gorilla”. Three months later, the Simian Army post described Chaos Gorilla doing exactly that. An outage wrote the roadmap.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>SLOs come from Lesson 0.5; burn-rate alerts use the metrics stack from Lesson 6.3 and feed the on-call process in Lesson 6.4. Canaries and flags (Lesson 6.2) shrink each bad deploy's cost. The resilience features in the chaos playground are Lessons 1.2 (health checks), 3.4 (failover via leader election), 4.4 (timeouts and circuit breakers) and 1.3 (stampede protection). For AI systems, the same discipline applies to model APIs: an SLO on latency and error rate, plus a fallback model when the primary provider is slow.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Book</span> <a href="https://sre.google/sre-book/eliminating-toil/" target="_blank" rel="noopener">Google SRE book: Eliminating Toil</a>. The definition of toil and why the 50% cap exists; the whole book is free online.</li>
+      <li><span class="kind">Book</span> <a href="https://sre.google/workbook/alerting-on-slos/" target="_blank" rel="noopener">SRE Workbook: Alerting on SLOs</a>. Builds burn-rate alerts step by step, with the 14.4 rule.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.aws.amazon.com/whitepapers/latest/disaster-recovery-workloads-on-aws/disaster-recovery-options-in-the-cloud.html" target="_blank" rel="noopener">AWS: Disaster recovery options in the cloud</a>. The four DR strategies in detail.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Your SLO is 99.9% over 30 days. An incident fails 10% of requests for 30 minutes. Roughly how much of the error budget did it use?</div>
+    <div class="opts"><button class="opt">About 1%</button><button class="opt" data-ok>About 7%</button><button class="opt">About 70%</button></div>
+    <div class="explain">The budget is 0.1% of 43,200 minutes = 43.2 minutes. The incident cost 0.1 × 30 = 3 full-outage minutes, and 3 ÷ 43.2 ≈ <b>7%</b>. Under the example policy that's below the 20% postmortem threshold, but worth a look.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Halfway through the window you've already spent the whole error budget. Product wants to launch a big feature tomorrow. Under an error-budget policy, what happens?</div>
+    <div class="opts"><button class="opt">Launch anyway; the budget is just a guideline</button><button class="opt" data-ok>Releases pause (except P0 and security fixes) and the team works on reliability until the service is back within its SLO</button><button class="opt">Lower the SLO so the launch fits</button></div>
+    <div class="explain">That's what the policy was agreed for, in advance. Exceptions are possible but explicit and escalated. Quietly lowering the SLO to fit a launch defeats the point; if the SLO is genuinely too strict for users' needs, change it deliberately, not tomorrow.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You want to test whether your service survives losing a zone. What's the best first experiment?</div>
+    <div class="opts"><button class="opt">Shut down a whole production zone at peak, to make it realistic</button><button class="opt" data-ok>Define steady state, move a small slice of traffic into an experiment group, fail it there with an automatic abort, and compare with the control group</button><button class="opt">Skip testing; the cloud provider guarantees zones are independent</button></div>
+    <div class="explain">Chaos engineering is an experiment, not a stunt: a measurable steady state, a hypothesis, a minimal blast radius and an abort button. Grow the radius as confidence grows.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Error budget = (1 − SLO) × window: 99.9% over 30 days ≈ 43 minutes. Budget left → ship; budget spent → freeze and fix.</li>
+      <li>Write the policy in advance (4-week window, P0/security exceptions, postmortem for any incident over 20%). Alert on burn rate, e.g. 14.4× for 1 hour.</li>
+      <li>Keep toil under ~50%; automate the biggest item every sprint.</li>
+      <li>Chaos engineering: steady state → hypothesis → inject failure → compare, with a tiny blast radius. Game days practise the people side.</li>
+      <li>Know your RPO and RTO; replicas copy mistakes; a backup counts only once you've restored it.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => (bs.find(b => b.classList.contains("on")) || bs[0]).dataset.v;
+  };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // ---------- Playground 1: error-budget quarter ----------
+  const DPW = [1, 2, 5, 10, 20, 50], CFR = [0.02, 0.05, 0.1, 0.15, 0.25, 0.4], TTM = [5, 15, 30, 60, 120];
+  const getSlo = seg("slo", () => quarter()), getPol = seg("pol", () => quarter());
+  let seedQ = 5;
+  function simQuarter(policy, seed) {
+    const slo = +getSlo(), dpw = DPW[+$("dpw").value], canary = $("can").checked;
+    let cfr = CFR[+$("cfr").value], ttm = TTM[+$("ttm").value];
+    const rng = MX.seeded(seed), DAYS = 91, WIN = 28, budget = (1 - slo) * WIN * 1440;
+    const bad = new Array(DAYS).fill(0); const series = []; let shipped = 0, frozenDays = 0, pms = 0, frozen = false;
+    for (let d = 0; d < DAYS; d++) {
+      const used = () => bad.slice(Math.max(0, d - WIN + 1), d + 1).reduce((a, b) => a + b, 0);
+      // infrastructure blips happen regardless of deploys
+      if (rng() < 0.01) bad[d] += 2 + 8 * rng();
+      if (policy === "eb") frozen = used() >= budget;
+      if (frozen) { frozenDays++; cfr = Math.max(0.01, cfr * 0.93); ttm = Math.max(5, ttm * 0.95); }   // reliability work during the freeze
+      else {
+        const lam = dpw / 7; let n = Math.floor(lam); if (rng() < lam - n) n++;
+        for (let k = 0; k < n; k++) {
+          shipped++;
+          if (rng() < cfr) {
+            const sev = 0.2 + 0.8 * rng(), blast = canary ? 0.05 : 1, mins = canary ? Math.min(ttm, 10) : ttm;
+            const cost = sev * blast * mins; bad[d] += cost;
+            if (cost > 0.2 * budget) pms++;
+          }
+        }
+      }
+      series.push([d + 1, Math.max(-100, 100 * (1 - used() / budget))]);
+    }
+    const totalBad = bad.reduce((a, b) => a + b, 0), avail = 1 - totalBad / (DAYS * 1440);
+    return { series, shipped, frozenDays, pms, avail, slo };
+  }
+  function quarter() {
+    $("dpwv").textContent = DPW[+$("dpw").value]; $("cfrv").textContent = CFR[+$("cfr").value] * 100 + "%";
+    $("ttmv").textContent = TTM[+$("ttm").value] + " min";
+    const pol = getPol(), r = simQuarter(pol, seedQ), other = simQuarter(pol === "eb" ? "none" : "eb", seedQ);
+    const none = pol === "none" ? r : other;
+    Plot.line($("eb"), { series: [
+      { label: "error budget remaining (rolling 4 weeks)", color: MX.css(r.avail >= r.slo ? "--c-ca" : "--c-er"), data: r.series, fill: true }],
+      hlines: [{ y: 0, label: "budget spent", color: MX.css("--c-er") }], xLabel: "day of quarter", yLabel: "% of budget left", xMin: 1, xMax: 91, yMin: -100, yMax: 100 });
+    const pct = v => (v * 100).toFixed(v >= 0.999 ? 3 : 2) + "%";
+    $("av").textContent = pct(r.avail) + (r.avail >= r.slo ? " ✅" : " ❌");
+    $("dep").textContent = r.shipped; $("frz").textContent = r.frozenDays; $("pm").textContent = r.pms;
+    $("cmp").textContent = pol === "eb" ? `${none.shipped} deploys, ${pct(none.avail)}` : "this is it";
+    let msg, cls;
+    if (pol === "none") { msg = r.avail >= r.slo ? "You met the SLO without a policy this time: your process is safe enough for this target." : `Missed the SLO (${pct(r.avail)} vs ${pct(r.slo)}). Users felt every bad deploy, and nothing forced the team to fix the cause.`; cls = r.avail >= r.slo ? "good" : "bad"; }
+    else if (r.frozenDays > 45) { msg = `Frozen for ${r.frozenDays} of 91 days. This SLO is stricter than this deploy process can support. Either users don't need this many nines, or invest: canaries, faster rollback, fewer failing changes.`; cls = "bad"; }
+    else if (r.frozenDays > 0) { msg = `The policy froze releases for ${r.frozenDays} days, and the team used them to improve its process. You shipped ${r.shipped} deploys (vs ${none.shipped} without the policy) and ${r.avail >= r.slo ? "met" : "nearly met"} the SLO.`; cls = r.avail >= r.slo ? "good" : ""; }
+    else { msg = `No freezes needed: the budget never ran out. You could even afford riskier launches.${$("can").checked ? " Canaries keep each bad deploy tiny." : ""}`; cls = "good"; }
+    $("qmsg").className = "advice " + cls; $("qmsg").textContent = msg;
+  }
+  ["dpw", "cfr", "ttm"].forEach(id => ($(id).oninput = quarter));
+  $("can").onchange = quarter;
+  $("runq").onclick = quarter;
+  $("luckq").onclick = () => { seedQ = (seedQ * 31 + 7) % 997; quarter(); };
+  quarter();
+
+  // ---------- Playground 2: chaos experiment ----------
+  const F = new Flow($("fl"), { width: 720, height: 250 });
+  F.node("u", { x: 55, y: 125, w: 90, label: "👤 Users", sub: "3,000 req/s", kind: "cl" })
+   .node("lb", { x: 170, y: 125, w: 80, label: "⚖️ LB", sub: "", kind: "nw" });
+  const Z = ["A", "B", "C"];
+  Z.forEach((z, i) => F.node("z" + z, { x: 330, y: 45 + i * 80, w: 150, label: `Zone ${z}`, sub: "2 instances", kind: "sv" }));
+  F.node("ca", { x: 520, y: 60, w: 110, label: "⚡ Cache", sub: "zone B", kind: "ca" })
+   .node("dbp", { x: 520, y: 175, w: 120, label: "🗄️ Primary", sub: "zone A", kind: "db" })
+   .node("dbr", { x: 660, y: 175, w: 100, label: "Replica", sub: "zone B", kind: "db" });
+  F.edge("u", "lb");
+  Z.forEach(z => { F.edge("lb", "z" + z); F.edge("z" + z, "ca", { noArrow: true }); });
+  F.edge("ca", "dbp", { label: "misses" }).edge("dbp", "dbr", { dashed: true });
+  F.render();
+
+  const getFt = seg("ft", () => idle()), getBr = seg("br", () => {});
+  const R = () => ({ hc: $("r-hc").checked, n1: $("r-n1").checked, fo: $("r-fo").checked, to: $("r-to").checked, cf: $("r-cf").checked });
+  // failure fraction in the experiment group, t = minutes since injection
+  function errAt(f, r, t) {
+    const cap = (r.n1 ? 3 : 2) * 3 * 700;
+    if (f === "inst") { const left = cap - 700; return (r.hc ? (t < 0.17 ? 0.0003 : 0) : 1 / 6) + Math.max(0, 1 - left / 3000); }   // with health checks, retries mask the in-flight failures
+    if (f === "zone") { const left = cap * 2 / 3; return (r.hc ? (t < 0.17 ? 0.0003 : 0) : 1 / 3) + Math.max(0, 1 - left / 3000) * (r.hc ? 1 : 0.5); }
+    if (f === "db") return r.fo ? (t < 0.5 ? 0.1 : 0) : 0.1;
+    if (f === "lat") return r.to ? 0.002 : Math.min(0.6, 0.05 + t * 0.25);
+    if (f === "cache") return r.cf ? 0.0005 : Math.min(0.4, 0.1 + t * 0.15);
+    return 0;
+  }
+  const FIX = { inst: ["hc", "LB health checks: the load balancer keeps sending traffic to a dead instance."],
+    zone: ["n1", "N+1 capacity: after losing a zone, 4 instances × 700 req/s can't carry 3,000 req/s. Run enough instances that any 2 zones carry full load."],
+    db: ["fo", "Automatic failover: without it, every write fails until a human promotes the replica (Lesson 3.4)."],
+    lat: ["to", "Timeouts + a circuit breaker: requests pile up waiting on the slow database until every thread is stuck (Lesson 4.4)."],
+    cache: ["cf", "Cache-miss protection: with the cache gone, every read hits the database at once and it falls over. Coalesce misses and keep DB headroom (Lesson 1.3)."] };
+  const BASE = 0.0005; let lastFix = null, running = false;
+  function idle() {
+    const n = $("r-n1").checked ? 3 : 2;
+    Z.forEach(z => F.set("z" + z, { down: false, hot: false, load: 0.7, sub: `${n} instances` }));
+    ["ca", "dbp"].forEach(id => F.set(id, { down: false, hot: false, load: 0.5 }));
+    F.set("dbp", { label: "🗄️ Primary", sub: "zone A" }); F.set("dbr", { label: "Replica", sub: "zone B" });
+  }
+  function experiment() {
+    const f = getFt(), r = R(), abort = $("abort").checked;
+    const shared = f === "db", blast = shared ? 1 : +getBr();   // a shared primary can't be failed for 1% of users
+    const series = [], ctrl = []; let worst = 1, hurt = 0, end = 8, aborted = false, below = 0, sumS = 0, nS = 0;
+    for (let t = 0; t <= 10.001; t += 0.1) {
+      const tt = +t.toFixed(1);
+      const inExp = tt >= 2 && tt < end;
+      const e = inExp ? Math.min(1, errAt(f, r, tt - 2) + BASE) : BASE;
+      const s = 1 - e;
+      if (inExp) {
+        worst = Math.min(worst, s); sumS += s; nS++;
+        hurt += e * 3000 * blast * 6;           // 0.1 min = 6 s
+        if (s < 0.99) below += 0.1;
+        if (abort && below >= 1 && !aborted) { aborted = true; end = tt + 0.1; }
+      }
+      series.push([tt, s * 100]); ctrl.push([tt, (1 - BASE) * 100]);
+    }
+    return { f, r, worst, avg: nS ? sumS / nS : 1, hurt, aborted, shared, blast, series, ctrl, len: Math.max(0, end - 2) };
+  }
+  function show(x) {
+    const held = x.avg >= 0.999;
+    Plot.line($("cc"), { series: [
+      { label: "control group success %", color: MX.css("--muted"), data: x.ctrl, dash: [5, 4] },
+      { label: "experiment group success %", color: MX.css(held ? "--good" : "--c-er"), data: x.series, fill: true }],
+      hlines: [{ y: 99.9, label: "steady state 99.9%", color: MX.css("--c-lt") }], xLabel: "minutes", yMin: Math.min(99, Math.floor(x.worst * 100) - 1), yMax: 100, xMin: 0, xMax: 10 });
+    $("hyp").textContent = (held ? "held ✅ " : "disproved 💥 ") + (x.avg * 100).toFixed(2) + "%";
+    $("worst").textContent = (x.worst * 100).toFixed(2) + "%";
+    $("hurt").textContent = Math.round(x.hurt).toLocaleString();
+    $("len").textContent = x.len.toFixed(1) + " min" + (x.aborted ? " (aborted)" : "");
+    if (held) { $("cmsg").className = "advice good"; $("cmsg").textContent = "Steady state held. Your confidence goes up; next time, grow the blast radius or try a nastier failure."; lastFix = null; }
+    else {
+      const [k, why] = FIX[x.f]; lastFix = x.r[k] ? null : k;
+      $("cmsg").className = "advice bad";
+      const residual = x.f === "db" ? "Failover worked: the replica was promoted in about 30 seconds, but writes (10% of requests) failed meanwhile. Retry writes from the client or buffer them in a queue (Lesson 3.1), or accept it as a known cost in the error budget." : "All the relevant protections are on, but capacity is still short.";
+      $("cmsg").innerHTML = `<b>Weakness found.</b> ${lastFix ? why : residual} ${x.aborted ? "Auto-abort stopped it after a minute below 99%." : ""} It cost ${Math.round(x.hurt).toLocaleString()} failed requests${x.blast < 1 ? ", kept small because only " + (x.blast * 100) + "% of traffic was in the experiment" : ""}.${x.shared ? " Note: a shared database primary can't be failed for just 1% of users, so this one hit everyone. Rehearse failover in staging first, then in a quiet window." : ""}`;
+    }
+  }
+  const run = experiment;
+  $("chaos").onclick = async () => {
+    if (running) return; running = true;
+    idle();
+    const x = run(); show(x);
+    const f = x.f;
+    const n = x.r.n1 ? 3 : 2;
+    if (f === "inst") F.set("zC", { hot: true, sub: `${n - 1} of ${n} up` + (x.r.hc ? "" : " · still gets traffic") });
+    if (f === "zone") F.set("zC", { down: true, load: 0, sub: "zone lost" });
+    if (f === "db") F.set("dbp", { down: true, load: 0 });
+    if (f === "cache") F.set("ca", { down: true, load: 0 });
+    if (f === "lat") F.set("dbp", { hot: true, sub: "+300 ms" });
+    if (f === "db" && x.r.fo) F.set("dbr", { label: "🗄️ New primary", sub: "promoted" });
+    const alive = ["zA", "zB", "zC"].filter(id => !(f === "zone" && id === "zC" && x.r.hc));
+    const strained = x.avg < 0.999;
+    if (strained) alive.forEach(id => F.set(id, { hot: true, load: 1 }));
+    for (let i = 0; i < 6; i++) {
+      const tgt = alive[i % alive.length], bad = strained && i % 2 === 1;
+      await F.packet(["u", "lb", tgt], { color: bad ? "--c-er" : "--c-cl", dur: 380, back: !bad });
+    }
+    running = false;
+  };
+  $("fix").onclick = () => { if (lastFix) { $("r-" + lastFix).checked = true; lastFix = null; $("cmsg").className = "advice"; $("cmsg").textContent = "Fix applied. Run the same experiment again to check it."; } };
+  ["r-hc", "r-n1", "r-fo", "r-to", "r-cf", "abort"].forEach(id => ($(id).onchange = () => show(run())));
+  document.querySelectorAll("#br button").forEach(b => b.addEventListener("click", () => show(run())));
+  document.querySelectorAll("#ft button").forEach(b => b.addEventListener("click", () => show(run())));
+  show(run());
+})();
+</script>
+</body>
+</html>

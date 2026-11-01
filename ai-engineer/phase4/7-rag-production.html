@@ -1,0 +1,406 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.7 RAG in production · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .lock { font-size: .75rem; font-family: var(--mono); padding: 1px 6px; border-radius: 999px; border: 1px solid var(--line); margin-left: 6px; }
+  .lock.no { border-color: var(--c-rk); color: var(--c-rk); }
+  .hit.leak { border-left-color: var(--c-rk); background: color-mix(in srgb, var(--c-rk) 10%, var(--bg2)); }
+  .hit.gone { text-decoration: line-through; opacity: .6; }
+  .calcgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 6px 16px; }
+  .calcgrid label { display: flex; justify-content: space-between; gap: 8px; align-items: center; font-size: .88rem; }
+  .calcgrid input[type=range] { width: 120px; }
+</style>
+</head>
+<body data-lesson="a4-7" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 7</div>
+  <h1>RAG in production: freshness, permissions, caching & cost</h1>
+  <p class="subtitle">A demo answers questions. A production RAG system answers them for the right person, from current data, within a latency and cost budget, and forgets what it's told to forget.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Metadata filters</b> on vector search (Lesson 3.4) and vector databases (Lesson 2.3).</li>
+      <li><b>Embedding a corpus</b> costs tokens; changing the embedding model means re-embedding (Lessons 2.1 and 4.2).</li>
+      <li><b>Prompt injection</b>: instructions hidden in retrieved content (preview of Lesson 8.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In August 2024 the security firm PromptArmor disclosed an attack on Slack AI. Slack AI's retrieval searched public channels even when the user hadn't joined them (Slack called that intended behaviour). So an attacker could post a message with hidden instructions in a public channel. When a victim later asked Slack AI about something in their own <b>private</b> channel, retrieval pulled in the attacker's message too, and the instructions could make the answer leak the private data through a link.</p>
+    <p>No database was breached. The leak happened in the <b>retrieval scope</b>: what the system was allowed to put into the prompt, for whom, alongside what.</p>
+  </div>
+
+  <h2>Numbers first: the serving budget</h2>
+  <p>A typical RAG request, end to end (illustrative, measure yours):</p>
+  <table>
+    <tr><th>Stage</th><th>Typical latency</th><th>Typical cost driver</th></tr>
+    <tr><td>Cache lookup (embed question + search cache)</td><td class="tk">20–50 ms</td><td>Tiny</td></tr>
+    <tr><td>Query rewrite (small LLM, Lesson 4.1)</td><td class="tk">300–800 ms</td><td>≈ 300 tokens</td></tr>
+    <tr><td>Embed query + vector search with filters</td><td class="tk">20–100 ms</td><td>Database capacity</td></tr>
+    <tr><td>Rerank top 50 (cross-encoder)</td><td class="tk">100–300 ms</td><td>Reranker calls</td></tr>
+    <tr><td>Generation: TTFT (time to first token) + streaming</td><td class="tk">0.5–1 s + ≈ 3–5 s</td><td>≈ 3,000 input + 300 output tokens: usually most of the bill</td></tr>
+  </table>
+  <p>Generation dominates both latency and cost, so the two biggest levers are <b>sending fewer, better tokens</b> (Lessons 3.5 and 4.2) and <b>not calling the model at all</b> when you've answered the same question before (caching). Every other production concern in this lesson is about doing all of that <i>correctly</i>: for the right user, from fresh data.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    In production, <b>the retrieval scope is a security boundary and a correctness boundary</b>. Whatever retrieval can return, the model can repeat. So permissions are enforced <i>inside</i> the search (not after it, not in the prompt), caches are keyed by who is allowed to see the answer, deletes reach every copy, and freshness is a number you monitor, not a hope.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the library with a locked room</span>
+    <p>A library has a public floor and a locked archive. A good librarian never fetches from the archive for someone without a key, even if the book is the best match. They don't fetch it and then hide it behind their back either: they shouldn't have walked in. And if a book is withdrawn, it comes off the shelf, out of the photocopy tray and out of the “popular answers” binder at the front desk.</p>
+  </div>
+
+  <h2>Permissions: filter inside the search</h2>
+  <table>
+    <tr><th>Approach</th><th>What happens</th><th>Verdict</th></tr>
+    <tr><td>No filter, “the prompt says don't reveal HR data”</td><td>Restricted chunks enter the context; one injection or misread and they're in the answer</td><td class="rk">A leak waiting to happen</td></tr>
+    <tr><td><b>Post-filter</b>: retrieve top-k, then drop what the user can't see</td><td>Safe, but if 4 of your top 5 were restricted, you answer from 1 chunk (or none)</td><td class="tk">Safe, poor recall</td></tr>
+    <tr><td><b>Pre-filter</b>: the ACL (access-control list) is a metadata filter inside the vector query</td><td>Search only among chunks the user may read; you still get k good results</td><td class="ev">The standard</td></tr>
+    <tr><td>Separate index per tenant (namespace)</td><td>Hard isolation between customers; per-tenant deletes are trivial</td><td class="ev">For multi-tenant SaaS</td></tr>
+  </table>
+  <p>Store each chunk's allowed groups (copied from the source system: SharePoint, Drive, Confluence, your database) as metadata at ingestion, and pass the <b>user's</b> groups from your auth system at query time, never from the model. Microsoft states the rule for 365 Copilot plainly: it only surfaces organizational data the individual user has at least view permission for.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The permission leak</span>
+    <p class="hint">An internal assistant over seven docs, each with an access list. Pick who's asking and how retrieval enforces permissions. Then turn on the semantic cache, and try deleting a document. Restricted docs the user can't see are marked in red if they reach the model. Answers are not generated; what matters is which chunks would enter the prompt.</p>
+    <div class="controls">
+      <label>user <select id="pu" class="btn small"></select></label>
+      <label>question <select id="pq" class="btn small"></select></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="pmode"><button data-v="none" class="on" id="pm-none">No filter</button><button data-v="post" id="pm-post">Post-filter</button><button data-v="pre" id="pm-pre">Pre-filter (ACL in query)</button></span>
+      <label>top-k <input type="range" id="pk" min="1" max="4" value="3"> <b class="mono" id="pkv"></b></label>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="pcache"> semantic cache (Bob from HR asked first)</label>
+      <span class="seg" id="pkey"><button data-v="q" class="on" id="pkey-q">key: question only</button><button data-v="acl" id="pkey-acl">key: question + user's groups</button></span>
+    </div>
+    <div class="controls">
+      <button class="btn small" id="pdel">🗑 Delete “Salary bands 2026”</button>
+      <label><input type="checkbox" id="ppurge"> deletes also purge caches</label>
+    </div>
+    <div class="verdict" id="pverdict"></div>
+    <div id="phits"></div>
+    <div class="stat-row">
+      <div class="stat">chunks the model sees <b id="pn">–</b></div>
+      <div class="stat">restricted chunks leaked <b id="pleak">–</b></div>
+      <div class="stat">leaks across all users × questions <b id="pall">–</b></div>
+    </div>
+  </div>
+  <p>What you should see: with no filter, Alice (an engineer) asking about salary bands gets the HR-only salary table and offer rules in her context. Post-filtering stops the leak but leaves her with fewer chunks than k. Pre-filtering gives her a full set of chunks she's allowed to read. Now turn on a cache keyed only by the question: Bob's cached HR answer is served to Alice, a leak <b>even with pre-filtering</b>. Key the cache by her groups and it's gone. Finally, delete the salary doc without purging caches: the index forgets it, the cache doesn't.</p>
+
+  <h2>Freshness: how stale is the answer?</h2>
+  <p>Your index is a copy of the source systems, and copies go stale. The useful number is the <b>staleness window</b>: time from a change in the source (a policy edited, a ticket closed, a doc deleted) until retrieval reflects it.</p>
+  <table>
+    <tr><th>Strategy</th><th>Staleness window</th><th>Cost</th></tr>
+    <tr><td>Nightly full rebuild</td><td class="tk">up to 24 h</td><td>Re-embeds everything every night: wasteful at scale</td></tr>
+    <tr><td>Scheduled incremental sync (changed since last run, by timestamp or content hash)</td><td class="tk">minutes to an hour</td><td>Only changed chunks are re-embedded</td></tr>
+    <tr><td>Event-driven: CDC (change data capture) or webhooks per change</td><td class="tk">seconds to minutes</td><td>A pipeline to operate; the right choice for tickets, chats, inventory</td></tr>
+    <tr><td>Don't index it: query the live system as a tool (Lessons 4.4 and 4.6)</td><td class="ev">zero</td><td>A call per question; only for structured, fast sources (prices, stock, order status)</td></tr>
+  </table>
+  <p>Two more freshness traps live at serving time: <b>caches</b> (a cached answer is as stale as its TTL, time-to-live) and <b>derived data</b> (summaries, graph communities and hypothetical questions from Lessons 4.2–4.3 must be regenerated when their sources change). How to run the ingestion jobs, queues and backfills that keep an index fresh at scale is Lesson 4.8.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: freshness, deletes and a model change</span>
+    <p>A knowledge base of 2 million documents ≈ 20 million chunks of 300 tokens = 6 billion tokens.</p>
+    <ul>
+      <li><b>Nightly full rebuild</b> with an embedding model at $0.02 per million tokens: 6,000 × $0.02 = <b>$120 a night ≈ $3,600 a month</b>, and up to 24 h stale.</li>
+      <li><b>Incremental</b>: if 0.5% of chunks change per day, 100,000 chunks × 300 = 30M tokens = <b>$0.60 a day</b>, and staleness drops to however often you sync.</li>
+      <li><b>Changing the embedding model</b> (vectors from different models can't be compared, so it's all or nothing): 6B tokens once, <b>$120</b> at $0.02/M or <b>$780</b> at $0.13/M, plus running old and new indexes side by side until the new one passes your eval. The money is small; the time, rate limits and cutover are the work (Lesson 4.8).</li>
+      <li><b>A deletion request</b> must reach: the source copy in your doc store, every chunk's vector, caches holding answers built from it, derived summaries and graph nodes, and logs or eval sets that copied it. GDPR's Article 17 requires erasure “without undue delay”.</li>
+    </ul>
+    <p class="muted">Embedding prices: OpenAI's text-embedding-3-small and -large list prices as of October 2026. Many vector indexes mark deleted vectors with tombstones and reclaim space later, so check that deleted items are also excluded from search immediately.</p>
+  </div>
+
+  <h2>Caching: the cheapest answer is the one you don't generate</h2>
+  <table>
+    <tr><th>Cache</th><th>Key</th><th>Saves</th><th>Risk</th></tr>
+    <tr><td>Exact-match response cache</td><td>Normalised question text + user's permission set + index version</td><td>Everything on repeats</td><td>Low hit rate on free text</td></tr>
+    <tr><td><b>Semantic cache</b></td><td>Question embedding within a similarity threshold (+ permissions + version)</td><td>Generation on paraphrases</td><td><b>False hits</b>: “cancel my order” ≈ “cancel my subscription”</td></tr>
+    <tr><td>Retrieval cache</td><td>Query → retrieved chunk IDs</td><td>Search and rerank</td><td>Staleness after updates</td></tr>
+    <tr><td>Provider prompt caching</td><td>Identical prompt prefix (system prompt, static docs)</td><td>Input tokens and TTFT on the shared prefix</td><td>Only helps a stable prefix (Lesson 1.4)</td></tr>
+  </table>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Latency and cost budget</span>
+    <p class="hint">Tune a RAG serving path. Bars show where the time goes on a cache miss. All defaults are illustrative; replace them with your own traces.</p>
+    <div class="calcgrid">
+      <label>queries per day <input type="range" id="bQ" min="3" max="7" step="0.25" value="5"> <b class="mono" id="bQv"></b></label>
+      <label><input type="checkbox" id="bRw" checked> query rewrite (ms) <input type="range" id="bRwMs" min="100" max="1500" step="50" value="500"> <b class="mono" id="bRwMsv"></b></label>
+      <label>vector search (ms) <input type="range" id="bVs" min="10" max="300" step="10" value="60"> <b class="mono" id="bVsv"></b></label>
+      <label><input type="checkbox" id="bRr" checked> rerank (ms) <input type="range" id="bRrMs" min="50" max="600" step="10" value="200"> <b class="mono" id="bRrMsv"></b></label>
+      <label>context tokens sent <input type="range" id="bIn" min="500" max="20000" step="250" value="3000"> <b class="mono" id="bInv"></b></label>
+      <label>answer tokens <input type="range" id="bOut" min="50" max="1500" step="50" value="300"> <b class="mono" id="bOutv"></b></label>
+      <label>TTFT (ms) <input type="range" id="bTt" min="200" max="3000" step="50" value="600"> <b class="mono" id="bTtv"></b></label>
+      <label>output speed (tokens/s) <input type="range" id="bTps" min="20" max="300" step="10" value="80"> <b class="mono" id="bTpsv"></b></label>
+      <label>$ per M input <input type="range" id="bPin" min="0.1" max="15" step="0.1" value="3"> <b class="mono" id="bPinv"></b></label>
+      <label>$ per M output <input type="range" id="bPout" min="0.4" max="75" step="0.2" value="15"> <b class="mono" id="bPoutv"></b></label>
+      <label>cache hit rate <input type="range" id="bHit" min="0" max="0.8" step="0.05" value="0.2"> <b class="mono" id="bHitv"></b></label>
+      <label>false hits (share of hits) <input type="range" id="bFh" min="0" max="0.1" step="0.005" value="0.01"> <b class="mono" id="bFhv"></b></label>
+    </div>
+    <canvas class="chart" id="bchart" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">miss latency (full answer) <b id="bMiss">–</b></div>
+      <div class="stat">average latency <b id="bAvg">–</b></div>
+      <div class="stat">cost per 1,000 queries <b id="bK">–</b></div>
+      <div class="stat">cost per day <b id="bDay">–</b></div>
+      <div class="stat">wrong cached answers per day <b id="bWrong">–</b></div>
+    </div>
+    <p class="hint" id="bmsg"></p>
+  </div>
+  <p>Push the hit rate to 50% and cost halves, but even a 1% false-hit rate on 100,000 queries a day at that hit rate is 500 wrong answers served instantly and confidently. Semantic caches need a strict threshold, permission-aware keys, short TTLs for volatile topics and an eval set of near-miss paraphrases (“cancel order” vs “cancel subscription”).</p>
+
+  <h2>Monitoring retrieval in production</h2>
+  <p>Offline evals (Lesson 5.4) tell you the system was good on launch day. In production, watch signals that move when retrieval breaks:</p>
+  <ul>
+    <li><b>Empty or low-score retrievals</b>: share of queries whose best chunk scores below a threshold; spikes mean a new topic or a broken index.</li>
+    <li><b>Abstention rate</b> (“I don't know”) and <b>citation coverage</b> (answers with at least one citation).</li>
+    <li><b>Freshness lag</b>: newest indexed timestamp vs source; failed ingestion jobs.</li>
+    <li><b>User signals</b>: thumbs, citation clicks, reformulated questions right after an answer.</li>
+    <li><b>Sampled LLM-judge scores</b> on live traces for groundedness and relevance (Lesson 5.6), plus <b>per-stage latency and cost</b> (Lesson 8.1).</li>
+  </ul>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Vector databases with filtered search and multi-tenancy: <b>Qdrant</b> (payload index with <code>is_tenant</code>), <b>Pinecone</b> (one namespace per tenant), <b>Weaviate</b> (native multi-tenancy), <b>pgvector</b> (Postgres filters, row-level security, iterative index scans). Semantic caches: Redis (LangCache), GPTCache. Tracing and monitoring: Langfuse, LangSmith, Arize Phoenix, OpenTelemetry (Lesson 8.1).</p>
+<pre><code><span class="c"># Qdrant: tenant isolation + document ACLs enforced inside the vector query</span>
+<span class="k">from</span> qdrant_client <span class="k">import</span> QdrantClient, models
+client = QdrantClient(url=<span class="s">"http://localhost:6333"</span>)
+client.create_payload_index(<span class="s">"chunks"</span>, field_name=<span class="s">"tenant_id"</span>,
+    field_schema=models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD, is_tenant=<span class="k">True</span>))
+
+hits = client.query_points(<span class="s">"chunks"</span>, query=query_vector, limit=<span class="n">5</span>,
+    query_filter=models.Filter(must=[
+        models.FieldCondition(key=<span class="s">"tenant_id"</span>, match=models.MatchValue(value=user.tenant_id)),
+        models.FieldCondition(key=<span class="s">"allowed_groups"</span>, match=models.MatchAny(any=user.groups)),  <span class="c"># from your auth system</span>
+    ])).points
+
+<span class="c"># Semantic cache key: never share answers across permission sets or index versions</span>
+cache_key = (embed(question), frozenset(user.groups), INDEX_VERSION)</code></pre>
+<pre><code><span class="c">-- pgvector: the same filter in SQL; iterative scans keep k results under selective filters</span>
+SET hnsw.iterative_scan = strict_order;
+SELECT id, content FROM chunks
+WHERE tenant_id = $1 AND allowed_groups && $2      <span class="c">-- array overlap with the user's groups</span>
+ORDER BY embedding <=> $3                          <span class="c">-- cosine distance</span>
+LIMIT 5;</code></pre>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Pre-filter ACLs</td><td>No leaks, full k</td><td>ACL sync from every source; selective filters can slow approximate search</td></tr>
+      <tr><td>Index per tenant</td><td>Hard isolation, easy tenant deletion</td><td>Many small indexes; cross-tenant features harder</td></tr>
+      <tr><td>Event-driven freshness</td><td>Seconds of staleness</td><td>A streaming pipeline to run and monitor</td></tr>
+      <tr><td>Semantic cache</td><td>Big latency and cost cuts on repeats</td><td>False hits, stale answers, permission leaks if mis-keyed</td></tr>
+      <tr><td>Rewrite + rerank stages</td><td>Better answers</td><td>+0.3–1 s each; budget them per route</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>One database (Postgres + pgvector or a managed vector DB), <code>tenant_id</code> and <code>allowed_groups</code> on every chunk from day one (retrofitting ACLs is painful), incremental sync by content hash, an exact-match cache keyed by user groups, and traces with per-stage timings.</p></div>
+      <div><h4>At scale</h4><p>Permission sync services per source system, event-driven indexing, per-tenant indexes for big customers, deletion pipelines with audit trails, semantic caches with per-topic thresholds and TTLs, latency budgets per route, and dashboards for staleness, empty retrievals and groundedness.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Make our internal RAG assistant safe to roll out to the whole company.” A senior answer:</p>
+    <ul>
+      <li><b>Permissions</b>: ACLs synced from source systems as chunk metadata, enforced as pre-filters with the user's groups from auth; never “the prompt says don't”.</li>
+      <li><b>Caches and derived data</b> keyed by permission set and index version; deletes propagate everywhere, with an audit trail.</li>
+      <li><b>Freshness</b> as an SLO (service-level objective): incremental or event-driven sync, staleness monitored, live tools for volatile data.</li>
+      <li><b>Budget</b>: per-stage latency and cost, caching strategy, and production monitoring of retrieval quality; mentions prompt injection from retrieved content.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Retrieval scope as an attack surface</b> <span class="tag co">🏢 Slack / PromptArmor · 2024</span> <a href="https://promptarmor.substack.com/p/data-exfiltration-from-slack-ai-via" target="_blank" rel="noopener">Data exfiltration from Slack AI via indirect prompt injection</a></div>
+      <p><b>How:</b> Slack AI retrieved from public channels the user wasn't in; an attacker's instructions in a public channel rode along with the victim's private data into the prompt.</p>
+      <p><b>Why it matters:</b> permission filtering alone isn't enough when retrieved text can carry instructions; what you retrieve <i>together</i> is part of the security model.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Permission-trimmed enterprise retrieval</b> <span class="tag co">🏢 Microsoft</span> <a href="https://learn.microsoft.com/en-us/copilot/microsoft-365/microsoft-365-copilot-privacy" target="_blank" rel="noopener">Data, privacy and security for Microsoft 365 Copilot</a></div>
+      <p><b>How:</b> Copilot only surfaces organizational data that the individual user has at least view permission for, relying on the existing permission models of services such as SharePoint.</p>
+      <p><b>Why this method:</b> the source systems already know who can see what; RAG must inherit those permissions rather than invent its own, which also means oversharing in the source becomes oversharing in answers.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Multi-tenancy in one collection</b> <span class="tag oss">🧰 Open source</span> <a href="https://qdrant.tech/documentation/guides/multitenancy/" target="_blank" rel="noopener">Qdrant: multitenancy</a></div>
+      <p><b>How:</b> a tenant field on every point, indexed as a keyword payload with <code>is_tenant: true</code>, and a filter on it in every query.</p>
+      <p><b>Why this method:</b> thousands of small tenants are cheaper in one collection than in thousands; the tenant index lets the engine organise storage per tenant for fast filtered search.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A namespace per customer</b> <span class="tag co">🏢 Pinecone</span> <a href="https://docs.pinecone.io/guides/index-data/implement-multitenancy" target="_blank" rel="noopener">Implement multitenancy</a></div>
+      <p><b>How:</b> one namespace per tenant on a serverless index; every upsert and query targets exactly one namespace.</p>
+      <p><b>Why this method:</b> isolation by construction, and offboarding a tenant is deleting a namespace; plans allow from 100 to 1,000,000 namespaces per index.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The right to be forgotten</b> <span class="tag hist">📜 History · 2016</span> <a href="https://gdpr-info.eu/art-17-gdpr/" target="_blank" rel="noopener">GDPR Article 17</a></div>
+      <p><b>How:</b> data subjects can require erasure of their personal data, and the controller must erase it without undue delay when grounds apply.</p>
+      <p><b>Why it matters for RAG:</b> personal data copied into chunks, vectors, caches, summaries and logs is still personal data; deletion has to reach every copy.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the filter that ate your results</span>
+    <p>pgvector's README spells out a classic surprise: approximate search finds candidates first and filters after, so if a condition matches 10% of rows, an HNSW index with the default <code>hnsw.ef_search</code> of 40 returns only about <b>4</b> matching rows on average, even if you asked for 10. The fix is iterative index scans (or partial indexes), which keep searching until enough rows pass the filter.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Filters and vector databases are Lessons 2.3 and 3.4; derived indexes from 4.2–4.3 add copies to keep fresh and to delete; ingestion jobs, batch embedding and backfills are Lesson 4.8. Production monitoring is Lessons 5.6 and 8.1, caching and routing for cost is 8.2, prompt injection and PII are 8.3, governance and privacy law are 8.5. The underlying systems ideas are in the System Design course: <a href="../../system-design-course/phase1/3-caching.html">caching</a>, <a href="../../system-design-course/phase4/6-auth.html">authentication & authorization</a> and <a href="../../system-design-course/phase3/2-kafka.html">Kafka and event streams</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://promptarmor.substack.com/p/data-exfiltration-from-slack-ai-via" target="_blank" rel="noopener">PromptArmor: Data exfiltration from Slack AI</a>. A real retrieval-scope attack, step by step.</li>
+      <li><span class="kind">Docs</span> <a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener">pgvector README</a>. Filtering, iterative index scans and partial indexes.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.weaviate.io/weaviate/manage-collections/multi-tenancy" target="_blank" rel="noopener">Weaviate multi-tenancy</a>. Per-tenant shards, activity states and offboarding.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 200,000 queries a day, $0.012 per uncached answer. A semantic cache reaches a 30% hit rate, with 2% of hits wrong. Daily saving, and wrong answers served from cache?</div>
+    <div class="opts"><button class="opt">$240 saved, 0 wrong</button><button class="opt" data-ok>≈ $720 saved, ≈ 1,200 wrong answers a day</button><button class="opt">≈ $2,400 saved, ≈ 120 wrong</button></div>
+    <div class="explain">Hits: 200,000 × 0.3 = 60,000 × $0.012 = <b>$720</b> saved (minus small lookup costs). Wrong: 60,000 × 0.02 = <b>1,200</b> a day. Whether that's worth it depends on what a wrong answer costs you; often it means a stricter threshold.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A contractor asks the internal assistant about “Q3 layoffs” and receives a summary of an exec-only planning doc. Retrieval has a metadata filter on <code>allowed_groups</code>. Where should you look first?</div>
+    <div class="opts"><button class="opt">The embedding model</button><button class="opt" data-ok>Every copy outside the filtered index: a shared semantic or response cache, a pre-built summary or graph community that includes the doc, or ACLs that weren't synced at ingestion</button><button class="opt">The LLM's temperature</button></div>
+    <div class="explain">If the index filter works, the leak comes through something keyed without permissions (caches) or derived from restricted content (summaries, communities), or the chunk's ACL metadata is wrong because sync failed. Derived data must inherit the strictest ACL of its sources.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Support agents complain the assistant cites a refund policy that changed this morning. Your index rebuilds nightly. Best fix?</div>
+    <div class="opts"><button class="opt">Rebuild every hour</button><button class="opt">Tell the model the current date</button><button class="opt" data-ok>Incremental, event-driven re-indexing of changed documents (webhook or CDC), plus cache invalidation for answers that cited them, and a staleness metric</button></div>
+    <div class="explain">Hourly full rebuilds are wasteful and still stale. Re-embed only what changed as it changes, invalidate cached answers that depended on it, and monitor the lag so you know when it breaks.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Whatever retrieval returns, the model can repeat: enforce ACLs inside the search (pre-filter), with groups from auth, and namespaces per tenant when isolation matters.</li>
+      <li>Caches and derived data are copies: key them by permissions and index version, and make deletes reach every copy.</li>
+      <li>Freshness is a staleness window you measure: incremental or event-driven updates, live tools for volatile data.</li>
+      <li>Generation dominates latency and cost: send fewer tokens, cache carefully (false hits are confident wrong answers), and monitor retrieval in production.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  AI.addConcept(["reorg", "reorganised", "reorganized", "reorganisation", "merge", "restructure", "layoffs"]);
+  const DOCS = [
+    { t: "Expense policy: meals up to 60 dollars per day when travelling.", acl: ["all"] },
+    { t: "Salary bands 2026: Senior Engineer 150k to 185k, Staff Engineer 185k to 230k.", acl: ["hr"], name: "Salary bands 2026" },
+    { t: "Reorg plan (draft): the Platform team will merge with Infra in Q1; two manager roles removed.", acl: ["exec"] },
+    { t: "On-call guide: page the Platform on-call through the pager rotation; escalate after 15 minutes.", acl: ["eng"] },
+    { t: "Engineering levels: Senior Engineers lead projects; Staff Engineers set technical direction.", acl: ["all"] },
+    { t: "Offer approval: salary offers above the band need VP sign-off.", acl: ["hr"] },
+    { t: "Platform team charter: owns the deploy pipeline and the internal developer portal.", acl: ["all"] },
+  ];
+  const USERS = [["Alice · engineer", ["all", "eng"]], ["Bob · HR", ["all", "hr"]], ["Carol · exec", ["all", "exec", "hr", "eng"]], ["Dave · contractor", ["all"]]];
+  const PQ = ["What are the salary bands for senior engineers?", "Is the Platform team being reorganised?", "How do I page the on-call engineer?", "How much can I spend on meals when travelling?"];
+  const BOB = { q: "What are the salary bands for senior engineers?", groups: ["all", "hr"] }; // the cached question
+  $("pu").innerHTML = USERS.map((u, i) => `<option value="${i}">${u[0]}</option>`).join("");
+  $("pq").innerHTML = PQ.map((q, i) => `<option value="${i}">${i + 1}. ${q}</option>`).join("");
+  let mode = "none", key = "q", deleted = false;
+  const segs = (id, set) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); set(b.dataset.v); render(); })); };
+  segs("pmode", v => (mode = v)); segs("pkey", v => (key = v));
+  const can = (groups, d) => d.acl.some(g => groups.includes(g));
+  function retrieve(groups, q, k, m) {
+    const ids = DOCS.map((_, i) => i).filter(i => !(deleted && i === 1));
+    if (m === "pre") { const ok = ids.filter(i => can(groups, DOCS[i])); return AI.search(ok.map(i => DOCS[i].t), q, { mode: "hybrid", k }).map(r => ok[r.i]); }
+    const top = AI.search(ids.map(i => DOCS[i].t), q, { mode: "hybrid", k }).map(r => ids[r.i]);
+    return m === "post" ? top.filter(i => can(groups, DOCS[i])) : top;
+  }
+  // what Bob's cached answer was built from (pre-filtered with HR groups, before any deletion)
+  const bobCtx = () => { const ids = DOCS.map((_, i) => i).filter(i => can(BOB.groups, DOCS[i])); return AI.search(ids.map(i => DOCS[i].t), BOB.q, { mode: "hybrid", k: 3 }).map(r => ids[r.i]); };
+  function serve(ui, qi, k) {
+    const groups = USERS[ui][1], q = PQ[qi];
+    if ($("pcache").checked) {
+      const sim = AI.cosine(AI.embed(q), AI.embed(BOB.q));
+      const sameKey = key === "q" || JSON.stringify([...groups].sort()) === JSON.stringify([...BOB.groups].sort());
+      const purged = deleted && $("ppurge").checked;
+      if (sim >= 0.9 && sameKey && !purged) return { ids: bobCtx(), cached: true, sim };
+    }
+    return { ids: retrieve(groups, q, k, mode), cached: false };
+  }
+  function render() {
+    const ui = +$("pu").value, qi = +$("pq").value, k = +$("pk").value, groups = USERS[ui][1];
+    $("pkv").textContent = k;
+    $("pdel").textContent = deleted ? "↺ Restore “Salary bands 2026”" : "🗑 Delete “Salary bands 2026”";
+    const r = serve(ui, qi, k);
+    const leaks = r.ids.filter(i => !can(groups, DOCS[i]));
+    const ghost = r.ids.includes(1) && deleted;
+    $("phits").innerHTML = (r.cached ? `<div class="muted">served from the semantic cache (similarity ${r.sim.toFixed(2)} to Bob's question): no retrieval ran for this user</div>` : "") +
+      (r.ids.length ? r.ids.map(i => `<div class="hit${!can(groups, DOCS[i]) ? " leak" : ""}">${esc(DOCS[i].t)}<span class="lock${can(groups, DOCS[i]) ? "" : " no"}">${DOCS[i].acl.join(", ")}</span>${deleted && i === 1 ? ' <span class="lock no">deleted</span>' : ""}</div>`).join("") : `<div class="hit miss">No chunks: the model can only say it doesn't know.</div>`);
+    $("pverdict").innerHTML = ghost ? `<span class="rk">❌ A deleted document is still being served from the cache. Deletes must purge every copy.</span>`
+      : leaks.length ? `<span class="rk">❌ ${leaks.length} restricted chunk${leaks.length > 1 ? "s" : ""} reached the model for ${esc(USERS[ui][0])}${r.cached ? " (via the cache)" : ""}. One injection or careless answer and it's disclosed.</span>`
+      : r.ids.length < k && !r.cached ? `<span class="tk">⚠️ No leak, but only ${r.ids.length} of ${k} chunks survived: post-filtering threw away the rest of the context.</span>`
+      : `<span class="ev">✅ Every chunk the model sees is one this user may read.</span>`;
+    $("pn").textContent = r.ids.length; $("pleak").textContent = leaks.length;
+    let total = 0; USERS.forEach((u, a) => PQ.forEach((_, b) => { total += serve(a, b, k).ids.filter(i => !can(u[1], DOCS[i])).length; }));
+    $("pall").textContent = total;
+  }
+  ["pu", "pq", "pk"].forEach(id => ($(id).oninput = render)); ["pcache", "ppurge"].forEach(id => ($(id).onchange = render));
+  $("pdel").onclick = () => { deleted = !deleted; render(); };
+  render();
+
+  // ---------- budget calculator ----------
+  const ids = ["bQ", "bRw", "bRwMs", "bVs", "bRr", "bRrMs", "bIn", "bOut", "bTt", "bTps", "bPin", "bPout", "bHit", "bFh"];
+  function calc() {
+    const v = Object.fromEntries(ids.map(i => [i, $(i).type === "checkbox" ? $(i).checked : +$(i).value]));
+    const qd = Math.round(Math.pow(10, v.bQ));
+    const rw = v.bRw ? v.bRwMs : 0, rr = v.bRr ? v.bRrMs : 0, lookup = 35, gen = v.bTt + 1000 * v.bOut / v.bTps;
+    const miss = lookup + rw + 30 + v.bVs + rr + gen;
+    const hitLat = lookup + 150; // lookup + streaming a cached answer
+    const avg = v.bHit * hitLat + (1 - v.bHit) * miss;
+    const rwCost = v.bRw ? (300 * 1 + 30 * 5) / 1e6 : 0; // small model, illustrative $1 / $5 per M
+    const genCost = v.bIn * v.bPin / 1e6 + v.bOut * v.bPout / 1e6;
+    const perMiss = genCost + rwCost + (v.bRr ? 0.001 : 0);
+    const perQ = (1 - v.bHit) * perMiss;
+    const fmtMs = ms => ms >= 1000 ? (ms / 1000).toFixed(2) + " s" : Math.round(ms) + " ms";
+    const show = { bQv: qd.toLocaleString("en-US"), bRwMsv: v.bRwMs + " ms", bVsv: v.bVs + " ms", bRrMsv: v.bRrMs + " ms", bInv: v.bIn.toLocaleString("en-US"), bOutv: v.bOut, bTtv: v.bTt + " ms", bTpsv: v.bTps, bPinv: "$" + v.bPin.toFixed(1), bPoutv: "$" + v.bPout.toFixed(1), bHitv: Math.round(v.bHit * 100) + "%", bFhv: (v.bFh * 100).toFixed(1) + "%" };
+    Object.entries(show).forEach(([k2, t]) => ($(k2).textContent = t));
+    $("bMiss").textContent = fmtMs(miss); $("bAvg").textContent = fmtMs(avg);
+    $("bK").textContent = "$" + (perQ * 1000).toFixed(2); $("bDay").textContent = "$" + Math.round(perQ * qd).toLocaleString("en-US");
+    $("bWrong").textContent = Math.round(qd * v.bHit * v.bFh).toLocaleString("en-US");
+    Plot.bars($("bchart"), { bars: [
+      { label: "cache lookup", value: lookup, color: MX.css("--c-ev") },
+      { label: "rewrite", value: rw, color: MX.css("--c-md") },
+      { label: "embed + search", value: 30 + v.bVs, color: MX.css("--c-cx") },
+      { label: "rerank", value: rr, color: MX.css("--c-tl") },
+      { label: "TTFT", value: v.bTt, color: MX.css("--c-tk") },
+      { label: "streaming answer", value: Math.round(1000 * v.bOut / v.bTps), color: MX.css("--c-rk") },
+    ], yMin: 0, yLabel: "ms on a cache miss" });
+    $("bmsg").textContent = `Generation is ${Math.round(100 * gen / miss)}% of miss latency and ${Math.round(100 * genCost / perMiss)}% of the cost per answered query. Assumptions: rewrite on a small model at $1 / $5 per million tokens, rerank ≈ $0.001 per query, cache hit ≈ 185 ms.`;
+  }
+  ids.forEach(i => { $(i).oninput = calc; $(i).onchange = calc; });
+  calc();
+})();
+</script>
+</body>
+</html>

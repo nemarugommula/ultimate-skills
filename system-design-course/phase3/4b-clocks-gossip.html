@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.4b Time without a leader: clocks, vector clocks & gossip · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .reps { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 8px; margin: 8px 0; }
+  .rep { border: 1px solid var(--c-db); border-radius: 10px; padding: 8px 10px; background: var(--bg2); font-size: .85rem; }
+  .rep.cut { border-color: var(--c-er); border-style: dashed; }
+  .rep h4 { margin: 0 0 4px; font-size: .9rem; }
+  .ver { font-family: var(--mono, monospace); font-size: .8rem; margin: 2px 0; }
+  .ver.sib { color: var(--c-lt); }
+  .lwwline { color: var(--muted); font-size: .78rem; margin-top: 4px; border-top: 1px dashed var(--line); padding-top: 4px; }
+  #gs circle { transition: fill .2s; }
+</style>
+</head>
+<body data-lesson="s3-4b" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 4b</div>
+  <h1>Time without a leader: clocks, vector clocks & gossip</h1>
+  <p class="subtitle">Machines can't agree on what time it is, so “the latest write wins” quietly loses data. Logical clocks order events by cause instead of by clock, vector clocks spot conflicting writes, and gossip spreads news to thousands of nodes with no leader at all.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Async replicas</b> accept writes and copy them later, so copies can diverge (Lesson 2.3).</li>
+      <li><b>Last-write-wins (LWW)</b> picks the copy with the latest timestamp; <b>TrueTime</b> is Spanner's clock with an error bar (Lesson 2.6).</li>
+      <li><b>Consensus</b> uses a leader and majorities; Raft's numbered <b>terms</b> and <b>heartbeats</b> (Lesson 3.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>At midnight UTC (Coordinated Universal Time) on 1 January 2017, a leap second was added to the world's clocks. Deep inside Cloudflare's DNS software, code measured how long an upstream server took to answer by subtracting two readings of the wall clock. It assumed the result could never be negative. During the leap second, time went backwards, the measurement went negative, and a random-number function that was fed that value <b>panicked</b>.</p>
+    <p>At peak about <b>0.2% of Cloudflare's DNS queries</b> were affected. The postmortem's diagnosis: the belief that time cannot go backwards. Every distributed system that orders events by wall-clock time makes a version of that bet. This lesson is about not making it.</p>
+  </div>
+
+  <h2>Numbers first: how wrong is a clock?</h2>
+  <p>Every server's clock is driven by a cheap crystal that ticks slightly too fast or too slow. <b>NTP</b> (Network Time Protocol) nudges it back toward a reference server every so often. Typical figures:</p>
+  <table>
+    <tr><th>What</th><th>Typical size</th><th>Source of the number</th></tr>
+    <tr><td><span class="lt">Drift between syncs</span></td><td>Spanner assumes a worst case of 200 µs per second: up to <b>17 seconds a day</b> if never corrected</td><td>Spanner paper (2012)</td></tr>
+    <tr><td><span class="lt">Offset between servers synced by NTP</span></td><td>CockroachDB's engineers estimate “somewhere between” <b>100 and 250 ms</b> as a safe bound</td><td>Cockroach Labs blog (2022)</td></tr>
+    <tr><td><span class="lt">GPS + atomic clocks (TrueTime)</span></td><td><b>1–7 ms</b> uncertainty, about 4 ms most of the time</td><td>Spanner paper (Lesson 2.6)</td></tr>
+    <tr><td><span class="er">Jumps</span></td><td>NTP corrections, leap seconds, a virtual machine paused and resumed: time can go <b>backwards</b></td><td>Cloudflare 2017</td></tr>
+  </table>
+  <p>Now the damage. Server A's clock runs 80 ms fast. A user updates their cart on A at real time 12:00:00.000, so the write is stamped <b>.080</b>. Thirty milliseconds later they change it again, and that request lands on server B, whose clock is right: stamped <b>.030</b>. Last-write-wins keeps the <i>higher</i> timestamp: A's older write. The newer change is silently thrown away. No error, no log line.</p>
+  <div class="eq">
+    two writes can be ordered wrongly whenever &nbsp; <span class="lt">real gap</span> &lt; <span class="er">clock offset</span>
+    <span class="say">“If two writes are closer together in real time than the clocks disagree, a timestamp can't tell you which came first.” With 100 ms of offset, a user double-clicking is enough.</span>
+  </div>
+  <div class="legend"><span class="lt">real gap: true time between two writes</span><span class="er">offset: how far apart the two servers' clocks are</span></div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Stop asking “what time was it?” and ask “<b>could this event have known about that one?</b>” That's causality, and you can track it with counters instead of clocks. A <b>Lamport clock</b> gives an order that never contradicts cause and effect. A <b>vector clock</b> also tells you when two writes were <b>concurrent</b> (neither knew about the other), so you keep both instead of guessing. And <b>gossip</b> spreads information through a cluster with no leader, reaching everyone in a number of rounds that grows only with log N.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: two copies of a shopping list</span>
+    <p>You and your partner each have a paper copy of the shopping list. Next to it you each keep a tally: “edits by me, edits by you”. When you meet, you compare tallies. If yours says (3, 1) and theirs says (2, 1), yours includes everything theirs has, so you throw theirs away. If yours says (3, 1) and theirs says (2, 2), each of you made an edit the other hasn't seen. Neither list is “newer”; you sit down and merge them. Wristwatches never come into it. That tally is a vector clock.</p>
+  </div>
+
+  <h2>Lamport clocks: a counter that respects cause</h2>
+  <p>In 1978 Leslie Lamport defined “a <b>happened before</b> b” without any physical clock: a and b are in the same process and a came first, or a is sending a message and b is receiving it (or a chain of those). Otherwise they're <b>concurrent</b>. Then he gave each process a counter:</p>
+  <ol>
+    <li>Before each event, add 1 to your counter.</li>
+    <li>Every message carries the sender's counter.</li>
+    <li>On receiving, set your counter to max(yours, the message's) + 1.</li>
+  </ol>
+  <p>Guarantee: if a happened before b, then L(a) &lt; L(b). Sort by (counter, node ID) and you get one total order that every node agrees on and that never puts an effect before its cause. Raft's <b>terms</b> (Lesson 3.4) are this idea: a number that only goes up, and seeing a bigger one means you're behind.</p>
+  <p>The limit: L(a) &lt; L(b) does <b>not</b> mean a happened before b. Two independent writes get some order, but you can't tell that they were actually concurrent. For conflict detection you need more information.</p>
+
+  <h2>Vector clocks: one counter per node</h2>
+  <p>A <b>vector clock</b> keeps one counter per replica, like <code>[A:2, B:1, C:0]</code>. A replica that accepts a write adds 1 to its own entry. When versions meet, you compare entry by entry:</p>
+  <table>
+    <tr><th>Compare V and W</th><th>Meaning</th><th>What to do</th></tr>
+    <tr><td>Every entry of V ≤ W</td><td>V happened before W: W already includes V</td><td class="db">Keep W, drop V safely</td></tr>
+    <tr><td>Some entries bigger in V, some in W</td><td><b>Concurrent</b>: each saw writes the other didn't</td><td class="lt">Keep <b>both</b> (called <b>siblings</b>) and merge</td></tr>
+  </table>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the cart from the Dynamo paper, in miniature</span>
+    <ul>
+      <li>Replica A takes “add milk”: <code>[A:1]</code>. Then “add bread” on A: <code>[A:2]</code>, which supersedes <code>[A:1]</code> (every entry ≥).</li>
+      <li>The network splits. On B, someone adds eggs to the <code>[A:2]</code> version: <code>[A:2, B:1]</code>. On C, someone adds cheese to the same <code>[A:2]</code>: <code>[A:2, C:1]</code>.</li>
+      <li>Compare <code>[A:2, B:1, C:0]</code> with <code>[A:2, B:0, C:1]</code>: B is bigger in the first, C in the second. <b>Concurrent.</b> Keep both siblings: {milk, bread, eggs} and {milk, bread, cheese}.</li>
+      <li>The next client to read gets both, merges them (a cart merges by union: {milk, bread, eggs, cheese}) and writes the result through A: <code>[A:3, B:1, C:1]</code>, which supersedes both.</li>
+      <li>With last-write-wins, one of eggs or cheese would have vanished, and which one depends on whose clock ran fast.</li>
+    </ul>
+    <p>The cost: the clock grows with the number of replicas that write the key, so Dynamo trimmed the oldest entries once a clock reached about 10. Riak later moved to <b>dotted version vectors</b>, which track the exact write that created each sibling and keep the number of siblings from exploding.</p>
+  </div>
+
+  <div class="playground" id="pg1">
+    <span class="label">🎮 Playground · Three replicas, a partition and a fast clock</span>
+    <p class="hint">Each write adds the next item to a shared cart on one replica. Connected replicas copy every write immediately. Cut C off, write on both sides, then heal and watch vector clocks find the conflict. Underneath each replica, a grey line shows what a last-write-wins store with wall-clock timestamps would hold. Then give C a fast clock.</p>
+    <div class="controls">
+      <button class="btn" id="wA">✍️ Write on A</button>
+      <button class="btn" id="wB">✍️ Write on B</button>
+      <button class="btn" id="wC">✍️ Write on C</button>
+      <button class="btn" id="cut">✂️ Cut C off</button>
+      <button class="btn primary" id="heal">🔧 Heal & sync</button>
+      <button class="btn" id="mrg">🤝 Read & merge on A</button>
+      <button class="btn" id="vreset">Reset</button>
+    </div>
+    <div class="controls">
+      <label>C's clock offset <input type="range" id="skew" min="-3" max="3" step="0.5" value="0"> <b class="mono" id="skewv"></b></label>
+    </div>
+    <div class="reps" id="reps"></div>
+    <div class="stat-row">
+      <div class="stat">concurrent writes detected <b id="vconf">0</b></div>
+      <div class="stat">old versions safely dropped <b id="vsup">0</b></div>
+      <div class="stat">items lost with vector clocks <b id="vlost">0</b></div>
+      <div class="stat">items LWW silently lost <b id="llost">0</b></div>
+    </div>
+    <p class="hint" id="vmsg">Writes happen one simulated second apart.</p>
+  </div>
+  <p>Things to try: write on A twice, cut C off, write on B and on C, then heal. The two sides are concurrent, so A ends up holding two siblings, and LWW would have dropped one side's item. Press “Read & merge” to resolve them into one version that supersedes both. Then reset, set C's clock to +2 s, leave the network alone, and write C, A, B in turn: the later writes on A and B carry <i>smaller</i> timestamps than C's, so LWW discards them even though nothing was partitioned. Vector clocks don't care: they never look at the wall clock.</p>
+
+  <h2>Hybrid logical clocks and TrueTime: keeping real time, safely</h2>
+  <p>Pure counters lose a useful property: “show me the data as of 12:00” means nothing to <code>[A:3, B:1]</code>. Two ways to get time back:</p>
+  <ul>
+    <li><b>Hybrid logical clocks (HLC)</b> (2014): a timestamp is (wall time, small counter). It stays close to the real clock, but it never goes backwards and, like a Lamport clock, a node that receives a later timestamp moves past it. CockroachDB stamps every transaction with an HLC, assumes a <b>maximum clock offset</b> between nodes (500 ms by default), and treats any value stamped within that window as uncertain: the read restarts just above it. A node whose clock drifts past the limit shuts itself down rather than return wrong answers.</li>
+    <li><b>TrueTime</b> (Spanner, Lesson 2.6): GPS receivers and atomic clocks shrink the uncertainty to a few milliseconds, then each commit waits it out. It's the hardware answer to the same problem. Google's paper adds a telling statistic: in its fleet, bad CPUs were 6 times more likely than bad clocks.</li>
+  </ul>
+  <table>
+    <tr><th>Clock</th><th>Tells you</th><th>Size</th><th>Used by</th></tr>
+    <tr><td><span class="lt">Wall clock + LWW</span></td><td>Roughly when; order only if writes are far apart</td><td>8 bytes</td><td>Cassandra, DynamoDB global tables (default)</td></tr>
+    <tr><td><span class="nw">Lamport clock</span></td><td>An order consistent with cause</td><td>One counter</td><td>Raft terms (the same idea)</td></tr>
+    <tr><td><span class="nw">Vector clock / DVV</span></td><td>Ordered or <b>concurrent</b> (conflict!)</td><td>One counter per writer</td><td>Dynamo, Riak</td></tr>
+    <tr><td><span class="ca">Hybrid logical clock</span></td><td>Cause-respecting order close to real time</td><td>Wall time + counter</td><td>CockroachDB</td></tr>
+    <tr><td><span class="ca">TrueTime</span></td><td>Real time with a guaranteed error bar</td><td>An interval</td><td>Spanner</td></tr>
+  </table>
+
+  <h2>Gossip: how news spreads with no leader</h2>
+  <p>Consensus (Lesson 3.4) needs a leader and majorities. That's right for “who is the primary?”, but far too heavy for “which of these 2,000 nodes are alive, and which key ranges do they own?”. Leaderless systems use <b>gossip</b> (also called epidemic protocols): every second, each node picks a random peer and the two swap what they know. A rumour known by 1 node is known by about 2 after one round, 4 after two, 8 after three…</p>
+  <div class="eq">
+    rounds to reach everyone ≈ <span class="nw">log<sub>2</sub> N</span> (plus a few)
+    <span class="say">“The number of nodes that know roughly doubles each round, so a cluster 1,000 times bigger needs only about 10 more rounds.” Each node still sends the same few messages per second, however big the cluster gets.</span>
+  </div>
+  <div class="legend"><span class="nw">N: number of nodes</span></div>
+  <p>Gossip is used for three jobs: <b>membership</b> (who's in the cluster), <b>failure detection</b> (who's stopped answering), and <b>anti-entropy</b> (repairing replicas that drifted apart).</p>
+
+  <div class="playground" id="pg2">
+    <span class="label">🎮 Playground · Spread a rumour</span>
+    <p class="hint">One node learns something (a new member joined, a node died). Each round, nodes contact <b>fanout</b> random peers. In <b>push</b> mode only nodes that know send it; in <b>push-pull</b> every node contacts peers and the two exchange news both ways (what Dynamo and Cassandra do, once per second). Kill nodes and drop messages to see how robust it is.</p>
+    <svg id="gs"></svg>
+    <div class="controls">
+      <label>nodes <input type="range" id="gn" min="0" max="4" step="1" value="3"> <b class="mono" id="gnv"></b></label>
+      <label>fanout <input type="range" id="gf" min="1" max="4" step="1" value="1"> <b class="mono" id="gfv"></b></label>
+      <label>dead nodes <input type="range" id="gd" min="0" max="40" step="10" value="0"> <b class="mono" id="gdv"></b></label>
+      <label>message loss <input type="range" id="gl" min="0" max="50" step="10" value="0"> <b class="mono" id="glv"></b></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="gm"><button data-v="push" id="gpush">push</button><button data-v="pp" id="gpp" class="on">push-pull</button></span>
+      <button class="btn primary" id="grun">▶ Spread a rumour</button>
+      <button class="btn" id="gavg">Average of 50 runs</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">rounds to reach all live nodes <b id="gr">–</b></div>
+      <div class="stat">log₂ N <b id="glog">–</b></div>
+      <div class="stat">messages per node per round <b id="gmpn">–</b></div>
+      <div class="stat">everyone knows after (1 round/s) <b id="gt">–</b></div>
+    </div>
+    <canvas class="chart" id="gc" style="height:190px"></canvas>
+    <p class="hint" id="gmsg"></p>
+  </div>
+  <p>Things to try: with 1,024 nodes in push-pull, everyone knows in about 9–10 rounds; log₂ 1,024 = 10. Drop to 64 nodes: about 6. Switch to push with fanout 1 and it's slower (around 18 rounds for 1,024), because late in the epidemic most pushes land on nodes that already know; fanout 2 fixes most of that. Now kill 40% of nodes and add 30% message loss: it still reaches every live node, in about twice the rounds. No leader to lose, no single path to break.</p>
+
+  <h2>Failure detection: “dead” is a guess</h2>
+  <p>Over a network you can't tell a dead node from a slow one (Lesson 0.2). So every failure detector trades <b>speed</b> against <b>false alarms</b>. Two classic improvements over a fixed timeout:</p>
+  <ul>
+    <li><b>Phi accrual</b> (from a paper by Hayashibara and colleagues; used by Cassandra and Akka): instead of a yes/no timeout, each node learns the normal rhythm of a peer's heartbeats (mean and spread of the gaps) and computes a suspicion level φ (phi) = −log<sub>10</sub>(probability that a healthy peer would be this late). φ = 8 means a one-in-100-million delay. Cassandra's default threshold is 8. A jittery network automatically gets a more patient detector.</li>
+    <li><b>SWIM</b> (Scalable Weakly-consistent Infection-style Membership, 2002; the basis of HashiCorp's memberlist, Serf and Consul): each period, a node pings one random peer; if there's no answer it asks k other nodes to try (<code>ping-req</code>), so one bad link doesn't condemn a node. A node that still fails is first marked <b>suspect</b>, and gets time to refute it before being declared dead. Updates ride along on the ping messages, gossip-style, so the load per node stays constant.</li>
+  </ul>
+
+  <div class="playground" id="pg3">
+    <span class="label">🎮 Playground · Is node 7 dead?</span>
+    <p class="hint">Node 7 sends a heartbeat about once a second, with network jitter. Over 30 seconds it pauses for 3 s (a long garbage-collection pause: alive, just frozen), and later really crashes. Compare a fixed 1.5 s timeout, phi accrual, and phi plus a SWIM-style suspicion period.</p>
+    <div class="controls">
+      <label>network jitter (σ) <input type="range" id="fj" min="0.05" max="0.5" step="0.05" value="0.15"> <b class="mono" id="fjv"></b></label>
+      <label>phi threshold <input type="range" id="fth" min="1" max="16" step="1" value="8"> <b class="mono" id="fthv"></b></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="fm"><button data-v="fixed" id="ffix">Fixed 1.5 s timeout</button><button data-v="phi" id="fphi" class="on">Phi accrual</button><button data-v="susp" id="fsus">Phi + suspicion (5 s)</button></span>
+      <label><input type="checkbox" id="fgc" checked> 💤 3 s GC pause at t = 8 s</label>
+      <label><input type="checkbox" id="fcr" checked> 💀 crash at t = 20 s</label>
+    </div>
+    <canvas class="chart" id="fc" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">false “dead” verdicts <b id="ffa">–</b></div>
+      <div class="stat">crash detected after <b id="fdt">–</b></div>
+      <div class="stat">phi trips after a silence of (learned) <b id="ftt">–</b></div>
+      <div class="stat">false alarms / day from jitter alone <b id="ffd">–</b></div>
+    </div>
+    <p class="hint" id="fmsg"></p>
+  </div>
+  <p>Things to try: with phi accrual, the GC pause is a false “dead” verdict: a 3 s silence is wildly unusual for a peer that normally beats every second. Switch to suspicion: the node is suspected, then refutes it when it wakes, and no alarm fires. The price shows in the crash: it's detected 5 s later. Notice too that after the pause, the detector has learned that this peer can go quiet, so it has become more patient. Now raise the jitter to 0.5 with the fixed timeout: false alarms everywhere, from jitter alone. Phi accrual learns the rhythm and stays quiet.</p>
+
+  <h2>Anti-entropy: finding the differences cheaply</h2>
+  <p>Replicas drift: a write missed a replica that was down, a disk lost a file. Comparing two replicas key by key means shipping every key. A <b>Merkle tree</b> (a hash tree) fixes that: each leaf is the hash of a range of keys, each parent the hash of its children, and the root summarizes everything.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: one bad key among a million</span>
+    <ul>
+      <li>Two replicas hold about 2<sup>20</sup> ≈ 1,048,576 keys each, in a binary Merkle tree 20 levels deep.</li>
+      <li>Compare the roots: 1 hash each. Different, so compare the two children; only one side differs. Repeat down the tree.</li>
+      <li>That's about 2 hashes per level × 20 levels = <b>40 hashes</b> exchanged to find the one bad key, instead of a million. If the roots match, the replicas are identical after exchanging a single hash.</li>
+    </ul>
+    <p>Dynamo keeps one Merkle tree per key range; Cassandra builds them during <code>nodetool repair</code>.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>You rarely implement these yourself; you configure them in <b>Cassandra</b> (gossip, phi accrual, Merkle-tree repair, LWW timestamps), <b>Riak</b> (vector clocks, dotted version vectors, siblings), HashiCorp <b>memberlist</b>, <b>Serf</b> and <b>Consul</b> (SWIM gossip), <b>Akka Cluster</b> (gossip + phi accrual), and <b>CockroachDB</b> (HLC + max offset). On every machine: <b>chrony</b> or ntpd for clock sync, and managed time services such as Amazon Time Sync. And in code: measure durations with a <b>monotonic</b> clock, never with wall time.</p>
+<pre><code><span class="c"># Cassandra: what this node's gossip and failure detector believe</span>
+nodetool status          <span class="c"># UN = up/normal, DN = down/normal, per this node's view</span>
+nodetool gossipinfo      <span class="c"># each peer's generation, heartbeat version and state</span>
+nodetool repair -pr      <span class="c"># anti-entropy: build Merkle trees, stream only mismatched ranges</span>
+
+<span class="c"># cassandra.yaml: suspicion level before marking a peer down (default 8)</span>
+phi_convict_threshold: <span class="n">8</span>
+
+<span class="c"># Consul (Serf/SWIM gossip): cluster membership as this agent sees it</span>
+consul members</code></pre>
+<pre><code><span class="c"># a vector clock compare in 6 lines of Python</span>
+<span class="k">def</span> compare(v, w):                       <span class="c"># v, w: dicts like {"A": 2, "B": 1}</span>
+    nodes = v.keys() | w.keys()
+    le = all(v.get(n, <span class="n">0</span>) <= w.get(n, <span class="n">0</span>) <span class="k">for</span> n <span class="k">in</span> nodes)
+    ge = all(v.get(n, <span class="n">0</span>) >= w.get(n, <span class="n">0</span>) <span class="k">for</span> n <span class="k">in</span> nodes)
+    <span class="k">return</span> <span class="s">"equal"</span> <span class="k">if</span> le <span class="k">and</span> ge <span class="k">else</span> <span class="s">"before"</span> <span class="k">if</span> le <span class="k">else</span> <span class="s">"after"</span> <span class="k">if</span> ge <span class="k">else</span> <span class="s">"concurrent"</span></code></pre>
+    <p class="hint">Try it locally: <code>consul agent -dev</code> in one terminal, then <code>consul members</code> in another. In Python, time a request with <code>time.monotonic()</code>, not <code>time.time()</code>; in Go, <code>time.Since(start)</code> uses the monotonic reading.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th></th><th>Last-write-wins (timestamps)</th><th>Vector clocks + siblings</th><th>Consensus / single leader</th></tr>
+      <tr><td>Concurrent writes</td><td class="er">One silently lost</td><td class="db">Both kept; app merges</td><td class="db">Can't happen: one order</td></tr>
+      <tr><td>Writable during a partition</td><td>Yes</td><td>Yes</td><td class="er">Only the majority side</td></tr>
+      <tr><td>App complexity</td><td>None</td><td class="lt">Merge logic per data type (or use CRDTs, data types that merge automatically)</td><td>None, but latency per write</td></tr>
+      <tr><td>Good for</td><td>Data where losing a racing update is fine (last-seen timestamps, caches)</td><td>Carts, collaborative data, multi-region “always writable”</td><td>Money, uniqueness, anything that must not fork</td></tr>
+    </table>
+    <p>For membership: gossip scales to thousands of nodes with constant load per node, but it's <b>eventually</b> consistent: for a few seconds different nodes disagree about who's alive. For “exactly one leader” you still need consensus (Lesson 3.4).</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>One primary database gives you one order for free; you don't need any of this yet. Do two things now: run chrony or your cloud's time service everywhere, and measure durations with monotonic clocks. Never use timestamps to decide which of two writes wins, and use database sequences, not wall time, for “latest” logic.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Multi-region, always-writable stores (Cassandra, DynamoDB global tables, Riak-style systems) where the conflict policy is a design decision per table; gossip-based membership in service meshes and databases; tuned failure detectors (Akka's docs suggest raising phi from 8 to 12 on noisy cloud networks); clock-offset monitoring as an alert; and HLC or TrueTime in globally distributed SQL.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>When a design has multiple writable replicas, the interviewer wants to hear:</p>
+    <ul>
+      <li>That <b>wall-clock LWW can drop writes</b>, with the reason (clock offset larger than the gap between writes) and when that's acceptable.</li>
+      <li>How you <b>detect conflicts</b> (vector clocks / version vectors) and how you <b>resolve</b> them (merge function, CRDT, or ask the user).</li>
+      <li>How nodes learn about membership and failures without a central registry: <b>gossip</b>, with spread time ≈ log N rounds, and a failure detector tuned for false alarms vs detection speed.</li>
+      <li>How replicas repair drift: <b>anti-entropy with Merkle trees</b>, read repair, hinted handoff.</li>
+    </ul>
+    <p>Common follow-ups: “Two users edit the same document offline. What happens when they reconnect?” “How long until the whole cluster knows a node died?” (detection time + about log₂ N gossip rounds). “Why not just use NTP timestamps?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Ordering without clocks</b> <span class="tag hist">📜 History · 1978</span> <a href="https://lamport.azurewebsites.net/pubs/time-clocks.pdf" target="_blank" rel="noopener">Lamport: Time, Clocks, and the Ordering of Events in a Distributed System (PDF)</a></div>
+      <p><b>How:</b> defines “happened before” as a partial order from process order and messages, and logical clocks that satisfy the clock condition: if a happened before b, then C(a) &lt; C(b). Breaking ties by process gives a total order all processes agree on.</p>
+      <p><b>Why this method:</b> physical clocks are never perfectly in sync, but cause and effect can be tracked exactly with counters carried on messages.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Vector clocks, gossip and Merkle trees in one system</b> <span class="tag co">🏢 Amazon · 2007</span> <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Dynamo: Amazon's Highly Available Key-value Store (PDF)</a></div>
+      <p><b>How:</b> vector clocks detect concurrent versions and the application reconciles them (the shopping cart merges); each node gossips membership with a random peer every second; Merkle trees drive anti-entropy. Over 24 hours of shopping-cart traffic, 99.94% of requests saw exactly one version.</p>
+      <p><b>Why this method:</b> an “always writable” cart: adding an item must never fail, so conflicts are allowed and resolved later rather than prevented.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Gossip and phi accrual, but last-write-wins</b> <span class="tag oss">🧰 Open source</span> <a href="https://cassandra.apache.org/doc/latest/cassandra/architecture/dynamo.html" target="_blank" rel="noopener">Apache Cassandra: Dynamo-style architecture</a></div>
+      <p><b>How:</b> every second each node updates its heartbeat and gossips with a random peer; a phi accrual failure detector decides UP or DOWN locally; Merkle-tree repair fixes drift. Unlike Dynamo, conflicts are resolved by last-write-wins on per-column timestamps, and the docs say plainly that correctness depends on clocks, so run NTP.</p>
+      <p><b>Why this method:</b> LWW keeps the data model simple (no siblings for apps to merge), at the cost of trusting synchronized clocks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>SWIM membership as a library</b> <span class="tag oss">🧰 HashiCorp</span> <a href="https://github.com/hashicorp/memberlist" target="_blank" rel="noopener">memberlist (Go)</a></div>
+      <p><b>How:</b> based on the 2002 SWIM paper (random probes, indirect <code>ping-req</code>, suspicion, infection-style dissemination), extended with “Lifeguard” to avoid falsely accusing peers when the <i>local</i> node is slow from CPU starvation or network delay. Serf and Consul build on it.</p>
+      <p><b>Why this method:</b> constant message load per node and failure detection that doesn't slow down as the cluster grows.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Spanner's guarantees without atomic clocks</b> <span class="tag co">🏢 Cockroach Labs · 2022</span> <a href="https://www.cockroachlabs.com/blog/living-without-atomic-clocks/" target="_blank" rel="noopener">Living without atomic clocks</a></div>
+      <p><b>How:</b> hybrid logical clocks plus a configured maximum clock offset. A read that meets a value inside its uncertainty window restarts with a higher timestamp; nodes compare offsets and a node beyond the limit terminates itself.</p>
+      <p><b>Why this method:</b> runs on ordinary cloud machines with NTP, paying with occasional read restarts instead of special hardware.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · relativity in your database</span>
+    <p>Lamport says the idea came from physics. Special relativity teaches that observers in different places can disagree about which of two events came first; only events that could causally affect each other have a fixed order. Reading a note on keeping duplicate databases in sync, he recognized the same structure in messages between computers. He also recalls Jim Gray telling him that people called the paper either trivial or brilliant, and he wouldn't argue with either.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This lesson is the leaderless half of Phase 3. Raft (Lesson 3.4) avoids conflicts by electing one leader; Dynamo-style stores accept conflicts and detect them with vector clocks, the AP choice from CAP (Lesson 2.6). Gossip carries the ring membership that consistent hashing needs (Lesson 2.4). Kafka gives you one order per partition because each partition has one leader (Lesson 3.2). Event sourcing (Lesson 3.2b) needs an order per stream, which a version number gives. Chat (Lesson 7.4) needs messages in causal order. In collaborative and offline-first apps, CRDTs push the merge-instead-of-overwrite idea all the way to the data type.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Dynamo (SOSP 2007)</a>. Section 4.4 is the clearest vector-clock example in print; 4.7–4.8 cover Merkle trees and gossip.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.riak.com/riak/kv/latest/learn/concepts/causal-context/index.html" target="_blank" rel="noopener">Riak: causal context</a>. Vector clocks, siblings, and why dotted version vectors limit “sibling explosion”.</li>
+      <li><span class="kind">Docs</span> <a href="https://doc.akka.io/libraries/akka-core/current/typed/failure-detector.html" target="_blank" rel="noopener">Akka: phi accrual failure detector</a>. The phi formula, the default threshold of 8, and when to raise it.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A 1,000-node cluster gossips membership: every second, each node exchanges state with one random peer (push-pull). Roughly how long until all nodes know about a new member?</div>
+    <div class="opts"><button class="opt" data-ok>About 10 seconds</button><button class="opt">About 1,000 seconds</button><button class="opt">Under 1 second</button></div>
+    <div class="explain">The number of nodes that know roughly doubles each round, so it takes about log₂ 1,000 ≈ 10 rounds, at one round per second. That's why gossip scales: 1,000× more nodes costs only about 10 more rounds, and each node still sends one message per second.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Replica X holds a version with vector clock [A:3, B:1, C:0]; replica Y holds [A:2, B:2, C:0]. What should happen when they sync?</div>
+    <div class="opts"><button class="opt">Keep X's version: A's counter is higher</button><button class="opt" data-ok>Keep both as siblings: they're concurrent, so the application must merge them</button><button class="opt">Keep Y's version: its counters add up to more</button></div>
+    <div class="explain">X is bigger in A, Y is bigger in B, so neither includes the other: each saw a write the other didn't. Dropping either loses a write. Keep both and merge (union for a cart), then write the merged version with a clock that dominates both.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A shopping cart is replicated in three regions and must stay writable during a network partition. Adding an item must never be lost. Which design fits?</div>
+    <div class="opts"><button class="opt">Last-write-wins using each region's NTP timestamp</button><button class="opt">A single Raft group across the three regions</button><button class="opt" data-ok>Vector clocks (or a CRDT) per cart, with siblings merged by union</button></div>
+    <div class="explain">LWW can silently drop an add when clocks disagree or writes race. Raft prevents conflicts but the minority side can't write during a partition, which breaks “always writable”. Detecting concurrency and merging is exactly what Dynamo did for carts. The known catch: a removed item can come back after a merge.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Clocks drift and jump; NTP offsets of 100+ ms are normal. If writes are closer together than the offset, timestamps order them wrongly, and LWW silently drops one.</li>
+      <li>Lamport clocks: counter, max on receive. Order respects cause, but can't detect concurrency. Vector clocks can: compare entry by entry; neither ≤ the other means conflict: keep siblings, merge.</li>
+      <li>HLC = wall time + counter (CockroachDB); TrueTime = tiny, known uncertainty, then wait (Spanner).</li>
+      <li>Gossip reaches everyone in ≈ log₂ N rounds with constant load per node. Failure detection is a guess: phi accrual adapts to jitter, SWIM adds indirect probes and suspicion.</li>
+      <li>Merkle trees find differences between replicas by exchanging a few dozen hashes instead of every key.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- playground 1: vector clocks vs LWW ----------
+  const NM = ["A", "B", "C"], ITEMS = ["🥛 milk", "🍞 bread", "🥚 eggs", "🧀 cheese", "🍎 apples", "☕ coffee", "🍌 bananas", "🍫 chocolate", "🥕 carrots", "🧈 butter"];
+  let reps, lww, simT, nextItem, cut, st, added, msg;
+  const leq = (a, b) => a.every((x, i) => x <= b[i]);
+  const cmp = (a, b) => leq(a, b) && leq(b, a) ? "eq" : leq(a, b) ? "before" : leq(b, a) ? "after" : "conc";
+  const vcs = v => "[" + v.map((x, i) => NM[i] + ":" + x).join(" ") + "]";
+  const union = vs => [...new Set(vs.flatMap(v => v.items))];
+  const conn = (i, j) => i === j || !cut || (i !== 2 && j !== 2);
+  const skew = i => (i === 2 ? +$("skew").value : 0);
+  const vreset = () => {
+    reps = NM.map(() => [{ items: [], vc: [0, 0, 0] }]);
+    lww = NM.map(() => ({ items: [], ts: -1 }));
+    simT = 0; nextItem = 0; cut = false; st = { conf: new Set(), sup: 0 }; added = new Set();
+    msg = "Writes happen one simulated second apart. Start by writing on A.";
+  };
+  const receive = (r, v) => { // anti-entropy at replica r
+    let add = true, conc = false; const keep = [];
+    for (const w of reps[r]) {
+      const c = cmp(w.vc, v.vc);
+      if (c === "before") st.sup++;
+      else { keep.push(w); if (c === "eq" || c === "after") add = false; else conc = true; }
+    }
+    if (add) { keep.push(v); if (conc) keep.forEach(w => { if (w !== v && cmp(w.vc, v.vc) === "conc") st.conf.add([vcs(w.vc), vcs(v.vc)].sort().join("|")); }); }
+    reps[r] = keep;
+  };
+  const lwwPut = (r, items, ts) => { // LWW store: every reachable replica keeps the highest timestamp
+    let wonHome = false;
+    NM.forEach((_, j) => { if (conn(r, j) && ts > lww[j].ts) { lww[j] = { items, ts }; if (j === r) wonHome = true; } });
+    return wonHome;
+  };
+  const write = r => {
+    const cur = reps[r], merged = union(cur), vc = cur.reduce((m, v) => m.map((x, i) => Math.max(x, v.vc[i])), [0, 0, 0]);
+    const item = ITEMS[nextItem++ % ITEMS.length]; added.add(item);
+    vc[r]++; simT += 1;
+    const v = { items: merged.includes(item) ? merged : [...merged, item], vc };
+    reps[r] = [v];
+    NM.forEach((_, j) => { if (j !== r && conn(r, j)) receive(j, v); });
+    const ts = simT + skew(r), base = lww[r].items;
+    const ok = lwwPut(r, base.includes(item) ? base : [...base, item], ts);
+    msg = `${NM[r]} adds ${item}${cur.length > 1 ? " (after merging " + cur.length + " siblings it read)" : ""}: clock ${vcs(vc)}, wall stamp ${ts.toFixed(1)} s.` +
+      (ok ? "" : ` LWW: a replica already holds a stamp ≥ ${ts.toFixed(1)} s, so this write is silently ignored.`);
+    paintV();
+  };
+  const heal = () => {
+    cut = false;
+    for (let pass = 0; pass < 2; pass++)
+      for (let i = 0; i < 3; i++) for (let j = 0; j < 3; j++) if (i !== j) reps[i].slice().forEach(v => receive(j, v));
+    const best = lww.reduce((b, x) => (x.ts > b.ts ? x : b));
+    lww = NM.map(() => ({ items: best.items.slice(), ts: best.ts }));
+    const sib = Math.max(...reps.map(r => r.length));
+    msg = sib > 1 ? `Synced. The versions are concurrent (neither clock ≤ the other), so every replica keeps ${sib} siblings. LWW kept only the highest stamp.`
+      : "Synced. Every version was ordered (one clock ≤ the other), so the newer one simply replaced the older.";
+    paintV();
+  };
+  const merge = () => {
+    if (reps[0].length < 2) { msg = "A has a single version: nothing to merge. Create a conflict first (cut, write on both sides, heal)."; return paintV(); }
+    const cur = reps[0], vc = cur.reduce((m, v) => m.map((x, i) => Math.max(x, v.vc[i])), [0, 0, 0]);
+    vc[0]++; simT += 1;
+    const v = { items: union(cur), vc };
+    reps[0] = [v];
+    NM.forEach((_, j) => { if (j && conn(0, j)) receive(j, v); });
+    msg = `A read ${cur.length} siblings, merged them by union and wrote ${vcs(vc)}, which is ≥ every sibling's clock, so it supersedes them all.`;
+    paintV();
+  };
+  function paintV() {
+    $("skewv").textContent = (+$("skew").value > 0 ? "+" : "") + (+$("skew").value).toFixed(1) + " s";
+    $("cut").textContent = cut ? "🔌 C is cut off (heal to reconnect)" : "✂️ Cut C off";
+    $("reps").innerHTML = reps.map((vs, i) => `<div class="rep${cut && i === 2 ? " cut" : ""}"><h4>Replica ${NM[i]} <span class="muted">· clock ${skew(i) ? (skew(i) > 0 ? "+" : "") + skew(i) + " s" : "exact"}${cut && i === 2 ? " · ✂️ partitioned" : ""}</span></h4>` +
+      vs.map(v => `<div class="ver${vs.length > 1 ? " sib" : ""}">${v.items.length ? v.items.map(x => x.split(" ")[0]).join(" ") : "(empty cart)"} ${vcs(v.vc)}</div>`).join("") +
+      (vs.length > 1 ? `<div class="ver sib">⚠️ ${vs.length} siblings: concurrent</div>` : "") +
+      `<div class="lwwline">LWW copy: ${lww[i].items.length ? lww[i].items.map(x => x.split(" ")[0]).join(" ") : "(empty)"} ${lww[i].ts >= 0 ? "@ " + lww[i].ts.toFixed(1) + " s" : ""}</div></div>`).join("");
+    const vcHas = new Set(reps.flatMap(r => union(r))), lwwHas = new Set(lww.flatMap(x => x.items));
+    const lostL = [...added].filter(x => !lwwHas.has(x));
+    $("vconf").textContent = st.conf.size; $("vsup").textContent = st.sup;
+    $("vlost").textContent = [...added].filter(x => !vcHas.has(x)).length;
+    $("llost").textContent = lostL.length ? lostL.length + " (" + lostL.map(x => x.split(" ")[0]).join(" ") + ")" : "0";
+    $("llost").style.color = lostL.length ? MX.css("--c-er") : "";
+    $("vmsg").textContent = msg;
+  }
+  NM.forEach((n, i) => ($("w" + n).onclick = () => write(i)));
+  $("cut").onclick = () => { if (cut) return heal(); cut = true; msg = "C is cut off. Writes on A/B and on C can no longer see each other."; paintV(); };
+  $("heal").onclick = heal;
+  $("mrg").onclick = merge;
+  $("vreset").onclick = () => { vreset(); paintV(); };
+  $("skew").oninput = paintV;
+  vreset(); paintV();
+
+  // ---------- playground 2: gossip ----------
+  const SIZES = [16, 64, 256, 1024, 4096];
+  const GW = 720, GH = 220, NS = "http://www.w3.org/2000/svg";
+  const gsvg = $("gs"); gsvg.setAttribute("viewBox", `0 0 ${GW} ${GH}`); gsvg.style.width = "100%";
+  const getGM = seg("gm", () => {});
+  let gTimer = null, gCircles = [], lastCurve = null;
+  const gLabels = () => {
+    $("gnv").textContent = SIZES[+$("gn").value].toLocaleString("en-US");
+    $("gfv").textContent = $("gf").value; $("gdv").textContent = $("gd").value + "%"; $("glv").textContent = $("gl").value + "%";
+  };
+  const gossip = (N, f, mode, loss, deadFrac, rng) => { // returns per-round informed share of live nodes, plus state history
+    const alive = new Array(N).fill(true), k = Math.round(deadFrac * N);
+    const ids = Array.from({ length: N - 1 }, (_, i) => i + 1);
+    for (let i = 0; i < k; i++) { const j = i + Math.floor(rng() * (ids.length - i)); [ids[i], ids[j]] = [ids[j], ids[i]]; alive[ids[i]] = false; }
+    let inf = new Uint8Array(N); inf[0] = 1;
+    const live = alive.filter(Boolean).length, curve = [100 / live], hist = [inf.slice()];
+    let cnt = 1, rounds = 0;
+    while (cnt < live && rounds < 60) {
+      rounds++; const nx = inf.slice();
+      for (let i = 0; i < N; i++) {
+        if (!alive[i] || (mode === "push" && !inf[i])) continue;
+        for (let j = 0; j < f; j++) {
+          let p = Math.floor(rng() * (N - 1)); if (p >= i) p++;
+          if (rng() < loss || !alive[p]) continue;
+          if (inf[i]) nx[p] = 1; else if (inf[p]) nx[i] = 1;
+        }
+      }
+      inf = nx; cnt = 0; for (let i = 0; i < N; i++) if (inf[i] && alive[i]) cnt++;
+      curve.push(100 * cnt / live); hist.push(inf.slice());
+    }
+    return { curve, hist, alive, rounds, done: cnt >= live };
+  };
+  const drawNodes = (N, alive) => {
+    gsvg.innerHTML = ""; gCircles = [];
+    const cols = Math.ceil(Math.sqrt(N * GW / GH)), rows = Math.ceil(N / cols), cw = GW / cols, ch = GH / rows, r = Math.max(1.5, Math.min(cw, ch) * 0.36);
+    for (let i = 0; i < N; i++) {
+      const c = document.createElementNS(NS, "circle");
+      c.setAttribute("cx", (i % cols + 0.5) * cw); c.setAttribute("cy", (Math.floor(i / cols) + 0.5) * ch); c.setAttribute("r", r);
+      c.setAttribute("fill", alive[i] ? MX.css("--line") : "none");
+      if (!alive[i]) { c.setAttribute("stroke", MX.css("--c-er")); c.setAttribute("stroke-width", 1); }
+      gsvg.appendChild(c); gCircles.push(c);
+    }
+  };
+  const plotG = (curve, ghost) => {
+    const N = SIZES[+$("gn").value], lg = Math.log2(N), xmax = Math.max(curve.length - 1, ghost ? ghost.length - 1 : 0, Math.ceil(lg) + 2);
+    const series = [{ label: "% of live nodes that know", color: MX.css("--c-nw"), data: curve.map((y, x) => [x, y]), dots: true, fill: true },
+      { label: "log₂ N", color: MX.css("--c-lt"), data: [[lg, 0], [lg, 100]], dash: [5, 4] }];
+    if (ghost) series.splice(1, 0, { label: "previous run", color: MX.css("--muted"), data: ghost.map((y, x) => [x, y]), dash: [2, 3] });
+    Plot.line($("gc"), { series, xLabel: "round", yMin: 0, yMax: 100, xMin: 0, xMax: xmax });
+  };
+  const gStats = (N, f, rounds, done) => {
+    $("gr").textContent = done ? rounds : "> 60";
+    $("glog").textContent = Math.log2(N).toFixed(1);
+    $("gmpn").textContent = f + (getGM() === "pp" ? " (+ replies)" : " (from nodes that know)");
+    $("gt").textContent = done ? rounds + " s" : "–";
+  };
+  let gSeed = 1;
+  $("grun").onclick = () => {
+    clearInterval(gTimer); gLabels();
+    const N = SIZES[+$("gn").value], f = +$("gf").value, mode = getGM();
+    const res = gossip(N, f, mode, +$("gl").value / 100, +$("gd").value / 100, MX.seeded(gSeed++));
+    drawNodes(N, res.alive);
+    const ghost = lastCurve; lastCurve = res.curve;
+    let k = 0; const infC = MX.css("--c-nw"), newC = MX.css("--c-ca");
+    const step = () => {
+      const h = res.hist[k], prev = k ? res.hist[k - 1] : null;
+      for (let i = 0; i < N; i++) if (res.alive[i] && h[i]) gCircles[i].setAttribute("fill", prev && !prev[i] ? newC : infC);
+      plotG(res.curve.slice(0, k + 1), ghost);
+      $("gmsg").textContent = `Round ${k}: ${res.curve[k].toFixed(0)}% of live nodes know.`;
+      if (++k >= res.hist.length) {
+        clearInterval(gTimer); gStats(N, f, res.rounds, res.done);
+        $("gmsg").textContent = res.done
+          ? `Every live node knew after ${res.rounds} rounds (log₂ ${N.toLocaleString("en-US")} = ${Math.log2(N).toFixed(1)}).${+$("gd").value || +$("gl").value ? " Dead nodes and lost messages only slowed it down a little." : ""}`
+          : "Still not everyone after 60 rounds.";
+      }
+    };
+    step(); gTimer = setInterval(step, N > 1000 ? 380 : 300);
+  };
+  $("gavg").onclick = () => {
+    clearInterval(gTimer); gLabels();
+    const N = SIZES[+$("gn").value], f = +$("gf").value, mode = getGM(), runs = N >= 4096 ? 20 : 50;
+    let tot = 0, maxR = 0, ok = 0; const rng = MX.seeded(99), curves = [];
+    for (let t = 0; t < runs; t++) {
+      const r = gossip(N, f, mode, +$("gl").value / 100, +$("gd").value / 100, rng);
+      if (r.done) { ok++; tot += r.rounds; maxR = Math.max(maxR, r.rounds); }
+      curves.push(r.curve);
+    }
+    const L = Math.max(...curves.map(c => c.length));
+    const avg = Array.from({ length: L }, (_, x) => curves.reduce((sm, c) => sm + (x < c.length ? c[x] : c[c.length - 1]), 0) / runs);
+    drawNodes(N, new Array(N).fill(true)); gCircles.forEach(c => c.setAttribute("fill", MX.css("--c-nw")));
+    lastCurve = avg; plotG(avg, null);
+    gStats(N, f, ok ? (tot / ok).toFixed(1) : 0, ok > 0);
+    $("gt").textContent = ok ? (tot / ok).toFixed(1) + " s (worst " + maxR + ")" : "–";
+    $("gmsg").textContent = `${runs} runs: on average ${ok ? (tot / ok).toFixed(1) : "–"} rounds, worst ${maxR}. Compare with log₂ N = ${Math.log2(N).toFixed(1)}; try other sizes to see it grow by about 1–2 rounds per 4× nodes.`;
+  };
+  ["gn", "gf", "gd", "gl"].forEach(id => ($(id).oninput = gLabels));
+  gLabels(); drawNodes(SIZES[3], new Array(SIZES[3]).fill(true)); plotG([100 / 1024], null);
+
+  // ---------- playground 3: failure detection ----------
+  const getFM = seg("fm", () => fd());
+  const logTail = z => { // log of P(Z > z) for a standard normal, accurate in the far tail (Numerical Recipes erfcc)
+    const x = z / Math.SQRT2, ax = Math.abs(x), t = 1 / (1 + 0.5 * ax);
+    const p = -ax * ax - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277))))))));
+    return x >= 0 ? Math.log(0.5 * t) + p : Math.log(1 - 0.5 * t * Math.exp(p));
+  };
+  const zFor = th => { let lo = -5, hi = 40; for (let i = 0; i < 80; i++) { const m = (lo + hi) / 2; (-logTail(m) / Math.LN10 > th) ? (hi = m) : (lo = m); } return (lo + hi) / 2; };
+  function fd() {
+    const sig = +$("fj").value, th = +$("fth").value, mode = getFM(), gc = $("fgc").checked, cr = $("fcr").checked;
+    $("fjv").textContent = sig.toFixed(2) + " s"; $("fthv").textContent = th;
+    const rng = MX.seeded(3), gauss = () => { let u = 0; while (!u) u = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng()); };
+    const beats = []; let t = 0;
+    while (t < 30) {
+      t += Math.max(0.2, 1 + sig * gauss());
+      if (gc && t > 8 && t < 11) t = 11 + Math.max(0, sig * gauss() * 0.2);
+      if (cr && t >= 20) break;
+      beats.push(t);
+    }
+    const hist = []; for (let i = 0; i < 20; i++) hist.push(Math.max(0.2, 1 + sig * gauss())); // warm-up intervals
+    const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+    let last = 0, bi = 0, dead = false, suspectAt = null, fa = 0, detect = null;
+    const phiS = [], deadDots = [], DT = 0.05; let mNow = 1, sdNow = sig;
+    for (let x = 0; x <= 30.0001; x += DT) {
+      while (bi < beats.length && beats[bi] <= x) { hist.push(beats[bi] - last); if (hist.length > 100) hist.shift(); last = beats[bi]; bi++; if (dead) dead = false; suspectAt = null; }
+      const m = mean(hist), sd = Math.max(0.05, Math.sqrt(mean(hist.map(v => (v - m) ** 2))));
+      mNow = m; sdNow = sd;
+      const gap = x - last, phi = Math.min(20, -logTail((gap - m) / sd) / Math.LN10);
+      phiS.push([x, phi]);
+      const trip = mode === "fixed" ? gap > 1.5 : phi >= th;
+      if (!dead && trip) {
+        if (mode === "susp") { if (suspectAt == null) suspectAt = x; else if (x - suspectAt >= 5) dead = true; }
+        else dead = true;
+        if (dead) {
+          deadDots.push([x, mode === "fixed" ? Math.min(20, phi) : th]);
+          const reallyDead = cr && x >= 20;
+          if (reallyDead && detect == null) detect = x - 20; else if (!reallyDead) fa++;
+        }
+      }
+    }
+    const zt = zFor(th);
+    Plot.line($("fc"), { series: [
+      { label: "phi (suspicion level)", color: MX.css("--c-nw"), data: phiS },
+      { label: "declared dead", color: MX.css("--c-er"), data: deadDots.length ? deadDots : [[0, -5]], dotsOnly: false, dots: true, dash: [1, 1e6] }],
+      hlines: mode === "fixed" ? [] : [{ y: th, label: "threshold " + th, color: MX.css("--c-er") }], xLabel: "seconds", yMin: 0, yMax: 20, xMin: 0, xMax: 30 });
+    $("ffa").textContent = fa; $("ffa").style.color = fa ? MX.css("--c-er") : "";
+    $("fdt").textContent = !cr ? "(no crash)" : detect == null ? "not yet" : detect.toFixed(1) + " s";
+    $("ftt").textContent = mode === "fixed" ? "1.5 s (fixed)" : (mNow + sdNow * zt).toFixed(2) + " s" + (mode === "susp" ? " + 5 s" : "");
+    $("ffd").textContent = mode === "fixed" ? (86400 * Math.exp(logTail(0.5 / sig))).toFixed(0) : (86400 * Math.pow(10, -th)).toPrecision(2);
+    $("fmsg").textContent = mode === "fixed" ? (fa ? `A fixed timeout ignores the network's rhythm: ${fa} false verdict(s) here.` : "No false alarms at this jitter, but a jittery network would set them off.") :
+      mode === "phi" ? (fa ? `Phi tripped ${fa} time(s) on a live node (the GC pause looks just like a crash). Raising the threshold buys patience, but slows real detection.` : "No false verdicts: the silences were all within what this peer's history makes plausible.") :
+      `Suspicion first, death 5 s later unless the node refutes it. ${fa ? fa + " false verdict(s) still got through." : "The paused node woke up and refuted the suspicion: no false alarm."}`;
+  }
+  ["fj", "fth"].forEach(id => ($(id).oninput = fd));
+  ["fgc", "fcr"].forEach(id => ($(id).onchange = fd));
+  fd();
+})();
+</script>
+</body>
+</html>

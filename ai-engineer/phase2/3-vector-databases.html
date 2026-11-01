@@ -1,0 +1,436 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.3 Vector databases · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .pts { width: 100%; height: 360px; display: block; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; cursor: crosshair; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .req { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 6px 18px; margin: 10px 0; }
+  .req label { font-size: .92rem; display: flex; gap: 8px; align-items: center; }
+  .req select { font: inherit; padding: 3px 6px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg2); color: var(--text); }
+  .pick { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 6px 0; background: var(--bg2); }
+  .pick.top { border: 2px solid var(--c-cx); }
+  .pick .why { font-size: .88rem; color: var(--muted); }
+  .pick .sc { float: right; font-family: var(--mono); font-size: .85rem; color: var(--muted); }
+</style>
+</head>
+<body data-lesson="a2-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 3</div>
+  <h1>Vector databases: pgvector, Pinecone, Qdrant, Weaviate & friends</h1>
+  <p class="subtitle">An ANN index finds nearby vectors. A vector database also has to filter by tenant and date, survive crashes, handle updates and deletes, and not cost a fortune. That's where most production pain lives.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Embeddings</b> are vectors for text; we search for the nearest ones (Lesson 2.1).</li>
+      <li><b>HNSW</b> is a graph index; <b>efSearch</b> is how many candidates it collects per query (Lesson 2.2).</li>
+      <li>Memory math: N vectors × d dimensions × 4 bytes (2.2). Basic SQL helps for the pgvector examples.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Mem0, a company that gives AI agents long-term memory, kept its vectors in Postgres with pgvector and HNSW indexes. In 2026 its engineers found the indexes showed <b>0 scans</b> in production. Once queries added selective per-tenant filters, Postgres's planner decided a sequential scan was cheaper, so every vector search scanned a <b>1,153 GB</b> table. Under load, searches took <b>8 to 14 seconds</b>.</p>
+    <p>The fix wasn't a better embedding model. They moved vector search to a dedicated engine (turbopuffer) and kept the records in Postgres: retrieval dropped to about <b>110 to 120 ms</b>. The index worked fine on its own; it was the <b>filter</b> that broke it.</p>
+  </div>
+
+  <h2>Numbers first: what a database adds to an index</h2>
+  <table>
+    <tr><th>You need…</th><th>An ANN library (Faiss, hnswlib)</th><th>A vector database</th></tr>
+    <tr><td>Nearest neighbours</td><td>✅ fast</td><td>✅ same algorithms inside</td></tr>
+    <tr><td>Filter: “only tenant 42, only 2026 docs”</td><td>❌ build it yourself</td><td>✅ metadata (payload) filters</td></tr>
+    <tr><td>Insert, update, delete one document</td><td>⚠️ partial</td><td>✅ upserts and deletes by id</td></tr>
+    <tr><td>Survive a crash, replicas, backups</td><td>❌ save files yourself</td><td>✅ write-ahead log, replication, snapshots</td></tr>
+    <tr><td>Many customers in one system</td><td>❌</td><td>✅ namespaces, tenant indexes, access control</td></tr>
+    <tr><td>Keyword + vector in one query</td><td>❌</td><td>✅ in many (Lesson 2.4)</td></tr>
+  </table>
+  <p>Plain sentence: a vector database is a normal database whose star feature is “order by similarity”. Judge it like any database: correctness under filters, durability, operations, cost. The ANN algorithm is often the same HNSW everywhere.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    The hard part of vector search in production is <b>combining similarity with ordinary constraints</b>: filters, tenants, permissions, freshness and deletes. A pure ANN index finds “the nearest 40 vectors anywhere”; your user needs “the nearest 10 vectors <b>they're allowed to see</b>”. How a database closes that gap decides whether results are fast, correct, or empty.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the bookshop with a smart assistant</span>
+    <p>The assistant (the ANN index) can instantly bring you the 40 books most like the one in your hand. But you only want <b>paperbacks in Spanish</b>. <b>Post-filtering</b>: the assistant brings 40, and you throw out the ones that don't match. If only 1 in 50 books is a Spanish paperback, you're left with nothing. <b>Pre-filtering</b>: you first walk to the Spanish paperback shelf and compare every book there yourself: perfect, but slow if the shelf is huge. <b>Filtered search</b>: the assistant knows the filter while walking the shop, and keeps going until it has 10 that match.</p>
+  </div>
+
+  <h2>Filtering: the empty-results trap</h2>
+  <p>pgvector's own documentation spells out the trap: filters are applied <b>after</b> the approximate index is scanned, so <i>“if a condition matches 10% of rows, with HNSW and the default <code>hnsw.ef_search</code> of 40, only 4 rows will match on average.”</i> You asked for 10 results and got 4, with no error.</p>
+  <table>
+    <tr><th>Strategy</th><th>How</th><th>Good when</th><th>Fails when</th></tr>
+    <tr><td><b>Post-filter</b></td><td>ANN top-ef candidates, then drop non-matching</td><td>Filter keeps most rows</td><td class="rk">Selective filters: too few or zero results</td></tr>
+    <tr><td><b>Pre-filter</b> (exact)</td><td>Find matching rows first (normal index), then compare every one</td><td>Filter keeps few rows (a tenant with 2,000 docs)</td><td>Filter keeps millions of rows: back to brute force</td></tr>
+    <tr><td><b>Filtered / iterative graph search</b></td><td>Walk the graph, skip non-matching nodes, keep going until k matches (pgvector 0.8.0+ iterative scans; Qdrant's filterable HNSW)</td><td>Most cases</td><td>Filter correlated with the vectors can strand the walk; needs a scan limit</td></tr>
+    <tr><td><b>Query planner</b> (auto)</td><td>Estimate how many rows match, then choose exact scan or graph search per query (Qdrant does this)</td><td>Mixed workloads</td><td>Bad estimates; still needs payload indexes</td></tr>
+  </table>
+  <p>Two more structural fixes: <b>partition</b> by the filter (one partition or partial index per tenant or category, which pgvector's README recommends for tenant isolation), and <b>payload indexes</b> on fields you filter by (Qdrant's docs say to create them before ingesting data).</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Filtered search simulator</span>
+    <p class="hint">1,200 document vectors in an HNSW-style graph (as in Lesson 2.2). Coloured dots match the filter (say, “tenant = Acme”), grey ones don't. Click to move the query (✚). We want the 10 nearest <b>matching</b> documents. Start with post-filtering at 10%, then make the filter more selective, then make it correlated (Acme's docs all sit far away, about a different topic).</p>
+    <div class="controls">
+      <label>strategy <span class="seg" id="strat"><button id="sPost" class="on">Post-filter</button><button id="sPre">Pre-filter (exact)</button><button id="sIter">Iterative scan</button><button id="sPlan">Planner (auto)</button></span></label>
+    </div>
+    <div class="controls">
+      <label>rows matching the filter <span class="seg" id="sel"><button id="f1">1%</button><button id="f5">5%</button><button id="f10" class="on">10%</button><button id="f25">25%</button><button id="f100">100%</button></span></label>
+      <label><input type="checkbox" id="corr"> filter correlated with the vectors</label>
+    </div>
+    <canvas class="pts" id="fcv"></canvas>
+    <div class="stat-row">
+      <div class="stat">results returned <b id="fGot">–</b></div>
+      <div class="stat">recall vs. true filtered top-10 <b id="fRec">–</b></div>
+      <div class="stat">distance computations <b id="fCost">–</b></div>
+      <div class="stat">rows matching <b id="fMatch">–</b></div>
+    </div>
+    <div class="verdict" id="fMsg"></div>
+    <p class="hint">Simulated with 2D points and a toy graph: efSearch = 40; iterative scan doubles the candidate list until 10 matches or a 600-candidate limit (like pgvector's <code>hnsw.max_scan_tuples</code>); the planner switches to an exact scan when fewer than 200 rows match. Real engines differ in details, not in shape.</p>
+  </div>
+  <p>What you should see: post-filtering at 10% returns about 3 or 4 of 10, at 1% usually none. Pre-filtering is always correct but costs one comparison per matching row, so at 100% it's brute force. Iterative scan fixes random filters, but when the filter is correlated (Acme's documents are far from the query), the graph walk wanders through hundreds of non-matching neighbours and can hit its limit. The planner wins both ways, which is why mature engines have one.</p>
+
+  <h2>The rest of the database job</h2>
+  <ul>
+    <li><b>Multi-tenancy.</b> Options: one index per tenant (clean isolation, painful with 100,000 small tenants), or one shared index with a tenant field (efficient, but every query must filter, and noisy neighbours share resources). Pinecone uses <b>namespaces</b>; Qdrant recommends one collection with a tenant payload index marked <code>is_tenant</code>; Postgres offers partitions and row-level security. Never rely on the application remembering to add the filter: enforce it in one place (Lesson 4.7 covers permissions).</li>
+    <li><b>Updates and deletes.</b> HNSW graphs don't like deletions: most engines mark a deleted node as a tombstone and clean up later, and graphs degrade until vacuumed or rebuilt. pgvector's README notes that vacuuming HNSW indexes can take a while and suggests reindexing first. Re-embedding changed documents means upsert (delete + insert).</li>
+    <li><b>Durability.</b> An in-memory Faiss index disappears on restart unless you save and reload it; databases log writes, replicate and snapshot. Ask: what happens to the last minute of writes when a node dies?</li>
+    <li><b>Freshness.</b> Some systems make new writes searchable in milliseconds, others after a background index build. If your agent writes a memory and reads it a second later, that matters.</li>
+    <li><b>Cost.</b> The RAM for vectors plus graph usually dominates (Lesson 2.2's calculator). Serverless engines that keep vectors on object storage and cache hot data trade some latency for much lower cost on large, mostly cold, multi-tenant data.</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: does pgvector on one box fit?</span>
+    <p>A B2B app: 300 tenants, 5 million chunks in total, 1,536-dim vectors, 20 queries per second at peak.</p>
+    <ul>
+      <li>Vectors (<code>vector</code>, float32): 5,000,000 × 1,536 × 4 = <b>30.7 GB</b>. With <code>halfvec</code> (float16): <b>15.4 GB</b>.</li>
+      <li>HNSW links (M = 16): about 5M × 128 bytes ≈ <b>0.64 GB</b>. Text and metadata: say 5M × 2 KB = <b>10 GB</b>, mostly on disk.</li>
+      <li>Working set with <code>halfvec</code>: about 16 GB of hot index, so a 32 to 64 GB Postgres instance holds it in memory. 20 queries per second is light for one node.</li>
+      <li>Filters: the biggest tenant has 400,000 chunks (8%), the smallest 2,000 (0.04%). With a plain HNSW index and post-filtering, small tenants get empty results. Fix: iterative scans, plus partitioning or an exact scan for small tenants.</li>
+    </ul>
+    <p>Verdict: pgvector is enough, if you design the filtering. Note also that pgvector indexes <code>vector</code> columns up to 2,000 dimensions and <code>halfvec</code> up to 4,000, so a 3,072-dim model needs <code>halfvec</code> or Matryoshka truncation to be indexed at all.</p>
+  </div>
+
+  <h2>The landscape (as of 2026)</h2>
+  <table>
+    <tr><th>System</th><th>What it is</th><th>Reach for it when</th></tr>
+    <tr><td><b>pgvector</b></td><td>Postgres extension: <code>vector</code>, <code>halfvec</code>, <code>sparsevec</code> types, HNSW and IVFFlat indexes</td><td>You already run Postgres; you want joins, transactions and one database (hosted on Supabase, Neon, AWS, Google Cloud, Azure…)</td></tr>
+    <tr><td><b>Pinecone</b></td><td>Fully managed, closed-source, serverless vector database</td><td>No-ops is the priority; namespaces for tenants</td></tr>
+    <tr><td><b>Qdrant</b></td><td>Open-source (Rust) engine, self-host or cloud</td><td>Heavy filtering and multi-tenancy; sparse + dense hybrid</td></tr>
+    <tr><td><b>Weaviate</b></td><td>Open-source engine with built-in BM25 + vector hybrid</td><td>You want hybrid search and integrations out of the box</td></tr>
+    <tr><td><b>Milvus</b> (Zilliz Cloud)</td><td>Open-source, distributed, many index types incl. GPU</td><td>Hundreds of millions to billions of vectors</td></tr>
+    <tr><td><b>Chroma</b></td><td>Open-source, very simple, runs embedded or as a server</td><td>Prototypes, notebooks, local apps</td></tr>
+    <tr><td><b>LanceDB</b></td><td>Embedded, columnar (Lance format), works on object storage</td><td>Large or multimodal datasets, analytics next to search</td></tr>
+    <tr><td><b>turbopuffer</b></td><td>Serverless vector and full-text search built on object storage</td><td>Many tenants, lots of mostly cold data, cost-sensitive</td></tr>
+    <tr><td><b>Elasticsearch / OpenSearch</b></td><td>Mature keyword search engines with k-NN (HNSW) added</td><td>You already run them; keyword search matters as much as vectors</td></tr>
+    <tr><td><b>MongoDB Atlas Vector Search</b></td><td>Vector index inside MongoDB</td><td>Your data already lives in MongoDB</td></tr>
+    <tr><td><b>Faiss</b>, hnswlib, Voyager</td><td>Libraries, not databases</td><td>Static or batch indexes inside your own service; research</td></tr>
+  </table>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Which vector store?</span>
+    <p class="hint">Tick your requirements. Each option gets points for what it does well for you and loses points where it fights you. This is a starting shortlist, not a verdict: run your own load test with your filters.</p>
+    <div class="req">
+      <label>Vectors <select id="rScale"><option value="s">under 1 million</option><option value="m" selected>1 to 100 million</option><option value="l">100 million or more</option></select></label>
+      <label>Operations <select id="rOps"><option value="managed" selected>fully managed, please</option><option value="self">we can self-host</option><option value="none">it's a prototype</option></select></label>
+      <label><input type="checkbox" id="rPg" checked> we already run Postgres</label>
+      <label><input type="checkbox" id="rEs"> we already run Elasticsearch / OpenSearch</label>
+      <label><input type="checkbox" id="rMongo"> our data lives in MongoDB</label>
+      <label><input type="checkbox" id="rFilter"> heavy metadata filters / many tenants</label>
+      <label><input type="checkbox" id="rHybrid"> need keyword + vector hybrid</label>
+      <label><input type="checkbox" id="rOpen"> must be open source</label>
+      <label><input type="checkbox" id="rCold"> lots of rarely queried data; cost first</label>
+      <label><input type="checkbox" id="rJoin"> need SQL joins and transactions with app data</label>
+    </div>
+    <div class="controls"><button class="btn primary" id="choose">▶ Rank options</button></div>
+    <div id="picks"></div>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>pgvector</b> with <code>psycopg</code> and the <code>pgvector</code> Python package; the <b>qdrant-client</b>, <b>pinecone</b>, <b>weaviate-client</b>, <b>pymilvus</b>, <b>chromadb</b> and <b>lancedb</b> SDKs; and framework wrappers in LangChain and LlamaIndex that hide the differences (handy for prototypes, limiting for tuning).</p>
+<pre><code><span class="c">-- pgvector (0.8.x): a table, an HNSW index, and a filtered search</span>
+<span class="k">CREATE EXTENSION IF NOT EXISTS</span> vector;
+<span class="k">CREATE TABLE</span> chunks (
+  id        bigserial <span class="k">PRIMARY KEY</span>,
+  tenant_id int <span class="k">NOT NULL</span>,
+  body      text,
+  embedding vector(<span class="n">1536</span>)
+);
+<span class="k">CREATE INDEX ON</span> chunks <span class="k">USING</span> hnsw (embedding vector_cosine_ops);  <span class="c">-- defaults m = 16, ef_construction = 64</span>
+<span class="k">CREATE INDEX ON</span> chunks (tenant_id);
+
+<span class="k">SET</span> hnsw.ef_search = <span class="n">100</span>;
+<span class="k">SET</span> hnsw.iterative_scan = relaxed_order;   <span class="c">-- keep scanning when the filter drops rows</span>
+<span class="k">SELECT</span> id, body, embedding &lt;=&gt; $1 <span class="k">AS</span> distance    <span class="c">-- &lt;=&gt; cosine distance, &lt;-&gt; L2, &lt;#&gt; negative inner product</span>
+<span class="k">FROM</span> chunks <span class="k">WHERE</span> tenant_id = <span class="n">42</span>
+<span class="k">ORDER BY</span> embedding &lt;=&gt; $1 <span class="k">LIMIT</span> <span class="n">10</span>;</code></pre>
+<pre><code><span class="c"># Python + pgvector</span>
+<span class="k">import</span> psycopg, numpy <span class="k">as</span> np
+<span class="k">from</span> pgvector.psycopg <span class="k">import</span> register_vector
+
+conn = psycopg.connect(<span class="s">"dbname=app"</span>, autocommit=<span class="k">True</span>)
+register_vector(conn)                          <span class="c"># numpy arrays ⇄ vector columns</span>
+q = np.array(query_embedding)
+rows = conn.execute(
+    <span class="s">"SELECT id, body FROM chunks WHERE tenant_id = %s ORDER BY embedding &lt;=&gt; %s LIMIT 10"</span>,
+    (<span class="n">42</span>, q)).fetchall()
+
+<span class="c"># Qdrant: one collection, tenant field indexed as a tenant key</span>
+<span class="k">from</span> qdrant_client <span class="k">import</span> QdrantClient, models
+
+client = QdrantClient(url=<span class="s">"http://localhost:6333"</span>)
+client.create_collection(collection_name=<span class="s">"chunks"</span>,
+    vectors_config=models.VectorParams(size=<span class="n">1536</span>, distance=models.Distance.COSINE))
+client.create_payload_index(collection_name=<span class="s">"chunks"</span>, field_name=<span class="s">"tenant_id"</span>,
+    field_schema=models.KeywordIndexParams(type=models.KeywordIndexType.KEYWORD, is_tenant=<span class="k">True</span>))
+client.upsert(collection_name=<span class="s">"chunks"</span>, points=[
+    models.PointStruct(id=<span class="n">1</span>, vector=doc_embedding, payload={<span class="s">"tenant_id"</span>: <span class="s">"acme"</span>, <span class="s">"body"</span>: <span class="s">"Refunds take 5 days."</span>})])
+hits = client.query_points(collection_name=<span class="s">"chunks"</span>, query=query_embedding, limit=<span class="n">10</span>,
+    query_filter=models.Filter(must=[models.FieldCondition(key=<span class="s">"tenant_id"</span>, match=models.MatchValue(value=<span class="s">"acme"</span>))]),
+    search_params=models.SearchParams(hnsw_ef=<span class="n">128</span>)).points</code></pre>
+    <p class="hint">With <code>relaxed_order</code>, pgvector may return results slightly out of distance order; its README shows re-sorting them in an outer query if you need exact order.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Vectors in your existing database (pgvector, Mongo, Elastic)</td><td>One system, joins, transactions, existing backups and access control</td><td>Shares resources with your app; tuning filters is on you; scale limits sooner</td></tr>
+      <tr><td>Dedicated vector database</td><td>Filtered search, hybrid, quantization and scale built in</td><td>Another system to sync, secure and pay for; data duplicated</td></tr>
+      <tr><td>Managed / serverless</td><td>No ops, scales to zero</td><td>Per-query or per-GB pricing; less control; vendor lock-in</td></tr>
+      <tr><td>Self-hosted open source</td><td>Control, cost at scale, data stays home</td><td>You own upgrades, backups, on-call</td></tr>
+      <tr><td>One shared index for all tenants</td><td>Efficient, simple</td><td>Every query must filter; noisy neighbours; harder deletes per tenant</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Use the database you already have: pgvector if you're on Postgres, or a managed service if you aren't. Put tenant and permission filters in a single data-access function, turn on iterative scans, and write a test that a tiny tenant still gets 10 results.</p></div>
+      <div><h4>At scale</h4><p>Dedicated clusters or serverless engines per workload, vectors sharded by tenant or region, quantized indexes, a sync pipeline from the source of truth (change data capture), recall and latency dashboards per tenant size, and planned re-indexing when models change.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Which vector database would you use, and why?” A senior answer:</p>
+    <ul>
+      <li>Refuses to answer by brand. Asks about <b>scale, filters and tenancy, update rate, latency target, team ops capacity</b> and what database already exists.</li>
+      <li>Names the <b>filtering strategy</b> explicitly (post vs pre vs filtered graph search) and the empty-results trap.</li>
+      <li>Covers <b>durability, deletes and sync</b> from the source of truth, plus the cost driver (RAM per vector).</li>
+      <li>Proposes a <b>load test with real filters</b> on two candidates before committing.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Vectors next to records, not in them</b> <span class="tag co">🏢 Mem0 · 2026</span> <a href="https://mem0.ai/blog/how-we-cut-vector-search-latency-by-70x" target="_blank" rel="noopener">How we cut vector search latency by 70x</a></div>
+      <p><b>How:</b> a two-phase read: the vector engine returns matching memory IDs, then Postgres fetches the full records.</p>
+      <p><b>Why this method:</b> with selective tenant filters, Postgres stopped using its HNSW indexes and scanned a 1,153 GB table; separating search from storage brought retrieval to about 110 to 120 ms.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Reuse the search engine you have</b> <span class="tag co">🏢 Figma · 2024</span> <a href="https://www.figma.com/blog/the-infrastructure-behind-ai-search-in-figma/" target="_blank" rel="noopener">The infrastructure behind AI search in Figma</a></div>
+      <p><b>How:</b> embeddings for billions of entries indexed with OpenSearch's k-NN, alongside metadata for faceted filters; quantization and removing drafts and duplicates kept the in-memory index manageable.</p>
+      <p><b>Why this method:</b> OpenSearch already ran Figma's keyword search. They also hit a real-world bug: removing embeddings from <code>_source</code> to save space made document updates wipe them, so they re-fetched vectors from DynamoDB on update.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Filters inside the graph</b> <span class="tag oss">🧰 Open source</span> <a href="https://qdrant.tech/articles/filterable-hnsw/" target="_blank" rel="noopener">Qdrant: Filterable HNSW</a></div>
+      <p><b>How:</b> extra graph edges are built within each payload category, so a filtered walk stays connected; a query planner picks exact scan or graph search from the estimated number of matches.</p>
+      <p><b>Why this method:</b> plain HNSW with nodes removed by a filter splits into disconnected pieces past a threshold, and search accuracy falls off a cliff.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Iterative index scans</b> <span class="tag oss">🧰 Open source · 2024</span> <a href="https://github.com/pgvector/pgvector#iterative-index-scans" target="_blank" rel="noopener">pgvector 0.8.0</a></div>
+      <p><b>How:</b> when filters drop rows, the HNSW or IVFFlat scan continues automatically until enough results are found or a limit (<code>hnsw.max_scan_tuples</code>, 20,000 by default) is hit.</p>
+      <p><b>Why this method:</b> it fixes “asked for 10, got 4” without changing queries, while the limit caps the cost of very selective filters.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the 2,000-dimension wall</span>
+    <p>pgvector can store vectors of up to 16,000 dimensions, but its indexes only accept <code>vector</code> columns up to 2,000 dimensions (<code>halfvec</code> up to 4,000). Many teams discover this the day they try to index 3,072-dimensional embeddings from a large model. The usual fixes are exactly Lesson 2.1's: store <code>halfvec</code>, or ask the model for fewer Matryoshka dimensions.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Indexes come from Lesson 2.2; hybrid keyword + vector queries are next (2.4). Permissions, freshness and caching for RAG in production are Lesson 4.7, and agent memory stores (6.4) are vector databases too. In the System Design course, see <a href="../../system-design-course/phase2/7-specialized-stores.html">specialized stores (incl. vector stores)</a> and <a href="../../system-design-course/phase2/4-sharding.html">sharding</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener">pgvector README</a>. Indexing, filtering, iterative scans, tuning and scaling in one page.</li>
+      <li><span class="kind">Docs</span> <a href="https://qdrant.tech/documentation/manage-data/multitenancy/" target="_blank" rel="noopener">Qdrant: Multitenancy</a>. Why one collection with a tenant index usually beats a collection per tenant.</li>
+      <li><span class="kind">Blog</span> <a href="https://qdrant.tech/articles/filterable-hnsw/" target="_blank" rel="noopener">Filterable HNSW</a>. The graph-connectivity argument behind filtered search.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. HNSW with efSearch = 40 and post-filtering. The filter matches 5% of rows, independent of the vectors. About how many results come back when you ask for 10?</div>
+    <div class="opts"><button class="opt">10</button><button class="opt">About 5</button><button class="opt" data-ok>About 2</button></div>
+    <div class="explain">The index returns about 40 candidates; 5% of 40 = <b>2</b> survive the filter on average. Fixes: iterative/filtered scans, a larger efSearch, pre-filtering for selective filters, or partitioning by the filter field.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A SaaS app has 20,000 tenants, most with a few hundred documents. What's usually the best layout?</div>
+    <div class="opts"><button class="opt">A separate index per tenant</button><button class="opt" data-ok>One shared index with an indexed tenant field, and filtered search that falls back to an exact scan for small tenants</button><button class="opt">One shared index, post-filtering by tenant in the application</button></div>
+    <div class="explain">20,000 tiny indexes waste memory and operations. A shared index with a tenant key (Qdrant's <code>is_tenant</code>, namespaces, partitions) is efficient; filtered search or an exact scan keeps small tenants' results full. App-side post-filtering returns empty pages for small tenants.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your team runs Postgres, has 2 million chunks, a small ops team and per-customer filters. A colleague wants a new managed vector database. What's the strongest first move?</div>
+    <div class="opts"><button class="opt" data-ok>Try pgvector with HNSW, halfvec if needed, and iterative scans; load-test with real tenant filters before adding a new system</button><button class="opt">Use Faiss in the API process; it's the fastest library</button><button class="opt">Pick the database at the top of a benchmark blog post</button></div>
+    <div class="explain">2 million vectors fit comfortably on one Postgres node, and you keep joins, transactions and existing backups. A dedicated system may win later; the load test with your filters will tell you when. An in-process Faiss index lacks filters, durability and updates.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>A vector database = ANN index + filters, CRUD, durability, tenancy and often hybrid search.</li>
+      <li>Post-filtering with selective filters returns too few or zero results; use filtered/iterative search, a planner, or pre-filtering for small subsets.</li>
+      <li>Multi-tenancy: usually one shared index with an indexed tenant key, enforced in one place.</li>
+      <li>Deletes degrade graphs; plan vacuuming, rebuilds and re-embedding.</li>
+      <li>Start with the database you have (pgvector is enough for millions of vectors) and load-test with real filters before adding a new system.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const d2 = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2;
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  // ---------- data + toy HNSW (same idea as Lesson 2.2)
+  const r0 = MX.seeded(21), C = [];
+  for (let i = 0; i < 9; i++) C.push([r0() * 0.84 + 0.08, r0() * 0.84 + 0.08]);
+  const g = () => { const u = r0() || 1e-9, v = r0(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+  const P = Array.from({ length: 1200 }, () => { const c = C[Math.floor(r0() * 9)]; return [MX.clamp(c[0] + g() * 0.07, 0.01, 0.99), MX.clamp(c[1] + g() * 0.07, 0.01, 0.99)]; });
+  const tag = P.map(() => r0());
+  const xsSorted = P.map(p => p[0]).sort((a, b) => a - b);
+  function build(M) {
+    const r = MX.seeded(3), mL = 1 / Math.log(M), L = [], G = [];
+    let entry = 0, top = 0;
+    P.forEach((p, i) => {
+      const l = Math.min(4, Math.floor(-Math.log(r() || 1e-9) * mL));
+      L.push(l); G.push(Array.from({ length: l + 1 }, () => []));
+      if (i === 0) { top = l; return; }
+      for (let k = Math.min(l, top); k >= 0; k--) {
+        const cand = []; for (let j = 0; j < i; j++) if (L[j] >= k) cand.push(j);
+        cand.sort((a, b) => d2(P[a], p) - d2(P[b], p));
+        const nb = cand.slice(0, M), mx = k ? M : 2 * M;
+        G[i][k] = nb.slice();
+        nb.forEach(j => { G[j][k].push(i); if (G[j][k].length > mx) { G[j][k].sort((a, b) => d2(P[a], P[j]) - d2(P[b], P[j])); G[j][k].length = mx; } });
+      }
+      if (l > top) { top = l; entry = i; }
+    });
+    return { G, entry, top };
+  }
+  const H = build(8);
+  function ann(q, ef) {
+    let ep = H.entry, comps = 1;
+    for (let l = H.top; l > 0; l--) { let ch = true; while (ch) { ch = false; for (const n of H.G[ep][l]) { comps++; if (d2(P[n], q) < d2(P[ep], q)) { ep = n; ch = true; } } } }
+    const by = (a, b) => d2(P[a], q) - d2(P[b], q), Cn = [ep], W = [ep], seen = new Set([ep]);
+    while (Cn.length) {
+      Cn.sort(by); const c = Cn.shift(); W.sort(by);
+      if (W.length >= ef && d2(P[c], q) > d2(P[W[W.length - 1]], q)) break;
+      for (const n of H.G[c][0]) { if (seen.has(n)) continue; seen.add(n); comps++; if (W.length < ef || d2(P[n], q) < d2(P[W[W.length - 1]], q)) { Cn.push(n); W.push(n); W.sort(by); if (W.length > ef) W.pop(); } }
+    }
+    W.sort(by); return { res: W, comps };
+  }
+
+  // ---------- simulator
+  let strat = "post", sel = 0.1, q = [0.18, 0.5], last = null;
+  const matchFn = () => {
+    const corr = $("corr").checked, cut = xsSorted[Math.min(P.length - 1, Math.floor((1 - sel) * P.length))];
+    return i => sel >= 1 || (corr ? P[i][0] >= cut : tag[i] < sel);
+  };
+  function run() {
+    const m = matchFn(), K = 10, matching = P.map((_, i) => i).filter(m);
+    const truth = matching.slice().sort((a, b) => d2(P[a], q) - d2(P[b], q)).slice(0, K);
+    let res = [], cost = 0, cand = [], note = "", used = strat;
+    if (strat === "plan") used = matching.length < 200 ? "pre" : "iter";
+    if (used === "post") { const a = ann(q, 40); cand = a.res; res = a.res.filter(m).slice(0, K); cost = a.comps; }
+    else if (used === "pre") { res = truth.slice(); cost = matching.length; cand = matching; }
+    else {
+      let ef = 40, a;
+      while (true) { a = ann(q, ef); const mm = a.res.filter(m); if (mm.length >= K || ef >= 600) { res = mm.slice(0, K); break; } ef = Math.min(600, ef * 2); }
+      cost = a.comps; cand = a.res; note = ` (candidate list grew to ${ef})`;
+    }
+    const tset = new Set(truth), rec = truth.length ? res.filter(i => tset.has(i)).length / truth.length : 1;
+    last = { m, cand, res, truth };
+    $("fGot").textContent = res.length + " / 10"; $("fRec").textContent = Math.round(rec * 100) + "%";
+    $("fCost").textContent = cost + note; $("fMatch").textContent = matching.length;
+    const planNote = strat === "plan" ? `The planner chose ${used === "pre" ? "an exact scan (few rows match)" : "graph search with iterative scan (many rows match)"}. ` : "";
+    $("fMsg").innerHTML = res.length < Math.min(K, matching.length)
+      ? `<span class="rk">❌ ${planNote}Asked for 10, got ${res.length}. ${used === "post" ? "Post-filtering threw away most of the 40 candidates. No error, just a short (or empty) result list." : "The walk hit its candidate limit before finding enough matches: the matching rows are far from the query in the graph."}</span>`
+      : rec < 1 ? `<span class="tk">⚠️ ${planNote}Full list, but recall ${Math.round(rec * 100)}%: some true nearest matches were missed.</span>`
+      : `<span class="ev">✅ ${planNote}All 10 true nearest matching documents, for ${cost} distance computations${used === "pre" && matching.length > 600 ? ". Correct, but this is close to brute force: pre-filtering only pays off for selective filters" : ""}.</span>`;
+    draw();
+  }
+  function draw() {
+    if (!last) return;
+    const cv = $("fcv"), dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 600, h = cv.clientHeight || 360;
+    cv.width = w * dpr; cv.height = h * dpr;
+    const c = cv.getContext("2d"); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, w, h);
+    const X = x => 10 + x * (w - 20), Y = y => 10 + y * (h - 20);
+    const dot = (p, r, col) => { c.fillStyle = col; c.beginPath(); c.arc(X(p[0]), Y(p[1]), r, 0, 7); c.fill(); };
+    const ring = (p, r, col) => { c.strokeStyle = col; c.lineWidth = 2.2; c.beginPath(); c.arc(X(p[0]), Y(p[1]), r, 0, 7); c.stroke(); };
+    P.forEach((p, i) => dot(p, last.m(i) ? 3.2 : 2.2, last.m(i) ? MX.css("--c-md") : MX.css("--line")));
+    last.cand.slice(0, 600).forEach(i => ring(P[i], 4, MX.css("--c-tk")));
+    const got = new Set(last.res);
+    last.res.forEach(i => ring(P[i], 6.5, MX.css("--c-cx")));
+    last.truth.filter(i => !got.has(i)).forEach(i => ring(P[i], 7, MX.css("--c-rk")));
+    c.strokeStyle = MX.css("--text"); c.lineWidth = 2.5; c.beginPath();
+    c.moveTo(X(q[0]) - 8, Y(q[1])); c.lineTo(X(q[0]) + 8, Y(q[1])); c.moveTo(X(q[0]), Y(q[1]) - 8); c.lineTo(X(q[0]), Y(q[1]) + 8); c.stroke();
+    c.font = "12px " + MX.css("--font"); c.fillStyle = MX.css("--muted");
+    c.fillText("purple = matches filter · gold = candidates examined · green = returned · red = missed", 14, h - 14);
+  }
+  const seg = (id, fn) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); fn(b); run(); })); };
+  seg("strat", b => (strat = { sPost: "post", sPre: "pre", sIter: "iter", sPlan: "plan" }[b.id]));
+  seg("sel", b => (sel = parseInt(b.textContent, 10) / 100));
+  $("corr").onchange = run;
+  $("fcv").addEventListener("click", e => { const r = $("fcv").getBoundingClientRect(); q = [MX.clamp((e.clientX - r.left - 10) / (r.width - 20), 0, 1), MX.clamp((e.clientY - r.top - 10) / (r.height - 20), 0, 1)]; run(); });
+  run();
+  window.addEventListener("resize", draw);
+  new MutationObserver(draw).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme", "class"] });
+
+  // ---------- chooser
+  const OPTS = [
+    { n: "pgvector (Postgres)", f: { pg: 4, join: 4, open: 2, s: 2, m: 1, l: -3, managed: 1, self: 1, none: 0, hybrid: 0, filter: 1, cold: 0 }, why: "One database, SQL joins and transactions; HNSW + iterative scans; hosted by every major cloud and Supabase/Neon." },
+    { n: "Pinecone", f: { managed: 4, self: -4, none: 1, s: 1, m: 2, l: 2, filter: 1, hybrid: 1, open: -6, cold: 1 }, why: "Fully managed serverless; namespaces for tenants; no servers to run. Closed source." },
+    { n: "Qdrant", f: { self: 3, managed: 2, none: 1, open: 2, filter: 4, hybrid: 2, s: 1, m: 2, l: 1 }, why: "Filter-aware HNSW, tenant payload indexes, sparse + dense hybrid; open source with a cloud option." },
+    { n: "Weaviate", f: { self: 2, managed: 2, none: 1, open: 2, hybrid: 4, filter: 2, s: 1, m: 2, l: 1 }, why: "Built-in BM25 + vector hybrid with an alpha weight; multi-tenancy; open source with a cloud option." },
+    { n: "Milvus / Zilliz Cloud", f: { self: 2, managed: 2, open: 2, l: 4, m: 1, s: -1, none: -2, filter: 1, hybrid: 1 }, why: "Distributed, many index types including GPU; built for hundreds of millions to billions." },
+    { n: "Chroma", f: { none: 4, s: 3, m: -1, l: -4, open: 2, self: 1, managed: 0 }, why: "The easiest start: embedded in Python, great for prototypes and local apps." },
+    { n: "LanceDB", f: { none: 2, self: 2, open: 2, cold: 3, s: 1, m: 2, l: 1 }, why: "Embedded, columnar, on object storage; good for large or multimodal data and analytics." },
+    { n: "turbopuffer", f: { managed: 3, self: -4, cold: 4, filter: 2, hybrid: 2, m: 2, l: 2, open: -6 }, why: "Serverless search on object storage; cheap per tenant for mostly cold data. Closed source." },
+    { n: "Elasticsearch / OpenSearch", f: { es: 5, hybrid: 3, filter: 2, self: 1, managed: 1, m: 1, l: 1, open: 1 }, why: "Mature BM25 plus k-NN and RRF in one engine; best if you already run it." },
+    { n: "MongoDB Atlas Vector Search", f: { mongo: 5, managed: 2, self: -2, filter: 1, s: 1, m: 1 }, why: "Vectors next to your documents in MongoDB; one system to secure." },
+    { n: "Faiss (library)", f: { none: 1, self: 1, open: 2, l: 1, managed: -3, filter: -3, join: -2 }, why: "Fast ANN library, no filters, durability or updates: build those yourself." },
+  ];
+  $("choose").onclick = () => {
+    const sc = $("rScale").value, ops = $("rOps").value;
+    const on = { pg: $("rPg").checked, es: $("rEs").checked, mongo: $("rMongo").checked, filter: $("rFilter").checked, hybrid: $("rHybrid").checked, open: $("rOpen").checked, cold: $("rCold").checked, join: $("rJoin").checked };
+    const ranked = OPTS.map(o => {
+      let s = (o.f[sc] || 0) + (o.f[ops] || 0);
+      Object.keys(on).forEach(k => { if (on[k]) s += o.f[k] || 0; });
+      if (on.open && (o.f.open || 0) < 0) s -= 100; // hard requirement
+      return { o, s };
+    }).sort((a, b) => b.s - a.s);
+    $("picks").innerHTML = ranked.slice(0, 4).map((r, i) => `<div class="pick${i === 0 ? " top" : ""}"><span class="sc">score ${r.s < -50 ? "excluded" : r.s}</span><b>${i + 1}. ${esc(r.o.n)}</b><div class="why">${esc(r.o.why)}</div></div>`).join("")
+      + `<p class="hint">Then shortlist two, load your real data and filters, and measure recall@10, p95 latency and monthly cost.</p>`;
+  };
+  ["rScale", "rOps", "rPg", "rEs", "rMongo", "rFilter", "rHybrid", "rOpen", "rCold", "rJoin"].forEach(id => ($(id).onchange = () => $("choose").onclick()));
+  $("choose").onclick();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P.4 Concurrency & parallelism · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .lgd { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: .82rem; margin: 6px 0; }
+  .lgd i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 5px; vertical-align: -2px; }
+  .rc-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 10px 0; }
+  .th { border: 2px solid var(--line); border-radius: 10px; padding: 6px 8px; background: var(--bg2); }
+  .th h5 { margin: 0 0 4px; font-size: .9rem; display: flex; justify-content: space-between; }
+  .th .ln { font-family: var(--mono); font-size: .8rem; padding: 1px 4px; border-radius: 4px; white-space: pre; }
+  .th .ln.cur { background: color-mix(in srgb, var(--c-tl) 30%, transparent); }
+  .th .ln.done { color: var(--muted); }
+  .th.blocked { border-color: var(--c-rk); }
+  .th.fin { opacity: .6; }
+  .shared { text-align: center; font-family: var(--mono); font-size: 1.05rem; padding: 8px; border: 2px dashed var(--c-cx); border-radius: 10px; }
+  .rlog { font-family: var(--mono); font-size: .8rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-height: 40px; white-space: pre-wrap; max-height: 160px; overflow-y: auto; }
+</style>
+</head>
+<body data-lesson="ap-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase P · Lesson 4</div>
+  <h1>Concurrency & parallelism: the GIL, threads, processes</h1>
+  <p class="subtitle">When Python can do several things at once, when it only looks like it can, and how to pick between asyncio, threads and processes for LLM calls, tokenizing, parsing and embedding.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>asyncio</b> overlaps waiting on one thread; it can't speed up computation (Lesson P.3).</li>
+      <li><b>I/O-bound</b> work waits on the network or disk (LLM calls, vector DB queries). <b>CPU-bound</b> work keeps a processor busy (parsing PDFs, cleaning text, counting tokens in pure Python) (Lesson P.3).</li>
+      <li>A <b>process</b> is a running program with its own memory. A <b>thread</b> is a line of execution inside a process; threads share the process's memory. A CPU <b>core</b> runs one thread at a time.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>PEP 703, the proposal to make CPython's Global Interpreter Lock optional, was written by Sam Gross and accepted in October 2023. Its motivation is about AI: section titles include “GPU-Heavy Workloads Require Multi-Core Processing” and “The GIL Makes Deploying Python AI Models Difficult”.</p>
+    <p>Since then, as of late 2026: Python 3.13 shipped an experimental free-threaded build, 3.14 made it officially supported (PEP 779), and 3.15 (October 2026) added a stable ABI so extensions can target it. It is still a <b>separate, optional build</b>; the default <code>python</code> still has a GIL, and whether free-threading ever becomes the default is undecided. So you need to understand both worlds.</p>
+  </div>
+
+  <h2>Numbers first: same code, three ways</h2>
+  <p>Measured on a 12-core laptop with the standard CPython 3.13 build (your numbers will differ, the pattern won't):</p>
+  <table>
+    <tr><th>Workload</th><th>Sequential</th><th>8 threads</th><th>8 processes</th></tr>
+    <tr><td>8 CPU-bound jobs (a pure-Python counting loop, ~0.14 s each)</td><td>1.09 s</td><td class="rk">1.09 s (no gain)</td><td class="ev">0.35 s (3.1×)</td></tr>
+    <tr><td>16 I/O-bound calls (0.5 s wait each), 16 threads</td><td>8.07 s</td><td class="ev">0.51 s (16×)</td><td>(not needed)</td></tr>
+  </table>
+  <p>Plain sentence: <b>threads made the waiting parallel but not the computing</b>. Processes made the computing parallel, though not 8×, because starting workers and passing data between them costs time. The reason is the GIL.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Concurrency</b> is dealing with many things at once (interleaving them); <b>parallelism</b> is doing many things at the same instant (on several cores). In standard CPython, the <b>GIL</b> lets only one thread run Python bytecode at a time per interpreter. It's released while a thread waits on I/O and by many C/Rust extensions (NumPy, PyTorch kernels, fast tokenizers) during heavy work. So: <b>asyncio</b> for many I/O waits, <b>threads</b> for I/O with sync libraries or for GIL-releasing native code, <b>processes</b> for pure-Python CPU work. The free-threaded build changes only the CPU-bound row of that table.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: one kitchen, one knife</span>
+    <p>A kitchen (a process) has several cooks (threads) but only one knife (the GIL). Any cook chopping (running Python code) needs the knife, so adding cooks doesn't chop faster. But cooks waiting on an oven (I/O) don't need the knife, so many cooks can each have something in the oven at once. A cook using the food processor (a C extension that releases the GIL) puts the knife down too. Want more chopping? Open more kitchens (processes), each with its own knife, and accept the cost of carrying ingredients between them (pickling). The free-threaded build hands every cook a knife, and now cooks can collide over the same cutting board (race conditions).</p>
+  </div>
+
+  <h2>The GIL: what it is and what it protects</h2>
+  <ul>
+    <li><b>What:</b> a lock inside CPython. The glossary says it assures “that only one thread executes Python bytecode at a time.”</li>
+    <li><b>Why:</b> it makes the interpreter's internals, like reference counts (Lesson P.5) and built-in types such as <code>dict</code>, implicitly safe against concurrent access, which keeps CPython simple and single-threaded code fast.</li>
+    <li><b>Switching:</b> a thread holding the GIL is asked to give it up every <b>5 ms</b> (<code>sys.getswitchinterval()</code> returns 0.005), so CPU-bound threads take turns instead of running together.</li>
+    <li><b>Released:</b> during blocking I/O (sockets, files, <code>time.sleep</code>), and by extensions that do long work in C, C++ or Rust and choose to release it.</li>
+    <li><b>Not a safety guarantee for your code.</b> The GIL protects the interpreter, not your logic: a read-modify-write across two statements can still interleave (see the race playground below).</li>
+  </ul>
+  <table>
+    <tr><th>Python version</th><th>Free-threaded (no-GIL) build status</th></tr>
+    <tr><td>3.13 (Oct 2024)</td><td>Experimental, optional installer component (<code>python3.13t</code>).</td></tr>
+    <tr><td>3.14 (Oct 2025)</td><td><b>Officially supported</b>, still optional (PEP 779). Single-threaded overhead reported at roughly 5–10% in that release.</td></tr>
+    <tr><td>3.15 (Oct 2026)</td><td>Stable ABI for free-threaded extensions (PEP 803); macOS installers include it by default. The docs now report ~1% (macOS aarch64) to ~8% (x86-64 Linux) average single-thread overhead. Extensions not marked compatible <b>re-enable the GIL</b> with a warning; check with <code>sys._is_gil_enabled()</code>.</td></tr>
+  </table>
+  <p class="muted">Two other runtime changes you may hear about: an experimental JIT compiler (in 3.15's docs, a 7–8% geometric-mean speedup on x86-64 Linux; the 3.14 docs say it's not recommended for production), and multiple interpreters in one process, each with its own GIL (<code>concurrent.interpreters</code> and <code>InterpreterPoolExecutor</code>, new in 3.14 via PEP 734).</p>
+
+  <h2>Threads, processes, asyncio: how each one works</h2>
+  <table>
+    <tr><th></th><th>asyncio</th><th>Threads (<code>ThreadPoolExecutor</code>)</th><th>Processes (<code>ProcessPoolExecutor</code>)</th></tr>
+    <tr><td>Runs on</td><td>1 thread, many coroutines</td><td>Many threads, one process, one GIL</td><td>Many processes, each with its own interpreter and GIL</td></tr>
+    <tr><td>Parallel CPU?</td><td>No</td><td>Only for code that releases the GIL (or on the free-threaded build)</td><td class="ev">Yes</td></tr>
+    <tr><td>Cost per worker</td><td>Tiny (a coroutine)</td><td>An OS thread (default pool: <code>min(32, cpus + 4)</code>)</td><td>A whole interpreter: startup time, memory, imports</td></tr>
+    <tr><td>Sharing data</td><td>Everything shared; switches only at <code>await</code></td><td>Everything shared; switches can happen almost anywhere</td><td>Nothing shared: arguments and results are <b>pickled</b> (serialized) and copied</td></tr>
+    <tr><td>Best for</td><td>Hundreds of LLM / HTTP calls with async clients</td><td>I/O with sync-only libraries; NumPy/Rust work that releases the GIL</td><td>Pure-Python CPU work: parsing, cleaning, custom tokenizing</td></tr>
+  </table>
+  <p><b>Process gotchas.</b> Workers start by importing your module, so the pool code must sit under <code>if __name__ == "__main__":</code>. Python picks a <b>start method</b>: <code>spawn</code> (a fresh interpreter; the default on macOS and Windows) or <code>forkserver</code> (the default on Linux since 3.14); <code>fork</code> is no longer the default anywhere because forking a process that has threads is unsafe. Lambdas and open connections can't be pickled, and pickling big objects (a 2 GB DataFrame, a model) per task can cost more than the work: pass file paths or IDs, load heavy things once per worker with <code>initializer=</code>, and use <code>chunksize</code> for many small tasks.</p>
+
+  <div class="playground" id="pg-chooser">
+    <span class="label">🎮 Playground · Pick the executor</span>
+    <p class="hint">A <b>simulation</b> of 40 tasks on an 8-core machine, ticking in 5 ms steps like the GIL's switch interval. Choose the workload, the executor, the worker count and the CPython build. Each row is a worker (or, for asyncio, a task in flight); colors show what it's doing. Predict the wall time before you press run.</p>
+    <div class="controls">
+      task <span class="seg" id="ccTask"><button data-v="io" class="on">LLM call via a sync SDK (1 s wait)</button><button data-v="py">clean + tokenize in pure Python (0.2 s CPU)</button><button data-v="c">NumPy / Rust batch (0.2 s, releases the GIL)</button></span>
+    </div>
+    <div class="controls">
+      executor <span class="seg" id="ccEx"><button data-v="seq">sequential</button><button data-v="thread" class="on">threads</button><button data-v="proc">processes</button><button data-v="async">asyncio</button></span>
+      <label>workers <input type="range" id="ccW" min="1" max="40" step="1" value="8"> <b class="mono" id="ccWv"></b></label>
+    </div>
+    <div class="controls">
+      build <span class="seg" id="ccB"><button data-v="gil" class="on">standard (GIL)</button><button data-v="ft">free-threaded (3.14t+)</button></span>
+      <button class="btn primary" id="cc-run">▶ Run</button>
+      <button class="btn" id="cc-all">Compare all executors</button>
+    </div>
+    <canvas id="ccCanvas" style="width:100%;height:200px;display:block"></canvas>
+    <div class="lgd"><span><i style="background:var(--c-tl)"></i>running on a core</span><span><i style="background:var(--c-rk)"></i>waiting for the GIL</span><span><i style="background:var(--c-cx)"></i>waiting on I/O</span><span><i style="background:var(--c-tk)"></i>waiting for a free core</span></div>
+    <canvas class="chart" id="ccBars" style="height:200px;display:none"></canvas>
+    <div class="verdict" id="ccMsg"></div>
+    <div class="stat-row">
+      <div class="stat">wall time <b id="ccTime">–</b></div>
+      <div class="stat">CPU cores busy <b id="ccUtil">–</b></div>
+      <div class="stat">speed-up vs sequential <b id="ccSpeed">–</b></div>
+    </div>
+    <p class="hint">Model: an I/O task is 5 ms of Python, a 1 s wait, 5 ms of Python; a pure-Python task is 200 ms holding the GIL; a native task is 5 ms of Python then 200 ms with the GIL released. Process workers pay 100 ms to start and 5 ms to pickle each task's input and output. The free-threaded build adds 5% to Python code. asyncio is modelled with an async client: waits overlap, all computing happens on the loop's one thread.</p>
+  </div>
+  <p>What you should see: for I/O, every concurrent option wins big, and asyncio with 40 tasks in flight wins most: all 40 waits overlap on one thread. For pure-Python CPU work, threads are no faster than sequential (red: waiting for the GIL) until you switch to the free-threaded build; processes win on the standard build. For GIL-releasing native work, plain threads already use all 8 cores. asyncio never helps CPU work: it runs it on one thread and blocks the loop while it does.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: planning a CPU-heavy ingest</span>
+    <p>50,000 PDFs need text extraction and cleaning in a pure-Python library, ~0.4 s of CPU each, before embedding.</p>
+    <ul>
+      <li>One core: 50,000 × 0.4 s = 20,000 s ≈ <b>5.6 hours</b>.</li>
+      <li>8 threads on the standard build: still ≈ 5.6 hours (one GIL), plus switching overhead.</li>
+      <li>8 processes: 20,000 ÷ 8 = 2,500 s ≈ <b>42 minutes</b> ideally; budget ~10–20% extra for startup, pickling and uneven files, so ~50 minutes.</li>
+      <li>Pass <b>paths</b> to workers, not file bytes: pickling a 200-character path is free, pickling a 5 MB PDF 50,000 times is 250 GB of copying.</li>
+      <li>Then embedding is I/O-bound again: feed the extracted text into an async pipeline with a semaphore (Lesson P.3), not into the process pool.</li>
+    </ul>
+  </div>
+
+  <h2>Queues: producer/consumer between stages</h2>
+  <p>Real pipelines mix both kinds of work: download (I/O) → parse (CPU) → embed (I/O) → upsert (I/O). Connect stages with <b>queues</b>: producers <code>put</code> work, consumers <code>get</code> it. Give every queue a <code>maxsize</code>: when consumers fall behind, <code>put</code> blocks, and the slow stage automatically slows the fast one down instead of letting memory fill up. That's <b>backpressure</b>. Use <code>queue.Queue</code> between threads, <code>asyncio.Queue</code> between coroutines, and <code>multiprocessing.Queue</code> (or the executor itself) between processes. A <b>sentinel</b> value like <code>None</code> tells consumers to stop.</p>
+
+  <h2>Race conditions and locks</h2>
+  <p>A <b>race condition</b> is a bug where the result depends on the timing of threads or tasks. The classic is a <b>read-modify-write</b>: read a shared value, compute, write it back. If another thread writes in between, its update is lost. Two measurements from this lesson's test scripts, on CPython 3.13 with the GIL:</p>
+  <ul>
+    <li>50 threads each doing <code>current = tokens_used; log(...); tokens_used = current + 100</code>, where the log call waits ~1 ms: the total came out <b>100 instead of 5,000</b>. The GIL was released during the wait, so every thread read the same starting value.</li>
+    <li>The asyncio version (<code>current = budget; await asyncio.sleep(0); budget = current - 10</code>, 50 tasks): <b>990 instead of 500</b>. In async code, every <code>await</code> is a place another task can run.</li>
+  </ul>
+  <p>Even a bare <code>counter += 1</code> is three steps in bytecode (load, add, store). In our test it lost about 60% of increments on Python 3.9 and none on 3.13, because of where the interpreter happens to check for thread switches; that's an implementation detail, not a promise, and on the free-threaded build threads really do run simultaneously. The fix is the same everywhere: guard the whole read-modify-write with a <b>lock</b> (<code>with lock:</code> / <code>async with lock:</code>), or avoid shared mutable state (each worker returns its result; one place aggregates).</p>
+
+  <div class="playground" id="pg-race">
+    <span class="label">🎮 Playground · Lose an update, then lock it</span>
+    <p class="hint">Two threads each record 100 tokens of usage into a shared counter, in three steps. You are the scheduler: step either thread in any order. Try to make the total come out wrong, then turn on the lock and try again. (A model of thread interleaving; real switches are decided by the interpreter and the OS.)</p>
+    <div class="controls">
+      <label><input type="checkbox" id="rcLock"> protect it with <code>with lock:</code></label>
+      <button class="btn primary" id="rc-t1">Step thread 1</button><button class="btn primary" id="rc-t2">Step thread 2</button><button class="btn" id="rc-reset">Reset</button>
+      <button class="btn" id="rc-many">Run 1,000 random schedules</button>
+    </div>
+    <div class="shared">shared <b>tokens_used = <span id="rcShared">0</span></b> <span class="muted">(expected 200)</span></div>
+    <div class="rc-grid" id="rcThreads"></div>
+    <div class="rlog" id="rcLog"></div>
+    <div class="verdict" id="rcMsg"></div>
+  </div>
+  <p>What you should see: run thread 1's read, then thread 2's read, then both writes, and the total is 100: one update vanished, with no error anywhere. With the lock on, thread 2 blocks at <code>acquire</code> until thread 1 releases, and every schedule gives 200. Across 1,000 random schedules without the lock, a large share lose an update.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Standard library:</b> <code>concurrent.futures</code> (<code>ThreadPoolExecutor</code>, <code>ProcessPoolExecutor</code>, <code>as_completed</code>; <code>InterpreterPoolExecutor</code> in 3.14+), <code>threading.Lock</code>, <code>queue.Queue</code>, <code>multiprocessing</code>, <code>asyncio.to_thread</code>. <b>In the AI stack:</b> PyTorch's <code>DataLoader(num_workers=…)</code> uses worker processes; Hugging Face <code>datasets.map(num_proc=…)</code> does too; Ray and Dask scale the same ideas across machines. Runnable on Python 3.9+ (checked on 3.13):</p>
+<pre><code><span class="k">import</span> os, queue, threading, time
+<span class="k">from</span> concurrent.futures <span class="k">import</span> ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+
+<span class="k">def</span> call_llm_sync(prompt: str) -&gt; str:          <span class="c"># stand-in for a sync SDK call (waits on the network)</span>
+    time.sleep(<span class="n">0.5</span>)
+    <span class="k">return</span> <span class="s">f"answer to {prompt}"</span>
+
+<span class="k">def</span> clean_and_count(text: str) -&gt; int:          <span class="c"># CPU-bound, pure Python: holds the GIL</span>
+    <span class="k">return</span> sum(<span class="n">1</span> <span class="k">for</span> w <span class="k">in</span> text.lower().split() <span class="k">if</span> w.isalpha())
+
+<span class="k">if</span> __name__ == <span class="s">"__main__"</span>:                       <span class="c"># required: process workers re-import this module</span>
+    <span class="c"># 1) I/O-bound + a sync-only library → threads (the GIL is released while waiting)</span>
+    prompts = [<span class="s">f"q{i}"</span> <span class="k">for</span> i <span class="k">in</span> range(<span class="n">20</span>)]
+    <span class="k">with</span> ThreadPoolExecutor(max_workers=<span class="n">10</span>) <span class="k">as</span> pool:
+        futures = {pool.submit(call_llm_sync, p): p <span class="k">for</span> p <span class="k">in</span> prompts}
+        answers = {futures[f]: f.result() <span class="k">for</span> f <span class="k">in</span> as_completed(futures)}   <span class="c"># ~1 s, not 10 s</span>
+
+    <span class="c"># 2) CPU-bound pure Python → processes (each has its own interpreter and GIL)</span>
+    docs = [<span class="s">"Refunds are available within 30 days "</span> * <span class="n">20_000</span>] * <span class="n">16</span>
+    <span class="k">with</span> ProcessPoolExecutor(max_workers=os.cpu_count()) <span class="k">as</span> pool:
+        counts = list(pool.map(clean_and_count, docs, chunksize=<span class="n">2</span>))      <span class="c"># args and results are pickled</span>
+
+    <span class="c"># 3) Producer/consumer with a bounded queue (backpressure) and a lock for shared state</span>
+    q: queue.Queue = queue.Queue(maxsize=<span class="n">100</span>)   <span class="c"># producers block when consumers fall behind</span>
+    tokens_used, lock = <span class="n">0</span>, threading.Lock()
+    <span class="k">def</span> producer():
+        <span class="k">for</span> i <span class="k">in</span> range(<span class="n">500</span>):
+            q.put(<span class="s">f"chunk-{i}"</span>)
+        q.put(<span class="k">None</span>)                              <span class="c"># sentinel: no more work</span>
+    <span class="k">def</span> consumer():
+        <span class="k">global</span> tokens_used
+        <span class="k">while</span> (item := q.get()) <span class="k">is not</span> <span class="k">None</span>:
+            <span class="k">with</span> lock:                           <span class="c"># read-modify-write must not interleave</span>
+                tokens_used += len(item)
+        q.put(<span class="k">None</span>)                              <span class="c"># let the other consumers stop too</span>
+    threads = [threading.Thread(target=producer)] + [threading.Thread(target=consumer) <span class="k">for</span> _ <span class="k">in</span> range(<span class="n">4</span>)]
+    <span class="k">for</span> th <span class="k">in</span> threads: th.start()
+    <span class="k">for</span> th <span class="k">in</span> threads: th.join()
+    print(<span class="s">"tokens_used"</span>, tokens_used)              <span class="c"># 4390, every time</span></code></pre>
+    <p class="hint">Inside async code, reach for <code>await asyncio.to_thread(fn, ...)</code> for a blocking call and <code>loop.run_in_executor(process_pool, fn, ...)</code> for CPU work, so the event loop keeps serving other requests.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>asyncio</td><td>Cheapest concurrency for I/O; thousands of in-flight calls</td><td>No CPU parallelism; needs async libraries; one blocking call stalls all</td></tr>
+      <tr><td>Threads</td><td>Work with any sync library; shared memory, no pickling</td><td>GIL limits pure-Python CPU work; races need locks; harder to debug</td></tr>
+      <tr><td>Processes</td><td>True CPU parallelism on the standard build; a crash or leak stays in one worker</td><td>Startup and memory per worker (each may load its own model); pickling costs; no shared state</td></tr>
+      <tr><td>Free-threaded build</td><td>Parallel threads with shared memory</td><td>Some extensions not ready (they re-enable the GIL); single-thread overhead; races you never saw before become real</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>asyncio for every model and API call; <code>to_thread</code> for the odd sync library; a <code>ProcessPoolExecutor</code> for the one CPU-heavy step (PDF parsing) with paths in and text out; scale the web tier with several server worker processes. Don't share mutable state between workers: return results.</p></div>
+      <div><h4>At scale</h4><p>Each kind of work gets its own fleet: async API servers, CPU worker pools behind a queue for parsing, GPU servers that batch requests for models (Lesson 7.4). Pipelines run on Ray, Dask or a workflow engine. Teams benchmark the free-threaded build for thread-heavy services once their native dependencies support it, rather than assuming a speed-up.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <ul>
+      <li>“What is the GIL, and when does it matter?” One thread runs Python bytecode at a time per interpreter; it matters for pure-Python CPU work, not for I/O or GIL-releasing native code. Mention the free-threaded build (3.13 experimental, 3.14 supported, optional) and its trade-offs.</li>
+      <li>“Threads, processes or asyncio for: 10,000 LLM calls? Parsing 1M HTML pages? Running NumPy similarity on batches?” asyncio (or threads with a sync client); processes; threads (NumPy releases the GIL), or just vectorize.</li>
+      <li>“Why is my ProcessPoolExecutor slower than a for loop?” Tasks too small relative to process startup and pickling; send big objects per task; use <code>chunksize</code>, batch the work, or load data in the worker.</li>
+      <li>“Does the GIL make my code thread-safe?” No. It protects the interpreter's internals; your multi-step updates still need locks.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Making the GIL optional, for AI</b> <span class="tag res">🧪 PEP · 2023</span> <a href="https://peps.python.org/pep-0703/" target="_blank" rel="noopener">PEP 703: Making the GIL Optional in CPython</a></div>
+      <p><b>How:</b> a <code>--disable-gil</code> build with biased and deferred reference counting, per-object locking and other changes so the interpreter is safe without a global lock.</p>
+      <p><b>Why this method:</b> the PEP's motivation cites AI/ML: model serving and data loading want threads that share memory and run in parallel, which multiprocessing makes awkward.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Worker processes for data loading</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.pytorch.org/docs/stable/data.html" target="_blank" rel="noopener">PyTorch: torch.utils.data</a></div>
+      <p><b>How:</b> <code>DataLoader</code> loads in a single process by default; set <code>num_workers</code> to a positive integer for multi-process loading.</p>
+      <p><b>Why this method:</b> the docs say it directly: within a process, the GIL prevents fully parallelizing Python code across threads, so loading in worker processes keeps the GPU fed.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Rust under the hood</b> <span class="tag oss">🧰 Open source</span> <a href="https://huggingface.co/docs/tokenizers/index" target="_blank" rel="noopener">Hugging Face Tokenizers</a></div>
+      <p><b>How:</b> the tokenizers used by Transformers are implemented in Rust; the docs claim under 20 seconds to tokenize a gigabyte of text on a server CPU.</p>
+      <p><b>Why this method:</b> moving the hot loop out of Python sidesteps the GIL and interpreter overhead, the same reason NumPy and PyTorch do their heavy lifting in native code.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The current state, documented</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.python.org/3/howto/free-threading-python.html" target="_blank" rel="noopener">Python support for free threading</a></div>
+      <p><b>How:</b> install the free-threaded build, check <code>sys._is_gil_enabled()</code>, force the GIL with <code>PYTHON_GIL=1</code> or <code>-X gil</code>, and track package support on community sites.</p>
+      <p><b>Why this method:</b> compatibility is gradual; any extension not marked free-threading-safe turns the GIL back on, so you measure before you rely on it.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 5 milliseconds</span>
+    <p>Run <code>import sys; sys.getswitchinterval()</code> and you'll get <code>0.005</code>. That's the “timeslice” CPython aims to give a thread before asking it to hand over the GIL: 200 handovers a second, which is why CPU-bound threads look concurrent but never finish sooner. You can change it with <code>sys.setswitchinterval()</code>, which changes how often threads take turns, not how much work gets done.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>P.3's event loop handles the I/O side; this lesson adds the CPU side. Reference counting, the thing the GIL protects, is the heart of P.5 (memory and garbage collection). P.6 runs FastAPI with several worker processes. Later: batch embedding pipelines (4.8), serving models on GPUs where batching beats threading (7.4), and cost/latency tuning (8.2). Queues and backpressure across machines are in the System Design course: <a href="../../system-design-course/phase3/1-queues.html">message queues</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/library/concurrent.futures.html" target="_blank" rel="noopener">concurrent.futures</a>. Thread, interpreter and process pools behind one interface.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/howto/free-threading-python.html" target="_blank" rel="noopener">Free-threading HOWTO</a>. What changes without the GIL, and how to check.</li>
+      <li><span class="kind">PEP</span> <a href="https://peps.python.org/pep-0703/" target="_blank" rel="noopener">PEP 703</a>. The motivation section is a tour of Python's AI pain points.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 40 pure-Python cleaning tasks of 0.2 s CPU each, on 8 cores with the standard (GIL) build. Roughly how long with 8 threads, and with 8 processes?</div>
+    <div class="opts"><button class="opt">1 s and 1 s</button><button class="opt" data-ok>~8 s and ~1 s</button><button class="opt">~8 s and ~8 s</button></div>
+    <div class="explain">Total CPU is 40 × 0.2 = 8 s. Threads share one GIL, so they take turns: ~8 s. Processes each have their own GIL: 8 s ÷ 8 ≈ 1 s, plus a bit for startup and pickling. On the free-threaded build, threads would get close to ~1 s too.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A vendor's Python SDK for a reranking API is sync-only. You need 2,000 calls of ~0.8 s each inside a batch script. What's the simplest good approach?</div>
+    <div class="opts"><button class="opt">A <code>ProcessPoolExecutor</code> with 2,000 workers</button><button class="opt" data-ok>A <code>ThreadPoolExecutor</code> with ~20–50 workers (sized to the rate limit), with timeouts and retries</button><button class="opt">Call it inside <code>async def</code> functions with <code>asyncio.gather</code></button></div>
+    <div class="explain">It's I/O-bound, and the GIL is released while each thread waits on the network, so threads overlap the waits with no rewrite. Processes waste memory and startup for no CPU gain. Calling a sync SDK inside <code>async def</code> blocks the loop (Lesson P.3) unless you wrap each call in <code>asyncio.to_thread</code>.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You moved a step to <code>ProcessPoolExecutor</code> and it got slower. Each task receives a 300 MB pandas DataFrame and does 5 ms of work. What's the best fix?</div>
+    <div class="opts"><button class="opt">Add more processes</button><button class="opt">Switch to threads to make it faster on the standard build</button><button class="opt" data-ok>Stop shipping the DataFrame per task: load it once per worker (<code>initializer=</code>) or send only row ranges or IDs, and batch work with <code>chunksize</code></button></div>
+    <div class="explain">Each task pickles and copies 300 MB to do 5 ms of work, so serialization dominates. Send small descriptions of work and keep heavy data resident in each worker. (Or check whether a vectorized NumPy/pandas call removes the need for parallelism at all, Lesson P.7.)</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Concurrency interleaves; parallelism runs at the same instant. The GIL allows one thread of Python bytecode at a time per interpreter, released during I/O and by many native extensions.</li>
+      <li>I/O-bound → asyncio (or threads for sync libraries). Pure-Python CPU → processes (mind pickling, use <code>__main__</code>, <code>chunksize</code>, <code>initializer</code>). Native GIL-releasing code → threads are fine.</li>
+      <li>Free-threaded CPython: officially supported since 3.14, still optional as of 3.15; measure before relying on it.</li>
+      <li>The GIL doesn't make your code thread-safe: lock read-modify-writes, use bounded queues for backpressure, prefer returning results over sharing state.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const segInit = (gid, cb) => {
+    const bs = [...$(gid).querySelectorAll("button")];
+    bs.forEach(b => { b.id = gid + "-" + b.dataset.v; b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }; });
+  };
+
+  /* ---------- Playground 1: executor simulator (5 ms ticks, GIL modelled) ---------- */
+  const DT = 5, CORES = 8, NT = 40;
+  const TASKS = { io: () => [["py", 5], ["io", 1000], ["py", 5]], py: () => [["py", 200]], c: () => [["py", 5], ["c", 200]] };
+  const st = { task: "io", ex: "thread", b: "gil" };
+  segInit("ccTask", v => { st.task = v; run(); });
+  segInit("ccEx", v => { st.ex = v; run(); });
+  segInit("ccB", v => { st.b = v; run(); });
+  $("ccW").oninput = () => { $("ccWv").textContent = $("ccW").value; run(); };
+  $("ccWv").textContent = $("ccW").value;
+
+  function sim(task, ex, W, build, rec) {
+    const ft = build === "ft", lanes = ex === "seq" ? 1 : W;
+    const proc = i => (ex === "proc" ? i : 0);
+    const cores = ex === "async" || ex === "seq" ? 1 : CORES;
+    const L = Array.from({ length: lanes }, () => ({ seg: ex === "proc" ? [["start", 100]] : [], task: false, done: false }));
+    let next = 0, t = 0, finished = 0, runTicks = 0, rr = 0;
+    const hist = rec ? L.map(() => []) : null;
+    const load = l => {
+      if (next >= NT) { l.done = true; l.task = false; return; }
+      next++; l.task = true;
+      l.seg = TASKS[task]().map(([k, ms]) => [k, ft && k === "py" ? Math.max(DT, Math.round(ms * 1.05 / DT) * DT) : ms]);
+      if (ex === "proc") l.seg = [["pk", 5], ...l.seg, ["pk", 5]];
+    };
+    L.forEach(l => { if (!l.seg.length) load(l); });
+    while (finished < NT && t < 120000) {
+      const want = [];
+      L.forEach((l, i) => { if (!l.done && l.seg.length && l.seg[0][0] !== "io") want.push(i); });
+      const granted = new Set(), gil = new Set(), why = {};
+      let used = 0;
+      for (let k = 0; k < want.length; k++) {
+        const i = want[(k + rr) % want.length], kind = L[i].seg[0][0];
+        const needsGil = !ft && (kind === "py" || kind === "pk");
+        if (used >= cores) { why[i] = "core"; continue; }
+        if (needsGil && gil.has(proc(i))) { why[i] = "gil"; continue; }
+        granted.add(i); used++; if (needsGil) gil.add(proc(i));
+      }
+      rr++;
+      L.forEach((l, i) => {
+        let s = "idle";
+        if (!l.done && l.seg.length) {
+          const kind = l.seg[0][0];
+          if (kind === "io" || granted.has(i)) {
+            s = kind === "io" ? "io" : "run";
+            if (s === "run") runTicks++;
+            l.seg[0][1] -= DT;
+            if (l.seg[0][1] <= 0) { l.seg.shift(); if (!l.seg.length) { if (l.task) finished++; load(l); } }
+          } else s = why[i] === "gil" ? "gil" : "core";
+        }
+        if (rec) hist[i].push(s);
+      });
+      t += DT;
+    }
+    return { t: t / 1000, util: runTicks / (t / DT * CORES), hist };
+  }
+  function drawLanes(r) {
+    const cv = $("ccCanvas"), dpr = window.devicePixelRatio || 1, Wd = cv.clientWidth || 700, H = cv.clientHeight || 200;
+    cv.width = Wd * dpr; cv.height = H * dpr;
+    const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, Wd, H);
+    const show = r.hist.slice(0, 8), n = show.length, Lx = 70, B = 20, rowH = Math.min(26, (H - B - 6) / n);
+    const ticks = r.hist[0].length, X = k => Lx + (Wd - Lx - 8) * k / ticks;
+    const col = { run: MX.css("--c-tl"), gil: MX.css("--c-rk"), io: MX.css("--c-cx"), core: MX.css("--c-tk") };
+    g.font = "11px " + MX.css("--font");
+    show.forEach((h, i) => {
+      const y = 6 + i * rowH;
+      g.fillStyle = MX.css("--muted"); g.textAlign = "right";
+      g.fillText((st.ex === "async" ? "task " : st.ex === "proc" ? "proc " : st.ex === "seq" ? "main " : "thread ") + (i + 1), Lx - 6, y + rowH / 2 + 4);
+      let k0 = 0;
+      for (let k = 1; k <= h.length; k++) {
+        if (k === h.length || h[k] !== h[k0]) {
+          if (col[h[k0]]) { g.fillStyle = col[h[k0]]; g.fillRect(X(k0), y + 2, Math.max(0.8, X(k) - X(k0)), rowH - 4); }
+          k0 = k;
+        }
+      }
+    });
+    g.fillStyle = MX.css("--muted"); g.textAlign = "center";
+    const tot = ticks * DT / 1000, step = tot > 20 ? 5 : tot > 8 ? 2 : tot > 3 ? 1 : 0.5;
+    for (let s = 0; s <= tot + 1e-9; s += step) g.fillText((+s.toFixed(1)) + " s", X(s * 1000 / DT), H - 4);
+    if (r.hist.length > 8) { g.textAlign = "right"; g.fillText(`+ ${r.hist.length - 8} more rows not shown`, Wd - 10, 6 + n * rowH + 10); }
+  }
+  let base = {};
+  function run() {
+    $("ccBars").style.display = "none"; $("ccCanvas").style.display = "block";
+    const W = +$("ccW").value, r = sim(st.task, st.ex, W, st.b, true);
+    const key = st.task + st.b;
+    if (!base[key]) base[key] = sim(st.task, "seq", 1, st.b, false).t;
+    drawLanes(r);
+    $("ccTime").textContent = r.t.toFixed(2) + " s";
+    $("ccUtil").textContent = (r.util * CORES).toFixed(1) + " of 8";
+    $("ccSpeed").textContent = (base[key] / r.t).toFixed(1) + "×";
+    let m;
+    const sp = base[key] / r.t;
+    if (st.task === "py" && st.ex === "thread" && st.b === "gil") m = `<span class="rk">Red everywhere: ${W} threads, one GIL. Only one thread runs Python at a time, so ${W} threads take as long as one. Try processes, or the free-threaded build.</span>`;
+    else if (st.task !== "io" && st.ex === "async") m = `<span class="rk">asyncio runs all computation on one thread: no faster than sequential, and the event loop is blocked the whole time.</span>`;
+    else if (st.task === "io" && st.ex === "proc") m = `<span class="tk">It works, but each process costs startup and memory just to wait on the network. Threads or asyncio do this for less.</span>`;
+    else if (sp > 1.5) m = `<span class="ev">${sp.toFixed(1)}× faster than sequential (${r.t.toFixed(2)} s).</span>`;
+    else m = `<span class="muted">${sp.toFixed(1)}× vs sequential. Add workers or change executor.</span>`;
+    $("ccMsg").innerHTML = m;
+  }
+  $("cc-run").onclick = run;
+  $("cc-all").onclick = () => {
+    const W = +$("ccW").value;
+    const rows = [["sequential", "seq", 1], [`threads ×${W}`, "thread", W], [`processes ×${W}`, "proc", W], [`asyncio ×${W}`, "async", W]];
+    const bars = rows.map(([label, ex, w]) => ({ label, value: +sim(st.task, ex, w, st.b, false).t.toFixed(2), color: MX.css(ex === "seq" ? "--muted" : ex === "thread" ? "--c-tl" : ex === "proc" ? "--c-md" : "--c-cx") }));
+    $("ccCanvas").style.display = "none"; $("ccBars").style.display = "block";
+    Plot.bars($("ccBars"), { bars, yMin: 0, yLabel: "wall time (s)" });
+    const best = bars.reduce((a, b) => (b.value < a.value ? b : a));
+    $("ccMsg").innerHTML = `<span class="ev">Fastest for this workload on the ${st.b === "ft" ? "free-threaded" : "standard"} build: ${best.label} (${best.value} s). Press Run to see the lanes again.</span>`;
+  };
+  run();
+
+  /* ---------- Playground 2: race condition stepper ---------- */
+  const PLAIN = ["current = tokens_used      # read", "current = current + 100    # modify", "tokens_used = current      # write"];
+  const LOCKED = ["lock.acquire()", "current = tokens_used      # read", "current = current + 100    # modify", "tokens_used = current      # write", "lock.release()"];
+  let R;
+  function rcReset() {
+    const lines = $("rcLock").checked ? LOCKED : PLAIN;
+    R = { lines, shared: 0, owner: null, th: [{ pc: 0, cur: "–" }, { pc: 0, cur: "–" }], log: [] };
+    $("rcMsg").innerHTML = ""; rcRender();
+  }
+  function rcStep(k, R, quiet) {
+    const T = R.th[k], line = R.lines[T.pc];
+    if (line === undefined) return "done";
+    if (line.startsWith("lock.acquire")) {
+      if (R.owner !== null && R.owner !== k) { if (!quiet) R.log.push(`thread ${k + 1}: lock.acquire() blocks: thread ${R.owner + 1} holds the lock`); return "blocked"; }
+      R.owner = k;
+    } else if (line.startsWith("lock.release")) R.owner = null;
+    else if (line.includes("# read")) T.cur = R.shared;
+    else if (line.includes("# modify")) T.cur = T.cur + 100;
+    else if (line.includes("# write")) R.shared = T.cur;
+    if (!quiet) R.log.push(`thread ${k + 1}: ${line.split("#")[0].trim()}   → current=${T.cur}, tokens_used=${R.shared}`);
+    T.pc++;
+    return "ok";
+  }
+  function rcRender() {
+    $("rcShared").textContent = R.shared;
+    $("rcThreads").innerHTML = R.th.map((T, k) => {
+      const fin = T.pc >= R.lines.length, blocked = !fin && R.lines[T.pc].startsWith("lock.acquire") && R.owner !== null && R.owner !== k;
+      return `<div class="th${blocked ? " blocked" : ""}${fin ? " fin" : ""}"><h5><span>thread ${k + 1}</span><span class="muted">local current = ${T.cur}</span></h5>` +
+        R.lines.map((l, i) => `<div class="ln${i === T.pc ? " cur" : i < T.pc ? " done" : ""}">${l}</div>`).join("") + "</div>";
+    }).join("");
+    $("rcLog").textContent = R.log.join("\n"); $("rcLog").scrollTop = 1e6;
+    if (R.th.every(T => T.pc >= R.lines.length))
+      $("rcMsg").innerHTML = R.shared === 200 ? `<span class="ev">✅ 200: both updates survived${R.lines === LOCKED ? ", guaranteed by the lock" : " this time, because the reads and writes didn't overlap"}.</span>` : `<span class="rk">❌ ${R.shared}: an update was lost. Both threads read the same starting value, and the second write overwrote the first. No exception, no warning.</span>`;
+  }
+  $("rc-t1").onclick = () => { rcStep(0, R); rcRender(); };
+  $("rc-t2").onclick = () => { rcStep(1, R); rcRender(); };
+  $("rc-reset").onclick = rcReset;
+  $("rcLock").onchange = rcReset;
+  $("rc-many").onclick = () => {
+    const rng = MX.seeded(5), lines = $("rcLock").checked ? LOCKED : PLAIN;
+    let lost = 0;
+    for (let n = 0; n < 1000; n++) {
+      const S = { lines, shared: 0, owner: null, th: [{ pc: 0, cur: 0 }, { pc: 0, cur: 0 }], log: [] };
+      let guard = 0;
+      while (S.th.some(T => T.pc < lines.length) && guard++ < 100) {
+        const alive = [0, 1].filter(k => S.th[k].pc < lines.length);
+        rcStep(alive[Math.floor(rng() * alive.length)], S, true);
+      }
+      if (S.shared !== 200) lost++;
+    }
+    $("rcMsg").innerHTML = lost ? `<span class="rk">${lost} of 1,000 random schedules (${(lost / 10).toFixed(1)}%) lost an update. Here every step is a possible switch point; real interpreters switch less often, so in production the same bug strikes rarely and under load, which makes it far harder to find.</span>` : `<span class="ev">0 of 1,000 schedules lost an update: the lock makes read-modify-write a single step as far as other threads are concerned.</span>`;
+  };
+  rcReset();
+})();
+</script>
+</body>
+</html>

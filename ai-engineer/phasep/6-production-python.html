@@ -1,0 +1,552 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P.6 Production Python for AI services · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .stream { min-height: 2.6em; font-size: .95rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+  .log { max-height: 230px; overflow-y: auto; }
+  .bug { display: grid; grid-template-columns: 1fr auto; gap: 6px 10px; align-items: center; border: 1px solid var(--line); border-left: 5px solid var(--line); border-radius: 8px; padding: 6px 10px; margin: 6px 0; background: var(--bg2); font-size: .9rem; }
+  .bug.ok { border-left-color: var(--good); } .bug.no { border-left-color: var(--bad); }
+  .chip { display: inline-block; font-size: .75rem; font-weight: 700; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); margin-left: 4px; }
+  .chip.hit { color: var(--c-ev); border-color: var(--c-ev); }
+</style>
+</head>
+<body data-lesson="ap-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase P · Lesson 6</div>
+  <h1>Production Python for AI services: FastAPI, Pydantic, streaming, uv, pytest</h1>
+  <p class="subtitle">The notebook works. Now it has to be a service: reproducible installs, validated inputs, streamed tokens, sane timeouts, secrets that don't leak, and tests that don't call a paid model on every commit.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Type hints and classes</b>: <code>def f(x: str) -> int</code>, dataclasses, decorators (Lesson P.1).</li>
+      <li><b>async/await</b>: <code>async def</code>, <code>await</code>, async generators with <code>yield</code> (Lessons P.2–P.3).</li>
+      <li><b>Calling a model API</b> and <b>streaming</b> tokens as they're generated (Lesson 0.5).</li>
+      <li><b>HTTP</b>: requests, status codes (200 OK, 4xx your fault, 5xx server's fault), JSON bodies.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Open the docs of OpenAI's and Anthropic's official Python SDKs and you'll find the same two defaults: requests <b>time out after 10 minutes</b>, and failed or timed-out requests are <b>retried 2 times</b> with a short exponential backoff.</p>
+    <p>Those are sensible defaults for a script that generates a long report. In a chat API they mean one hung provider connection can hold your user (and one of your server's connections) for <b>3 attempts × 10 minutes = 30 minutes</b>. Nothing is broken in the code; it's a configuration you didn't choose. This lesson is about choosing it.</p>
+  </div>
+
+  <h2>Numbers first: where a chat request's time goes</h2>
+  <table>
+    <tr><th>Step</th><th>Typical time</th><th>What can go wrong</th></tr>
+    <tr><td>Parse and validate the JSON body</td><td class="tk">&lt; 1 ms</td><td>Missing or wrong fields → reject with <b>422</b> before spending anything.</td></tr>
+    <tr><td>Retrieve context (vector search)</td><td class="tk">20–150 ms</td><td>Slow database, empty results.</td></tr>
+    <tr><td>Model: time to first token (TTFT)</td><td class="tk">0.3–2 s</td><td>Rate limit (<b>429</b>), overload (<b>5xx</b>), a hung connection.</td></tr>
+    <tr><td>Model: the rest of the answer</td><td class="tk">5–30 s for long answers</td><td>Timeout too short for the whole answer.</td></tr>
+  </table>
+  <p class="muted">Typical ranges; they vary a lot by model, prompt size and load. Measure yours (Lesson 8.2).</p>
+  <p>Two lessons fall out of this table. First, <b>stream</b>: the user sees words after ~1 s instead of a spinner for 15 s. Second, almost all the risk sits in one network call you don't control, so <b>timeouts and retries</b> are part of your design, not an afterthought.</p>
+
+  <h2>1. A reproducible project with uv</h2>
+  <p>A <b>virtual environment</b> (venv) is a folder with its own Python and installed packages, so this project's library versions don't clash with another's. A <b>lockfile</b> records the exact version of every package, including dependencies of dependencies, so your laptop, CI and the Docker image install the same thing. <b>uv</b>, from Astral (the makers of Ruff), does both: it manages Python versions, venvs, dependencies and a universal <code>uv.lock</code>, and its docs claim 10–100× faster installs than pip.</p>
+<pre><code>uv init rag-api && cd rag-api        <span class="c"># pyproject.toml, .python-version, README, .gitignore</span>
+uv add fastapi uvicorn pydantic-settings anthropic   <span class="c"># updates pyproject.toml + uv.lock + .venv</span>
+uv add --dev pytest ruff mypy         <span class="c"># dev-only tools</span>
+uv run pytest                         <span class="c"># runs inside the project venv, syncing it first</span>
+uv sync --locked                      <span class="c"># CI / Docker: install exactly the lockfile, fail if it's stale</span></code></pre>
+  <p>Commit <code>pyproject.toml</code> and <code>uv.lock</code>; never commit <code>.venv</code>. The same pattern works with Poetry or pip-tools; the idea that matters is <b>declared dependencies + a lockfile</b>.</p>
+
+  <h2>2. Validate at the boundary: FastAPI + Pydantic</h2>
+  <p><b>FastAPI</b> is a web framework where you describe each endpoint with type hints. <b>Pydantic</b> models (classes whose fields have types and constraints) define the request and response. FastAPI validates every incoming body against the request model; if it fails, the client gets <b>422 Unprocessable</b> with a list of exactly which field is wrong, and your code never runs. The response model is your <b>contract</b> with the frontend: it's documented automatically (OpenAPI at <code>/docs</code>) and filtered on the way out.</p>
+<pre><code><span class="k">class</span> AskRequest(BaseModel):
+    question: str = Field(min_length=<span class="n">1</span>, max_length=<span class="n">2_000</span>)   <span class="c"># caps prompt size (and cost)</span>
+    top_k: int = Field(default=<span class="n">3</span>, ge=<span class="n">1</span>, le=<span class="n">20</span>)
+
+<span class="c"># POST /ask {"question": ""} → 422:</span>
+<span class="c"># {"detail": [{"type": "string_too_short", "loc": ["body", "question"], ...}]}</span></code></pre>
+  <p>Validating input is also cheap protection: a <code>max_length</code> on the question stops a 500,000-character paste from becoming a 125,000-token bill.</p>
+
+  <h2>3. Stream tokens with Server-Sent Events</h2>
+  <p><b>Server-Sent Events</b> (SSE) is a simple HTTP format for pushing a stream of messages from server to client: the response stays open with type <code>text/event-stream</code>, and each message is a few lines like <code>event: token</code> / <code>data: "Hello"</code> followed by a blank line. Browsers read it natively with <code>EventSource</code>, and most LLM APIs stream this way. Since version 0.135, FastAPI supports it directly: return <code>EventSourceResponse</code> and <code>yield</code> events from an async generator. It also sends a keep-alive comment every 15 seconds and disables proxy buffering for you. (On older versions, use <code>StreamingResponse</code> with <code>media_type="text/event-stream"</code> and format the lines yourself.)</p>
+
+  <h2>4. Timeouts and retries around the provider</h2>
+  <ul>
+    <li><b>Set a timeout you can explain.</b> The HTTP library's <i>read</i> timeout is the longest wait for the next chunk of data, not for the whole response. When streaming, chunks arrive every few tens of milliseconds, so a 20 s read timeout catches a dead connection without killing a long answer. Without streaming, the whole answer is one chunk, and a 20 s timeout will cut off every long generation.</li>
+    <li><b>Retry only what can succeed next time</b>: timeouts, connection errors, 429 and 5xx. Never retry a 400 (your request is wrong, and it'll be wrong three times). Back off exponentially with jitter (random spread) so a thousand clients don't retry in lockstep.</li>
+    <li><b>Know the worst case</b>: attempts × timeout + backoff. Put a deadline on the whole request too.</li>
+    <li><b>Streams don't replay.</b> The SDKs don't retry a stream once you've started consuming it, because that could duplicate output already delivered. If the connection dies mid-answer, tell the client and let it retry.</li>
+  </ul>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    An AI service is a thin, careful wrapper around a slow, expensive, occasionally failing network call. Production Python is mostly about the wrapper: <b>validate</b> before you spend, <b>stream</b> so users see progress, <b>bound</b> every wait, <b>retry</b> only the retryable, <b>log</b> what happened per request, and <b>test</b> it all with a fake model so tests are fast, free and deterministic.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a restaurant kitchen with one star chef</span>
+    <p>The chef (the model) is brilliant, slow and occasionally doesn't answer. The host checks every order is complete before it reaches the kitchen (validation, 422). Waiters bring dishes out course by course instead of all at once (streaming). If the chef doesn't respond, the waiter waits a set time, then asks again, maybe twice, then apologizes (timeout, retries, error). Every order slip has a number (request ID) so complaints can be traced (logs). And the kitchen rehearses with a stand-in cook who follows a script (mocked LLM in tests).</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The life of a request</span>
+    <p class="hint">A simulated <code>POST /ask</code> through validation, retrieval and an LLM provider (scripted; no real model is called; clock times are simulated). Pick a scenario and settings, then run it. Try: <b>provider hangs forever</b> with the SDK default 10 min timeout; then <b>long answer</b> with streaming off and a 10 s timeout; then fix both.</p>
+    <div class="controls">
+      <span class="seg" id="lc-sc"><button id="lc-ok" data-v="ok" class="on">Normal</button><button id="lc-bad" data-v="bad">Missing field</button><button id="lc-r429" data-v="r429">429 then OK</button><button id="lc-hang1" data-v="hang1">Hangs once</button><button id="lc-long" data-v="long">Long answer</button><button id="lc-down" data-v="down">Hangs forever</button></span>
+    </div>
+    <div class="controls">
+      <label>read timeout <input type="range" id="lc-to" min="0" max="5" step="1" value="5"> <b class="mono" id="lc-tov"></b></label>
+      <label>max_retries <input type="range" id="lc-re" min="0" max="3" step="1" value="2"> <b class="mono" id="lc-rev"></b></label>
+      <label><input type="checkbox" id="lc-st" checked> stream tokens (SSE)</label>
+      <button class="btn primary" id="lc-run">▶ Send request</button>
+    </div>
+    <svg id="lc-flow"></svg>
+    <div class="stream" id="lc-out"><span class="muted">The user's screen appears here.</span></div>
+    <div class="verdict" id="lc-verdict"></div>
+    <div class="stat-row">
+      <div class="stat">status <b id="lc-status">–</b></div>
+      <div class="stat">user sees first words <b id="lc-ttfb">–</b></div>
+      <div class="stat">total time <b id="lc-total">–</b></div>
+      <div class="stat">provider attempts <b id="lc-att">–</b></div>
+    </div>
+    <div class="prompt log" id="lc-log"></div>
+  </div>
+  <p>What you should see: with the defaults, a hung provider keeps the user waiting <b>30 minutes</b> for an error. A 20 s timeout turns that into about a minute; with 1 retry, about 40 s. A missing field is rejected in under a millisecond, at no cost. And the long answer shows why streaming and read timeouts belong together: without streaming, a 10 s timeout kills a perfectly healthy 13 s answer three times in a row.</p>
+
+  <h2>5. Config, secrets and logs</h2>
+  <ul>
+    <li><b>Config from the environment</b> (the twelve-factor habit): API keys, model IDs, timeouts and URLs come from environment variables, so the same image runs in dev, staging and prod. <b>pydantic-settings</b> turns them into a typed, validated <code>Settings</code> object, and <code>SecretStr</code> prints as <code>**********</code> so keys don't leak into logs or tracebacks. Keep local values in a git-ignored <code>.env</code>; in production, use your platform's secret store.</li>
+    <li><b>Structured logs</b>: one JSON line per event with fields (<code>request_id</code>, <code>model</code>, <code>input_tokens</code>, <code>output_tokens</code>, <code>latency_ms</code>, <code>status</code>) instead of prose. Then “p95 latency by model” or “cost per tenant” is a query, not a grep. Use the standard <code>logging</code> module or <b>structlog</b>, and don't log raw prompts or user data unless your privacy policy allows it (Lesson 8.5).</li>
+  </ul>
+
+  <h2>6. Background tasks vs a queue</h2>
+  <p>FastAPI's <code>BackgroundTasks</code> runs a function <b>after</b> the response is sent, in the same process: perfect for small things like writing a feedback row or sending an email. But if the process restarts (a deploy, a crash, an autoscaler), the task is simply gone, and a heavy task competes with requests for CPU. For real work (re-embedding 50,000 documents, running a 500-case eval), FastAPI's own docs point to bigger tools like <b>Celery</b> with a message queue such as Redis or RabbitMQ: the job is stored, retried, and run by separate workers you scale independently.</p>
+
+  <h2>7. Tests that don't call the model</h2>
+  <p><b>pytest</b> finds functions named <code>test_*</code> and runs them; a <b>fixture</b> is a function that sets something up for a test (a client, a fake model) and cleans up afterwards. The key move for AI services is <b>dependency injection</b>: the endpoint asks for an <code>LLM</code> via <code>Depends(get_llm)</code>, and tests swap in a scripted fake with <code>app.dependency_overrides</code>. Three kinds of test, catching different bugs:</p>
+  <table>
+    <tr><th>Test</th><th>What it checks</th><th>Speed and cost</th></tr>
+    <tr><td><b>Unit, mocked LLM</b></td><td>Your code: prompt assembly, parsing, retries, error handling, given scripted model output (including malformed output).</td><td>Milliseconds, free, deterministic: run on every commit.</td></tr>
+    <tr><td><b>Contract / schema</b></td><td>The API's shape: response matches the Pydantic model, status codes, the stream's event sequence ends with <code>done</code>.</td><td>Milliseconds, free.</td></tr>
+    <tr><td><b>Golden eval</b></td><td>Quality: a fixed set of real questions with expected answers, run against the <i>real</i> model and scored (Phase 5).</td><td>Minutes and real money: on prompt or model changes, or nightly.</td></tr>
+  </table>
+  <p>Add a <b>type checker</b> (mypy, Pyright, or Astral's newer <b>ty</b>) and <b>Ruff</b> (a very fast linter and formatter) in CI: they catch <code>None</code> passed where a <code>str</code> is expected and undefined names in rarely-run branches, before any test runs.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: choosing timeout and retries</span>
+    <p>Your product promise: an answer, or a clear error, within <b>60 s</b>. Streaming is on; TTFT is under 2 s at p99; tokens arrive every ~40 ms.</p>
+    <ul>
+      <li>SDK defaults: worst case = 3 attempts × 600 s = <b>1,800 s</b> (30 min). Way over.</li>
+      <li>Read timeout 20 s, max_retries 2: 3 × 20 s + backoff (~0.5 + 1 s) ≈ <b>61.5 s</b>. Just over.</li>
+      <li>Read timeout 15 s, max_retries 2: 3 × 15 + 1.5 ≈ <b>46.5 s</b>. Under the promise, with room for retrieval.</li>
+      <li>Is 15 s safe for healthy requests? With streaming, the longest silent gap is the TTFT (≤ 2 s), so yes: 7× headroom. Without streaming, a 400-token answer at 25 tokens/s takes 16 s + TTFT, and 15 s would time out <i>healthy</i> requests.</li>
+    </ul>
+    <p>Then add an overall deadline (for example <code>asyncio.timeout(55)</code> around the call, Python 3.11+) so no combination of retries can exceed the promise.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Build a test suite</span>
+    <p class="hint">Nine bugs are planted in this RAG service. Choose which kinds of checks run in CI, then run it. Each bug is either caught (and by which check) or ships to production. Start with only the golden eval, then only unit tests, then find the cheapest suite that catches everything a test can catch.</p>
+    <div class="controls">
+      <label><input type="checkbox" id="ts-unit" checked> unit tests, mocked LLM</label>
+      <label><input type="checkbox" id="ts-contract"> contract / schema tests</label>
+      <label><input type="checkbox" id="ts-golden"> golden eval (real model)</label>
+      <label><input type="checkbox" id="ts-static"> type check + Ruff</label>
+      <button class="btn primary" id="ts-run">▶ Run CI</button>
+    </div>
+    <div id="ts-bugs"></div>
+    <div class="verdict" id="ts-verdict"></div>
+    <div class="stat-row">
+      <div class="stat">bugs caught <b id="ts-score">–</b></div>
+      <div class="stat">CI time per run <b id="ts-time">–</b></div>
+      <div class="stat">CI model spend per run <b id="ts-cost">–</b></div>
+    </div>
+    <p class="hint">Times and the eval cost are illustrative (a 200-case golden set at about $0.003 per case). The point is the shape: cheap checks on every commit, the paid eval when prompts or models change.</p>
+  </div>
+
+  <h2>8. Ship it in a container</h2>
+  <p>A Docker image packages the code, the Python version and the locked dependencies into one artifact that runs the same everywhere. uv's Docker guide recommends copying the <code>uv</code> binary from its official image (pinned to a version), installing only the dependencies (<code>uv sync --frozen --no-install-project</code>, with just the lockfile mounted) in a layer <b>before</b> copying your code, then <code>uv sync --locked</code> after it, so a code change doesn't reinstall every package, and keeping <code>.venv</code> out of the build with <code>.dockerignore</code>. Images, layers and caching are taught in depth in the System Design course: <a href="../../system-design-course/phase5/1-docker.html">Docker: images, layers & containers</a>.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>uv</b> (projects, lockfile), <b>FastAPI</b> + <b>Uvicorn</b> (web server), <b>Pydantic</b> + <b>pydantic-settings</b>, the provider SDKs (<b>anthropic</b>, <b>openai</b>), <b>tenacity</b> for retries around your own calls, <b>structlog</b>, <b>pytest</b>, <b>Ruff</b>, <b>mypy</b> / <b>Pyright</b> / <b>ty</b>, Docker. A complete small service and its tests (tested with FastAPI 0.162 and pytest 9 on Python 3.13; <code>fastapi.sse</code> needs FastAPI ≥ 0.135):</p>
+<pre><code><span class="c"># app.py</span>
+<span class="k">import</span> json, logging, time, uuid
+<span class="k">from</span> collections.abc <span class="k">import</span> AsyncIterable, AsyncIterator
+<span class="k">from</span> typing <span class="k">import</span> Protocol
+
+<span class="k">from</span> fastapi <span class="k">import</span> Depends, FastAPI
+<span class="k">from</span> fastapi.sse <span class="k">import</span> EventSourceResponse, ServerSentEvent
+<span class="k">from</span> pydantic <span class="k">import</span> BaseModel, Field, SecretStr
+<span class="k">from</span> pydantic_settings <span class="k">import</span> BaseSettings, SettingsConfigDict
+
+
+<span class="k">class</span> Settings(BaseSettings):                  <span class="c"># reads APP_* env vars (or .env)</span>
+    model_config = SettingsConfigDict(env_prefix=<span class="s">"APP_"</span>, env_file=<span class="s">".env"</span>)
+    llm_api_key: SecretStr = SecretStr(<span class="s">""</span>)     <span class="c"># SecretStr never prints its value</span>
+    llm_model: str = <span class="s">"your-model-id"</span>
+    llm_timeout_s: float = <span class="n">20.0</span>                <span class="c"># not the 10-minute SDK default</span>
+    llm_max_retries: int = <span class="n">2</span>
+
+
+<span class="k">class</span> AskRequest(BaseModel):
+    question: str = Field(min_length=<span class="n">1</span>, max_length=<span class="n">2_000</span>)
+    top_k: int = Field(default=<span class="n">3</span>, ge=<span class="n">1</span>, le=<span class="n">20</span>)
+
+
+<span class="k">class</span> AskResponse(BaseModel):
+    answer: str
+    sources: list[str]
+
+
+<span class="k">class</span> LLM(Protocol):
+    <span class="k">def</span> stream(self, prompt: str) -> AsyncIterator[str]: ...
+
+
+<span class="k">class</span> ProviderLLM:                             <span class="c"># the real thing (Anthropic SDK shown)</span>
+    <span class="k">def</span> __init__(self, s: Settings):
+        <span class="k">from</span> anthropic <span class="k">import</span> AsyncAnthropic
+        self.model = s.llm_model
+        self.client = AsyncAnthropic(api_key=s.llm_api_key.get_secret_value(),
+                                     timeout=s.llm_timeout_s, max_retries=s.llm_max_retries)
+
+    <span class="k">async def</span> stream(self, prompt: str) -> AsyncIterator[str]:
+        <span class="k">async with</span> self.client.messages.stream(
+            model=self.model, max_tokens=<span class="n">512</span>,
+            messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: prompt}],
+        ) <span class="k">as</span> stream:
+            <span class="k">async for</span> text <span class="k">in</span> stream.text_stream:
+                <span class="k">yield</span> text
+
+
+DOCS = {<span class="s">"refunds"</span>: <span class="s">"Refunds are available within 30 days."</span>,
+        <span class="s">"shipping"</span>: <span class="s">"Standard shipping takes 3 to 5 business days."</span>}
+log = logging.getLogger(<span class="s">"rag"</span>)
+app = FastAPI()
+
+
+<span class="k">def</span> get_llm() -> LLM:                          <span class="c"># tests replace this dependency</span>
+    <span class="k">return</span> ProviderLLM(Settings())
+
+
+<span class="k">def</span> build_prompt(question: str, k: int) -> tuple[str, list[str]]:
+    ids = list(DOCS)[:k]                       <span class="c"># stand-in for real retrieval (Phase 3)</span>
+    context = <span class="s">"\n"</span>.join(<span class="s">f"[{i}] {DOCS[i]}"</span> <span class="k">for</span> i <span class="k">in</span> ids)
+    <span class="k">return</span> <span class="s">f"Answer from the context only.\n&lt;context&gt;\n{context}\n&lt;/context&gt;\nQ: {question}"</span>, ids
+
+
+@app.post(<span class="s">"/ask"</span>, response_model=AskResponse)
+<span class="k">async def</span> ask(req: AskRequest, llm: LLM = Depends(get_llm)) -> AskResponse:
+    t0, rid = time.perf_counter(), uuid.uuid4().hex[:<span class="n">8</span>]
+    prompt, ids = build_prompt(req.question, req.top_k)
+    answer = <span class="s">""</span>.join([tok <span class="k">async for</span> tok <span class="k">in</span> llm.stream(prompt)])
+    log.info(json.dumps({<span class="s">"event"</span>: <span class="s">"ask"</span>, <span class="s">"request_id"</span>: rid, <span class="s">"sources"</span>: ids,
+                         <span class="s">"latency_ms"</span>: round(<span class="n">1000</span> * (time.perf_counter() - t0))}))
+    <span class="k">return</span> AskResponse(answer=answer, sources=ids)
+
+
+@app.post(<span class="s">"/ask/stream"</span>, response_class=EventSourceResponse)   <span class="c"># FastAPI >= 0.135</span>
+<span class="k">async def</span> ask_stream(req: AskRequest, llm: LLM = Depends(get_llm)) -> AsyncIterable[ServerSentEvent]:
+    prompt, ids = build_prompt(req.question, req.top_k)
+    <span class="k">async for</span> tok <span class="k">in</span> llm.stream(prompt):
+        <span class="k">yield</span> ServerSentEvent(data=tok, event=<span class="s">"token"</span>)
+    <span class="k">yield</span> ServerSentEvent(data={<span class="s">"sources"</span>: ids}, event=<span class="s">"sources"</span>)
+    <span class="k">yield</span> ServerSentEvent(raw_data=<span class="s">"[DONE]"</span>, event=<span class="s">"done"</span>)</code></pre>
+<pre><code><span class="c"># test_app.py   (run: uv run pytest -q)</span>
+<span class="k">import</span> pytest
+<span class="k">from</span> fastapi.testclient <span class="k">import</span> TestClient
+
+<span class="k">from</span> app <span class="k">import</span> AskResponse, app, get_llm
+
+
+<span class="k">class</span> FakeLLM:                                  <span class="c"># scripted stand-in: no network, no cost</span>
+    <span class="k">def</span> __init__(self, tokens):
+        self.tokens, self.prompts = tokens, []
+
+    <span class="k">async def</span> stream(self, prompt):
+        self.prompts.append(prompt)
+        <span class="k">for</span> t <span class="k">in</span> self.tokens:
+            <span class="k">yield</span> t
+
+
+@pytest.fixture
+<span class="k">def</span> fake():
+    llm = FakeLLM([<span class="s">"Refunds "</span>, <span class="s">"take "</span>, <span class="s">"30 days."</span>])
+    app.dependency_overrides[get_llm] = <span class="k">lambda</span>: llm
+    <span class="k">yield</span> llm
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+<span class="k">def</span> client():
+    <span class="k">return</span> TestClient(app)
+
+
+<span class="k">def</span> test_answer_matches_contract(client, fake):          <span class="c"># contract / schema test</span>
+    r = client.post(<span class="s">"/ask"</span>, json={<span class="s">"question"</span>: <span class="s">"How long do refunds take?"</span>})
+    <span class="k">assert</span> r.status_code == <span class="n">200</span>
+    body = AskResponse.model_validate(r.json())
+    <span class="k">assert</span> body.answer == <span class="s">"Refunds take 30 days."</span>
+
+
+<span class="k">def</span> test_prompt_contains_retrieved_context(client, fake):  <span class="c"># unit test, mocked LLM</span>
+    client.post(<span class="s">"/ask"</span>, json={<span class="s">"question"</span>: <span class="s">"refunds?"</span>, <span class="s">"top_k"</span>: <span class="n">1</span>})
+    <span class="k">assert</span> <span class="s">"within 30 days"</span> <span class="k">in</span> fake.prompts[<span class="n">0</span>]
+
+
+<span class="k">def</span> test_empty_question_is_rejected(client, fake):
+    r = client.post(<span class="s">"/ask"</span>, json={<span class="s">"question"</span>: <span class="s">""</span>})
+    <span class="k">assert</span> r.status_code == <span class="n">422</span>                            <span class="c"># Pydantic validation error</span>
+
+
+<span class="k">def</span> test_stream_ends_with_done(client, fake):
+    <span class="k">with</span> client.stream(<span class="s">"POST"</span>, <span class="s">"/ask/stream"</span>, json={<span class="s">"question"</span>: <span class="s">"refunds?"</span>}) <span class="k">as</span> r:
+        body = <span class="s">""</span>.join(r.iter_text())
+    <span class="k">assert</span> <span class="s">"event: token"</span> <span class="k">in</span> body
+    <span class="k">assert</span> body.rstrip().endswith(<span class="s">"data: [DONE]"</span>)</code></pre>
+    <p class="hint">Run locally with <code>uv run fastapi dev app.py</code> (needs the <code>fastapi[standard]</code> extra) or <code>uv run uvicorn app:app --reload</code>, then try <code>curl -N -X POST localhost:8000/ask/stream -H 'content-type: application/json' -d '{"question":"refunds?"}'</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Streaming (SSE)</td><td>First words in ~1 s; short read timeouts become safe</td><td>Errors mid-stream need their own event; harder to post-process or validate the whole answer first</td></tr>
+      <tr><td>Short timeouts + retries</td><td>Bounded waits; recovers from transient failures</td><td>Too short kills healthy requests; retries multiply load during an outage</td></tr>
+      <tr><td>BackgroundTasks</td><td>Zero infrastructure</td><td>Lost on restart; competes with requests for CPU</td></tr>
+      <tr><td>A job queue (Celery, cloud queues)</td><td>Durable, retried, scaled separately</td><td>More moving parts to run and monitor</td></tr>
+      <tr><td>Mocked-LLM tests</td><td>Fast, free, deterministic</td><td>Say nothing about answer quality: you still need the golden eval</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>One FastAPI service: uv + lockfile, Pydantic models on every endpoint, SSE streaming, timeouts set explicitly, settings from env vars, JSON logs with a request ID, and a pytest suite with a fake LLM that runs in under 10 s. A 50-question golden eval you run by hand before changing the prompt.</p></div>
+      <div><h4>At scale</h4><p>A shared internal “LLM client” package with timeouts, retries, budgets and tracing built in (often behind an LLM gateway, Lesson 8.1), contract tests between teams, golden evals gating every prompt or model change in CI, queues for indexing and batch jobs, and images built from locked dependencies with provenance checks.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Take this notebook that calls an LLM and turn it into a production API.” A senior answer covers:</p>
+    <ul>
+      <li><b>Contract</b>: Pydantic request/response models, input limits, 422s, versioned endpoints.</li>
+      <li><b>Latency</b>: streaming over SSE, async I/O for the provider call (Lesson P.3), and what TTFT the product needs.</li>
+      <li><b>Failure</b>: explicit read timeouts, retries only on 408/429/5xx/connection errors with jittered backoff, an overall deadline, and a fallback model or a clear error (Lesson 8.1).</li>
+      <li><b>Operations</b>: env-based config with secrets in a store, structured logs with tokens and latency per request, a lockfile and a container image.</li>
+      <li><b>Testing</b>: mocked-LLM unit tests and contract tests on every commit, a golden eval on prompt/model changes.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Retries and timeouts built into the SDK</b> <span class="tag oss">🧰 OpenAI Python SDK</span> <a href="https://github.com/openai/openai-python" target="_blank" rel="noopener">openai-python README</a></div>
+      <p><b>How:</b> connection errors, 408, 409, 429 and ≥500 responses are retried 2 times with short exponential backoff; requests time out after 10 minutes by default; responses are Pydantic models. Stream consumption is not retried automatically.</p>
+      <p><b>Why this method:</b> transient failures are common at LLM scale, and replaying a stream could duplicate output the app already received.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The same defaults, configurable per request</b> <span class="tag oss">🧰 Anthropic Python SDK</span> <a href="https://platform.claude.com/docs/en/api/sdks/python" target="_blank" rel="noopener">Claude SDK for Python docs</a></div>
+      <p><b>How:</b> 2 automatic retries with exponential backoff, a 10-minute default timeout, both overridable on the client or per call with <code>with_options(...)</code>; an async client and a streaming helper with <code>text_stream</code>.</p>
+      <p><b>Why this method:</b> the docs recommend streaming for long requests, because idle connections can be dropped by networks before a long non-streamed answer arrives.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>SSE as a first-class response</b> <span class="tag oss">🧰 FastAPI · 0.135+</span> <a href="https://fastapi.tiangolo.com/tutorial/server-sent-events/" target="_blank" rel="noopener">Server-Sent Events (SSE)</a></div>
+      <p><b>How:</b> <code>yield</code> items or <code>ServerSentEvent</code>s from a path operation with <code>response_class=EventSourceResponse</code>; works with POST (as MCP uses it).</p>
+      <p><b>Why this method:</b> the docs name AI chat streaming as a main use; FastAPI adds a 15-second keep-alive ping, <code>Cache-Control: no-cache</code> and <code>X-Accel-Buffering: no</code> so proxies don't buffer or close the stream.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Locked, layered container builds</b> <span class="tag oss">🧰 uv</span> <a href="https://docs.astral.sh/uv/guides/integration/docker/" target="_blank" rel="noopener">Using uv in Docker</a></div>
+      <p><b>How:</b> pin the uv image version, <code>uv sync --locked</code> so builds fail if the lockfile is stale, install dependencies in an intermediate layer before copying the code, and keep <code>.venv</code> out of the image.</p>
+      <p><b>Why this method:</b> reproducible images, and rebuilds after a code change reuse the cached dependency layer.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the error that tells you exactly what's wrong</span>
+    <p>That 422 isn't a generic “bad request”. Pydantic's error lists the <code>type</code> (<code>string_too_short</code>), the exact location (<code>["body", "question"]</code>), the bad input and the constraint (<code>min_length: 1</code>). That precision is why the same structured error is what you feed back to a model whose JSON failed validation, in the validate-and-retry loop for structured outputs (Lesson 1.3).</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Type hints and Pydantic build on P.1; streaming endpoints are async generators (P.2–P.3); worker processes and the event loop come from P.4. Calling and streaming models is Lesson 0.5, validated structured output Lesson 1.3, golden evals in CI Lessons 5.1 and 5.6, gateways, fallbacks and tracing Lesson 8.1. In the System Design course: <a href="../../system-design-course/phase4/4-resilience.html">resilience (timeouts, retries, circuit breakers)</a>, <a href="../../system-design-course/phase3/1-queues.html">queues</a> and <a href="../../system-design-course/phase6/1-cicd.html">CI/CD</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.astral.sh/uv/guides/projects/" target="_blank" rel="noopener">uv: working on projects</a>. pyproject, lockfile, <code>uv add</code>, <code>uv run</code>.</li>
+      <li><span class="kind">Docs</span> <a href="https://fastapi.tiangolo.com/advanced/settings/" target="_blank" rel="noopener">FastAPI: settings and environment variables</a>. pydantic-settings, caching settings, overriding in tests.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.python-httpx.org/advanced/timeouts/" target="_blank" rel="noopener">HTTPX timeouts</a>. Connect, read, write and pool timeouts, and what each one means.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You set the SDK to <code>timeout=30</code> and <code>max_retries=2</code>. The provider accepts the connection and then sends nothing, every time. Roughly how long until your user gets an error?</div>
+    <div class="opts"><button class="opt">30 s</button><button class="opt" data-ok>About 90 s, plus a little backoff</button><button class="opt">30 minutes</button></div>
+    <div class="explain">max_retries=2 means 3 attempts: 3 × 30 s = 90 s, plus short exponential backoff between attempts. With the 10-minute default it would be 30 minutes. Add an overall deadline if you need a hard cap.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A teammate renamed the response field <code>answer</code> to <code>text</code>. Unit tests and the golden eval are green, and the mobile app broke in production. Which test would have caught it?</div>
+    <div class="opts"><button class="opt">More golden-eval questions</button><button class="opt" data-ok>A contract test that validates responses against the published response model (or the OpenAPI schema clients depend on)</button><button class="opt">A test with a bigger model</button></div>
+    <div class="explain">Answer quality didn't change, so evals stay green; the <i>shape</i> did. Contract tests pin the API shape that other teams and apps rely on.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. An admin endpoint re-embeds 50,000 documents using <code>BackgroundTasks</code>. Deploys happen several times a day, and some documents never get re-embedded. What's the right fix?</div>
+    <div class="opts"><button class="opt">Raise the provider timeout</button><button class="opt">Make the endpoint wait until the job finishes</button><button class="opt" data-ok>Put the job on a durable queue processed by separate workers, with retries and progress tracking</button></div>
+    <div class="explain">BackgroundTasks run in the web process after the response; a restart loses them. A queue (Celery, a cloud queue) stores the job, retries failures, and lets you scale workers separately from the API.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>uv + <code>pyproject.toml</code> + <code>uv.lock</code>: the same dependencies on every machine; <code>uv sync --locked</code> in CI and Docker.</li>
+      <li>Pydantic models at the boundary: 422 before you spend a token; the response model is your contract.</li>
+      <li>Stream with SSE (<code>EventSourceResponse</code>); pair it with a short read timeout.</li>
+      <li>Never ship SDK defaults blindly: worst case = attempts × timeout. Retry only 408/429/5xx/connection errors, with jitter.</li>
+      <li>Settings from env (SecretStr), JSON logs per request, queues for heavy jobs.</li>
+      <li>Test with a fake LLM via dependency overrides; contract tests for shape; golden evals for quality.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // ---------- Playground 1: request lifecycle ----------
+  const TO = [5, 10, 15, 20, 60, 600];
+  const F = new Flow($("lc-flow"), { width: 720, height: 170 });
+  F.node("cl", { x: 80, y: 85, w: 120, h: 50, label: "Client app", sub: "POST /ask", kind: "cl" })
+   .node("api", { x: 260, y: 85, w: 140, h: 50, label: "FastAPI", sub: "validate body", kind: "sv" })
+   .node("db", { x: 440, y: 40, w: 130, h: 46, label: "Retrieval", sub: "vector search", kind: "db" })
+   .node("llm", { x: 620, y: 110, w: 140, h: 50, label: "LLM provider", sub: "scripted", kind: "nw" })
+   .edge("cl", "api", { label: "JSON" }).edge("api", "db").edge("api", "llm", { label: "prompt" }).render();
+  let scen = "ok", runId = 0;
+  const segBtns = [...$("lc-sc").querySelectorAll("button")];
+  segBtns.forEach(b => (b.onclick = () => { segBtns.forEach(x => x.classList.toggle("on", x === b)); scen = b.dataset.v; labels(); }));
+  function labels() {
+    const t = TO[+$("lc-to").value];
+    $("lc-tov").textContent = t >= 600 ? "600 s (SDK default)" : t + " s";
+    $("lc-rev").textContent = $("lc-re").value + ($("lc-re").value === "2" ? " (default)" : "");
+  }
+  ["lc-to", "lc-re"].forEach(id => ($(id).oninput = labels));
+  labels();
+  const fmtT = s => s < 0.001 ? "< 1 ms" : s >= 120 ? (s / 60).toFixed(1) + " min" : s >= 10 ? s.toFixed(0) + " s" : s >= 1 ? s.toFixed(1) + " s" : Math.round(s * 1000) + " ms";
+  const ANSWER = "Refunds are available within 30 days of delivery, and Plus members get 60 days. The money goes back to your original payment method within 5 business days.";
+
+  // Pure simulation: returns the timeline. Prototype-checked: defaults + 'down' = 1,800 s + backoff.
+  function simulate(sc, timeout, retries, streaming) {
+    const ev = []; let t = 0;
+    const L = (msg, cls) => ev.push({ t, msg, cls });
+    L("POST /ask received");
+    if (sc === "bad") { t += 0.0008; L('422 · body.question: Field required → returned before any model call', "rk"); return { ev, status: 422, ttfb: null, total: t, attempts: 0, ok: false }; }
+    t += 0.0005; L("✓ AskRequest validated");
+    t += 0.08; L("retrieved 3 chunks (80 ms)");
+    const nTok = sc === "long" ? 300 : 40, TTFT = 0.8, RATE = 25;
+    for (let a = 0; a <= retries; a++) {
+      if (a > 0) { const b = 0.5 * 2 ** (a - 1); t += b; L(`backoff ${b.toFixed(1)} s, then retry #${a}`, "tk"); }
+      L(`attempt ${a + 1}: calling provider (read timeout ${timeout} s)`);
+      const hang = sc === "down" || (sc === "hang1" && a === 0);
+      if (sc === "r429" && a === 0) { t += 0.2; L("provider → 429 Too Many Requests (retryable)", "rk"); continue; }
+      if (hang) { t += timeout; L(`no bytes for ${timeout} s → ReadTimeout (retryable)`, "rk"); continue; }
+      const genTime = nTok / RATE;
+      const longestGap = streaming ? TTFT : TTFT + genTime;
+      if (longestGap > timeout) { t += timeout; L(`answer not finished after ${timeout} s (no streaming, so no bytes yet) → ReadTimeout`, "rk"); continue; }
+      const first = t + TTFT;
+      if (streaming) { t = first; L(`first token after ${TTFT} s, streaming ${nTok} tokens to the client`, "ev"); t = first + genTime; }
+      else { t = first + genTime; L(`full answer received after ${(TTFT + genTime).toFixed(1)} s (nothing to show until now)`, "ev"); }
+      L(`200 OK · ${nTok} output tokens`, "ev");
+      return { ev, status: 200, ttfb: streaming ? first : t, total: t, attempts: a + 1, ok: true, nTok, streaming };
+    }
+    L(`all ${retries + 1} attempts failed → 504 to the client`, "rk");
+    return { ev, status: 504, ttfb: null, total: t, attempts: retries + 1, ok: false };
+  }
+  $("lc-run").onclick = async () => {
+    const id = ++runId, timeout = TO[+$("lc-to").value], retries = +$("lc-re").value, streaming = $("lc-st").checked;
+    const R = simulate(scen, timeout, retries, streaming);
+    ["cl", "api", "db", "llm"].forEach(n => F.set(n, { hot: false, down: false }));
+    F.set("llm", { sub: "scripted" }); F.set("api", { sub: "validate body" });
+    $("lc-out").innerHTML = '<span class="muted">waiting…</span>'; $("lc-verdict").textContent = "";
+    ["lc-status", "lc-ttfb", "lc-total", "lc-att"].forEach(k => ($(k).textContent = "…"));
+    $("lc-log").innerHTML = R.ev.map(e => `<div${e.cls ? ` class="${e.cls}"` : ""}>[t=${fmtT(e.t).padStart(7)}] ${e.msg}</div>`).join("");
+    await F.packet(["cl", "api"], { color: "--c-in", dur: 350 });
+    if (id !== runId) return;
+    if (R.status === 422) { F.set("api", { hot: true, sub: "422 invalid body" }); await F.packet(["api", "cl"], { color: "--c-rk", dur: 350 }); }
+    else {
+      await F.packet(["api", "db"], { color: "--c-cx", dur: 300, back: true });
+      for (let a = 0; a < Math.max(1, R.attempts); a++) {
+        if (id !== runId) return;
+        F.set("llm", { sub: `attempt ${a + 1}`, hot: !R.ok || a < R.attempts - 1 });
+        await F.packet(["api", "llm"], { color: "--c-md", dur: 300, back: R.ok && a === R.attempts - 1 });
+      }
+      F.set("llm", { hot: !R.ok, down: R.status === 504, sub: R.ok ? "200 OK" : "timed out" });
+      if (R.ok && R.streaming) {
+        const words = ANSWER.split(" "); $("lc-out").textContent = "";
+        for (let i = 0; i < words.length; i++) { if (id !== runId) return; $("lc-out").textContent += words[i] + " "; await sleep(25); }
+      } else if (R.ok) { await sleep(300); $("lc-out").textContent = ANSWER; }
+    }
+    if (id !== runId) return;
+    if (!R.ok) $("lc-out").innerHTML = `<span class="rk">${R.status === 422 ? "422: please enter a question." : "Sorry, something went wrong. Please try again."}</span>`;
+    $("lc-status").textContent = R.status;
+    $("lc-ttfb").textContent = R.ttfb == null ? "never" : fmtT(R.ttfb);
+    $("lc-total").textContent = fmtT(R.total);
+    $("lc-att").textContent = R.attempts;
+    $("lc-verdict").innerHTML = R.status === 422 ? '<span class="ev">Rejected at the boundary in under a millisecond: no retrieval, no tokens, no cost.</span>'
+      : !R.ok && R.total > 300 ? `<span class="rk">The user waited ${fmtT(R.total)} for an error. Lower the read timeout (and maybe retries) so the worst case fits your product.</span>`
+      : !R.ok && scen === "long" ? '<span class="rk">A healthy answer was killed by the timeout on every attempt. Turn on streaming (the read timeout then only covers gaps between tokens) or raise the timeout.</span>'
+      : !R.ok ? `<span class="tk">Failed fast: a clear error after ${fmtT(R.total)}. Good, if the provider is truly down; consider a fallback model (Lesson 8.1).</span>`
+      : R.attempts > 1 ? `<span class="ev">Recovered by retrying (${R.attempts} attempts). The user barely noticed.</span>`
+      : !R.streaming && R.total > 5 ? `<span class="tk">Worked, but the user stared at a spinner for ${fmtT(R.total)}. Streaming would show words after about a second.</span>`
+      : '<span class="ev">Healthy request.</span>';
+  };
+
+  // ---------- Playground 2: test-suite builder ----------
+  const CHECKS = {
+    unit: ["unit", 4, 0], contract: ["contract", 3, 0], golden: ["golden eval", 360, 0.6], static: ["types + Ruff", 5, 0],
+  };
+  const BUGS = [
+    ["The prompt template drops {context}: the model never sees retrieved chunks and answers from memory.", ["unit", "golden"]],
+    ["The response field answer was renamed text; the mobile app shows blank answers.", ["contract"]],
+    ["A new prompt wording makes 12% of refund answers wrong, though they look fluent.", ["golden"]],
+    ["The retry wrapper also retries 400 Bad Request: three identical failing calls on bad input.", ["unit"]],
+    ["Guest users have name = None, passed where a str is expected; the greeting crashes for guests.", ["static"]],
+    ["The model returns invalid JSON about 3% of the time; the parser raises and the API returns 500.", ["unit"]],
+    ["The streaming endpoint never sends the final done event; the UI spinner never stops.", ["contract"]],
+    ["An undefined variable sits in a rarely used error branch.", ["static"]],
+    ["Provider latency doubles at peak hours.", []],
+  ];
+  function runCI() {
+    const on = Object.keys(CHECKS).filter(k => $("ts-" + k).checked);
+    let caught = 0;
+    $("ts-bugs").innerHTML = BUGS.map(([txt, by], i) => {
+      const hit = by.filter(k => on.includes(k)); if (hit.length) caught++;
+      const right = hit.length ? hit.map(k => `<span class="chip hit">✓ ${CHECKS[k][0]}</span>`).join("")
+        : by.length ? `<span class="rk">🚨 shipped</span> <span class="muted">(needs ${by.map(k => CHECKS[k][0]).join(" or ")})</span>`
+        : '<span class="tk">no test catches this: monitoring does (Lesson 8.1)</span>';
+      return `<div class="bug ${hit.length ? "ok" : "no"}"><span>${i + 1}. ${txt}</span><span>${right}</span></div>`;
+    }).join("");
+    const secs = on.reduce((s, k) => s + CHECKS[k][1], 0), cost = on.reduce((s, k) => s + CHECKS[k][2], 0);
+    $("ts-score").textContent = `${caught} / 8 testable`;
+    $("ts-time").textContent = secs >= 60 ? (secs / 60).toFixed(1) + " min" : secs + " s";
+    $("ts-cost").textContent = "$" + cost.toFixed(2);
+    const all = caught === 8;
+    $("ts-verdict").innerHTML = !on.length ? '<span class="rk">No checks: every bug ships.</span>'
+      : all ? `<span class="ev">✅ Every testable bug is caught. Run the cheap three on every commit (${on.filter(k => k !== "golden").reduce((s, k) => s + CHECKS[k][1], 0)} s, $0) and the golden eval when the prompt or model changes.</span>`
+      : on.length === 1 && on[0] === "golden" ? '<span class="tk">The golden eval sees quality, but not shape, types or error paths, and it costs money on every run.</span>'
+      : `<span class="tk">${8 - caught} testable bug${8 - caught > 1 ? "s" : ""} still ship. Each kind of check sees a different layer.</span>`;
+  }
+  $("ts-run").onclick = runCI;
+  Object.keys(CHECKS).forEach(k => ($("ts-" + k).onchange = runCI));
+  runCI();
+})();
+</script>
+</body>
+</html>

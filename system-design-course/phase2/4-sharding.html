@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.4 Sharding &amp; consistent hashing · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  #ring { width: 100%; height: auto; display: block; background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; }
+  #ring text { font-size: 12px; fill: var(--muted); font-family: var(--font); }
+</style>
+</head>
+<body data-lesson="s2-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 4</div>
+  <h1>Sharding &amp; consistent hashing</h1>
+  <p class="subtitle">Split one database into many smaller ones, each holding a slice of the data, so writes and storage can grow past one machine. It's the most powerful scaling move for data, and the hardest to undo.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Replicas</b> spread reads but every write still goes to one leader (Lesson 2.3).</li>
+      <li>An <b>index</b> has to fit mostly in memory to stay fast (Lesson 2.2).</li>
+      <li>A <b>hash function</b> turns any key into a number that looks random, the same way every time (like <code>md5("user42")</code>).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2021 Notion took its app down for <b>five minutes</b> of scheduled maintenance. Behind that was months of work: splitting a single Postgres database into <b>480 logical shards</b> spread over <b>32 physical databases</b>, 15 shards each, with all of a workspace's data kept together.</p>
+    <p>Why 480? Because it divides evenly by 2, 3, 4, 5, 6, 8, 10, 12, 15, 16, 20, 24, 30, 32, 40, 48, 60, 80, 96, 120, 160 and 240, so they could later move to many different numbers of machines and keep shards evenly spread. Sharding is full of decisions like that, made early, that are expensive to change.</p>
+  </div>
+
+  <h2>Numbers first: when one leader isn't enough</h2>
+  <p>A typical growing product: <b>40 TB</b> of data, <b>40,000 writes/s</b> at peak. Suppose one primary comfortably handles about <b>5,000 writes/s</b> and about <b>2 TB</b> before backups, index builds and vacuums get painful. (Notion's own limits were 500 GB per table and 10 TB per physical database.)</p>
+  <table>
+    <tr><th>Limit</th><th>Need</th><th>One machine</th><th>Shards needed</th></tr>
+    <tr><td>Writes</td><td>40,000/s</td><td>~5,000/s</td><td>40,000 ÷ 5,000 = <b>8</b></td></tr>
+    <tr><td>Storage</td><td>40 TB</td><td>~2 TB</td><td>40 ÷ 2 = <b>20</b></td></tr>
+    <tr><td>Answer</td><td colspan="2">The bigger number wins, plus room to grow</td><td><b>32 shards</b></td></tr>
+  </table>
+  <p>Replicas can't fix either row: each replica stores <b>all</b> the data and replays <b>every</b> write. Only splitting the data helps.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Sharding (also called <b>partitioning</b>) gives each machine a <b>slice</b> of the rows, chosen by a <b>shard key</b>. Pick the key so that the hot queries need only one shard and the load spreads evenly. Get the key wrong and you get hot shards, or queries that must ask every shard.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the post office sorting room</span>
+    <p>One clerk can't sort a city's mail, so you hire 26 and give each a letter of the alphabet by surname. That's range sharding. It's lovely until you notice that far more people are named Smith than Xu, and the “S” clerk drowns (a <b>hot shard</b>). So you sort by a scrambled code instead (hash sharding): even work for everyone, but “all surnames from Sa to Sm” now means asking every clerk. And if you hire a 27th clerk, almost everyone's pile has to be redealt, unless you planned for it (consistent hashing).</p>
+  </div>
+
+  <h2>Choosing a shard key</h2>
+  <table>
+    <tr><th>Strategy</th><th>How it routes</th><th>Good at</th><th>Bad at</th></tr>
+    <tr><td><b>Hash</b> of the key</td><td><code>shard = hash(user_id) mod N</code>, or a ring (below)</td><td>Even spread of data and load</td><td>Range queries (“all orders this week”) hit every shard</td></tr>
+    <tr><td><b>Range</b> of the key</td><td>Users A–F on shard 1, G–M on shard 2… or by date</td><td>Range scans stay on one shard</td><td>Hot spots: sequential IDs and timestamps pile new writes onto the last shard</td></tr>
+    <tr><td><b>Directory</b> (lookup table)</td><td>A small service maps key → shard</td><td>Move any customer anywhere; isolate a giant customer</td><td>One more lookup and one more system to keep available</td></tr>
+  </table>
+  <p>Good shard keys come from your access patterns (Lesson 2.1). Notion and Slack shard by <b>workspace</b>, because almost every query is inside one workspace. Instagram shards by <b>user</b>. Discord partitions messages by <b>channel and time bucket</b>.</p>
+  <p>What you give up: <b>joins and transactions across shards</b>. Notion notes that transaction guarantees apply only within each database, so a change that touches two shards can half-succeed. Queries without the shard key become <b>scatter-gather</b>: ask every shard and merge.</p>
+
+  <div class="playground" id="pg-key">
+    <span class="label">🎮 Playground · Pick a shard key</span>
+    <p class="hint"><b>8,000 order writes/s</b> over 8 shards. Each shard can take about <b>1,500 writes/s</b> (assumed). Choose the key, then add a celebrity seller whose orders are a big share of all traffic. Bars inside each shard show its load.</p>
+    <svg id="kf"></svg>
+    <div class="controls">
+      <span class="seg" id="k-key"><button id="k-key-hash" data-v="hash" class="on">hash(user_id)</button><button id="k-key-rid" data-v="rid">range(user_id), sequential IDs</button><button id="k-key-time" data-v="time">range(created_at)</button></span>
+    </div>
+    <div class="controls">
+      <label>celebrity share of writes <input type="range" id="k-celeb" min="0" max="40" step="5" value="0"> <b class="mono" id="k-celebv"></b></label>
+      <label><input type="checkbox" id="k-salt"> split the hot key (<code>user_id#0…7</code>)</label>
+      <button class="btn primary" id="k-send">Send 16 writes</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">hottest shard <b id="k-hot">–</b></div>
+      <div class="stat">writes rejected <b id="k-rej">–</b></div>
+      <div class="stat">“one user's orders” asks <b id="k-q1">–</b></div>
+      <div class="stat">“orders in the last hour” asks <b id="k-q2">–</b></div>
+    </div>
+    <p class="hint" id="k-msg"></p>
+  </div>
+  <p>Things to try: <code>range(created_at)</code> looks tidy, but every new order lands on the newest shard: one machine does all the work while seven sit idle. Sequential user IDs do something similar, because new users tend to be the most active. Back on <code>hash(user_id)</code>, push the celebrity to 30%: hashing can't spread a single key, so one shard melts anyway. Splitting the hot key spreads it, at the price of reading 8 places to show that seller's orders.</p>
+
+  <h2>Resharding, and why <code>mod N</code> hurts</h2>
+  <p>With <code>shard = hash(key) mod N</code>, changing N changes almost every answer. Going from 4 to 5 shards, a key stays put only if <code>h mod 4 = h mod 5</code>, which is true for 1 key in 5. So <b>80% of the data has to move</b>. For a cache cluster that's 80% misses at once (Lesson 1.3); for a database it's moving 80% of your terabytes while serving traffic.</p>
+  <p><b>Consistent hashing</b> fixes this. Put both servers and keys on a ring of hash values (0 to 2³²). Each key belongs to the first server clockwise from it. Add a server and it only takes keys from its neighbour on the ring: about <b>1/N of the keys move</b>, the minimum possible. To even out the slices, each physical server gets many points on the ring, called <b>virtual nodes</b>. The Dynamo paper uses this, and notes you can give bigger machines more virtual nodes.</p>
+
+  <div class="playground" id="pg-ring">
+    <span class="label">🎮 Playground · The consistent-hash ring</span>
+    <p class="hint">20,000 keys, hashed onto the ring. Ticks are server positions (virtual nodes), dots are a sample of keys coloured by their owner. Add or remove a server and count the keys that move (flashed in red). Then compare with <code>hash mod N</code>.</p>
+    <svg id="ring" viewBox="0 0 720 300"></svg>
+    <div class="controls">
+      <span class="seg" id="g-mode"><button id="g-mode-ring" data-v="ring" class="on">Consistent hashing</button><button id="g-mode-mod" data-v="mod">hash mod N</button></span>
+      <label>virtual nodes per server <input type="range" id="g-v" min="1" max="200" step="1" value="1"> <b class="mono" id="g-vv"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="g-add">+ Add a server</button>
+      <button class="btn" id="g-rem">− Remove a server</button>
+      <button class="btn" id="g-reset">Reset to 4 servers</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">servers <b id="g-n">–</b></div>
+      <div class="stat">keys moved last change <b id="g-moved">–</b></div>
+      <div class="stat">ideal <b id="g-ideal">–</b></div>
+      <div class="stat">busiest server vs average <b id="g-imb">–</b></div>
+    </div>
+    <canvas class="chart" id="g-chart" style="height:170px"></canvas>
+    <p class="hint" id="g-msg"></p>
+  </div>
+  <p>Things to try: with 1 virtual node per server, the slices are wildly uneven; the busiest server often holds twice its fair share. Slide virtual nodes to 100 or more and the busiest server comes within about 10–20% of average. Now, with 50 or more virtual nodes, add a 5th server: consistent hashing moves about 20% of keys (with 1 virtual node it depends on where the new point happens to land). Switch to <code>mod N</code> and do the same: about 80% move.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: logical shards, the practical trick</span>
+    <p>Many companies skip the ring and use a fixed, large number of <b>logical shards</b> mapped to fewer machines. Instagram used several thousand logical shards in Postgres; Notion used 480.</p>
+    <ul>
+      <li>Route a key: <code>logical = user_id mod 2000</code>. Instagram's own example: user 31341 → 31341 mod 2000 = <b>shard 1341</b>.</li>
+      <li>Map logical to physical with a small table: shards 0–124 on machine 1, 125–249 on machine 2… 2,000 shards on 16 machines is 125 per machine.</li>
+      <li>To grow to 32 machines, move <b>whole logical shards</b> (62 or 63 per machine), with no rehashing of any key. Each move is copy, catch up, switch: the same as building a replica (Lesson 2.3).</li>
+    </ul>
+    <p>The logical-shard count is the one number you can't change cheaply, so pick it big, and (Notion's tip) with lots of divisors.</p>
+  </div>
+
+  <div class="box incident">
+    <span class="label">🔥 Resharding pain · Google's ad backend</span>
+    <p>The Spanner paper (2012) describes F1, Google's advertising backend, which had been on a MySQL database that was manually sharded many ways. Resharding that revenue-critical database as it grew was extremely costly: <b>the last resharding took over two years of intense effort</b>, with coordination and testing across dozens of teams. One reason F1 moved to Spanner was that Spanner reshards data across machines automatically.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Sharding layers for existing databases: <b>Vitess</b> for MySQL (YouTube, Slack; managed as PlanetScale) and <b>Citus</b> for Postgres. Databases that shard themselves: <b>DynamoDB</b>, <b>Cassandra/ScyllaDB</b>, <b>MongoDB</b> (sharded clusters), and distributed SQL like <b>Spanner</b>, <b>CockroachDB</b> and <b>TiDB</b>, which split ranges automatically.</p>
+<pre><code><span class="c">-- Citus (Postgres extension): shard a table by user_id</span>
+<span class="k">SELECT</span> create_distributed_table(<span class="s">'orders'</span>, <span class="s">'user_id'</span>);
+<span class="k">SELECT</span> * <span class="k">FROM</span> orders <span class="k">WHERE</span> user_id = <span class="n">42</span>;          <span class="c">-- routed to one shard</span>
+<span class="k">SELECT</span> count(*) <span class="k">FROM</span> orders <span class="k">WHERE</span> created_at &gt; now() - interval <span class="s">'1 hour'</span>;  <span class="c">-- fans out to all</span>
+
+<span class="c">// Vitess VSchema: shard orders by a hash of user_id</span>
+{ <span class="s">"sharded"</span>: <span class="k">true</span>,
+  <span class="s">"vindexes"</span>: { <span class="s">"hash"</span>: { <span class="s">"type"</span>: <span class="s">"hash"</span> } },
+  <span class="s">"tables"</span>: { <span class="s">"orders"</span>: { <span class="s">"column_vindexes"</span>: [ { <span class="s">"column"</span>: <span class="s">"user_id"</span>, <span class="s">"name"</span>: <span class="s">"hash"</span> } ] } } }
+
+<span class="c"># DynamoDB: the partition key IS the shard key</span>
+aws dynamodb create-table --table-name Orders \
+  --attribute-definitions AttributeName=user_id,AttributeType=S AttributeName=order_id,AttributeType=S \
+  --key-schema AttributeName=user_id,KeyType=HASH AttributeName=order_id,KeyType=RANGE \
+  --billing-mode PAY_PER_REQUEST</code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 8000:8000 amazon/dynamodb-local</code> and add <code>--endpoint-url http://localhost:8000</code> to the command above.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>✅ Shard when…</th><th>❌ Don't shard (yet) when…</th></tr>
+      <tr><td>Writes or data size exceed what one primary can take, with headroom</td><td>A bigger machine, better indexes, or archiving old rows would do (vertical scaling, Lesson 1.1)</td></tr>
+      <tr><td>A natural shard key exists: tenant, workspace, user</td><td>Your hot queries join across many users (a social graph, global leaderboards)</td></tr>
+      <tr><td>You can live without cross-shard transactions, or handle them with sagas (Lesson 3.5)</td><td>The team is small and the cost of operating 32 databases would dominate</td></tr>
+    </table>
+    <p><b>Costs you sign up for:</b> cross-shard queries, rebalancing, per-shard backups and migrations, IDs that must be unique across shards (Instagram packed time, shard and a sequence into one 64-bit ID), and uneven tenants.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Don't shard. One Postgres primary with replicas goes a very long way. But put a <code>tenant_id</code> (or <code>workspace_id</code>) on every table, include it in your keys and queries, and avoid global auto-increment IDs. That makes sharding a project instead of a rewrite when the day comes.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Many logical shards on fewer machines, a routing layer (Vitess, an in-house proxy, or a directory service), automatic shard moves, hot-tenant isolation (a giant customer gets its own shard), and IDs that carry the shard number. Or a database that shards itself, so teams never write routing code.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Interviewers want the <b>shard key</b> and its consequences, not the word “shard”. A senior answer covers:</p>
+    <ul>
+      <li>Why sharding is needed, with numbers (writes/s or TB beyond one machine).</li>
+      <li>The <b>shard key</b>, which queries stay on one shard and which fan out.</li>
+      <li><b>Hot keys</b> (a celebrity, a giant tenant) and how you'd handle them.</li>
+      <li>How you <b>add capacity</b>: consistent hashing or logical shards, and moving data online.</li>
+    </ul>
+    <p>Common follow-ups: “How do you generate unique IDs across shards?” “How do you query by something other than the shard key?” (a secondary index table keyed by that field, or a search index fed by change events).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Logical shards and IDs with the shard inside</b> <span class="tag co">🏢 Instagram · 2012</span> <a href="https://medium.com/instagram-engineering/sharding-ids-at-instagram-1cf5a71e5a5c" target="_blank" rel="noopener">Sharding &amp; IDs at Instagram</a></div>
+      <p><b>How:</b> several thousand logical shards mapped in code to far fewer physical Postgres servers. Each 64-bit ID holds 41 bits of milliseconds since a custom epoch, 13 bits of logical shard ID and 10 bits of a per-shard sequence.</p>
+      <p><b>Why this method:</b> moving logical shards is easy, and every ID says where its row lives and sorts by time, with no central ID service.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Sharding by workspace</b> <span class="tag co">🏢 Notion · 2021</span> <a href="https://www.notion.com/blog/sharding-postgres-at-notion" target="_blank" rel="noopener">Herding elephants: sharding Postgres at Notion</a></div>
+      <p><b>How:</b> 480 logical shards (Postgres schemas) over 32 physical databases, partitioned by workspace ID, with all tables reachable from a block sharded together.</p>
+      <p><b>Why this method:</b> almost every query lives inside one workspace, so it stays on one shard, and related rows stay together for transactions.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>From hand-rolled shards to Vitess</b> <span class="tag co">🏢 Slack · 2020</span> <a href="https://slack.engineering/scaling-datastores-at-slack-with-vitess/" target="_blank" rel="noopener">Scaling Datastores at Slack with Vitess</a></div>
+      <p><b>How:</b> Slack's MySQL shards were partitioned by workspace ID, with a metadata cluster to look up which shard holds a workspace. It migrated to Vitess from 2017; by the post, Vitess served 99% of its query load.</p>
+      <p><b>Why this method:</b> a sharding layer handles routing and resharding in one place, instead of in every service's code.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The ring with virtual nodes</b> <span class="tag co">🏢 Amazon · 2007</span> <a href="https://www.allthingsdistributed.com/files/amazon-dynamo-sosp2007.pdf" target="_blank" rel="noopener">Dynamo (SOSP 2007)</a></div>
+      <p><b>How:</b> Dynamo partitions keys with consistent hashing on a ring, and each node owns many virtual nodes; the count can follow a machine's capacity.</p>
+      <p><b>Why this method:</b> adding or losing a node only moves its neighbours' keys, and virtual nodes spread that work over many machines instead of one.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A database that reshards itself</b> <span class="tag co">🏢 Google · 2012</span> <a href="https://www.usenix.org/conference/osdi12/technical-sessions/presentation/corbett" target="_blank" rel="noopener">Spanner (OSDI 2012)</a></div>
+      <p><b>How:</b> Spanner automatically reshards data across machines as the data or the number of servers changes, and migrates data across machines, even across datacenters, to balance load and respond to failures.</p>
+      <p><b>Why this method:</b> after a manual MySQL reshard that took over two years, removing that work entirely was worth a more complex database.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · why it's called a shard</span>
+    <p>Notion's post says the word is thought to come from the game <b>Ultima Online</b>, whose developers needed a story for running several copies of the game world on separate servers: the world had been shattered into shards.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Each shard is usually replicated (Lesson 2.3). Cross-shard updates need sagas or two-phase commit (Lesson 3.5). Kafka partitions topics by key for the same reasons (Lesson 3.2), and cache clusters use consistent hashing so adding a node doesn't empty the cache (Lesson 1.3). The URL shortener and chat designs both start with “what's the shard key?” (Lessons 7.2 and 7.4).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://www.notion.com/blog/sharding-postgres-at-notion" target="_blank" rel="noopener">Herding elephants (Notion)</a>. A complete, honest sharding project: key choice, shard counts, migration and verification.</li>
+      <li><span class="kind">Blog</span> <a href="https://medium.com/instagram-engineering/sharding-ids-at-instagram-1cf5a71e5a5c" target="_blank" rel="noopener">Sharding &amp; IDs at Instagram</a>. Short, practical, and the origin of a lot of ID schemes.</li>
+      <li><span class="kind">Docs</span> <a href="https://vitess.io/docs/overview/history/" target="_blank" rel="noopener">Vitess history</a>. How YouTube went from one MySQL to replicas to shards.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A cache cluster uses <code>hash(key) mod N</code> and grows from 9 to 10 nodes. About what share of keys now map to a different node?</div>
+    <div class="opts"><button class="opt">About 10%</button><button class="opt">About 50%</button><button class="opt" data-ok>About 90%</button></div>
+    <div class="explain">A key stays only if <code>h mod 9 = h mod 10</code>, true for about 1 in 10 keys, so <b>~90% move</b> and the cache is effectively cold. With consistent hashing only about 1/10 move.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A B2B app (thousands of companies, each with users, projects and tasks) must shard. What's the best shard key?</div>
+    <div class="opts"><button class="opt">created_at, so old data sits on old shards</button><button class="opt" data-ok>company (tenant) ID</button><button class="opt">task ID, hashed for the most even spread</button></div>
+    <div class="explain">Almost every query is “within this company”, so tenant ID keeps them on one shard and keeps related rows together for transactions. Task ID spreads evenly but turns every project page into a scatter-gather. Watch for giant tenants and give them their own shard.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Orders are hash-sharded by user_id. One celebrity seller generates 30% of all writes and their shard is overloaded. What helps?</div>
+    <div class="opts"><button class="opt">Add more shards</button><button class="opt">Switch to range sharding on user_id</button><button class="opt" data-ok>Split that one key across several sub-keys (user_id#0…7), or give the seller dedicated capacity</button></div>
+    <div class="explain">One key always hashes to one place, so more shards don't help it. Splitting (salting) the hot key spreads its writes; reads of that seller then gather from the sub-keys. Big tenants often get their own shard.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Shard when writes or data size outgrow one primary; replicas can't help either.</li>
+      <li>The shard key decides everything: keep hot queries on one shard, spread load evenly, and plan for hot keys.</li>
+      <li><code>mod N</code> moves about N/(N+1) of keys on resize; consistent hashing moves about 1/N; virtual nodes even out the slices.</li>
+      <li>Practical pattern: many logical shards (Instagram thousands, Notion 480) mapped to fewer machines, moved whole.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  // 32-bit hash: FNV-1a then a murmur-style finalizer for a good spread
+  const hash = s => {
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
+    return h >>> 0;
+  };
+
+  // ---------- playground 1: shard key ----------
+  const SH = 8, TOTAL = 8000, CAP = 1500;
+  const K = new Flow($("kf"), { width: 720, height: 220 });
+  K.node("rt", { x: 90, y: 110, w: 120, label: "Router", sub: "8,000 writes/s", kind: "nw" });
+  for (let i = 0; i < SH; i++) K.node("s" + i, { x: 320 + (i % 4) * 118, y: i < 4 ? 55 : 165, w: 104, h: 52, label: "Shard " + (i + 1), sub: "", kind: "db" }).edge("rt", "s" + i);
+  K.render();
+  const getKey = seg("k-key", () => shardKey());
+  const RID = [1, 1, 1.2, 1.4, 1.8, 2.4, 3.4, 6]; // illustrative: newer users (higher IDs) are more active
+  function loads() {
+    const key = getKey(), celeb = +$("k-celeb").value / 100, salt = $("k-salt").checked;
+    let w;
+    if (key === "hash") w = Array(SH).fill(1 / SH);
+    else if (key === "rid") { const t = RID.reduce((a, b) => a + b, 0); w = RID.map(x => x / t); }
+    else w = [0, 0, 0, 0, 0, 0, 0, 1];
+    const L = w.map(x => x * (1 - celeb) * TOTAL);
+    const home = key === "time" ? 7 : 2; // the celebrity's own shard (hash or id range); time range: all new writes are on the newest shard anyway
+    if (salt && key !== "time") for (let i = 0; i < SH; i++) L[i] += celeb * TOTAL / SH; else L[home] += celeb * TOTAL;
+    return { key, celeb, salt, L, home };
+  }
+  function shardKey() {
+    const x = loads();
+    $("k-celebv").textContent = Math.round(x.celeb * 100) + "%";
+    let hot = 0; x.L.forEach((v, i) => { if (v > x.L[hot]) hot = i; });
+    const rej = x.L.reduce((a, v) => a + Math.max(0, v - CAP), 0), over = x.L.filter(v => v > CAP).length;
+    x.L.forEach((v, i) => K.set("s" + i, { load: v / CAP, sub: Math.round(v).toLocaleString() + "/s", hot: v > CAP }));
+    $("k-hot").textContent = `shard ${hot + 1}: ${Math.round(x.L[hot]).toLocaleString()}/s (${Math.round(100 * x.L[hot] / CAP)}% of capacity)`;
+    $("k-rej").textContent = Math.round(rej).toLocaleString() + "/s";
+    const one = x.key === "time" ? "all 8 shards" : x.salt && x.celeb > 0 ? "1 shard (8 for the celebrity)" : "1 shard";
+    $("k-q1").textContent = one; $("k-q2").textContent = x.key === "time" ? "1 shard" : "all 8 shards";
+    $("k-msg").textContent = rej > 0 ? `${over} shard(s) over capacity, ${Math.round(rej).toLocaleString()} writes/s failing or queueing while ${x.L.filter(v => v < CAP * 0.5).length} shard(s) sit under half busy.` :
+      `Every shard under capacity: the busiest is at ${Math.round(100 * x.L[hot] / CAP)}%.`;
+  }
+  const pick = (L, r) => { const t = L.reduce((a, b) => a + b, 0); let u = r * t; for (let i = 0; i < L.length; i++) { u -= L[i]; if (u <= 0) return i; } return L.length - 1; };
+  let sending = false;
+  $("k-send").onclick = async () => {
+    if (sending) return; sending = true;
+    const x = loads();
+    for (let j = 0; j < 16; j++) { const i = pick(x.L, Math.random()); K.packet(["rt", "s" + i], { color: x.L[i] > CAP ? "--c-er" : "--c-cl", dur: 500 }); await sleep(90); }
+    await sleep(500); sending = false;
+  };
+  $("k-celeb").oninput = shardKey; $("k-salt").onchange = shardKey;
+  shardKey();
+
+  // ---------- playground 2: the ring ----------
+  const NK = 20000, KEYS = Array.from({ length: NK }, (_, i) => hash("key:" + i));
+  const SAMPLE = 360;
+  const color = i => `hsl(${(i * 67 + 200) % 360} 70% 55%)`;
+  let servers, nextId, owner = null, lastMoved = null, ringPts = [];
+  const getMode = seg("g-mode", () => { owner = assign(); lastMoved = null; draw(); });
+  function points() {
+    const V = getMode() === "ring" ? +$("g-v").value : 1, pts = [];
+    servers.forEach(s => { for (let v = 0; v < V; v++) pts.push({ h: hash("server-" + s + "#" + v), s }); });
+    return pts.sort((a, b) => a.h - b.h);
+  }
+  function assign() {
+    const out = new Int32Array(NK);
+    if (getMode() === "mod") { for (let i = 0; i < NK; i++) out[i] = servers[KEYS[i] % servers.length]; ringPts = []; return out; }
+    ringPts = points();
+    const hs = ringPts.map(p => p.h);
+    for (let i = 0; i < NK; i++) {
+      let lo = 0, hi = hs.length; const k = KEYS[i];
+      while (lo < hi) { const m = (lo + hi) >> 1; if (hs[m] < k) lo = m + 1; else hi = m; }
+      out[i] = ringPts[lo === hs.length ? 0 : lo].s;
+    }
+    return out;
+  }
+  function change(fn) {
+    const before = owner; fn(); owner = assign();
+    let moved = 0; const mv = new Uint8Array(NK);
+    for (let i = 0; i < NK; i++) if (before[i] !== owner[i]) { moved++; mv[i] = 1; }
+    lastMoved = { n: moved, mv };
+    draw();
+  }
+  function draw() {
+    const svg = $("ring"), NS = "http://www.w3.org/2000/svg", cx = 160, cy = 150, R = 118;
+    const el = (t, a) => { const e = document.createElementNS(NS, t); Object.entries(a).forEach(([k, v]) => e.setAttribute(k, v)); svg.appendChild(e); return e; };
+    svg.innerHTML = "";
+    el("circle", { cx, cy, r: R, fill: "none", stroke: MX.css("--line"), "stroke-width": 2 });
+    const ang = h => (h / 4294967296) * 2 * Math.PI - Math.PI / 2;
+    for (let i = 0; i < SAMPLE; i++) {
+      const k = Math.floor(i * NK / SAMPLE), a = ang(KEYS[k]), moved = lastMoved && lastMoved.mv[k];
+      el("circle", { cx: cx + (R - 14) * Math.cos(a), cy: cy + (R - 14) * Math.sin(a), r: moved ? 3.2 : 2.2, fill: moved ? MX.css("--c-er") : color(owner[k] - 1) });
+    }
+    if (getMode() === "ring") ringPts.forEach(p => { const a = ang(p.h); el("line", { x1: cx + (R - 6) * Math.cos(a), y1: cy + (R - 6) * Math.sin(a), x2: cx + (R + 9) * Math.cos(a), y2: cy + (R + 9) * Math.sin(a), stroke: color(p.s - 1), "stroke-width": 3 }); });
+    const t = el("text", { x: cx, y: cy + 4, "text-anchor": "middle" }); t.textContent = getMode() === "ring" ? "hash ring 0 … 2³²" : "hash mod " + servers.length;
+    // legend + counts
+    const counts = servers.map(s => { let c = 0; for (let i = 0; i < NK; i++) if (owner[i] === s) c++; return c; });
+    servers.forEach((s, i) => {
+      el("rect", { x: 330, y: 30 + i * 24, width: 14, height: 14, rx: 3, fill: color(s - 1) });
+      const tx = el("text", { x: 352, y: 42 + i * 24 }); tx.textContent = `Server ${s}: ${counts[i].toLocaleString()} keys (${(100 * counts[i] / NK).toFixed(1)}%)`;
+    });
+    const avg = NK / servers.length, mx = Math.max(...counts);
+    $("g-vv").textContent = getMode() === "ring" ? $("g-v").value : "n/a";
+    $("g-n").textContent = servers.length;
+    $("g-moved").textContent = lastMoved ? `${lastMoved.n.toLocaleString()} (${(100 * lastMoved.n / NK).toFixed(1)}%)` : "–";
+    $("g-ideal").textContent = lastMoved ? `≈ ${(100 / Math.max(servers.length, lastMoved.prevN || servers.length)).toFixed(1)}%` : "≈ 1/N";
+    $("g-imb").textContent = (mx / avg).toFixed(2) + "×";
+    Plot.bars($("g-chart"), { bars: servers.map((s, i) => ({ label: "S" + s, value: counts[i], color: color(s - 1) })), yMin: 0, yLabel: "keys" });
+    $("g-msg").textContent = !lastMoved ? "Add or remove a server to see how many keys have to move." :
+      getMode() === "mod" ? `hash mod N: changing N reshuffled ${(100 * lastMoved.n / NK).toFixed(0)}% of keys. For a database, that's moving most of your data.` :
+      `Consistent hashing: only ${(100 * lastMoved.n / NK).toFixed(0)}% of keys moved, the ones between the changed server's points and its neighbours.`;
+  }
+  $("g-add").onclick = () => { if (servers.length >= 10) return; const p = servers.length; change(() => servers.push(nextId++)); lastMoved.prevN = p + 1; draw(); };
+  $("g-rem").onclick = () => { if (servers.length <= 2) return; const p = servers.length; change(() => servers.splice(Math.floor(servers.length / 2), 1)); lastMoved.prevN = p; draw(); };
+  $("g-reset").onclick = () => { servers = [1, 2, 3, 4]; nextId = 5; owner = assign(); lastMoved = null; draw(); };
+  $("g-v").oninput = () => { owner = assign(); lastMoved = null; draw(); };
+  window.addEventListener("themechange", () => draw());
+  servers = [1, 2, 3, 4]; nextId = 5; owner = assign(); draw();
+})();
+</script>
+</body>
+</html>

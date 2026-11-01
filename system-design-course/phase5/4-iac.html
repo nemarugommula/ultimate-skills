@@ -1,0 +1,526 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.4 Infrastructure as code: Terraform, Helm & GitOps · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .controls select { font: inherit; font-size: .85rem; padding: 2px 6px; background: var(--bg2); color: var(--text); border: 1px solid var(--line); border-radius: 6px; }
+  pre.plan { min-height: 120px; max-height: 360px; overflow-y: auto; }
+  pre.plan .add { color: #8fdc8f; } pre.plan .chg { color: #f2c46d; } pre.plan .del { color: #ff7b7b; } pre.plan .rep { color: #ff9f6b; font-weight: 700; }
+  .evlog { font-family: var(--mono); font-size: .75rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; min-height: 96px; white-space: pre-wrap; color: var(--muted); }
+  .risk { font-size: .9rem; margin: 6px 0; }
+</style>
+</head>
+<body data-lesson="s5-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 5 · Lesson 4</div>
+  <h1>Infrastructure as code: Terraform, Helm & GitOps</h1>
+  <p class="subtitle">Describe your servers, networks, databases and Kubernetes apps in files kept in git, and let tools make reality match. It's how you rebuild an environment in minutes, review infrastructure changes like code, and stop “someone clicked something in prod” incidents.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Desired state + reconciliation</b>: declare what should be true; a loop keeps making it true (Lesson 5.2).</li>
+      <li><b>Deployments, Services, HPAs</b> are YAML objects you apply to a cluster (Lessons 5.2 and 5.3).</li>
+      <li><b>Images tagged by git commit</b>, so a tag says exactly what code runs (Lesson 5.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On August 1, 2012, trading firm Knight Capital switched on new code. The SEC's order describes what had happened days earlier: during a manual deployment, one technician <b>did not copy the new code to one of the eight servers</b>, and nobody else reviewed it. That eighth server still held old, unused code, which the new release accidentally re-activated.</p>
+    <p>In about <b>45 minutes</b> it sent millions of orders, got over 4 million executions in 154 stocks, and Knight lost <b>more than $460 million</b>. Seven servers matched the plan; one had drifted. Infrastructure as code exists so that “what's deployed” is written down, reviewed, and enforced by a machine.</p>
+  </div>
+
+  <h2>Numbers first: clicking vs code</h2>
+  <p>A small product has 3 environments (dev, staging, prod), each with a network, a database, a cache, a load balancer, DNS records, 2 buckets, a Kubernetes cluster and 15 apps. That's well over <b>100 things</b> to configure, three times, consistently.</p>
+  <table>
+    <tr><th></th><th>Click in the console / SSH and edit</th><th>Infrastructure as code</th></tr>
+    <tr><td>Rebuild prod from scratch</td><td class="er">Days, from memory and a wiki that's out of date</td><td class="db">Typically minutes to an hour: run the same code against a new account</td></tr>
+    <tr><td>“What changed on Tuesday?”</td><td class="er">Nobody knows</td><td class="db"><code>git log</code></td></tr>
+    <tr><td>Review a change before it happens</td><td>Screenshare?</td><td>A pull request with the exact diff (<code>terraform plan</code>)</td></tr>
+    <tr><td>Staging matches prod</td><td>Hopefully</td><td>Same module, different inputs</td></tr>
+    <tr><td>Undo</td><td>Click it back, if you remember</td><td><code>git revert</code>, apply</td></tr>
+  </table>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Write the <b>desired state</b> of your infrastructure in files. A tool compares those files with the <b>real world</b>, shows you the <b>diff</b>, and applies only that. With <b>GitOps</b> you go one step further: git is the single source of truth, and an agent inside the cluster <b>keeps pulling and reconciling</b>, so a manual change in prod is detected and undone. It's Kubernetes' reconcile loop (Lesson 5.2), applied to everything.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the architect's blueprint</span>
+    <p>Builders don't rebuild a house from memory; they follow the blueprint. To add a window you <b>change the blueprint first</b>, the change is reviewed, and the builder works out the steps: some changes are a quick job (paint), some mean knocking down a wall and rebuilding it (move a load-bearing wall). <code>terraform plan</code> is the builder telling you which is which <i>before</i> picking up a hammer. GitOps adds an inspector who walks the house every few minutes and puts back anything that doesn't match the blueprint.</p>
+  </div>
+
+  <h2>Terraform in five words: write, plan, apply, state, modules</h2>
+  <ul>
+    <li><b>Write</b> resources in HCL (HashiCorp Configuration Language): “an S3 bucket called <code>acme-assets</code>”, “a <code>t3.small</code> server”. <b>Providers</b> are plugins that talk to each API (AWS, GCP, Cloudflare, GitHub, Datadog…).</li>
+    <li><b>Plan</b>: Terraform refreshes what really exists, compares it with your code, and prints the actions: <span class="db"><b>+</b> create</span>, <span class="lt"><b>~</b> update in-place</span>, <span class="er"><b>−</b> destroy</span>, and <span class="er"><b>−/+</b> destroy and then create replacement</span>.</li>
+    <li><b>Apply</b> executes the plan, in dependency order.</li>
+    <li><b>State</b> is Terraform's record mapping your code to real resource IDs. Keep it in a <b>remote backend with locking</b> (e.g. an S3 bucket or HCP Terraform) so two people can't apply at once, and protect it: it can contain secrets.</li>
+    <li><b>Modules</b> are reusable bundles (“a VPC”, “a service with its database”), called with different inputs per environment.</li>
+  </ul>
+  <p>The scary symbol is <b>−/+</b>. Some settings can't be changed on a live resource because the cloud API doesn't allow it (a server's machine image, a bucket's name), so Terraform <b>destroys the old one and creates a new one</b>. For a server that's downtime unless you add <code>create_before_destroy</code>; for a bucket or a database it can mean <b>data loss</b>. Reading the plan is the whole skill.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: read this plan</span>
+    <p>You change three lines in one pull request: the web server's <code>instance_type</code> from <code>t3.small</code> to <code>t3.medium</code>, its <code>ami</code> (machine image) to a new one, and the assets bucket's name.</p>
+    <ul>
+      <li><code>instance_type</code> alone would be <b>~ update in-place</b>: the AWS provider stops and starts the instance (a minute or two of downtime for that one server, typically).</li>
+      <li>But the <code>ami</code> change <b>forces replacement</b>, so the instance line becomes <b>−/+</b>: a new server with a new IP. One replacement covers both changes.</li>
+      <li>The bucket rename also <b>forces replacement</b>. The old bucket would be destroyed, so its files go with it, or (by default) the apply fails because the bucket isn't empty.</li>
+      <li>Summary line: <code>Plan: 2 to add, 0 to change, 2 to destroy.</code> Two “destroys” in a PR titled “bump instance size” is exactly what reviewers are there to catch.</li>
+    </ul>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The terraform plan simulator</span>
+    <p class="hint">Your current infrastructure is already applied. Edit the configuration below, press <b>terraform plan</b>, and read what would happen. Which attributes force a replacement follows the Terraform AWS provider docs. Then try the console “cowboy” button: someone changes prod by hand.</p>
+    <div class="controls">
+      <label>instance_type <select id="itype"><option>t3.small</option><option>t3.medium</option></select></label>
+      <label>ami <select id="iami"><option value="ami-0a1f">ami-0a1f (current)</option><option value="ami-0b2e">ami-0b2e (new)</option></select></label>
+      <label>servers (count) <input type="range" id="icount" min="1" max="3" step="1" value="1"> <b class="mono" id="icountv"></b></label>
+      <label><input type="checkbox" id="icbd"> create_before_destroy</label>
+    </div>
+    <div class="controls">
+      <label>bucket <select id="bname"><option>acme-assets</option><option>acme-assets-prod</option></select></label>
+      <label>security group name <select id="sgname"><option>web-sg</option><option>web-sg-v2</option></select></label>
+      <label>db instance_class <select id="dbclass"><option>db.t3.medium</option><option>db.r6g.large</option></select></label>
+      <label><input type="checkbox" id="dbkeep" checked> database block in the config</label>
+      <label><input type="checkbox" id="dbpd"> prevent_destroy on the DB</label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="tplan">terraform plan</button>
+      <button class="btn" id="tapply">terraform apply</button>
+      <button class="btn" id="tdrift">🤠 Someone opens port 22 in the console</button>
+      <button class="btn" id="treset">Reset</button>
+    </div>
+    <pre class="plan" id="pout"></pre>
+    <div class="stat-row">
+      <div class="stat">to add <b id="sa">–</b></div>
+      <div class="stat">to change <b id="sch">–</b></div>
+      <div class="stat">to destroy <b id="sx">–</b></div>
+      <div class="stat">web downtime (typical) <b id="sdt">–</b></div>
+      <div class="stat">data at risk <b id="sdl">–</b></div>
+    </div>
+    <div class="risk" id="prisk"></div>
+  </div>
+  <p>Things to try: change only <code>instance_type</code> (a safe in-place change). Then change the <code>ami</code>: −/+ and downtime; tick <code>create_before_destroy</code> and the downtime disappears. Rename the bucket and read the warning. Untick the database block with <code>prevent_destroy</code> on: Terraform's docs warn that removing the block destroys it anyway, because the protection lived in the block you deleted. Finally press the cowboy button, then plan: Terraform notices the drift and plans to remove the hand-made rule.</p>
+
+  <h2>Kubernetes apps as code: Helm and Kustomize</h2>
+  <p>A real service is 5 to 10 YAML objects (Deployment, Service, HPA, PDB, ConfigMap, Gateway route…), and you want them slightly different per environment: 2 replicas in staging, 20 in prod. Two common tools:</p>
+  <table>
+    <tr><th></th><th>Helm</th><th>Kustomize</th></tr>
+    <tr><td>Idea</td><td>A <b>chart</b> is a package of YAML <b>templates</b>; you install it with your own <b>values</b>. Each install is a <b>release</b> with history and rollback.</td><td>Plain YAML <b>base</b> + per-environment <b>overlays</b> that patch it. No templating language. Built into <code>kubectl</code> (<code>kubectl apply -k</code>).</td></tr>
+    <tr><td>Great for</td><td>Installing third-party software (databases, ingress controllers, monitoring) and sharing one chart across many services</td><td>Your own apps with small differences between environments</td></tr>
+    <tr><td>Watch out</td><td>Templates can get hard to read; always look at the rendered output (<code>helm template</code>)</td><td>Big differences between environments become many patches</td></tr>
+  </table>
+
+  <h2>GitOps: git is the source of truth</h2>
+  <p>With plain CI, a pipeline <b>pushes</b> changes into the cluster (<code>kubectl apply</code> from a CI job). With <b>GitOps</b>, an agent running <b>inside</b> the cluster, like <b>Argo CD</b> or <b>Flux</b>, <b>pulls</b> from git and reconciles:</p>
+  <ul>
+    <li>You change the desired state with a <b>pull request</b> (e.g. bump <code>image: api:3f9c2e1</code> → <code>api:a81b7c0</code> in <code>envs/prod/</code>). Review and merge.</li>
+    <li>Argo CD polls the repository every <b>three minutes</b> by default (or reacts to a webhook in seconds), sees the cluster is <b>OutOfSync</b>, and applies the change.</li>
+    <li>With <b>self-heal</b> on, Argo CD also syncs when the <i>live cluster</i> drifts from git, so someone's manual <code>kubectl edit</code> is put back.</li>
+    <li>Rollback = <code>git revert</code>. Audit log = <code>git log</code>. The CI system never needs credentials to production.</li>
+  </ul>
+  <p><b>Promotion between environments</b> is just more pull requests: the same image tag moves from <code>envs/dev</code> to <code>envs/staging</code> to <code>envs/prod</code>, often automated for dev and gated by approval for prod (Lesson 6.2 covers canaries and progressive delivery).</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · GitOps reconcile loop</span>
+    <p class="hint">Git says what prod should run; Argo CD keeps the cluster in line. Time runs fast (each tick is 10 seconds). Merge a release, then play the cowboy and edit prod by hand. Switch off self-heal or auto-sync to see what each one does.</p>
+    <svg id="gfl"></svg>
+    <div class="controls">
+      <button class="btn primary" id="gmerge">🔀 Merge PR: release next version</button>
+      <button class="btn" id="gscale">🤠 kubectl scale --replicas=10 in prod</button>
+      <button class="btn" id="ghot">🤠 kubectl set image (untested hotfix)</button>
+      <button class="btn" id="grevert">↩️ git revert last release</button>
+      <button class="btn" id="gsync">Sync now</button>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="gauto" checked> auto-sync</label>
+      <label><input type="checkbox" id="gheal" checked> self-heal</label>
+      <label><input type="checkbox" id="ghook"> git webhook (instead of polling every 3 min)</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">git (desired) <b id="gg">–</b></div>
+      <div class="stat">cluster (live) <b id="gl">–</b></div>
+      <div class="stat">status <b id="gs">–</b></div>
+      <div class="stat">last merge → live <b id="gt">–</b></div>
+    </div>
+    <canvas class="chart" id="gch" style="height:160px"></canvas>
+    <div class="evlog" id="gev"></div>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Terraform</b> and its open-source fork <b>OpenTofu</b> (created after HashiCorp moved Terraform to the BUSL licence), <b>Pulumi</b> and <b>AWS CDK</b> (infrastructure in TypeScript/Python), <b>Helm</b>, <b>Kustomize</b>, <b>Argo CD</b>, <b>Flux</b>, and policy checkers like <b>Checkov</b> or <b>OPA</b>. A small <code>main.tf</code>:</p>
+<pre><code><span class="k">terraform</span> {
+  backend <span class="s">"s3"</span> {                                 <span class="c"># remote, shared, locked state</span>
+    bucket       = <span class="s">"acme-terraform-state"</span>
+    key          = <span class="s">"prod/terraform.tfstate"</span>
+    region       = <span class="s">"us-east-1"</span>
+    use_lockfile = <span class="k">true</span>
+  }
+}
+<span class="k">provider</span> <span class="s">"aws"</span> { region = <span class="s">"us-east-1"</span> }
+
+<span class="k">module</span> <span class="s">"vpc"</span> {                                    <span class="c"># a reusable module with inputs</span>
+  source = <span class="s">"terraform-aws-modules/vpc/aws"</span>
+  name   = <span class="s">"prod"</span>
+  cidr   = <span class="s">"10.0.0.0/16"</span>
+  azs    = [<span class="s">"us-east-1a"</span>, <span class="s">"us-east-1b"</span>, <span class="s">"us-east-1c"</span>]
+}
+
+<span class="k">resource</span> <span class="s">"aws_s3_bucket"</span> <span class="s">"assets"</span> {
+  bucket = <span class="s">"acme-assets"</span>                          <span class="c"># renaming forces replacement!</span>
+}
+
+<span class="k">resource</span> <span class="s">"aws_db_instance"</span> <span class="s">"main"</span> {
+  engine              = <span class="s">"postgres"</span>
+  instance_class      = <span class="s">"db.t3.medium"</span>            <span class="c"># changes in place</span>
+  allocated_storage   = <span class="n">100</span>
+  multi_az            = <span class="k">true</span>                      <span class="c"># standby in another zone (Lesson 5.5)</span>
+  deletion_protection = <span class="k">true</span>                      <span class="c"># AWS refuses to delete it</span>
+  lifecycle { prevent_destroy = <span class="k">true</span> }            <span class="c"># Terraform refuses to plan its destruction</span>
+  <span class="c"># credentials from a secret manager, never in the file</span>
+}</code></pre>
+<pre><code>terraform init                       <span class="c"># download providers, connect to the backend</span>
+terraform plan -out=release.plan     <span class="c"># show the diff (post it on the PR)</span>
+terraform apply release.plan         <span class="c"># apply exactly what was reviewed</span>
+terraform plan -refresh-only         <span class="c"># just show drift: what changed outside Terraform</span></code></pre>
+    <p>Per-environment Helm values, and an Argo CD <b>Application</b> that keeps prod in sync with git:</p>
+<pre><code><span class="c"># envs/prod/values.yaml (overrides the chart's defaults)</span>
+image: { repository: registry.example.com/api, tag: <span class="s">"a81b7c0"</span> }
+replicaCount: <span class="n">6</span>
+autoscaling: { enabled: <span class="k">true</span>, minReplicas: <span class="n">6</span>, maxReplicas: <span class="n">60</span>, targetCPUUtilizationPercentage: <span class="n">60</span> }
+---
+<span class="k">apiVersion:</span> argoproj.io/v1alpha1
+<span class="k">kind:</span> Application
+<span class="k">metadata:</span> { name: api-prod, namespace: argocd }
+<span class="k">spec:</span>
+  project: default
+  source:
+    repoURL: https://github.com/acme/deploy.git
+    targetRevision: main
+    path: charts/api
+    helm: { valueFiles: [../../envs/prod/values.yaml] }
+  destination: { server: https://kubernetes.default.svc, namespace: api }
+  syncPolicy:
+    automated:
+      prune: <span class="k">true</span>       <span class="c"># delete objects that were removed from git</span>
+      selfHeal: <span class="k">true</span>    <span class="c"># undo manual changes to the live cluster</span></code></pre>
+    <p class="hint">Try it locally: <code>helm template my-api ./charts/api -f envs/prod/values.yaml</code> renders the YAML without touching any cluster, and <code>terraform plan</code> against a free-tier account (or LocalStack) is the safest way to learn the symbols.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>Pick it when…</th><th>Cost</th></tr>
+      <tr><td>Terraform / OpenTofu</td><td>Many providers (cloud, DNS, SaaS) in one declarative language; the industry default</td><td>State to manage; HCL logic gets awkward for complex loops</td></tr>
+      <tr><td>Pulumi / CDK</td><td>Your team prefers real programming languages and tests</td><td>Easier to write clever, hard-to-review infrastructure</td></tr>
+      <tr><td>GitOps (Argo CD / Flux)</td><td>Kubernetes apps, many teams, you want audit, drift correction and no CI credentials to prod</td><td>One more system to run; secrets need their own pattern (sealed or external secrets)</td></tr>
+      <tr><td>CI push (<code>kubectl apply</code> / <code>helm upgrade</code> from CI)</td><td>Small setups, one cluster</td><td>No drift correction; CI holds powerful credentials</td></tr>
+      <tr><td>Console clicking</td><td>Exploring, one-off experiments in a sandbox account</td><td>Unreviewable, unrepeatable, drifts. Never for prod.</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Even at two people, put the cloud account in Terraform from week one: one repo, remote state, modules for “a service” and “a database”, <code>terraform plan</code> in CI on every PR. If you're on Cloud Run or ECS, a GitHub Action that deploys on merge is plenty; add Argo CD when you adopt Kubernetes.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>A platform team publishes vetted modules and charts, state is split per team and environment to limit the blast radius of a bad apply, policy-as-code blocks risky plans (public buckets, deletes in prod), and GitOps manages hundreds of clusters with ApplicationSets, with promotions flowing through environments automatically.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Infrastructure as code comes up in “how do you deploy and operate this?” and in behavioural questions about outages. A strong answer:</p>
+    <ul>
+      <li>All infrastructure and app config in git; changes via reviewed PRs with the plan attached.</li>
+      <li>How you prevent <b>destructive changes</b>: reading −/+ lines, <code>prevent_destroy</code>, deletion protection, policies.</li>
+      <li><b>Drift</b>: how it's detected (scheduled <code>plan</code>, GitOps self-heal) and why manual prod changes are banned or temporary.</li>
+      <li><b>Environments</b>: same modules/charts, different inputs; promote the same artifact.</li>
+    </ul>
+    <p>Common follow-ups: “Two engineers apply at once?” (state locking). “Someone hotfixed prod by hand during an incident?” (allowed in emergencies, then written back to git, or self-heal reverts it). “How do you roll back infra?” (revert the commit; some changes, like deleted data, can't be rolled back, so backups matter).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The cost of one drifted server</b> <span class="tag co">🏢 Knight Capital · 2012</span> <a href="https://www.sec.gov/files/litigation/admin/2013/34-70694.pdf" target="_blank" rel="noopener">SEC order, File No. 3-15570</a></div>
+      <p><b>How:</b> new code was deployed by hand in stages; one of eight servers was missed and no second technician reviewed the deployment. The old code on that server ran wild for about 45 minutes.</p>
+      <p><b>Why this method matters:</b> repeatable, automated, verified deploys make “7 of 8 servers updated” impossible to miss.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Argo CD</b> <span class="tag co">🏢 Intuit · 2017–2022</span> <a href="https://www.cncf.io/announcements/2022/12/06/the-cloud-native-computing-foundation-announces-argo-has-graduated/" target="_blank" rel="noopener">CNCF: Argo has graduated</a></div>
+      <p><b>How:</b> Argo was created and open-sourced in 2017 by Applatix, which Intuit acquired; it joined the CNCF in 2020 and graduated in December 2022, used in production by over 350 organizations including Adobe, Capital One, Google and Tesla.</p>
+      <p><b>Why this method:</b> declarative, git-driven delivery to many Kubernetes clusters, with a UI that shows exactly what's out of sync.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The word “GitOps”</b> <span class="tag hist">📜 Weaveworks · 2017</span> <a href="https://web.archive.org/web/2023/https://www.weave.works/blog/gitops-operations-by-pull-request" target="_blank" rel="noopener">GitOps: Operations by Pull Request (archived)</a></div>
+      <p><b>How:</b> Alexis Richardson described Weaveworks' practice of driving operations through pull requests to declarative config in git, with tools that converge the cluster to it.</p>
+      <p><b>Why this method:</b> developers already knew git review; making it the path to production gave operations the same history, review and rollback.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Plan before you apply</b> <span class="tag oss">🧰 Terraform docs</span> <a href="https://developer.hashicorp.com/terraform/cli/commands/plan" target="_blank" rel="noopener">terraform plan</a> · <a href="https://developer.hashicorp.com/terraform/tutorials/state/resource-drift" target="_blank" rel="noopener">Manage resource drift</a></div>
+      <p><b>How:</b> the plan lists every create, in-place update, destroy and replacement (with <code># forces replacement</code> next to the culprit), and <code>-refresh-only</code> shows what changed outside Terraform.</p>
+      <p><b>Why this method:</b> separating “what will happen” from “do it” turns infrastructure changes into reviewable diffs.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · nine-year-old code</span>
+    <p>The code that ran wild on Knight's eighth server, “Power Peg”, hadn't been used since <b>2003</b>, nine years earlier, but it was still on the servers and could still be switched on. Dead code and hand-managed servers are a dangerous mix.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>GitOps is the reconcile loop from Lesson 5.2 with git as the dial. The YAML it syncs is Lesson 5.3's. Terraform creates the cloud pieces of Lesson 5.5 (VPCs, managed databases, buckets). CI/CD (Lesson 6.1) builds the image and opens the PR that bumps its tag; progressive delivery (Lesson 6.2) decides how fast it rolls out. In AI systems the same pattern manages GPU node pools and model-serving deployments, where a wrong apply is an expensive mistake.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://developer.hashicorp.com/terraform/language/meta-arguments/lifecycle" target="_blank" rel="noopener">Terraform: the lifecycle block</a>. <code>create_before_destroy</code>, <code>prevent_destroy</code>, <code>ignore_changes</code> and their sharp edges.</li>
+      <li><span class="kind">Docs</span> <a href="https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/" target="_blank" rel="noopener">Argo CD: automated sync, prune and self-heal</a>. Exactly what each switch in the simulator does.</li>
+      <li><span class="kind">Docs</span> <a href="https://kubernetes.io/docs/tasks/manage-kubernetes-objects/kustomization/" target="_blank" rel="noopener">Kubernetes: managing objects with Kustomize</a>. Bases, overlays and patches.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A plan says: <code>Plan: 3 to add, 1 to change, 3 to destroy.</code> There are 3 web servers and a load balancer in the config. What most likely happened?</div>
+    <div class="opts"><button class="opt">Terraform is adding 3 more servers</button><button class="opt" data-ok>A change forces replacement of the 3 servers (−/+), plus an in-place update to the load balancer</button><button class="opt">The state file is corrupted</button></div>
+    <div class="explain">Each −/+ counts once as “add” and once as “destroy”. 3 replacements = 3 to add + 3 to destroy. Check which attribute says <code># forces replacement</code>, and use <code>create_before_destroy</code> (or roll them one at a time) to avoid all three disappearing together.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. During an incident an engineer runs <code>kubectl scale --replicas=20</code> in prod. Argo CD has auto-sync and self-heal on, and git says 6. What happens, and what should the engineer do?</div>
+    <div class="opts"><button class="opt">The change sticks forever because kubectl overrides Argo CD</button><button class="opt" data-ok>Argo CD scales it back to 6 within seconds; change git (or pause the sync) instead</button><button class="opt">Argo CD deletes the Deployment</button></div>
+    <div class="explain">Self-heal treats live changes as drift and re-applies git. In an emergency, either commit the change (a fast PR) or deliberately pause auto-sync for that app, then write the fix back to git. (An HPA owning the replica count is the usual long-term answer.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Argo CD polls git every 3 minutes by default. You merge 40 times a day. Roughly how long does a merge wait before Argo CD notices it, on average, without webhooks?</div>
+    <div class="opts"><button class="opt" data-ok>About 1.5 minutes</button><button class="opt">About 3 minutes</button><button class="opt">About 2 hours</button></div>
+    <div class="explain">A merge lands at a random moment within the 3-minute polling interval, so the average wait is half of it: about 90 seconds (worst case 3 minutes). A webhook from your git host cuts it to seconds.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Infrastructure as code: desired state in git, a tool diffs it against reality and applies only the diff.</li>
+      <li>Terraform: write → <code>plan</code> → <code>apply</code>; state (remote, locked) maps code to real IDs; modules for reuse.</li>
+      <li>Read every <b>−/+</b>: replacement means downtime (fix: <code>create_before_destroy</code>) or data loss (protect: <code>prevent_destroy</code>, deletion protection).</li>
+      <li>Helm = templated packages with values; Kustomize = base + overlays.</li>
+      <li>GitOps (Argo CD, Flux): an in-cluster agent pulls from git and reconciles; self-heal reverts manual drift; rollback = <code>git revert</code>.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+
+  // ---------- terraform plan simulator ----------
+  const BASE = { itype: "t3.small", ami: "ami-0a1f", count: 1, cbd: false, bucket: "acme-assets", sg: "web-sg", dbclass: "db.t3.medium", dbkeep: true, dbpd: false };
+  let state = Object.assign({ ports: [443] }, BASE);   // what exists in the real world (and in state)
+  const cfg = () => ({
+    itype: $("itype").value, ami: $("iami").value, count: +$("icount").value, cbd: $("icbd").checked,
+    bucket: $("bname").value, sg: $("sgname").value, dbclass: $("dbclass").value, dbkeep: $("dbkeep").checked, dbpd: $("dbpd").checked, ports: [443],
+  });
+  function plan() {
+    const c = cfg(), L = [], acts = [];
+    $("icountv").textContent = c.count;
+    let add = 0, chg = 0, del = 0, downtime = 0, risk = [], errors = [];
+    const line = (cls, s) => L.push(`<span class="${cls}">${esc(s)}</span>`);
+    // security group
+    if (c.sg !== state.sg) {
+      line("rep", `  # aws_security_group.web must be replaced`);
+      line("rep", `-/+ resource "aws_security_group" "web" {`);
+      line("rep", `      ~ name = "${state.sg}" -> "${c.sg}" # forces replacement`);
+      line("", `    }`); add++; del++; acts.push("sg");
+    } else if (state.ports.join() !== c.ports.join()) {
+      line("chg", `  # aws_security_group.web will be updated in-place`);
+      line("chg", `  ~ resource "aws_security_group" "web" {`);
+      line("del", `      - ingress { from_port = 22, to_port = 22, cidr_blocks = ["0.0.0.0/0"] }`);
+      line("", `        # (1 unchanged ingress rule: 443)`);
+      line("", `    }`); chg++;
+      risk.push("🤠 Drift: someone added SSH open to the whole internet by hand. Terraform will remove it to match the code.");
+    }
+    // instances
+    const replace = c.ami !== state.ami;
+    for (let i = 0; i < Math.max(c.count, state.count); i++) {
+      const name = `aws_instance.web[${i}]`;
+      if (i >= state.count) {
+        line("add", `  # ${name} will be created`);
+        line("add", `  + resource "aws_instance" "web" {`);
+        line("add", `      + ami           = "${c.ami}"`);
+        line("add", `      + instance_type = "${c.itype}"`);
+        line("add", `      + public_ip     = (known after apply)`);
+        line("", `    }`); add++; continue;
+      }
+      if (i >= c.count) {
+        line("del", `  # ${name} will be destroyed`);
+        line("del", `  # (because index [${i}] is out of range for count)`);
+        line("del", `  - resource "aws_instance" "web" { ... }`); del++; continue;
+      }
+      if (replace) {
+        line("rep", `  # ${name} must be replaced`);
+        line("rep", `${c.cbd ? "+/-" : "-/+"} resource "aws_instance" "web" {`);
+        line("rep", `      ~ ami           = "${state.ami}" -> "${c.ami}" # forces replacement`);
+        if (c.itype !== state.itype) line("chg", `      ~ instance_type = "${state.itype}" -> "${c.itype}"`);
+        line("rep", `      ~ public_ip     = "54.x.x.${10 + i}" -> (known after apply)`);
+        line("", `    }`); add++; del++;
+        if (!c.cbd) downtime = Math.max(downtime, 90);
+      } else if (c.itype !== state.itype || acts.includes("sg")) {
+        line("chg", `  # ${name} will be updated in-place`);
+        line("chg", `  ~ resource "aws_instance" "web" {`);
+        if (c.itype !== state.itype) line("chg", `      ~ instance_type = "${state.itype}" -> "${c.itype}"   # stop, resize, start`);
+        if (acts.includes("sg")) line("chg", `      ~ vpc_security_group_ids = [ ... ] -> (known after apply)`);
+        line("", `    }`); chg++;
+        if (c.itype !== state.itype) downtime = Math.max(downtime, Math.min(c.count, state.count) > 1 ? 0 : 60);
+      }
+    }
+    if (replace && c.cbd) risk.push("✅ create_before_destroy: each new server is created first (+/-), so traffic can move over before the old one is destroyed.");
+    else if (replace) risk.push("⚠️ −/+ destroys each server <i>before</i> creating its replacement: with nothing else serving, the site is down until the new one boots. Add create_before_destroy.");
+    if (c.itype !== state.itype && !replace) risk.push(Math.min(c.count, state.count) > 1 ? "ℹ️ instance_type changes stop and start each server. With several behind a load balancer, do them one at a time." : "ℹ️ instance_type is changed in place, but the AWS provider stops and starts the instance: a short outage with a single server.");
+    // bucket
+    if (c.bucket !== state.bucket) {
+      line("rep", `  # aws_s3_bucket.assets must be replaced`);
+      line("rep", `-/+ resource "aws_s3_bucket" "assets" {`);
+      line("rep", `      ~ bucket = "${state.bucket}" -> "${c.bucket}" # forces replacement`);
+      line("", `    }`); add++; del++;
+      risk.push("🔥 The bucket name forces replacement. The old bucket and its objects would be destroyed; by default the destroy fails because the bucket isn't empty (force_destroy = true would delete every object). Rename by creating a new bucket, copying, then removing the old one.");
+    }
+    // database
+    if (state.dbkeep && !c.dbkeep) {
+      line("del", `  # aws_db_instance.main will be destroyed`);
+      line("del", `  # (because aws_db_instance.main is not in configuration)`);
+      line("del", `  - resource "aws_db_instance" "main" { ... }`); del++;
+      risk.push("🔥 Removing the block destroys the production database." + (c.dbpd ? " prevent_destroy doesn't help: it was in the block you deleted. AWS-side deletion_protection or a final snapshot is your last line of defence." : " Protect it with deletion_protection and prevent_destroy (and keep the block)."));
+    } else if (!state.dbkeep && c.dbkeep) {
+      line("add", `  # aws_db_instance.main will be created`);
+      line("add", `  + resource "aws_db_instance" "main" { instance_class = "${c.dbclass}" ... }`); add++;
+      risk.push("ℹ️ A brand-new, empty database. The old data is only back if you restore a snapshot.");
+    } else if (c.dbkeep && c.dbclass !== state.dbclass) {
+      line("chg", `  # aws_db_instance.main will be updated in-place`);
+      line("chg", `  ~ resource "aws_db_instance" "main" {`);
+      line("chg", `      ~ instance_class = "${state.dbclass}" -> "${c.dbclass}"`);
+      line("", `    }`); chg++;
+      risk.push("ℹ️ Resizing the database happens in place (with Multi-AZ, RDS does it on the standby and fails over: Lesson 5.5).");
+    }
+    const head = add + chg + del === 0 ? ["No changes. Your infrastructure matches the configuration."] :
+      ["Terraform used the selected providers to generate the following execution plan.", "Resource actions are indicated with the following symbols:", "  + create   ~ update in-place   - destroy   -/+ destroy and then create replacement" + (replace && c.cbd ? "   +/- create replacement and then destroy" : ""), ""];
+    const foot = add + chg + del ? ["", `Plan: ${add} to add, ${chg} to change, ${del} to destroy.`] : [];
+    $("pout").innerHTML = head.map(esc).join("\n") + "\n" + L.join("\n") + "\n" + foot.map(esc).join("\n");
+    $("sa").textContent = add; $("sch").textContent = chg; $("sx").textContent = del;
+    $("sdt").textContent = downtime ? "~" + downtime + " s" : "none";
+    const loss = (c.bucket !== state.bucket ? 1 : 0) + (state.dbkeep && !c.dbkeep ? 1 : 0);
+    $("sdl").textContent = loss ? (loss === 2 ? "bucket + database" : c.bucket !== state.bucket ? "bucket objects" : "database") : "none";
+    $("prisk").innerHTML = risk.map(r => `<div>${r}</div>`).join("");
+    return { add, chg, del, c };
+  }
+  ["itype", "iami", "icount", "icbd", "bname", "sgname", "dbclass", "dbkeep", "dbpd"].forEach(id => ($(id).oninput = $(id).onchange = plan));
+  $("tplan").onclick = plan;
+  $("tapply").onclick = () => {
+    const p = plan();
+    if (!p.add && !p.chg && !p.del) return;
+    if (state.bucket !== p.c.bucket) {
+      $("prisk").innerHTML = "<div>❌ Apply stopped: deleting the old bucket failed because it isn't empty. Everything before it was applied; fix the config and plan again.</div>";
+      state = Object.assign({}, p.c, { bucket: state.bucket });
+      return;
+    }
+    state = Object.assign({}, p.c);
+    plan();
+    $("prisk").innerHTML = "<div>✅ Applied. State now matches the configuration; the next plan shows no changes.</div>";
+  };
+  $("tdrift").onclick = () => { if (!state.ports.includes(22)) state.ports = [22, 443]; plan(); };
+  $("treset").onclick = () => {
+    state = Object.assign({ ports: [443] }, BASE);
+    $("itype").value = BASE.itype; $("iami").value = BASE.ami; $("icount").value = 1; $("icbd").checked = false;
+    $("bname").value = BASE.bucket; $("sgname").value = BASE.sg; $("dbclass").value = BASE.dbclass; $("dbkeep").checked = true; $("dbpd").checked = false;
+    plan();
+  };
+  plan();
+
+  // ---------- GitOps reconcile loop ----------
+  const G = new Flow($("gfl"), { width: 720, height: 200 });
+  G.node("dev", { x: 70, y: 50, label: "👩‍💻 You", sub: "pull request", kind: "cl" })
+   .node("git", { x: 260, y: 50, label: "📜 Git (main)", sub: "", kind: "db" })
+   .node("argo", { x: 460, y: 50, label: "Argo CD", sub: "", kind: "sv" })
+   .node("k8s", { x: 460, y: 155, w: 150, label: "Prod cluster", sub: "", kind: "nw" })
+   .node("cow", { x: 220, y: 155, label: "🤠 kubectl", sub: "by hand", kind: "er" })
+   .edge("dev", "git").edge("argo", "git", { dashed: true, label: "pull" }).edge("argo", "k8s", { label: "sync" }).edge("cow", "k8s", { dashed: true }).render();
+  const git = { ver: 1, replicas: 6, sha: "a1" }, live = { ver: 1, replicas: 6 };
+  let t = 0, lastPoll = 0, seen = { ...git }, syncedSha = "a1", mergeAt = null, lastLag = null, healAt = null, shaN = 1;
+  const glog = [], hist = [];
+  const gev = s => { glog.push(`${String(Math.floor(t / 60)).padStart(2)}:${String(t % 60).padStart(2, "0")}  ${s}`); if (glog.length > 7) glog.shift(); };
+  const same = () => live.ver === seen.ver && live.replicas === seen.replicas;
+  function sync(why) {
+    const was = `v${live.ver}×${live.replicas}`;
+    live.ver = seen.ver; live.replicas = seen.replicas; syncedSha = seen.sha;
+    gev(`argo: sync (${why}): ${was} → v${live.ver}×${live.replicas}`);
+    G.packet(["argo", "k8s"], { color: "--c-db", dur: 500 });
+    if (mergeAt != null && live.ver === git.ver) { lastLag = t - mergeAt; mergeAt = null; }
+  }
+  function poll() {
+    lastPoll = t;
+    if (seen.sha !== git.sha) { seen = { ...git }; gev(`argo: new commit ${git.sha} in git → OutOfSync`); G.packet(["git", "argo"], { color: "--c-cl", dur: 400 }); }
+  }
+  function gtick() {
+    t += 10;
+    if (!$("ghook").checked && t - lastPoll >= 180) poll();
+    const auto = $("gauto").checked, heal = $("gheal").checked;
+    if (!same()) {
+      if (auto && seen.sha !== syncedSha) sync("new revision");
+      else if (auto && heal) {
+        if (healAt == null) healAt = t + 5;            // self-heal timeout: 5 s by default
+        if (t >= healAt) { sync("self-heal: live cluster drifted"); healAt = null; }
+      }
+    } else healAt = null;
+    gpaint();
+  }
+  function gpaint() {
+    const ok = same() && seen.sha === git.sha;
+    $("gg").textContent = `v${git.ver} × ${git.replicas}`;
+    $("gl").textContent = `v${live.ver} × ${live.replicas}`;
+    $("gs").textContent = ok ? "Synced ✅" : "OutOfSync ⚠️";
+    $("gt").textContent = lastLag == null ? (mergeAt != null ? "waiting… " + (t - mergeAt) + " s" : "–") : lastLag + " s";
+    G.set("git", { sub: `${git.sha}: v${git.ver} × ${git.replicas}` });
+    G.set("argo", { sub: ($("ghook").checked ? "webhook" : `next poll in ${Math.max(0, 180 - (t - lastPoll))} s`) + (healAt ? " · healing" : "") });
+    G.set("k8s", { sub: `live: v${live.ver} × ${live.replicas}`, down: !ok, hot: !ok });
+    hist.push([t / 60, live.replicas, git.replicas]); if (hist.length > 90) hist.shift();
+    Plot.line($("gch"), { series: [
+      { label: "replicas in git", color: MX.css("--c-db"), data: hist.map(h => [h[0], h[2]]), dash: [6, 4] },
+      { label: "replicas live", color: MX.css("--c-sv"), data: hist.map(h => [h[0], h[1]]) },
+    ], xLabel: "minutes", yMin: 0, yMax: 12 });
+    $("gev").textContent = glog.join("\n") || "events will appear here";
+  }
+  const commit = (what, f) => {
+    f(); git.sha = (++shaN).toString(16).padStart(2, "0") + "c" + shaN; mergeAt = t; lastLag = null;
+    gev(`you: merged ${git.sha}: ${what}`); G.packet(["dev", "git"], { color: "--c-cl", dur: 400 });
+    if ($("ghook").checked) poll();
+    gpaint();
+  };
+  $("gmerge").onclick = () => commit(`release v${git.ver + 1}`, () => git.ver++);
+  $("grevert").onclick = () => { if (git.ver > 1) commit(`revert to v${git.ver - 1}`, () => git.ver--); };
+  $("gscale").onclick = () => { live.replicas = 10; gev("🤠 someone ran kubectl scale --replicas=10"); G.packet(["cow", "k8s"], { color: "--c-er", dur: 400 }); gpaint(); };
+  $("ghot").onclick = () => { live.ver = 99; gev("🤠 someone ran kubectl set image api=api:hotfix (v99)"); G.packet(["cow", "k8s"], { color: "--c-er", dur: 400 }); gpaint(); };
+  $("gsync").onclick = () => { poll(); if (!same()) sync("manual"); gpaint(); };
+  ["gauto", "gheal", "ghook"].forEach(id => ($(id).onchange = () => { gev(`setting: ${id === "gauto" ? "auto-sync" : id === "gheal" ? "self-heal" : "webhook"} ${$(id).checked ? "on" : "off"}`); if (id === "ghook" && $(id).checked) poll(); gpaint(); }));
+  gpaint();
+  setInterval(gtick, 700);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,430 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.4 Agentic, self-correcting & adaptive RAG · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .log { font-family: var(--mono); font-size: .8rem; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; max-height: 300px; overflow-y: auto; }
+  .log div { padding: 2px 0; border-bottom: 1px dashed var(--line); }
+  .log .t { color: var(--muted); float: right; }
+  table.rt td, table.rt th { font-size: .85rem; }
+  table.rt button { font: inherit; font-size: .78rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); cursor: pointer; }
+  table.rt button.on { background: var(--accent); color: #fff; }
+</style>
+</head>
+<body data-lesson="a4-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 4</div>
+  <h1>Agentic, self-correcting & adaptive RAG (Self-RAG, CRAG, routing)</h1>
+  <p class="subtitle">Naive RAG always retrieves once, from one place, and trusts whatever comes back. Agentic RAG lets the model decide: whether to retrieve, from where, whether the results are good enough, and what to try next.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Function calling</b>: the model can ask your code to run a tool (like <code>search_docs(query)</code>) and read the result (Lesson 1.3).</li>
+      <li><b>Query rewriting and decomposition</b> (Lesson 4.1); multi-hop questions (Lesson 4.3).</li>
+      <li><b>Latency and token cost</b> add up per LLM call (Lesson 0.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In June 2025 Anthropic described how Claude's Research feature works: a lead agent plans, then spins up subagents that search in parallel, each with its own context window, and the lead combines their findings. On Anthropic's internal research eval this multi-agent system beat a single agent by <b>90.2%</b>.</p>
+    <p>The bill came with it: agents used about <b>4×</b> the tokens of a chat interaction, and the multi-agent system about <b>15×</b>. Token usage alone explained 80% of the performance differences on a browsing benchmark. Agentic retrieval works, and you pay for it in tokens and seconds.</p>
+  </div>
+
+  <h2>Numbers first: the cost ladder</h2>
+  <table>
+    <tr><th>Pattern</th><th>LLM calls per question</th><th>Typical latency</th><th>What it buys</th></tr>
+    <tr><td>Naive RAG (retrieve → generate)</td><td>1</td><td class="tk">≈ 1–2 s</td><td>Fast, predictable</td></tr>
+    <tr><td>+ relevance grader (corrective RAG)</td><td>2–4</td><td class="tk">≈ 2–4 s</td><td>Catches bad retrieval; rewrites or falls back</td></tr>
+    <tr><td>Agent with a retrieval tool, multi-step</td><td>3–10</td><td class="tk">≈ 5–30 s</td><td>Multi-hop and compound questions</td></tr>
+    <tr><td>Multi-agent research</td><td>tens</td><td class="tk">minutes</td><td>Open-ended research (≈15× chat tokens per Anthropic)</td></tr>
+  </table>
+  <p class="muted">Calls and latencies are typical orders of magnitude, not guarantees; they depend on your model and how many loops you allow.</p>
+  <p>Most questions in a real product are simple. Paying the agentic price on every “how much is Plus?” wastes money; refusing to pay it on “compare X and Y across these three policies” gives wrong answers. The skill is choosing per question.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Turn retrieval from a fixed step into a <b>decision</b>. Four decisions, each a small LLM call or classifier: <b>whether</b> to retrieve (routing, adaptive RAG), <b>where</b> to retrieve from (vector store, web, SQL, graph), <b>is it good enough</b> (a relevance grader: CRAG, Self-RAG), and <b>what next</b> (rewrite, decompose, fall back, or stop). Each decision costs latency, so add them where your evals show failures.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the intern and the senior researcher</span>
+    <p>Ask an intern a question and they search once, grab the top result and write it up, even if it's about something else. A senior researcher first asks “do I even need to look this up?”, picks the right source (the wiki, the database, the news), skims the results and says “this isn't it”, rephrases, tries another source, and stops when they have enough. Agentic RAG teaches the system the senior's habits, and like a senior, it bills more hours.</p>
+  </div>
+
+  <h2>The patterns</h2>
+  <table>
+    <tr><th>Pattern</th><th>The decision it adds</th><th>How</th></tr>
+    <tr><td><b>Retrieval as a tool</b></td><td>Whether and what to search</td><td>Give the model a <code>search(query)</code> tool; it calls it zero, one or many times (ReAct-style loop, Lesson 6.1)</td></tr>
+    <tr><td><b>Iterative retrieval</b> (IRCoT, FLARE)</td><td>What to search next</td><td>Interleave reasoning steps with searches; IRCoT improved retrieval by up to 21 points on multi-hop QA. FLARE searches when the model's next sentence contains low-confidence tokens</td></tr>
+    <tr><td><b>Self-RAG</b> (2023)</td><td>Retrieve? Relevant? Supported? Useful?</td><td>A model trained to emit <b>reflection tokens</b>: <span class="mono">Retrieve</span> (yes/no/continue), <span class="mono">IsRel</span> (relevant/irrelevant), <span class="mono">IsSup</span> (fully/partially/no support), <span class="mono">IsUse</span> (1–5)</td></tr>
+    <tr><td><b>Corrective RAG</b> (CRAG, 2024)</td><td>Is retrieval good enough?</td><td>A lightweight evaluator (a fine-tuned T5-large, 0.77B parameters) scores the documents: <b>Correct</b> → refine them; <b>Incorrect</b> → web search instead; <b>Ambiguous</b> → both</td></tr>
+    <tr><td><b>Adaptive-RAG</b> (2024)</td><td>How much retrieval this question needs</td><td>A small classifier (T5-large) labels each question A (no retrieval), B (single-step) or C (multi-step) and routes it</td></tr>
+    <tr><td><b>Source routing</b></td><td>Where to look</td><td>Classifier or LLM picks vector store, web, SQL (4.6), graph (4.3), or several</td></tr>
+  </table>
+  <p>Notice the trained components: Self-RAG fine-tunes the generator, CRAG and Adaptive-RAG train small evaluators. In products, most teams approximate them with prompts to a small fast model, at the cost of a little more latency, and graduate to a trained classifier once they have logs to train on.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · An agentic RAG loop</span>
+    <p class="hint">The help centre from Lesson 4.1. Choose a question and the loop's settings, then run it. The router, rewriter, LLM grader and web search are <b>simulated</b> (scripted stand-ins for LLM calls and a search API); retrieval is real toy hybrid search. Watch the steps, tokens and seconds add up. Start with question 3 and the similarity grader.</p>
+    <div class="controls">
+      <label>question <select id="aq" class="btn small"></select></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="agrade"><button data-v="off" id="gr-off">No grader</button><button data-v="sim" class="on" id="gr-sim">Similarity ≥ threshold</button><button data-v="llm" id="gr-llm">LLM relevance judge</button></span>
+      <label>threshold <input type="range" id="athr" min="0.2" max="0.9" step="0.05" value="0.5"> <b class="mono" id="athrv"></b></label>
+    </div>
+    <div class="controls">
+      <label>max rewrites <input type="range" id="aret" min="0" max="2" value="1"> <b class="mono" id="aretv"></b></label>
+      <label><input type="checkbox" id="aweb" checked> web search fallback</label>
+      <button class="btn primary" id="arun">▶ Run the loop</button>
+    </div>
+    <svg id="aflow" style="width:100%"></svg>
+    <div class="verdict" id="averdict"></div>
+    <div class="log" id="alog"></div>
+    <div class="stat-row">
+      <div class="stat">LLM calls <b id="acalls">–</b></div>
+      <div class="stat">tokens <b id="atok">–</b></div>
+      <div class="stat">latency (illustrative) <b id="alat">–</b></div>
+    </div>
+  </div>
+  <p>What you should see: with no grader, question 2 (“stuff i got for xmas”) is answered from irrelevant chunks. The similarity grader catches that, but it waves through question 3: chunks about shipping look similar to a question about a courier strike, yet don't answer it. <b>Similarity isn't relevance</b>, which is why CRAG trains an evaluator and most products use an LLM judge. With the LLM judge, question 3 correctly falls back to the web; turn the web off and the honest outcome is “I don't know”. Try question 5 with the web on: when the help centre is missing a company-specific fact, a web fallback can import <i>someone else's</i> policy (here, another shop's student discount).</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what the grader costs, and what it saves</span>
+    <p>100,000 questions a day. Naive RAG: 1 generation call, ≈ 1.6 s. Adding an LLM grader adds ≈ 700 input tokens and ≈ 0.5 s to every question; suppose 15% of questions fail the grade and trigger a rewrite + second retrieval + second grade (≈ +0.9 s, +900 tokens).</p>
+    <ul>
+      <li>Extra tokens per day: 100,000 × 700 + 15,000 × 900 = 70M + 13.5M = <b>83.5M tokens</b>. At an illustrative $1 per million for a small model: <b>≈ $84 a day</b>.</li>
+      <li>Average added latency: 0.5 + 0.15 × 0.9 = <b>0.64 s</b>; the unlucky 15% wait 1.4 s longer.</li>
+      <li>If 10% of naive answers were wrong because retrieval missed, and the loop fixes even half of them, that's <b>5,000 fewer wrong answers a day</b> for ≈ $84. Usually worth it; but measure it, and grade only when the retrieval scores are borderline if latency matters.</li>
+    </ul>
+  </div>
+
+  <h2>Adaptive RAG: spend effort where it's needed</h2>
+  <p>Adaptive-RAG's insight is that a cheap classifier in front can send each question to the cheapest strategy that will answer it. Question types differ wildly: greetings and general knowledge need no retrieval; most help questions need one search; a few need several.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The adaptive router</span>
+    <p class="hint">Ten questions. Each needs at least a certain strategy (A no retrieval, B single search, C multi-step). Compare fixed policies against a router. The router here is a <b>rule-based stand-in</b> for a small trained classifier (Adaptive-RAG used T5-large) and makes one realistic mistake. Click a strategy in any row to override it, then compare.</p>
+    <div class="controls">
+      <span class="seg" id="rpol"><button data-v="A" id="p-A">Always A</button><button data-v="B" id="p-B">Always B</button><button data-v="C" id="p-C">Always C</button><button data-v="R" class="on" id="p-R">Router</button></span>
+    </div>
+    <div id="rtable"></div>
+    <canvas class="chart" id="rchart" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">correct <b id="rok">–</b></div>
+      <div class="stat">avg latency <b id="rlat">–</b></div>
+      <div class="stat">avg LLM calls <b id="rcalls">–</b></div>
+    </div>
+    <p class="hint">Illustrative costs: A = 1 call, 0.8 s · B = 1 call + 1 search, 1.8 s · C = 4 calls + 3 searches, 6.5 s · router = 0.05 s (a small classifier). A question answered with less than it needs counts as wrong (no retrieval → made-up policy; one search → misses the second half).</p>
+  </div>
+  <p>What you should see: “always A” is fast and wrong; “always C” is right and about 2.6× slower than the router on average; “always B” misses every multi-step question. The router gets 9 of 10 at a fraction of C's latency. Fix its one mistake by hand and you've just made the case for collecting routing labels from logs and training a better classifier.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>LangGraph</b> (graphs of nodes and conditional edges, with an agentic RAG tutorial in its docs), <b>LlamaIndex</b> agents and workflows, provider tool calling (OpenAI, Anthropic, Gemini), plus web search APIs for fallback. The graph below follows LangGraph's agentic RAG tutorial: the model decides whether to call the retriever tool; a grader routes to an answer or a question rewrite.</p>
+<pre><code><span class="k">from</span> typing <span class="k">import</span> Literal
+<span class="k">from</span> pydantic <span class="k">import</span> BaseModel, Field
+<span class="k">from</span> langchain.chat_models <span class="k">import</span> init_chat_model
+<span class="k">from</span> langgraph.graph <span class="k">import</span> StateGraph, MessagesState, START, END
+<span class="k">from</span> langgraph.prebuilt <span class="k">import</span> ToolNode
+
+grader = init_chat_model(<span class="s">"anthropic:claude-haiku-5-5"</span>, temperature=<span class="n">0</span>)   <span class="c"># small, fast judge (as of 2026)</span>
+
+<span class="k">class</span> <span class="f">Grade</span>(BaseModel):
+    binary_score: str = Field(description=<span class="s">"'yes' if the documents are relevant to the question, else 'no'"</span>)
+
+<span class="k">def</span> <span class="f">grade_documents</span>(state: MessagesState) -> Literal[<span class="s">"generate_answer"</span>, <span class="s">"rewrite_question"</span>]:
+    question, docs = state[<span class="s">"messages"</span>][<span class="n">0</span>].content, state[<span class="s">"messages"</span>][-<span class="n">1</span>].content
+    g = grader.with_structured_output(Grade).invoke(
+        [{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">f"Question: {question}\nDocuments: {docs}\nRelevant? yes or no."</span>}])
+    <span class="k">return</span> <span class="s">"generate_answer"</span> <span class="k">if</span> g.binary_score == <span class="s">"yes"</span> <span class="k">else</span> <span class="s">"rewrite_question"</span>
+
+<span class="k">def</span> <span class="f">route_on_tool_calls</span>(state: MessagesState):
+    <span class="k">return</span> <span class="s">"tools"</span> <span class="k">if</span> getattr(state[<span class="s">"messages"</span>][-<span class="n">1</span>], <span class="s">"tool_calls"</span>, <span class="k">None</span>) <span class="k">else</span> END
+
+g = StateGraph(MessagesState)
+g.add_node(generate_query_or_respond)            <span class="c"># LLM with the retriever tool bound: may answer directly</span>
+g.add_node(<span class="s">"retrieve"</span>, ToolNode([retriever_tool]))
+g.add_node(rewrite_question)
+g.add_node(generate_answer)
+g.add_edge(START, <span class="s">"generate_query_or_respond"</span>)
+g.add_conditional_edges(<span class="s">"generate_query_or_respond"</span>, route_on_tool_calls, {<span class="s">"tools"</span>: <span class="s">"retrieve"</span>, END: END})
+g.add_conditional_edges(<span class="s">"retrieve"</span>, grade_documents)
+g.add_edge(<span class="s">"rewrite_question"</span>, <span class="s">"generate_query_or_respond"</span>)   <span class="c"># the loop: cap it in production</span>
+g.add_edge(<span class="s">"generate_answer"</span>, END)
+graph = g.compile()</code></pre>
+    <p class="hint">Always cap loops: count rewrites in the graph state, or set LangGraph's recursion limit, so a question that can't be answered ends in “I don't know” instead of an expensive spin.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Relevance grader</td><td>Stops answers built on irrelevant chunks</td><td>+1 call per question; false rejections trigger needless fallbacks</td></tr>
+      <tr><td>Rewrite-and-retry loop</td><td>Recovers from bad phrasing</td><td>Unbounded latency unless capped; can drift</td></tr>
+      <tr><td>Web fallback</td><td>Answers fresh or out-of-corpus questions</td><td>Untrusted content (prompt injection, Lesson 8.3), someone else's facts, citations to vet</td></tr>
+      <tr><td>Agent decides everything</td><td>Most flexible; handles multi-hop</td><td>Least predictable cost and latency; harder to test and debug</td></tr>
+      <tr><td>Adaptive router</td><td>Cheap questions stay cheap</td><td>Misroutes; needs labels and its own eval</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Start with a fixed pipeline plus one decision: a cheap router (“retrieve or not, docs or SQL”) or a grader with a single rewrite. Cap the loop, log every step, and only make it more agentic where evals show multi-hop failures. Anthropic's own advice is to find the simplest solution and add agentic complexity only when needed.</p></div>
+      <div><h4>At scale</h4><p>Trained small classifiers for routing and relevance (cheaper and faster than LLM calls), per-route latency budgets, parallel tool calls, step-level tracing and evals of whole trajectories (Lesson 5.5), and deep-research style multi-agent flows reserved for high-value questions.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Our RAG answers confidently from irrelevant documents. And some questions need several lookups. Design a fix.” A senior answer:</p>
+    <ul>
+      <li>Adds a <b>relevance check</b> after retrieval (LLM judge or trained evaluator), explaining why a similarity threshold isn't enough.</li>
+      <li>On failure: <b>rewrite</b> and retry (capped), then fall back to another source or <b>abstain</b>; web fallback only with sanitising and citations.</li>
+      <li>Adds a <b>router</b> so simple questions skip the loop and complex ones get decomposition or iterative retrieval (Adaptive-RAG).</li>
+      <li>Puts numbers on it: added calls, p50/p95 latency, cost per 1,000 questions, and the eval showing fewer wrong answers.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Parallel research agents</b> <span class="tag co">🏢 Anthropic · 2025</span> <a href="https://www.anthropic.com/engineering/multi-agent-research-system" target="_blank" rel="noopener">How we built our multi-agent research system</a></div>
+      <p><b>How:</b> a lead agent plans and spawns subagents that search in parallel with separate context windows, then synthesises their results.</p>
+      <p><b>Why this method:</b> open-ended research needs many searches; it beat a single agent by 90.2% on an internal eval, at about 15× the tokens of a chat, so it's reserved for high-value tasks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Grade, then correct</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2401.15884" target="_blank" rel="noopener">Corrective RAG (CRAG)</a></div>
+      <p><b>How:</b> a 0.77B-parameter evaluator scores retrieved documents; thresholds map to Correct (refine into key “knowledge strips”), Incorrect (web search) or Ambiguous (both).</p>
+      <p><b>Why this method:</b> plug-and-play robustness when retrieval goes wrong; it significantly improved both standard RAG and Self-RAG across four datasets.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A model that critiques its own retrieval</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2310.11511" target="_blank" rel="noopener">Self-RAG (University of Washington, AI2, IBM)</a></div>
+      <p><b>How:</b> train the LM to emit reflection tokens deciding when to retrieve and whether passages are relevant, supported and useful.</p>
+      <p><b>Why this method:</b> retrieving a fixed number of passages every time hurts versatility; Self-RAG 7B and 13B outperformed ChatGPT and retrieval-augmented Llama 2 chat on open-domain QA, reasoning and fact verification.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Route by complexity</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2403.14403" target="_blank" rel="noopener">Adaptive-RAG (KAIST)</a></div>
+      <p><b>How:</b> a T5-large classifier, trained on labels collected automatically from which strategy actually succeeded, picks no-retrieval, single-step or multi-step per query.</p>
+      <p><b>Why this method:</b> one strategy for all queries is either wasteful on simple ones or inadequate on complex ones; routing improved both accuracy and efficiency over fixed and other adaptive baselines.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · retrieval triggered by doubt</span>
+    <p>FLARE (2023) doesn't decide up front whether to retrieve. It drafts the next sentence, and if any token in it has low probability (the model is unsure), it uses that draft as a search query, retrieves, and rewrites the sentence. The model's own uncertainty becomes the retrieval trigger.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Query rewriting and decomposition (4.1) become loop steps here; multi-hop questions (4.3) get an iterative alternative to graphs; SQL is one of the sources a router picks (4.6). The agent loop itself is Lesson 6.1, LangGraph in depth is 6.5, evaluating trajectories is 5.5 (with test sets built as in 5.7), and web-fallback safety is 8.3. Timeouts, retries and budgets are classic resilience engineering: <a href="../../system-design-course/phase4/4-resilience.html">resilience patterns</a> in the System Design course.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.langchain.com/oss/python/langgraph/agentic-rag" target="_blank" rel="noopener">LangGraph: build a custom RAG agent</a>. Retriever tool, grader, rewrite loop.</li>
+      <li><span class="kind">Blog</span> <a href="https://www.anthropic.com/engineering/building-effective-agents" target="_blank" rel="noopener">Anthropic: Building effective agents</a>. When (and when not) to go agentic.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2212.10509" target="_blank" rel="noopener">IRCoT: Interleaving Retrieval with Chain-of-Thought</a>. Iterative retrieval for multi-hop QA.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A router sends 60% of questions to A (0.8 s), 35% to B (1.8 s) and 5% to C (6.5 s), and itself adds 0.05 s. What's the average latency, versus 6.5 s for “always C”?</div>
+    <div class="opts"><button class="opt" data-ok>≈ 1.5 s</button><button class="opt">≈ 3.0 s</button><button class="opt">≈ 0.8 s</button></div>
+    <div class="explain">0.6 × 0.8 + 0.35 × 1.8 + 0.05 × 6.5 + 0.05 = 0.48 + 0.63 + 0.325 + 0.05 ≈ <b>1.49 s</b>, over 4× faster than always running the multi-step strategy.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your grader passes documents when cosine similarity ≥ 0.5. Logs show confident wrong answers to “is there a delivery delay because of the storm?” built from your generic shipping-times page. Why, and what fixes it?</div>
+    <div class="opts"><button class="opt">The threshold is too high; lower it to 0.3</button><button class="opt" data-ok>Similarity measures topic overlap, not whether the text answers the question; use an LLM or trained relevance judge, then fall back (web or “I don't know”)</button><button class="opt">Add more shipping documents</button></div>
+    <div class="explain">The shipping page is on-topic, so it's similar, but it can't answer a question about a current event. Relevance judging (CRAG's evaluator, Self-RAG's IsRel, or an LLM grader) asks the right question: does this support an answer?</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A team makes every question go through a 6-step agent with web search. Quality is slightly better, but p95 latency went from 2 s to 25 s and cost rose 6×. What's the senior move?</div>
+    <div class="opts"><button class="opt">Remove the agent entirely</button><button class="opt">Buy faster GPUs</button><button class="opt" data-ok>Add a router: simple questions take the 1-call path, only complex or failed-grade questions enter the agent loop, with a step cap</button></div>
+    <div class="explain">Agentic retrieval earns its cost on a minority of questions. Adaptive routing keeps the quality gain where it matters and the 2 s path for the rest; a step cap bounds the worst case.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Agentic RAG makes retrieval a decision: whether, where, good enough?, what next.</li>
+      <li>Self-RAG (reflection tokens), CRAG (evaluator + web fallback) and Adaptive-RAG (complexity router) are the reference designs; products approximate them with small, fast LLM calls.</li>
+      <li>Similarity isn't relevance: grade with a judge, cap the loop, and abstain when nothing relevant is found.</li>
+      <li>Every decision costs latency and tokens: route so that only the questions that need the loop pay for it.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const C = [
+    "Refunds: items can be returned for a refund within 30 days of delivery.",
+    "Plus members get an extended return window of 60 days for refunds.",
+    "Refunds go back to the original payment method within 5 business days.",
+    "Gift returns: items received as a gift can be returned for store credit, no receipt needed.",
+    "Standard shipping takes 3 to 5 business days.",
+    "Express shipping arrives the next business day if you order before 2 pm.",
+    "Plus costs 49 dollars per year and includes free express shipping on every order.",
+    "Every jacket has a two-year warranty against defects such as broken zippers or seams.",
+    "To make a warranty claim, send a photo of the defect to support.",
+    "If you are locked out, use the Forgot password link on the sign in page.",
+    "The password reset link expires after 30 minutes.",
+    "We ship to Canada and Mexico; international orders may pay import duties.",
+  ];
+  // questions: sub-queries (each with gold chunks and scripted rewrites); web: what a web search would return and whether it is right
+  const AQ = [
+    { q: "How many days do Plus members have to return a jacket?", subs: [{ q: "How many days do Plus members have to return a jacket?", gold: [1], rw: ["How many days can Plus members return a jacket?", "Plus member return window"] }] },
+    { q: "can I send back stuff i got for xmas", subs: [{ q: "can I send back stuff i got for xmas", gold: [3], rw: ["Can I return a gift?", "What is the gift return policy?"] }] },
+    { q: "Is the courier strike in Canada delaying deliveries this week?", web: { ok: true, t: "News site (simulated): a courier union strike is delaying parcels across Canada this week." },
+      subs: [{ q: "Is the courier strike in Canada delaying deliveries this week?", gold: [], rw: ["Are deliveries to Canada delayed by a courier strike?", "Canada courier strike delivery delays"] }] },
+    { q: "thanks, that's all!", chat: true, subs: [] },
+    { q: "Do you offer a student discount?", web: { ok: false, t: "Another retailer's help page (simulated): students get 15% off with a valid ID." },
+      subs: [{ q: "Do you offer a student discount?", gold: [], rw: ["Is there a discount for students?", "Student discount policy"] }] },
+    { q: "Compare the refund window and the warranty length for Plus members", subs: [
+      { q: "What is the refund window for Plus members?", gold: [1], rw: ["Plus member refund window"] },
+      { q: "How long is the jacket warranty?", gold: [7], rw: ["Jacket warranty length in years"] }] },
+  ];
+  AQ[4].note = "The help centre doesn't mention student discounts. The right answer is to say so or escalate, not to borrow another shop's offer.";
+  $("aq").innerHTML = AQ.map((a, i) => `<option value="${i}">${i + 1}. ${a.q}</option>`).join("");
+  // ---------- flow diagram ----------
+  const F = new Flow($("aflow"), { width: 760, height: 250 });
+  F.node("q", { x: 55, y: 50, w: 90, h: 42, label: "Question", kind: "cl" })
+   .node("agent", { x: 185, y: 50, w: 110, h: 42, label: "Router / agent", sub: "retrieve?", kind: "nw" })
+   .node("ret", { x: 335, y: 50, w: 110, h: 42, label: "Vector store", sub: "top-2", kind: "db" })
+   .node("grade", { x: 490, y: 50, w: 110, h: 42, label: "Grader", sub: "relevant?", kind: "ca" })
+   .node("gen", { x: 660, y: 50, w: 110, h: 42, label: "Generate", sub: "answer", kind: "nw" })
+   .node("rew", { x: 412, y: 150, w: 110, h: 42, label: "Rewrite", sub: "new query", kind: "nw" })
+   .node("web", { x: 580, y: 150, w: 110, h: 42, label: "Web search", sub: "fallback", kind: "sv" })
+   .node("ans", { x: 660, y: 215, w: 120, h: 40, label: "Answer", kind: "cl" })
+   .edge("q", "agent").edge("agent", "ret").edge("ret", "grade").edge("grade", "gen", { label: "yes" })
+   .edge("grade", "rew", { label: "no" }).edge("rew", "ret").edge("grade", "web", { dashed: true, label: "still no" })
+   .edge("web", "gen").edge("agent", "gen", { dashed: true }).edge("gen", "ans").render();
+
+  const COST = { route: [1, 330, 0.4], ret: [0, 0, 0.15], llmgrade: [1, 710, 0.5], simgrade: [0, 0, 0.01], rew: [1, 230, 0.4], web: [0, 0, 1.2], gen: [1, 0, 1.6] };
+  let grade = "sim";
+  const gBtns = [...$("agrade").querySelectorAll("button")];
+  gBtns.forEach(b => (b.onclick = () => { gBtns.forEach(x => x.classList.toggle("on", x === b)); grade = b.dataset.v; plan(); }));
+  const topk = q => AI.search(C, q, { mode: "hybrid", k: 2 }).map(r => r.i);
+  const maxSim = (q, ids) => { const v = AI.embed(q); return Math.max(...ids.map(i => AI.cosine(v, AI.embed(C[i])))); };
+  // simulate the loop: returns {steps:[{node,text,cost:[calls,tokens,sec],path}], context:[ids], web, outcome}
+  function simulate(a) {
+    const thr = +$("athr").value, maxRw = +$("aret").value, web = $("aweb").checked;
+    const steps = [], add = (path, text, c, extra) => steps.push({ path, text, c: c.slice(), ...(extra || {}) });
+    add(["q", "agent"], a.chat ? "router (simulated LLM): small talk, no retrieval needed" : a.subs.length > 1 ? `router (simulated LLM): compound question, ${a.subs.length} sub-questions` : "router (simulated LLM): needs the help centre, call search", COST.route);
+    if (a.chat) { add(["agent", "gen", "ans"], "generate: “You're welcome! Anything else?”", COST.gen); return { steps, outcome: "ok", msg: "✅ Answered directly: no retrieval, no wasted tokens." }; }
+    const context = []; let webUsed = null, anyRejected = false;
+    a.subs.forEach((s, si) => {
+      let q = s.q, tries = 0, accepted = false;
+      while (true) {
+        const ids = topk(q);
+        add(["agent", "ret"].slice(tries || si ? 1 : 0), `search${a.subs.length > 1 ? " (sub-question " + (si + 1) + ")" : ""}: “${q}” → chunks ${ids.join(", ")}`, COST.ret, { ids });
+        let pass;
+        if (grade === "off") pass = true;
+        else if (grade === "sim") { const m = maxSim(q, ids); pass = m >= thr; add(["ret", "grade"], `similarity grader: max cosine ${m.toFixed(2)} ${pass ? "≥" : "<"} ${thr.toFixed(2)} → ${pass ? "relevant" : "not relevant"}`, COST.simgrade); }
+        else { pass = s.gold.length > 0 && s.gold.every(g => ids.includes(g)); add(["ret", "grade"], `LLM judge (simulated): ${pass ? "yes, these chunks answer it" : "no, these chunks don't answer it"}`, COST.llmgrade); }
+        if (pass) { ids.forEach(i => { if (!context.includes(i)) context.push(i); }); accepted = true; break; }
+        if (tries >= maxRw || tries >= s.rw.length) break;
+        q = s.rw[tries]; tries++;
+        add(["grade", "rew"], `rewrite (simulated LLM): “${q}”`, COST.rew);
+      }
+      if (!accepted) {
+        anyRejected = true;
+        if (web && a.web) { webUsed = a.web; add(["grade", "web"], `web search (simulated): ${a.web.t}`, COST.web); }
+        else if (web) add(["grade", "web"], "web search (simulated): nothing useful found", COST.web);
+      }
+    });
+    const ctxTok = context.reduce((t, i) => t + AI.countTokens(C[i]), 0) + (webUsed ? 300 : 0);
+    const gc = COST.gen.slice(); gc[1] = 520 + ctxTok * 4;
+    const needAll = a.subs.flatMap(s => s.gold);
+    let outcome, msg;
+    if (!context.length && !webUsed) { outcome = "abstain"; msg = a.web && a.web.ok ? "⚠️ Abstains: “I couldn't find that in the help centre.” Honest, though web search would have answered it." : "✅ Abstains: “The help centre doesn't say; I'll pass you to a human.” That's the right answer here."; add(["grade", "gen", "ans"], "generate: no relevant context → abstain", gc); }
+    else if (webUsed && !webUsed.ok) { outcome = "bad"; msg = "❌ Answers with another retailer's policy from the web. " + a.note; add(["web", "gen", "ans"], "generate from the web result", gc); }
+    else if (webUsed && webUsed.ok) { outcome = "ok"; msg = "✅ Answered from the web result, with a citation to it."; add(["web", "gen", "ans"], "generate from the web result (cite it)", gc); }
+    else if (needAll.length && needAll.every(g => context.includes(g))) { outcome = "ok"; msg = `✅ Grounded answer: context includes chunk${needAll.length > 1 ? "s" : ""} ${needAll.join(", ")}.`; add(["grade", "gen", "ans"], `generate from chunks ${context.join(", ")}`, gc); }
+    else { outcome = "bad"; msg = `❌ Answers confidently from irrelevant chunks (${context.join(", ")}).${a.note ? " " + a.note : ""}`; add(["grade", "gen", "ans"], `generate from chunks ${context.join(", ")} (they don't answer it)`, gc); }
+    return { steps, outcome, msg };
+  }
+  function show(r) {
+    let calls = 0, tok = 0, sec = 0;
+    $("alog").innerHTML = r.steps.map((s, n) => { calls += s.c[0]; tok += s.c[1]; sec += s.c[2]; return `<div>${n + 1}. ${esc(s.text)}<span class="t">${s.c[0] ? s.c[0] + " call · " : ""}${s.c[1] ? s.c[1] + " tok · " : ""}${s.c[2].toFixed(2)} s</span></div>`; }).join("");
+    $("acalls").textContent = calls; $("atok").textContent = tok.toLocaleString("en-US"); $("alat").textContent = sec.toFixed(1) + " s";
+    $("averdict").innerHTML = `<span class="${r.outcome === "ok" ? "ev" : r.outcome === "bad" ? "rk" : "tk"}">${esc(r.msg)}</span>`;
+  }
+  function plan() {
+    $("athrv").textContent = grade === "sim" ? (+$("athr").value).toFixed(2) : "(not used)";
+    $("aretv").textContent = $("aret").value;
+    show(simulate(AQ[+$("aq").value]));
+  }
+  let running = false;
+  $("arun").onclick = async () => {
+    if (running) return; running = true;
+    const r = simulate(AQ[+$("aq").value]); show(r);
+    Object.keys(F.nodes).forEach(id => F.set(id, { hot: false }));
+    for (const s of r.steps) { s.path.forEach(id => F.set(id, { hot: true })); if (s.path.length > 1) await F.packet(s.path, { color: "--c-in", dur: 380 * (s.path.length - 1) }); }
+    running = false;
+  };
+  ["aq", "athr", "aret"].forEach(id => ($(id).oninput = plan)); $("aweb").onchange = plan;
+  plan();
+
+  // ---------- adaptive router ----------
+  const RQ = [
+    ["Hi! Who are you?", "A"], ["What does RAG stand for?", "A"], ["What is 15% of 49 dollars?", "A"],
+    ["How much does Plus cost?", "B"], ["When does the password reset link expire?", "B"], ["Do you ship to Mexico?", "B"], ["Can I return a gift?", "B"],
+    ["Compare the refund window and the warranty length for Plus members.", "C"],
+    ["If I'm a Plus member and order express at 3 pm, when does it arrive?", "C"],
+    ["My gift jacket's zip broke after a month: can it be repaired, and how long would that take?", "C"],
+  ];
+  const classify = q => { // rule-based stand-in for a trained complexity classifier
+    const s = q.toLowerCase();
+    if (/^(hi|hello|thanks)|stand for|\d+% of/.test(s)) return "A";
+    if (/compare|, and (when|how|what|can)|: .* and /.test(s)) return "C";
+    return "B";
+  };
+  const COSTR = { A: [1, 0.8], B: [1, 1.8], C: [4, 6.5] }, RANK = { A: 0, B: 1, C: 2 };
+  const override = {};
+  let pol = "R";
+  const pBtns = [...$("rpol").querySelectorAll("button")];
+  pBtns.forEach(b => (b.onclick = () => { pBtns.forEach(x => x.classList.toggle("on", x === b)); pol = b.dataset.v; renderR(); }));
+  const route = (i, p) => p === "R" ? (override[i] || classify(RQ[i][0])) : p;
+  function score(p) {
+    let ok = 0, lat = 0, calls = 0;
+    RQ.forEach(([, need], i) => { const r = route(i, p); ok += RANK[r] >= RANK[need]; lat += COSTR[r][1] + (p === "R" ? 0.05 : 0); calls += COSTR[r][0]; });
+    return { ok, lat: lat / RQ.length, calls: calls / RQ.length };
+  }
+  function renderR() {
+    $("rtable").innerHTML = `<table class="rt"><tr><th>question</th><th>needs</th><th>${pol === "R" ? "router picks (click to override)" : "policy uses"}</th><th>result</th></tr>${RQ.map(([q, need], i) => {
+      const r = route(i, pol), good = RANK[r] >= RANK[need];
+      const btns = pol === "R" ? ["A", "B", "C"].map(x => `<button data-i="${i}" data-r="${x}" class="${r === x ? "on" : ""}" id="ov${i}${x}">${x}</button>`).join(" ") : r;
+      return `<tr><td>${esc(q)}</td><td>${need}</td><td>${btns}${pol === "R" && override[i] ? ' <span class="muted">(overridden)</span>' : ""}</td><td>${good ? (RANK[r] > RANK[need] ? "✅ (overkill)" : "✅") : "❌"}</td></tr>`;
+    }).join("")}</table>`;
+    $("rtable").querySelectorAll("button[data-i]").forEach(b => (b.onclick = () => { override[+b.dataset.i] = b.dataset.r; renderR(); }));
+    const s = score(pol);
+    $("rok").textContent = s.ok + " / " + RQ.length; $("rlat").textContent = s.lat.toFixed(2) + " s"; $("rcalls").textContent = s.calls.toFixed(1);
+    const all = ["A", "B", "C", "R"].map(p => [p, score(p)]);
+    Plot.bars($("rchart"), { bars: all.flatMap(([p, x]) => [
+      { label: (p === "R" ? "router" : "always " + p) + " · correct", value: x.ok, color: MX.css("--c-ev") },
+      { label: (p === "R" ? "router" : "always " + p) + " · latency s", value: +x.lat.toFixed(2), color: MX.css("--c-tk") }]), yMin: 0 });
+  }
+  renderR();
+})();
+</script>
+</body>
+</html>

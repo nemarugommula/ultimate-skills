@@ -1,0 +1,446 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.7 Object storage, search, time-series &amp; vector stores · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  #ix-docs { width: 100%; min-height: 110px; font-family: var(--mono); font-size: .85rem; background: var(--bg2); color: var(--text); border: 1px solid var(--line); border-radius: 10px; padding: 8px; box-sizing: border-box; }
+  #ix-q { font: inherit; padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); min-width: 220px; }
+  .ixgrid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .ixbox { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; font-size: .86rem; max-height: 240px; overflow: auto; }
+  .ixbox code { font-size: .82rem; }
+  .ixbox .hit { color: var(--c-ca); font-weight: 700; }
+  .game { display: grid; gap: 8px; }
+  .gq { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; }
+  .gq .opts2 { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 6px; }
+  .gq .opts2 button { font: inherit; font-size: .8rem; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; }
+  .gq .opts2 button.right { background: var(--good); color: #fff; border-color: var(--good); }
+  .gq .opts2 button.wrong { background: var(--bad); color: #fff; border-color: var(--bad); }
+  .gq .why { font-size: .85rem; color: var(--muted); margin-top: 4px; }
+  @media (max-width: 600px) { .ixgrid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-lesson="s2-7" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 7</div>
+  <h1>Object storage, search, time-series &amp; vector stores</h1>
+  <p class="subtitle">Some data has a shape your main database handles badly: huge files, free-text search, millions of metrics per second, “find things like this”. Specialized stores do one of these jobs far better, and most large systems run several next to their main database.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>An <b>index</b> is a sorted structure that avoids reading everything; LSM trees turn writes into sequential appends (Lesson 2.2).</li>
+      <li>Big data is split into <b>shards</b> with <b>replicas</b> (Lessons 2.3 and 2.4).</li>
+      <li>A <b>CDN</b> caches files close to users (Lesson 1.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Amazon S3 is designed to exceed <b>99.999999999%</b> (“11 nines”) durability, and by default stores data redundantly across at least <b>3 Availability Zones</b> (separate datacenters in a region).</p>
+    <p>What does 11 nines mean? Store 10 million files and the expected loss is 10,000,000 × 0.00000000001 = 0.0001 files a year: <b>one file every 10,000 years</b>. You couldn't build that yourself with a few servers and RAID. It's why nearly every company stores its photos, videos, backups and logs in object storage instead of in a database.</p>
+  </div>
+
+  <h2>Numbers first: why photos don't go in Postgres</h2>
+  <p>A photo app: <b>10 million users</b>, each uploading <b>2 photos a day</b> of about <b>3 MB</b>.</p>
+  <table>
+    <tr><th></th><th>Photos in the database</th><th>Photos in object storage, metadata in the database</th></tr>
+    <tr><td>New data per day</td><td class="er">20M × 3 MB = <b>60 TB</b> in Postgres</td><td>60 TB in S3 + 20M rows × ~200 bytes = <b>4 GB</b> in Postgres</td></tr>
+    <tr><td>Backups, replicas, failover</td><td class="er">Every replica copies 60 TB/day</td><td class="db">The database stays small and fast</td></tr>
+    <tr><td>Serving a photo</td><td>Through your app servers</td><td class="ca">From a CDN in front of the bucket (Lesson 1.4)</td></tr>
+  </table>
+  <p>The same pattern repeats for every specialized store: the main database keeps the <b>source of truth</b> for small structured records; a specialized store holds the big, searchable or fast-changing part.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Pick storage by <b>the shape of the question</b>. “Give me file X” → object storage. “Which documents mention these words, best first?” → a search engine's <b>inverted index</b>. “What was CPU every 15 s for a week?” → a time-series database. “What's most similar to this?” → a vector index. Each one is built around one question.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a city's specialist buildings</span>
+    <p>A town hall (your relational database) keeps the official records. But you don't store furniture in the town hall: there's a warehouse (object storage). You don't find a book by walking the shelves: the library has a catalog by subject and word (search). The weather station logs a reading every minute in a compact notebook (time-series). And a perfume shop can find “something that smells like this” (vector search). Each building is bad at the others' jobs.</p>
+  </div>
+
+  <h2>Object storage: files at any scale</h2>
+  <p>Object storage (Amazon S3, Google Cloud Storage, Azure Blob Storage, Cloudflare R2, MinIO to self-host) stores <b>objects</b>: a blob of bytes plus metadata, under a <b>key</b> like <code>photos/u42/2025/beach.jpg</code> inside a <b>bucket</b>. You read and write over HTTP. You don't edit an object in place; you replace it.</p>
+  <ul>
+    <li>Big files: S3 objects can be very large, but a single PUT is limited to 5 GB; for objects over about 100 MB AWS suggests <b>multipart upload</b> (upload parts in parallel, then combine).</li>
+    <li>S3 gives <b>strong read-after-write consistency</b>: once a write succeeds, reads return the new object.</li>
+    <li><b>Presigned URLs</b> let a browser upload or download directly, without your servers in the middle and without AWS credentials on the client. Your API signs a URL that's valid for one object, one action and a limited time (up to 7 days, less if it was signed with temporary credentials).</li>
+  </ul>
+
+  <div class="playground" id="pg-upload">
+    <span class="label">🎮 Playground · Upload through your API, or straight to the bucket</span>
+    <p class="hint">Uploads either stream through your API servers to the bucket (“proxy”), or the API hands out a presigned URL and the client uploads directly. Assume one API server can relay about <b>100 MB/s</b> of uploads. Push the traffic up and watch the API melt in proxy mode.</p>
+    <svg id="uf"></svg>
+    <div class="controls">
+      <span class="seg" id="u-mode"><button id="u-mode-proxy" data-v="proxy" class="on">Proxy through the API</button><button id="u-mode-presign" data-v="presign">Presigned URL</button></span>
+      <label>file size <input type="range" id="u-size" min="0" max="3" step="0.01" value="0.477"> <b class="mono" id="u-sizev"></b></label>
+      <label>uploads/s <input type="range" id="u-rate" min="1" max="3.7" step="0.01" value="2.4"> <b class="mono" id="u-ratev"></b></label>
+      <button class="btn primary" id="u-go">Upload a photo</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">traffic through API servers <b id="u-bw">–</b></div>
+      <div class="stat">API servers needed for uploads <b id="u-srv">–</b></div>
+      <div class="stat">API requests per upload <b id="u-req">–</b></div>
+      <div class="stat">bytes that touch the bucket <b id="u-s3">–</b></div>
+    </div>
+    <p class="hint" id="u-msg"></p>
+  </div>
+  <p>Things to try: at about 250 uploads/s of 3 MB photos (our app's average), proxying pushes about 760 MB/s through your servers, 8 of them just to carry bytes. Raise it to 2,000 uploads/s of 50 MB videos and you'd need a thousand servers. With presigned URLs your API handles two tiny requests per upload, whatever the file size.</p>
+
+  <h2>Search: the inverted index</h2>
+  <p>A B-tree on a <code>description</code> column can find “descriptions starting with ‘red’” but not “descriptions containing ‘red’ and ‘shoes’, best match first”. <code>LIKE '%red%'</code> scans every row. Search engines (Elasticsearch, OpenSearch, Apache Solr, all built on the Lucene library; also Meilisearch, Typesense, and Postgres full-text search for smaller needs) use an <b>inverted index</b>: a map from each <b>word</b> to the list of documents containing it (a <b>posting list</b>).</p>
+  <ul>
+    <li>An <b>analyzer</b> splits text into terms and normalizes them: lowercasing, removing very common words, <b>stemming</b> (“replicas” → “replica”).</li>
+    <li>A query looks up each term's posting list and intersects (AND) or merges (OR) them. Then results are <b>ranked</b>; OpenSearch uses the BM25 algorithm, which favours rare words and documents where they appear often.</li>
+    <li>It's <b>near real-time</b>: Elasticsearch makes new documents searchable within about 1 second by default. Indexes are split into shards with replicas.</li>
+  </ul>
+
+  <div class="playground" id="pg-ix">
+    <span class="label">🎮 Playground · Build an inverted index</span>
+    <p class="hint">One document per line; edit them freely. The index updates as you type. Try searching <code>replica</code> with the analyzer off: “replicas” and “Replica” don't match. Then turn it on.</p>
+    <textarea id="ix-docs" spellcheck="false">Postgres replicas lag behind the leader
+Sharding Postgres at Notion with 480 logical shards
+Running a Replica in another region for failover
+Cache stampedes and how to stop them
+Leader election with Raft and etcd
+Consistent hashing moves few keys when shards change</textarea>
+    <div class="controls">
+      <input id="ix-q" value="postgres replica" aria-label="search query">
+      <span class="seg" id="ix-op"><button id="ix-op-or" data-v="or" class="on">OR (any word)</button><button id="ix-op-and" data-v="and">AND (all words)</button></span>
+      <label><input type="checkbox" id="ix-an" checked> analyzer: lowercase + stop words + stemming</label>
+      <button class="btn primary" id="ix-go">Search</button>
+      <button class="btn" id="ix-more">Add 2,000 generated docs</button>
+      <button class="btn" id="ix-reset">Reset docs</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">documents <b id="ix-n">–</b></div>
+      <div class="stat">distinct terms <b id="ix-t">–</b></div>
+      <div class="stat">postings read for this query <b id="ix-p">–</b></div>
+      <div class="stat">words a full scan reads <b id="ix-w">–</b></div>
+    </div>
+    <div class="ixgrid">
+      <div class="ixbox" id="ix-res"></div>
+      <div class="ixbox" id="ix-tab"></div>
+    </div>
+  </div>
+  <p>Things to try: add 2,000 generated documents. A full scan now reads tens of thousands of words for every search, while the index reads only the posting lists for your query's terms. That ratio is why search engines can answer in milliseconds over billions of documents.</p>
+
+  <h2>Time-series: metrics and events</h2>
+  <p>Metrics are a stream of <b>(series, timestamp, value)</b> samples: <code>cpu{host="web-7"}</code> at 10:00:15 = 0.62. Queries are almost always “this series, this time range, aggregated”. Time-series databases (Prometheus, InfluxDB, TimescaleDB, VictoriaMetrics, and cloud ones like Amazon Timestream) exploit that:</p>
+  <ul>
+    <li>Prometheus keeps the newest data in memory, protected by a write-ahead log, and writes immutable <b>two-hour blocks</b> to disk, later compacted into bigger ones (very like an LSM tree, Lesson 2.2).</li>
+    <li>Compression is extreme because consecutive samples are similar: Prometheus averages only <b>1–2 bytes per sample</b>. Facebook's Gorilla paper reported 16 bytes per point compressed to <b>1.37 bytes</b>.</li>
+    <li>Prometheus's sizing rule: <code>disk = retention seconds × samples per second × bytes per sample</code>. Default retention is 15 days.</li>
+  </ul>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: sizing Prometheus</span>
+    <p>1,000,000 active series, scraped every 15 s.</p>
+    <ul>
+      <li>Samples per second: 1,000,000 ÷ 15 ≈ <b>66,700</b>.</li>
+      <li>15 days = 1,296,000 s. At 2 bytes per sample: 66,700 × 1,296,000 × 2 ≈ <b>173 GB</b>. At Gorilla's 1.37 bytes: about 118 GB.</li>
+      <li>Uncompressed at 16 bytes (an 8-byte timestamp + an 8-byte value) it would be about 1.4 TB. Compression is the whole game.</li>
+    </ul>
+    <p>The thing that blows this up is <b>cardinality</b>: a label like <code>user_id</code> turns one series into millions (Lesson 6.3).</p>
+  </div>
+
+  <h2>Vector search: “find things like this”</h2>
+  <p>An <b>embedding</b> is a list of numbers (say 1,536 of them) produced by a machine-learning model, placed so that similar meanings end up close together. Semantic search, recommendations and RAG (retrieval-augmented generation: fetching relevant text to feed an LLM) all ask the same question: which stored vectors are <b>nearest</b> to this one?</p>
+  <ul>
+    <li><b>Exact search</b> compares against every vector. 10 million vectors × 1,536 dimensions = 15.4 billion multiply-adds per query, over 61 GB of 4-byte floats. Too slow for live traffic.</li>
+    <li><b>Approximate nearest neighbour</b> (ANN) indexes trade a little <b>recall</b> (the share of true nearest neighbours found) for huge speedups. pgvector, a Postgres extension, offers two: <b>HNSW</b> (a layered graph you walk toward the query; better speed–recall, slower builds, more memory) and <b>IVFFlat</b> (vectors grouped into lists; search only the nearest lists; faster builds, less memory).</li>
+    <li>Dedicated vector databases (Pinecone, Weaviate, Milvus, Qdrant) and search engines (Elasticsearch, OpenSearch) offer the same idea at larger scale.</li>
+  </ul>
+  <p>And <b>graph stores</b> (Neo4j, Amazon Neptune, Facebook's TAO) answer “who's connected to whom, within N hops?”, which is slow as repeated joins in SQL (Lesson 2.1).</p>
+
+  <div class="playground" id="pg-game">
+    <span class="label">🎮 Playground · Which store?</span>
+    <p class="hint">Eight real requirements. Pick the store you'd reach for first; you'll get instant feedback and a reason.</p>
+    <div class="game" id="game"></div>
+    <div class="stat-row"><div class="stat">score <b id="g-score">0 / 8</b></div><button class="btn" id="g-reset">Reset game</button></div>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Object storage: <b>S3</b>, <b>Google Cloud Storage</b>, <b>Azure Blob</b>, <b>Cloudflare R2</b>, <b>MinIO</b>. Search: <b>Elasticsearch</b>, <b>OpenSearch</b> (also managed on AWS), <b>Meilisearch</b>, <b>Typesense</b>. Time-series: <b>Prometheus</b>, <b>TimescaleDB</b>, <b>InfluxDB</b>. Vectors: <b>pgvector</b>, <b>Pinecone</b>, <b>Weaviate</b>, <b>Qdrant</b>.</p>
+<pre><code><span class="c"># S3: a presigned upload URL from Python (boto3), valid for 10 minutes</span>
+url = s3.generate_presigned_url(<span class="s">"put_object"</span>,
+    Params={<span class="s">"Bucket"</span>: <span class="s">"photos"</span>, <span class="s">"Key"</span>: <span class="s">f"u{user_id}/{uuid4()}.jpg"</span>, <span class="s">"ContentType"</span>: <span class="s">"image/jpeg"</span>},
+    ExpiresIn=<span class="n">600</span>)
+<span class="c"># ...or a download link from the CLI (max 7 days = 604800 s)</span>
+aws s3 presign s3://photos/u42/beach.jpg --expires-in <span class="n">3600</span>
+
+<span class="c"># Elasticsearch / OpenSearch: full-text query, ranked by relevance</span>
+curl -s localhost:9200/products/_search -H <span class="s">'Content-Type: application/json'</span> -d <span class="s">'
+  {"query": {"match": {"description": "red running shoes"}}}'</span>
+
+<span class="c"># Prometheus (PromQL): requests per second over the last 5 minutes</span>
+rate(http_requests_total{job=<span class="s">"api"</span>}[<span class="n">5m</span>])
+
+<span class="c">-- pgvector: store embeddings next to your data, find the 5 nearest</span>
+<span class="k">CREATE EXTENSION</span> vector;
+<span class="k">CREATE TABLE</span> docs (id <span class="k">bigserial PRIMARY KEY</span>, body <span class="k">text</span>, embedding vector(<span class="n">1536</span>));
+<span class="k">CREATE INDEX ON</span> docs <span class="k">USING</span> hnsw (embedding vector_cosine_ops);
+<span class="k">SELECT</span> id, body <span class="k">FROM</span> docs <span class="k">ORDER BY</span> embedding &lt;=&gt; <span class="s">'[0.12, -0.03, ...]'</span> <span class="k">LIMIT</span> <span class="n">5</span>;</code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 9000:9000 minio/minio server /data</code> gives you an S3-compatible bucket; <code>docker run -p 9090:9090 prom/prometheus</code> scrapes itself so you can try PromQL right away.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Store</th><th>Reach for it when</th><th>The catch</th></tr>
+      <tr><td>Object storage</td><td>Files, media, backups, logs, data-lake tables</td><td>Per-request cost and latency (tens of ms); no queries inside objects; design keys and lifecycle rules</td></tr>
+      <tr><td>Search engine</td><td>Free text, typo tolerance, relevance ranking, faceted filters</td><td>A second copy of your data to keep in sync; near real-time, not instant; heavy to run</td></tr>
+      <tr><td>Time-series DB</td><td>Metrics, sensor data, events queried by time range</td><td>Label cardinality explodes cost; not for per-user records</td></tr>
+      <tr><td>Vector index</td><td>Semantic search, recommendations, RAG</td><td>Approximate results; memory-hungry; embeddings must be regenerated when the model changes</td></tr>
+      <tr><td>Postgres extensions instead (full-text, pgvector, TimescaleDB)</td><td>Small to medium scale, one less system</td><td>Shares CPU and memory with your main workload</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Day one: files go to S3 (or R2) with presigned uploads and a CDN in front. Use Postgres for everything else, including full-text search and pgvector, until a measured need appears. Use managed Prometheus/Grafana for metrics. Every extra store is one more thing to back up, secure and keep in sync.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Dedicated clusters per job: search fed by change-data-capture streams from the main databases (Lesson 3.2), large time-series platforms for metrics, vector indexes for search and recommendations, object storage as the data lake for analytics. Dedicated teams own each one, with SLOs on freshness (how far the copy lags the source).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Most design problems have a blob, a search box or a metric in them. A senior answer covers:</p>
+    <ul>
+      <li><b>Files</b>: object storage + presigned URLs + CDN, with metadata in the database. Never stream big uploads through app servers without a reason.</li>
+      <li><b>Search</b>: an inverted index fed from the source of truth, how stale it may be, and what happens if indexing falls behind.</li>
+      <li><b>Metrics</b>: a time-series store, retention and cardinality.</li>
+      <li><b>Similarity</b>: embeddings + ANN index, and the recall vs latency trade-off.</li>
+    </ul>
+    <p>Common follow-ups: “How do you keep search in sync with the database?” (change events, or the outbox pattern, Lesson 3.5). “How do you stop people uploading 10 GB files?” (size limits in the presigned policy, then validate after upload).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Photos straight to object storage</b> <span class="tag co">🏢 Instagram · 2011</span> <a href="https://medium.com/instagram-engineering/what-powers-instagram-hundreds-of-instances-dozens-of-technologies-adf2e22da2ad" target="_blank" rel="noopener">What Powers Instagram</a></div>
+      <p><b>How:</b> the photos themselves went straight to Amazon S3, with CloudFront as the CDN, while Postgres held the structured data.</p>
+      <p><b>Why this method:</b> a tiny team could store several terabytes of photos (at the time) without running any storage servers, and keep its databases small.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Inverted index and BM25</b> <span class="tag oss">🧰 Open source · OpenSearch</span> <a href="https://docs.opensearch.org/latest/getting-started/intro/" target="_blank" rel="noopener">OpenSearch: intro to concepts</a></div>
+      <p><b>How:</b> the docs show an inverted index mapping each word to the documents it occurs in, and explain that results are ranked with BM25.</p>
+      <p><b>Why this method:</b> looking up a few posting lists is vastly cheaper than scanning every document, and BM25 ranks rare, repeated terms higher.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A time-series database on local disk</b> <span class="tag oss">🧰 Open source · Prometheus</span> <a href="https://prometheus.io/docs/prometheus/latest/storage/" target="_blank" rel="noopener">Prometheus storage</a></div>
+      <p><b>How:</b> samples are grouped into two-hour blocks; the current block lives in memory, protected by a write-ahead log; blocks are compacted in the background. Average cost: 1–2 bytes per sample.</p>
+      <p><b>Why this method:</b> metrics are append-only and read by time range, so immutable, compressed time blocks fit perfectly.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Compressing metrics 12×</b> <span class="tag co">🏢 Facebook · 2015</span> <a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf" target="_blank" rel="noopener">Gorilla: A Fast, Scalable, In-Memory Time Series Database (VLDB)</a></div>
+      <p><b>How:</b> delta-of-delta encoding for timestamps and XOR encoding for floating-point values brought points from 16 bytes to an average of 1.37 bytes.</p>
+      <p><b>Why this method:</b> at 12× smaller, recent monitoring data fit in memory, so dashboards and alerts queried RAM instead of disk.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Vectors inside Postgres</b> <span class="tag oss">🧰 Open source · pgvector</span> <a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener">pgvector</a></div>
+      <p><b>How:</b> a <code>vector</code> column type with exact search by default, plus HNSW and IVFFlat indexes for approximate search; the README notes that adding an approximate index can change query results.</p>
+      <p><b>Why this method:</b> embeddings sit next to the rows they describe, with transactions, joins and backups for free; many teams never need a separate vector database.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a second is “real time”</span>
+    <p>Elasticsearch calls its search “near real-time” because new documents become searchable at the next <b>refresh</b>, every second by default, and only on indices that received a search in the last 30 seconds. Writing a document and searching for it in the same millisecond can miss it. It's eventual consistency (Lesson 2.6) hiding in a search box.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Search indexes and caches are kept in sync with the database through change streams and Kafka (Lessons 3.2 and 3.5). Prometheus is the metrics half of observability (Lesson 6.3). Object storage + CDN is the backbone of video streaming (Lesson 7.5). In AI systems, a RAG pipeline is exactly this lesson: documents in object storage, chunks and embeddings in a vector index, metadata in Postgres.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.aws.amazon.com/AmazonS3/latest/userguide/PresignedUrlUploadObject.html" target="_blank" rel="noopener">S3: uploading objects with presigned URLs</a>. The exact rules for direct uploads.</li>
+      <li><span class="kind">Paper</span> <a href="https://www.vldb.org/pvldb/vol8/p1816-teller.pdf" target="_blank" rel="noopener">Gorilla (VLDB 2015)</a>. A short, clear paper on why time-series compression works.</li>
+      <li><span class="kind">Docs</span> <a href="https://github.com/pgvector/pgvector" target="_blank" rel="noopener">pgvector README</a>. The fastest way to try vector search on a database you already run.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You keep 500,000 series, scraped every 30 s, for 30 days, at about 2 bytes per sample. Roughly how much disk?</div>
+    <div class="opts"><button class="opt">About 9 GB</button><button class="opt" data-ok>About 86 GB</button><button class="opt">About 860 GB</button></div>
+    <div class="explain">500,000 ÷ 30 ≈ 16,700 samples/s × 2,592,000 s (30 days) × 2 bytes ≈ <b>86 GB</b>. Doubling the scrape rate or adding a high-cardinality label is how this quietly turns into terabytes.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Users upload videos of up to 2 GB from their phones. How should uploads work?</div>
+    <div class="opts"><button class="opt">POST the file to your API, which saves it to Postgres</button><button class="opt">POST it to your API, which streams it to S3</button><button class="opt" data-ok>The API returns presigned (multipart) upload URLs; the phone uploads straight to the bucket; the API records metadata when it's done</button></div>
+    <div class="explain">Direct uploads keep gigabytes of traffic off your servers, and multipart lets big files upload in parallel parts that can be retried individually. The database keeps only the key, owner, size and status.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. After adding an HNSW index to a pgvector column, a few searches return slightly different neighbours than before. Why?</div>
+    <div class="opts"><button class="opt">The index is corrupt</button><button class="opt" data-ok>HNSW is approximate: it trades a little recall for much faster queries</button><button class="opt">Cosine distance changes when you add an index</button></div>
+    <div class="explain">Without an index, pgvector does exact search (perfect recall). ANN indexes skip most vectors, so they occasionally miss a true neighbour. You can tune the trade-off (for HNSW, <code>hnsw.ef_search</code>) based on measured recall.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Files go to object storage (11 nines durability by design), uploaded with presigned URLs and served through a CDN; metadata stays in the database.</li>
+      <li>Search engines use an inverted index (word → documents), analyzers and BM25 ranking; they're near real-time copies of your data.</li>
+      <li>Time-series stores compress samples to 1–2 bytes; size them as retention × samples/s × bytes/sample, and watch cardinality.</li>
+      <li>Vector search finds nearest embeddings; ANN indexes (HNSW, IVFFlat) trade recall for speed. Start with Postgres extensions until scale demands more.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const big = v => v >= 1e9 ? (v / 1e9).toFixed(1) + "B" : v >= 1e6 ? (v / 1e6).toFixed(1) + "M" : v >= 1e3 ? (v / 1e3).toFixed(1) + "k" : String(Math.round(v));
+
+  // ---------- playground 1: uploads ----------
+  const F = new Flow($("uf"), { width: 720, height: 200 });
+  F.node("cl", { x: 70, y: 100, w: 100, label: "📱 Client", sub: "", kind: "cl" })
+   .node("api", { x: 300, y: 50, w: 130, label: "API servers", sub: "", kind: "sv" })
+   .node("s3", { x: 600, y: 100, w: 130, label: "🪣 S3 bucket", sub: "", kind: "db" })
+   .node("db", { x: 300, y: 160, w: 130, label: "Postgres", sub: "metadata", kind: "db" })
+   .edge("cl", "api").edge("api", "s3").edge("cl", "s3", { dashed: true }).edge("api", "db").render();
+  const getU = seg("u-mode", () => up());
+  const PER_SERVER = 100; // MB/s, assumed
+  function up() {
+    const m = getU(), size = Math.pow(10, +$("u-size").value), rate = Math.round(Math.pow(10, +$("u-rate").value));
+    $("u-sizev").textContent = size < 10 ? size.toFixed(1) + " MB" : Math.round(size) + " MB";
+    $("u-ratev").textContent = rate.toLocaleString();
+    const bw = rate * size, through = m === "proxy" ? bw : rate * 0.004; // presigned: two ~2 KB API calls per upload
+    const servers = Math.max(1, Math.ceil(through / PER_SERVER));
+    const fmtBw = v => v >= 1000 ? (v / 1000).toFixed(1) + " GB/s" : v >= 1 ? Math.round(v) + " MB/s" : Math.round(v * 1000) + " KB/s";
+    $("u-bw").textContent = fmtBw(through); $("u-srv").textContent = servers.toLocaleString();
+    $("u-req").textContent = m === "proxy" ? "1 (holding the whole file)" : "2 tiny ones (sign + done)";
+    $("u-s3").textContent = fmtBw(bw);
+    F.set("api", { sub: fmtBw(through) + (servers > 1 ? ` · ${servers} servers` : ""), load: m === "proxy" ? Math.min(1, servers / 20) : 0.02, hot: m === "proxy" && servers > 20 })
+     .set("s3", { sub: fmtBw(bw) + " in" }).set("cl", { sub: rate.toLocaleString() + " uploads/s" });
+    F.edgeStyle("cl", "s3", { dashed: m === "proxy", color: m === "presign" ? "--c-db" : "--line" });
+    $("u-msg").textContent = m === "proxy" ? `Every byte passes through your API: ${fmtBw(bw)} needs about ${servers.toLocaleString()} servers just to move files, and each upload holds a connection open for its whole duration.` :
+      `The bucket takes the ${fmtBw(bw)} directly. Your API only signs URLs and records metadata: about ${fmtBw(through)} of traffic.`;
+  }
+  let busy = false;
+  $("u-go").onclick = async () => {
+    if (busy) return; busy = true;
+    if (getU() === "proxy") {
+      F.set("cl", { sub: "uploading via API…" });
+      await F.packet(["cl", "api"], { color: "--c-cl", dur: 900, r: 9 });
+      await F.packet(["api", "s3"], { color: "--c-cl", dur: 700, r: 9 });
+      await F.packet(["api", "db"], { color: "--c-db", dur: 350 });
+    } else {
+      F.set("cl", { sub: "1. ask for a URL" }); await F.packet(["cl", "api"], { color: "--c-sv", dur: 350, back: true, r: 4 });
+      F.set("cl", { sub: "2. PUT to the URL" }); await F.packet(["cl", "s3"], { color: "--c-cl", dur: 900, r: 9 });
+      F.set("cl", { sub: "3. tell the API" }); await F.packet(["cl", "api"], { color: "--c-sv", dur: 300, r: 4 });
+      await F.packet(["api", "db"], { color: "--c-db", dur: 300 });
+    }
+    up(); busy = false;
+  };
+  ["u-size", "u-rate"].forEach(id => ($(id).oninput = up));
+  up();
+
+  // ---------- playground 2: inverted index ----------
+  const STOP = new Set(["a", "an", "and", "the", "of", "to", "in", "for", "with", "at", "how", "them", "when", "is", "on", "behind", "another"]);
+  const stem = w => { // a tiny stemmer: real engines use Porter, Snowball or language-specific analyzers
+    if (w.length > 4 && w.endsWith("ies")) return w.slice(0, -3) + "y";
+    if (w.length > 5 && w.endsWith("ing")) { const r = w.slice(0, -3); return /([b-df-hj-np-tv-z])\1$/.test(r) ? r.slice(0, -1) : r; }
+    if (w.length > 3 && w.endsWith("s") && !/(ss|es|us|is)$/.test(w)) return w.slice(0, -1);
+    return w;
+  };
+  const tokens = (text, an) => {
+    const raw = text.split(/[^A-Za-z0-9]+/).filter(Boolean);
+    return an ? raw.map(w => w.toLowerCase()).filter(w => !STOP.has(w)).map(stem) : raw;
+  };
+  const DEFAULT = $("ix-docs").value;
+  const getOp = seg("ix-op", () => ix());
+  let extra = [];
+  const VOC = ["postgres", "replica", "shard", "cache", "leader", "index", "query", "latency", "region", "failover", "partition", "quorum", "commit", "vacuum", "kafka", "queue", "search", "vector", "metric", "bucket", "upload", "lag", "write", "read", "token", "ring", "node", "cluster", "backup", "snapshot"];
+  function ix() {
+    const an = $("ix-an").checked;
+    const docs = $("ix-docs").value.split("\n").map(s => s.trim()).filter(Boolean).concat(extra);
+    const inv = new Map(); let words = 0; const lens = [];
+    docs.forEach((d, i) => {
+      const t = tokens(d, an); words += d.split(/\s+/).filter(Boolean).length; lens.push(t.length);
+      t.forEach(w => { if (!inv.has(w)) inv.set(w, new Map()); const m = inv.get(w); m.set(i, (m.get(i) || 0) + 1); });
+    });
+    const q = [...new Set(tokens($("ix-q").value, an))];
+    let postings = 0;
+    const lists = q.map(w => { const m = inv.get(w) || new Map(); postings += m.size; return m; });
+    let cand;
+    if (getOp() === "and") { cand = lists.length ? [...lists[0].keys()].filter(d => lists.every(m => m.has(d))) : []; }
+    else { cand = [...new Set(lists.flatMap(m => [...m.keys()]))]; }
+    const N = docs.length, avg = lens.reduce((a, b) => a + b, 0) / Math.max(1, N), k1 = 1.2, b = 0.75;
+    const scored = cand.map(d => {
+      let s = 0;
+      q.forEach((w, j) => { const m = lists[j]; if (!m.has(d)) return; const df = m.size, tf = m.get(d); const idf = Math.log(1 + (N - df + 0.5) / (df + 0.5)); s += idf * tf * (k1 + 1) / (tf + k1 * (1 - b + b * lens[d] / avg)); });
+      return { d, s };
+    }).sort((x, y) => y.s - x.s);
+    $("ix-n").textContent = N.toLocaleString(); $("ix-t").textContent = inv.size.toLocaleString();
+    $("ix-p").textContent = postings.toLocaleString(); $("ix-w").textContent = words.toLocaleString();
+    const qset = new Set(q);
+    const hl = text => esc(text).split(/(\s+)/).map(w => qset.has(an ? stem(w.toLowerCase().replace(/[^a-z0-9]/g, "")) : w.replace(/[^A-Za-z0-9]/g, "")) ? `<span class="hit">${w}</span>` : w).join("");
+    $("ix-res").innerHTML = `<b>Results (${scored.length}), ranked by a BM25-style score</b><br>` + (scored.length ? scored.slice(0, 8).map(r => `${r.s.toFixed(2)} · #${r.d + 1} ${hl(docs[r.d])}`).join("<br>") : "<span class='muted'>No matches. With the analyzer off, case and plural forms must match exactly.</span>");
+    const terms = [...inv.entries()].sort((x, y) => (qset.has(y[0]) - qset.has(x[0])) || y[1].size - x[1].size).slice(0, 16);
+    $("ix-tab").innerHTML = "<b>Inverted index (term → documents)</b><br>" + terms.map(([w, m]) => `<code class="${qset.has(w) ? "hit" : ""}">${esc(w)}</code> → ${[...m.keys()].slice(0, 8).map(d => "#" + (d + 1)).join(", ")}${m.size > 8 ? ` … (${m.size.toLocaleString()})` : ""}`).join("<br>") + (inv.size > 16 ? `<br><span class="muted">…and ${(inv.size - 16).toLocaleString()} more terms</span>` : "");
+  }
+  $("ix-go").onclick = ix;
+  $("ix-more").onclick = () => {
+    const rng = MX.seeded(extra.length + 1);
+    for (let i = 0; i < 2000; i++) { const n = 6 + Math.floor(rng() * 8), w = []; for (let j = 0; j < n; j++) w.push(VOC[Math.floor(Math.pow(rng(), 1.6) * VOC.length)]); extra.push(w.join(" ")); }
+    ix();
+  };
+  $("ix-reset").onclick = () => { extra = []; $("ix-docs").value = DEFAULT; ix(); };
+  $("ix-docs").oninput = ix; $("ix-q").oninput = ix; $("ix-an").onchange = ix;
+  ix();
+
+  // ---------- playground 3: which store? ----------
+  const OPTS = [["rel", "Relational DB"], ["obj", "Object storage"], ["search", "Search engine"], ["ts", "Time-series DB"], ["vec", "Vector index"], ["graph", "Graph store"], ["kv", "Key-value / cache"]];
+  const Q = [
+    ["Store 40 million profile photos and serve them through a CDN", "obj", "Big immutable files: object storage, with only the key in your database."],
+    ["Search bar over 5 million product listings, typo-tolerant, best match first", "search", "Free-text relevance ranking is exactly what an inverted index plus BM25 does."],
+    ["Record CPU, memory and request rate for 2,000 servers every 15 s, keep 30 days", "ts", "Append-only samples read by time range: a time-series store compresses them to a byte or two each."],
+    ["“Show support articles similar to this customer's question” using embeddings", "vec", "Nearest-neighbour search over embeddings: a vector index (pgvector HNSW, or a vector database)."],
+    ["Orders, payments and refunds that must add up exactly", "rel", "Money needs transactions and constraints (Lesson 2.5): a relational database."],
+    ["“People you may know”: friends of friends, three hops out", "graph", "Multi-hop relationship walks are what graph stores (like Facebook's TAO) are built for."],
+    ["Session tokens looked up on every request, 200,000 times per second", "kv", "Lookups by key at huge rates, small values, a TTL: Redis or DynamoDB (Lesson 1.3)."],
+    ["Nightly database backups and 2 years of raw application logs", "obj", "Huge, rarely read, must be durable: object storage, ideally with lifecycle rules to cheaper storage classes."],
+  ];
+  let score = 0;
+  function buildGame() {
+    score = 0; $("g-score").textContent = `0 / ${Q.length}`;
+    $("game").innerHTML = Q.map((q, i) => `<div class="gq"><div><b>${i + 1}.</b> ${q[0]}</div><div class="opts2">${OPTS.map(([k, n]) => `<button id="gm-${i}-${k}" data-q="${i}" data-k="${k}">${n}</button>`).join("")}</div><div class="why" id="gm-why-${i}"></div></div>`).join("");
+    $("game").querySelectorAll("button").forEach(b => (b.onclick = () => {
+      const i = +b.dataset.q, q = Q[i], box = b.parentElement;
+      if (box.dataset.done) return;
+      box.dataset.done = 1;
+      const ok = b.dataset.k === q[1];
+      b.classList.add(ok ? "right" : "wrong");
+      if (!ok) $(`gm-${i}-${q[1]}`).classList.add("right");
+      if (ok) score++;
+      $("gm-why-" + i).textContent = (ok ? "✅ " : "❌ ") + q[2];
+      $("g-score").textContent = `${score} / ${Q.length}`;
+    }));
+  }
+  $("g-reset").onclick = buildGame;
+  buildGame();
+})();
+</script>
+</body>
+</html>

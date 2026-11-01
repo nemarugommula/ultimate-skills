@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.1 Vertical vs horizontal scaling & stateless services · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .status { font-weight: 700; padding: 6px 12px; border-radius: 10px; background: var(--bg2); border: 1px solid var(--line); display: inline-block; }
+  .status.ok { color: var(--good); } .status.bad { color: var(--bad); }
+</style>
+</head>
+<body data-lesson="s1-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 1 · Lesson 1</div>
+  <h1>Vertical vs horizontal scaling & stateless services</h1>
+  <p class="subtitle">When one server isn't enough you can buy a bigger one or add more of them. Only the second keeps working when a machine dies, and it only works if your servers forget everything between requests.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>QPS / RPS</b> = queries (or requests) per second, how much load a server sees (Lesson 0.3).</li>
+      <li><b>Availability</b> = the share of time a system works; “three nines” is 99.9%, about 8.8 hours down a year (Lesson 0.5).</li>
+      <li>HTTP is <b>request → response</b>: each request can, in principle, be answered by any machine (Lesson 0.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On 9 February 2016, Stack Overflow's load balancers handled <b>209 million HTTP requests</b>, about 2,400 every second on average. The web tier behind them was just <b>9 primary web servers</b>.</p>
+    <p>Its architect, Nick Craver, wrote that the whole Q&A network could actually run on <b>a single server</b>. So why nine? His short answer: “rolling builds, headroom, and redundancy.” Those three words are this lesson.</p>
+  </div>
+
+  <h2>Numbers first: bigger box or more boxes?</h2>
+  <p>Your app runs on one cloud server with 2 virtual CPUs (vCPUs). It copes with about <b>100 requests per second</b>. Next month you expect <b>2,000</b>. You have two options.</p>
+  <ul>
+    <li><b>Scale vertically</b> (scale up): move to a machine 20× bigger.</li>
+    <li><b>Scale horizontally</b> (scale out): run 20 copies of the small machine behind a load balancer.</li>
+  </ul>
+  <p>Here are real list prices for one AWS server family (m7i, on-demand Linux, US East, checked in 2026):</p>
+  <table>
+    <tr><th>Machine</th><th>vCPUs</th><th>Memory</th><th>$ per hour</th><th>$ per vCPU-hour</th></tr>
+    <tr><td><span class="sv">m7i.large</span></td><td>2</td><td>8 GiB</td><td>0.1008</td><td>0.0504</td></tr>
+    <tr><td><span class="sv">m7i.4xlarge</span></td><td>16</td><td>64 GiB</td><td>0.8064</td><td>0.0504</td></tr>
+    <tr><td><span class="sv">m7i.24xlarge</span></td><td>96</td><td>384 GiB</td><td>4.8384</td><td>0.0504</td></tr>
+    <tr><td><span class="sv">m7i.48xlarge</span> (the biggest)</td><td>192</td><td>768 GiB</td><td>9.6768</td><td>0.0504</td></tr>
+  </table>
+  <p>Look at the last column. In the cloud, a core costs the same in a big box or a small one. So the real costs of scaling up are not the price. They are three other things:</p>
+  <ol>
+    <li><b>A ceiling.</b> The biggest box in this family has 192 vCPUs. Past that, there is nothing to buy.</li>
+    <li><b>A single point of failure</b> (SPOF): one part whose failure takes everything down. One box dies, the site dies.</li>
+    <li><b>Downtime to grow.</b> Resizing usually means stopping the machine and starting a bigger one.</li>
+  </ol>
+  <p>Scaling out has no ceiling in practice and survives a dead machine, but it adds a load balancer (Lesson 1.2) and one strict rule: <b>the servers must be stateless</b>. More on that below.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Scale <b>up</b> until it hurts; scale <b>out</b> to survive. Vertical scaling is the simplest fix for performance. Horizontal scaling is the only fix for <b>availability</b>, and it requires that any server can answer any request.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: one superstar cashier vs many checkout lanes</span>
+    <p>A supermarket could hire one superhuman cashier who scans 20× faster. It works, until she takes a lunch break and the whole store stops. Or it can open 20 normal lanes. One closes, the queue shifts and nobody notices. The lanes only work because <b>any cashier can serve any customer</b>: your shopping is in your basket, not in one cashier's head. That basket is the “shared state” of this lesson.</p>
+  </div>
+
+  <h2>The math of “what happens when one dies”</h2>
+  <p>Say one server is up <b>99.9%</b> of the time. Alone, that's about <b>8.8 hours</b> of downtime a year.</p>
+  <p>Now run <b>two</b>, where either one can carry all the traffic. The site is down only if both are down at once. If failures are independent, that's 0.001 × 0.001 = one in a million:</p>
+  <div class="eq">
+    availability with n spares = 1 − (1 − <span class="sv">a</span>)<sup>n</sup>
+    <span class="say">“The chance everything is down is the chance one is down, multiplied n times.” With a = 0.999 and n = 2: 1 − 0.000001 = 99.9999%, about 32 seconds a year.</span>
+  </div>
+  <div class="legend"><span class="sv">a: availability of one server</span><span class="lt">n: servers, any one of which can carry the load</span></div>
+  <p class="muted">The catch is “independent”. Two servers in the same rack share power and a network switch. That's why big systems spread copies across availability zones (separate data centers in one region) and regions (Lesson 5.5).</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: sizing a fleet with N+1</span>
+    <p>Peak traffic is <b>6,000 requests/s</b>. Load tests show one server is comfortable at <b>800 requests/s</b> (you never plan to run servers at 100%; queues explode near full load).</p>
+    <ul>
+      <li>Servers needed at peak: 6,000 ÷ 800 = 7.5, round up to <b>8</b>.</li>
+      <li>Add one spare so a dead server (or one being deployed) doesn't hurt: <b>N+1 = 9 servers</b>.</li>
+      <li>Losing one leaves 8 × 800 = 6,400 requests/s of capacity, still above the peak. ✅</li>
+      <li>With a single big box sized for 6,000, losing it leaves <b>0</b>.</li>
+    </ul>
+    <p>Stack Overflow's 9 primary web servers are this idea in real life: more than they strictly need, so they can deploy one at a time and lose one without anyone noticing.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Big box vs a fleet, over one day</span>
+    <p class="hint">Traffic follows a daily curve: quiet at 4 am, peak at 4 pm. Pretend each vCPU handles 50 requests/s of your app, and prices are the m7i ones above. Everything is sized to run at most 70% busy at the expected peak. Pick a strategy, then break it: kill a server at 6 pm, or make a post go viral at 8 pm.</p>
+    <svg id="fa"></svg>
+    <div class="controls">
+      <label>expected peak <input type="range" id="pk" min="500" max="20000" step="500" value="4000"> <b class="mono" id="pkv"></b></label>
+      <span class="seg" id="strat"><button data-v="big" class="on">1 big box</button><button data-v="fleet">Fixed fleet (N+1)</button><button data-v="auto">Fleet + autoscaling</button></span>
+    </div>
+    <div class="controls">
+      <button class="btn" id="kill">💥 Kill a server at 6 pm</button>
+      <button class="btn" id="viral">🚀 Viral spike ×3 at 8 pm</button>
+      <button class="btn" id="calm">↺ Calm day</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">machines <b id="nsv">–</b></div>
+      <div class="stat">cost / month <b id="cost">–</b></div>
+      <div class="stat">requests failed today <b id="drop">–</b></div>
+      <div class="stat">one machine = <b id="share">–</b> of capacity</div>
+    </div>
+    <canvas class="chart" id="dc" style="height:220px"></canvas>
+    <p class="hint" id="dmsg"></p>
+  </div>
+  <p>Things to try: with “1 big box”, push the peak above 6,700 requests/s. You need more than 192 vCPUs × 50 × 70%, and that box doesn't exist. Then kill the server at 6 pm: the big box fails <i>every</i> request for the hour it takes to replace it, while the fixed fleet shrugs. Finally compare the fixed fleet with autoscaling: autoscaling costs less at night, and it recovers from the viral spike, but it's always about 15 minutes late.</p>
+
+  <h2>Stateless: the rule that makes scaling out work</h2>
+  <p>A server is <b>stateless</b> when it keeps nothing between requests that another server would need. Every request carries (or points to) everything needed to answer it.</p>
+  <p>That doesn't mean your app has no state. It means the state lives <b>somewhere shared</b>, not in one server's memory or disk:</p>
+  <table>
+    <tr><th>State you might keep on the server</th><th>Why it breaks with 2+ servers</th><th>Where it goes instead</th></tr>
+    <tr><td>Login sessions in memory</td><td>The next request lands on another server: “who are you?”</td><td><span class="ca">Redis</span> / Memcached, the database, or a signed cookie / token (Lesson 4.6)</td></tr>
+    <tr><td>Uploaded files on local disk</td><td>Only one server has the file</td><td><span class="db">Object storage</span> like S3 (Lesson 2.7)</td></tr>
+    <tr><td>In-memory cache</td><td>Each server has a different copy; fine for speed, never as the truth</td><td>Shared cache (Lesson 1.3)</td></tr>
+    <tr><td>Background jobs / cron on “the” server</td><td>Run twice, or never, when servers come and go</td><td>A job queue (Lesson 3.1)</td></tr>
+    <tr><td>Open WebSocket connections</td><td>Truly tied to one machine</td><td>Accept it; use pub/sub so any server can push to it (Lesson 7.4)</td></tr>
+  </table>
+  <p>Once your servers are stateless they become <b>cattle, not pets</b>: identical, replaceable, and you can add ten more at 3 am without anyone touching them. That's what autoscaling (Lesson 5.3) and safe deploys (Lesson 6.2) need.</p>
+
+  <h3>Sessions: three ways to remember who's logged in</h3>
+  <table>
+    <tr><th>Approach</th><th>How</th><th>Catch</th></tr>
+    <tr><td><b>In server memory</b></td><td>Session dictionary inside the app process</td><td>Works on 1 server only. Lost on every restart and deploy.</td></tr>
+    <tr><td><b>Sticky sessions</b></td><td>The load balancer pins each user to one server, usually with a cookie (AWS calls its cookie <code>AWSALB</code>)</td><td>Server dies or restarts → its users are logged out. Load gets uneven. Twelve-Factor calls this a violation.</td></tr>
+    <tr><td><b>Shared session store</b></td><td>Session lives in Redis (or the database); the cookie holds only a random session ID</td><td>Redis is now critical: replicate it. One extra ~1 ms hop per request.</td></tr>
+  </table>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Why did I just get logged out?</span>
+    <p class="hint">Three app servers behind a load balancer that takes turns (round robin). Log in, then keep sending requests. Then break things: kill the server holding your session, or deploy (every server restarts). Switch where sessions live and try again.</p>
+    <svg id="fs"></svg>
+    <div class="controls">
+      <span class="hint">Sessions live in:</span>
+      <span class="seg" id="smode"><button data-v="mem" class="on">Server memory</button><button data-v="sticky">Sticky sessions</button><button data-v="redis">Shared Redis</button></span>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="login">🔑 Log in</button>
+      <button class="btn" id="next">➡️ Next request</button>
+      <button class="btn" id="killsv">💥 Kill my server</button>
+      <button class="btn" id="deploy">🚀 Deploy (restart all)</button>
+      <button class="btn" id="killredis">💥 Kill Redis</button>
+      <button class="btn" id="repair">🔧 Repair all</button>
+    </div>
+    <p><span class="status" id="sstat">Not logged in</span></p>
+    <div class="stat-row">
+      <div class="stat">requests sent <b id="nreq">0</b></div>
+      <div class="stat">answered as you <b id="nok">0</b></div>
+      <div class="stat">“please log in again” <b id="nbad">0</b></div>
+    </div>
+    <div class="controls"><button class="btn" id="sim">▶ Simulate 1,000 users for a day (one crash + one deploy)</button></div>
+    <canvas class="chart" id="sc" style="height:190px"></canvas>
+    <p class="hint" id="smsg">Forced re-logins per user, for each place sessions can live.</p>
+  </div>
+  <p>Notice what “Shared Redis” really did: it didn't remove the state, it <b>moved</b> it to one place built to hold it. Kill Redis and everyone is logged out at once. That's why production Redis runs with a replica and automatic failover (Lesson 2.3), and why some teams use signed tokens that need no lookup at all (Lesson 4.6).</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Redis</b> or <b>Memcached</b> as a session store (managed: AWS ElastiCache, Google Memorystore, Upstash), framework session backends, and a cloud <b>autoscaling group</b> (AWS Auto Scaling, GCP managed instance groups, Kubernetes HPA in Lesson 5.3) to run N identical servers. Moving Django sessions from the local process to Redis is two settings:</p>
+<pre><code><span class="c"># settings.py: sessions in Redis, so any server can read them</span>
+CACHES = {
+    <span class="s">"default"</span>: {
+        <span class="s">"BACKEND"</span>: <span class="s">"django.core.cache.backends.redis.RedisCache"</span>,
+        <span class="s">"LOCATION"</span>: <span class="s">"redis://sessions.internal:6379"</span>,
+    }
+}
+SESSION_ENGINE = <span class="s">"django.contrib.sessions.backends.cache"</span>     <span class="c"># or "...cached_db" to also write to the DB</span></code></pre>
+    <p>If you must use sticky sessions on AWS, it's one block on the target group (Terraform):</p>
+<pre><code><span class="k">resource</span> <span class="s">"aws_lb_target_group"</span> <span class="s">"web"</span> {
+  <span class="c"># ...</span>
+  stickiness {
+    type            = <span class="s">"lb_cookie"</span>
+    cookie_duration = <span class="n">86400</span>   <span class="c"># seconds; users stay pinned for a day</span>
+  }
+}</code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 6379:6379 redis</code>, log into your app, then <code>redis-cli KEYS '*session*'</code> to see your session sitting outside the app. Restart the app: you're still logged in.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs: up vs out</span>
+    <table>
+      <tr><th></th><th>⬆️ Scale up (bigger box)</th><th>➡️ Scale out (more boxes)</th></tr>
+      <tr><td>Code changes</td><td>None</td><td>Servers must be stateless</td></tr>
+      <tr><td>Limit</td><td>Biggest machine you can buy</td><td>Usually the database behind them (Phase 2)</td></tr>
+      <tr><td>One machine fails</td><td>Everything is down</td><td>Lose 1/N of capacity</td></tr>
+      <tr><td>Growing</td><td>Restart into a bigger box</td><td>Add a box, no downtime; can be automatic</td></tr>
+      <tr><td>Operations</td><td>One thing to watch</td><td>Load balancer, deploys, more moving parts</td></tr>
+      <tr><td>Best for</td><td>Databases and other stateful parts (for a long time)</td><td>Web and API servers, workers</td></tr>
+    </table>
+    <p>The usual real-world answer is <b>both</b>: scale the stateless tier out, and scale the database up as far as it goes before you shard it (Lesson 2.4).</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Make the app stateless from day one (it's cheap now, painful later): sessions in Redis or signed cookies, files in S3. Then run <b>2 small servers</b> behind a managed load balancer, not one. That's your availability story. Scale the database up; don't shard.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Thousands of identical instances in autoscaling groups across zones and regions, with capacity plans like “survive losing a whole zone” (N+1 at the zone level). Stateful systems (databases, caches, queues) are run by dedicated teams as platforms. Machines are cattle; nobody logs into one to fix it.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>When you draw “a few app servers behind a load balancer”, a senior answer adds:</p>
+    <ul>
+      <li>“The app tier is <b>stateless</b>: sessions in Redis, files in object storage, so I can autoscale it.”</li>
+      <li>A quick <b>capacity estimate</b>: peak QPS ÷ per-server QPS, plus a spare (N+1), spread across zones.</li>
+      <li>What's <b>still</b> a single point of failure (the database, the session store) and how it's protected.</li>
+    </ul>
+    <p>Common follow-ups: “What happens to logged-in users during a deploy?” · “Why not just buy a bigger server?” (Good answer: often you should, for the database, until the ceiling or availability forces you out.) · “Sticky sessions: yes or no?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>A few powerful servers, deliberately over-provisioned</b> <span class="tag co">🏢 Stack Overflow · 2016</span> <a href="https://nickcraver.com/blog/2016/02/17/stack-overflow-the-architecture-2016-edition/" target="_blank" rel="noopener">Stack Overflow: The Architecture, 2016 Edition</a></div>
+      <p><b>How:</b> 4 HAProxy load balancers in front of 11 IIS web servers (9 primary), 4 SQL Servers and 2 Redis servers, handling 209 million HTTP requests on the measured day. The SQL servers had 384 GB to 768 GB of RAM each (<a href="https://nickcraver.com/blog/2016/03/29/stack-overflow-the-hardware-2016-edition/" target="_blank" rel="noopener">hardware post</a>).</p>
+      <p><b>Why this method:</b> big machines keep the system simple; a handful of extra web servers buys rolling builds, headroom and redundancy.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Scaling one database up instead of out</b> <span class="tag co">🏢 Let's Encrypt · 2021</span> <a href="https://letsencrypt.org/2021/01/21/next-gen-database-servers" target="_blank" rel="noopener">The Next Gen Database Servers Powering Let's Encrypt</a></div>
+      <p><b>How:</b> its certificate authority runs against a single MariaDB primary. The upgrade moved it to 64 cores, 2 TB of RAM and 24 NVMe drives, and average query time fell from about 0.45 ms to 0.15 ms.</p>
+      <p><b>Why this method:</b> “to minimize complexity”: sharding would add risk, and hardware advances let them avoid it so far. Vertical scaling is still the right call for many databases.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Stateless, share-nothing processes</b> <span class="tag hist">📜 Twelve-Factor App (Heroku)</span> <a href="https://12factor.net/processes" target="_blank" rel="noopener">The Twelve-Factor App: VI. Processes</a></div>
+      <p><b>How:</b> “Twelve-factor processes are stateless and share-nothing”; anything that must persist goes to a backing service such as a database. It explicitly calls sticky sessions a violation.</p>
+      <p><b>Why this method:</b> its authors watched hundreds of thousands of apps run on Heroku; stateless processes can be started, killed and multiplied freely.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Pluggable session stores</b> <span class="tag oss">🧰 Open source · Django</span> <a href="https://docs.djangoproject.com/en/5.1/topics/http/sessions/" target="_blank" rel="noopener">Django: How to use sessions</a></div>
+      <p><b>How:</b> one setting switches sessions between the database, a cache like Redis, a write-through “cached_db” mode, or signed cookies that store the data on the client.</p>
+      <p><b>Why this method:</b> the app code never changes; you pick the trade-off (speed vs durability vs no server state at all) per deployment.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Sticky sessions as a managed feature</b> <span class="tag prod">🏭 AWS ALB</span> <a href="https://docs.aws.amazon.com/elasticloadbalancing/latest/application/edit-target-group-attributes.html#sticky-sessions" target="_blank" rel="noopener">ALB target group attributes: sticky sessions</a></div>
+      <p><b>How:</b> the load balancer sets a cookie (<code>AWSALB</code> for duration-based stickiness) and routes that browser to the same target until it expires.</p>
+      <p><b>Why this method:</b> a pragmatic bridge for legacy apps that keep state in memory, at the cost of uneven load and lost sessions when a target dies.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a world-famous site on one server</span>
+    <p>In the same 2016 post, Nick Craver noted that Stack Overflow's Q&A application is multi-tenant, and that they could “run the entire Q&A network off of a single application pool on a single server.” The other eight were never about raw speed. They were about surviving deploys and failures.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Scaling out needs something to spread requests over the servers: <b>load balancers</b> (Lesson 1.2). Stateless servers lean on shared stores: <b>caches</b> (1.3), <b>replicated databases</b> (2.3) and <b>object storage</b> (2.7). Autoscaling comes back with Kubernetes (5.3), and N+1 capacity planning with load tests (6.5). In AI systems the same split appears: stateless inference servers scale out behind a load balancer, while the conversation history lives in a shared store.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://nickcraver.com/blog/2016/03/29/stack-overflow-the-hardware-2016-edition/" target="_blank" rel="noopener">Stack Overflow: The Hardware, 2016 Edition</a>. Exactly what “a few big servers” looks like, with specs and photos.</li>
+      <li><span class="kind">Docs</span> <a href="https://12factor.net/processes" target="_blank" rel="noopener">Twelve-Factor: Processes</a>. One short page that defines stateless apps.</li>
+      <li><span class="kind">Blog</span> <a href="https://letsencrypt.org/2021/01/21/next-gen-database-servers" target="_blank" rel="noopener">Let's Encrypt's database servers</a>. A clear case for scaling a database up.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Peak traffic is 4,500 requests/s and one server is comfortable at 600 requests/s. Using N+1, how many servers do you run?</div>
+    <div class="opts"><button class="opt">8</button><button class="opt" data-ok>9</button><button class="opt">7</button></div>
+    <div class="explain">4,500 ÷ 600 = 7.5, round up to 8 for the peak, then add one spare: <b>9</b>. With one down (or being deployed) you still have 8 × 600 = 4,800 requests/s.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You add a second app server behind a round-robin load balancer. Users start getting logged out at random. What's the best fix?</div>
+    <div class="opts"><button class="opt">Go back to one bigger server</button><button class="opt" data-ok>Move sessions out of server memory into a shared store (like Redis) so any server can read them</button><button class="opt">Add a third server to spread the load</button></div>
+    <div class="explain">Sessions live in each server's memory, so half the requests land on a server that has never seen the user. A shared store makes the servers stateless. Sticky sessions would also hide it, but users still get logged out whenever their server restarts.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Each server is up 99% of the time, failures are independent, and either of two servers can carry all the traffic. What's the availability of the pair?</div>
+    <div class="opts"><button class="opt">99%</button><button class="opt">98%</button><button class="opt" data-ok>99.99%</button></div>
+    <div class="explain">Down only when both are down: 0.01 × 0.01 = 0.0001, so 1 − 0.0001 = <b>99.99%</b>. (98% would be the answer if you needed <i>both</i> up, which is what happens when two servers can't each carry the full load.)</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li><b>Vertical</b> = bigger box: simple, but has a ceiling, is a single point of failure, and needs downtime to grow.</li>
+      <li><b>Horizontal</b> = more boxes behind a load balancer: no practical ceiling, survives failures, needs <b>stateless</b> servers.</li>
+      <li>Size with <b>N+1</b>: peak ÷ per-server capacity, rounded up, plus a spare. Redundancy multiplies: 1 − (1 − a)<sup>n</sup>.</li>
+      <li>Keep sessions, files and jobs off the app server: Redis, object storage, queues. Sticky sessions are a crutch.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const money = v => "$" + Math.round(v).toLocaleString("en-US");
+  const big = v => v >= 1e6 ? (v / 1e6).toFixed(1) + " M" : v >= 1e3 ? (v / 1e3).toFixed(0) + " k" : Math.round(v) + "";
+
+  // ---------- playground 1: big box vs fleet over a day ----------
+  const PER_VCPU = 50, TARGET = 0.7, PRICE = 0.0504, SIZES = [2, 4, 8, 16, 32, 48, 64, 96, 192];
+  const STEPS = 96, DT = 900; // 15-minute steps
+  let event = "none"; // none | kill | viral
+  const getStrat = seg("strat", () => day());
+  let FA = null, faMode = null;
+  const drawFlow = (mode, label) => {
+    if (faMode !== mode) {
+      FA = new Flow($("fa"), { width: 720, height: 150 });
+      FA.node("u", { x: 70, y: 75, label: "👤 Users", sub: "", kind: "cl" });
+      if (mode === "big") FA.node("b", { x: 420, y: 75, w: 220, h: 56, label: "🖥️ One big box", sub: "", kind: "sv" }).edge("u", "b");
+      else {
+        FA.node("lb", { x: 260, y: 75, label: "Load balancer", sub: "round robin", kind: "nw" });
+        [0, 1, 2].forEach(i => FA.node("s" + i, { x: 470, y: 25 + i * 50, w: 120, h: 40, label: "app " + (i + 1), kind: "sv" }).edge("lb", "s" + i));
+        FA.node("more", { x: 640, y: 75, w: 110, h: 40, label: "… more", sub: "", kind: "sv" });
+        FA.edge("u", "lb");
+      }
+      FA.render(); faMode = mode;
+    }
+    return FA;
+  };
+  function day() {
+    const peak = +$("pk").value, strat = getStrat();
+    $("pkv").textContent = peak.toLocaleString("en-US") + " req/s";
+    const traffic = [], cap = [];
+    for (let i = 0; i < STEPS; i++) {
+      const h = i / 4, s = (1 - Math.cos(2 * Math.PI * (h - 4) / 24)) / 2;
+      let t = peak * (0.3 + 0.7 * s);
+      if (event === "viral" && h >= 20 && h < 22) t *= 3;
+      traffic.push(t);
+    }
+    const SMALL = 2 * PER_VCPU; // one m7i.large = 100 req/s
+    let dollars = 0, machines = "", share = "", note = "";
+    const needV = peak / PER_VCPU / TARGET;
+    const killStep = 72, REPAIR = 4; // dies at 18:00, replaced after an hour (autoscaling: 15 min)
+    if (strat === "big") {
+      const v = SIZES.find(x => x >= needV) || 192;
+      const ceiling = needV > 192;
+      for (let i = 0; i < STEPS; i++) cap.push(event === "kill" && i >= killStep && i < killStep + REPAIR ? 0 : v * PER_VCPU);
+      dollars = v * PRICE * 24 * 30;
+      machines = "1 × " + v + " vCPU";
+      share = "100%";
+      note = ceiling ? `You need ${Math.ceil(needV)} vCPUs, but the biggest box has 192. That's the ceiling: no machine big enough exists.` :
+        event === "kill" ? "The box died at 6 pm: every single request failed until it was replaced. One machine is a single point of failure." :
+        event === "viral" ? "The spike tripled traffic. A big box can't grow without a restart, so the overflow failed." :
+        "Simple and cheap enough. Now kill it at 6 pm.";
+      drawFlow("big").set("b", { label: "🖥️ One big box", sub: `m7i · ${v} vCPU`, down: event === "kill" });
+    } else {
+      const n0 = Math.ceil(peak / (SMALL * TARGET)) + 1;
+      let n = n0, total = 0;
+      for (let i = 0; i < STEPS; i++) {
+        if (strat === "auto") {
+          const seen = traffic[Math.max(0, i - 1)]; // autoscaler reacts to the last 15 minutes
+          n = Math.max(2, Math.ceil(seen / (SMALL * TARGET)) + 1);
+        }
+        let live = n;
+        if (event === "kill" && i >= killStep && i < killStep + (strat === "auto" ? 1 : REPAIR)) live = n - 1;
+        cap.push(live * SMALL); total += n;
+      }
+      dollars = total / 4 * 2 * PRICE * 30;
+      machines = strat === "auto" ? `${Math.min(...cap.map(c => c / SMALL))}–${Math.max(...cap.map(c => c / SMALL))} × 2 vCPU` : `${n0} × 2 vCPU`;
+      share = (100 / n0).toFixed(n0 > 20 ? 1 : 0) + "%";
+      note = event === "kill" ? `One of ${n0} machines died: capacity dipped by ${share}, the spare covered it, and almost nothing failed.` :
+        event === "viral" ? (strat === "auto" ? "Autoscaling added machines, but only after seeing the spike: the first 15 minutes overflowed." : "A fixed fleet has no room for 3× traffic; its spare covers one dead machine, not a viral post.") :
+        strat === "auto" ? "The fleet shrinks at night and grows for the afternoon peak: you pay for what you use." : "N+1 small machines: the same price per core as the big box, but one can die safely.";
+      const f = drawFlow("fleet");
+      f.set("lb", { sub: "round robin" }).set("more", { label: strat === "auto" ? "… autoscaling" : `… ${n0} total`, sub: "" });
+      [0, 1, 2].forEach(i => f.set("s" + i, { down: event === "kill" && i === 1, sub: event === "kill" && i === 1 ? "died 6 pm" : "" }));
+    }
+    let dropped = 0, totalReq = 0;
+    for (let i = 0; i < STEPS; i++) { dropped += Math.max(0, traffic[i] - cap[i]) * DT; totalReq += traffic[i] * DT; }
+    $("nsv").textContent = machines;
+    $("cost").textContent = money(dollars);
+    $("drop").textContent = big(dropped) + " (" + (100 * dropped / totalReq).toFixed(2) + "%)";
+    $("share").textContent = share;
+    $("dmsg").textContent = note;
+    const hrs = i => i / 4;
+    Plot.line($("dc"), {
+      series: [
+        { label: "traffic (req/s)", color: MX.css("--c-cl"), data: traffic.map((v, i) => [hrs(i), v]), fill: true },
+        { label: "capacity (req/s)", color: MX.css("--c-sv"), data: cap.map((v, i) => [hrs(i), v]) },
+      ], xMin: 0, xMax: 24, yMin: 0, yMax: Math.max(...traffic, ...cap) * 1.15, xLabel: "hour of day", yLabel: "req/s",
+    });
+  }
+  $("pk").oninput = day;
+  $("kill").onclick = () => { event = "kill"; day(); };
+  $("viral").onclick = () => { event = "viral"; day(); };
+  $("calm").onclick = () => { event = "none"; day(); };
+  day();
+
+  // ---------- playground 2: sessions ----------
+  const F = new Flow($("fs"), { width: 720, height: 210 });
+  F.node("u", { x: 70, y: 105, label: "👤 You", sub: "cookie: –", kind: "cl" })
+   .node("lb", { x: 240, y: 105, label: "Load balancer", sub: "round robin", kind: "nw" })
+   .node("redis", { x: 640, y: 105, w: 120, label: "⚡ Redis", sub: "sessions", kind: "ca" });
+  [0, 1, 2].forEach(i => F.node("a" + i, { x: 440, y: 35 + i * 70, w: 130, label: "app " + (i + 1), sub: "memory: –", kind: "sv" }).edge("lb", "a" + i).edge("a" + i, "redis", { dashed: true, noArrow: true }));
+  F.edge("u", "lb").render();
+
+  let S;
+  const reset = () => { S = { alive: [true, true, true], mem: [false, false, false], redisUp: true, redisHas: false, cookie: null, rr: 0, loggedIn: false, nreq: 0, nok: 0, nbad: 0, busy: false }; };
+  reset();
+  const getMode = seg("smode", () => { reset(); paint(); status("Not logged in", ""); });
+  const status = (txt, cls) => { const e = $("sstat"); e.textContent = txt; e.className = "status " + (cls || ""); };
+  const paint = () => {
+    const m = getMode();
+    [0, 1, 2].forEach(i => F.set("a" + i, { down: !S.alive[i], sub: !S.alive[i] ? "DOWN" : m === "redis" ? "stateless" : S.mem[i] ? "memory: your session" : "memory: –" }));
+    F.set("redis", { down: !S.redisUp, sub: m !== "redis" ? "(not used)" : !S.redisUp ? "DOWN" : S.redisHas ? "has your session" : "empty" });
+    F.set("lb", { sub: m === "sticky" ? "sticky cookie" : "round robin" });
+    F.set("u", { sub: S.cookie == null ? "cookie: –" : m === "sticky" ? `session + pin: app ${S.cookie + 1}` : "cookie: session id" });
+    [0, 1, 2].forEach(i => F.edgeStyle("a" + i, "redis", { hidden: m !== "redis" }));
+    $("nreq").textContent = S.nreq; $("nok").textContent = S.nok; $("nbad").textContent = S.nbad;
+  };
+  const pick = () => {
+    const m = getMode();
+    if (m === "sticky" && S.pin != null && S.alive[S.pin]) return S.pin;
+    for (let k = 0; k < 3; k++) { const i = (S.rr + k) % 3; if (S.alive[i]) { S.rr = i + 1; return i; } }
+    return -1;
+  };
+  const hasSession = i => getMode() === "redis" ? S.redisUp && S.redisHas : S.mem[i];
+  async function send(isLogin) {
+    if (S.busy) return;
+    S.busy = true;
+    const m = getMode(), i = pick();
+    if (i < 0) { status("All servers are down ❌", "bad"); S.busy = false; return; }
+    S.nreq++;
+    const toRedis = m === "redis";
+    await F.packet(toRedis ? ["u", "lb", "a" + i, "redis"] : ["u", "lb", "a" + i], { color: "--c-cl", dur: 380, back: true });
+    if (isLogin) {
+      if (m === "redis" && !S.redisUp) { status("Login failed: Redis is down ❌", "bad"); S.nbad++; }
+      else {
+        if (m === "redis") S.redisHas = true; else S.mem[i] = true;
+        if (m === "sticky") S.pin = i;
+        S.cookie = i; S.loggedIn = true; S.nok++;
+        status(`Logged in ✅ (session created on ${m === "redis" ? "Redis" : "app " + (i + 1)})`, "ok");
+      }
+    } else if (!S.loggedIn) status("You're not logged in yet: press Log in first", "");
+    else if (hasSession(i)) { S.nok++; status(`✅ app ${i + 1} knows you: “Welcome back!”`, "ok"); }
+    else {
+      S.nbad++; S.loggedIn = false; S.cookie = null;
+      status(m === "redis" ? "❌ Redis is down: no server can find your session. Logged out." :
+        `❌ app ${i + 1} has never heard of you. “Please log in again.”`, "bad");
+      if (m === "sticky") S.pin = null;
+    }
+    paint(); S.busy = false;
+  }
+  $("login").onclick = () => send(true);
+  $("next").onclick = () => send(false);
+  $("killsv").onclick = () => {
+    const m = getMode();
+    let i = m === "redis" ? (S.rr + 2) % 3 : S.mem.findIndex(x => x);
+    if (i < 0) i = (S.rr + 2) % 3;
+    S.alive[i] = false; S.mem[i] = false;
+    status(`💥 app ${i + 1} crashed (its memory is gone). Send the next request.`, "");
+    paint();
+  };
+  $("deploy").onclick = () => { S.mem = [false, false, false]; S.alive = [true, true, true]; status("🚀 New version deployed: every server restarted with empty memory. Send the next request.", ""); paint(); };
+  $("killredis").onclick = () => { S.redisUp = false; S.redisHas = false; status(getMode() === "redis" ? "💥 Redis crashed. Send the next request." : "Redis isn't used in this mode. Switch to Shared Redis.", ""); paint(); };
+  $("repair").onclick = () => { S.alive = [true, true, true]; S.redisUp = true; status("🔧 Everything is back up (memory starts empty).", ""); paint(); };
+  paint();
+
+  // batch: 1,000 users, 20 requests each, server 2 crashes at 40% of the day, a deploy restarts all at 70%
+  function simulate() {
+    const rng = MX.seeded(11), modes = ["mem", "sticky", "redis"], names = ["Server memory", "Sticky sessions", "Shared Redis"], res = [];
+    modes.forEach(m => {
+      let usersHit = 0, relogins = 0;
+      for (let u = 0; u < 1000; u++) {
+        const times = Array.from({ length: 20 }, () => rng()).sort((a, b) => a - b);
+        // app 2 (index 1) is down from 0.4 until the deploy at 0.7; the deploy wipes every server's memory
+        const up = (s, t) => !(s === 1 && t >= 0.4 && t < 0.7);
+        const anyUp = t => { let s; do s = Math.floor(rng() * 3); while (!up(s, t)); return s; };
+        let home = anyUp(times[0]), born = times[0], forced = false;
+        for (let r = 1; r < 20 && m !== "redis"; r++) {
+          const t = times[r];
+          const srv = m === "sticky" && up(home, t) ? home : anyUp(t);
+          const wiped = (home === 1 && born < 0.4 && t >= 0.4) || (born < 0.7 && t >= 0.7);
+          if (srv !== home || wiped) { forced = true; relogins++; home = srv; born = t; } // logs in again on this server
+        }
+        if (forced) usersHit++;
+      }
+      res.push({ label: names[modes.indexOf(m)], value: relogins / 1000, users: usersHit / 10, color: MX.css(m === "redis" ? "--c-ca" : "--c-er") });
+    });
+    Plot.bars($("sc"), { bars: res, yMin: 0, yLabel: "re-logins per user" });
+    $("smsg").textContent = `Forced re-logins per user over the day: memory ${res[0].value.toFixed(1)}, sticky ${res[1].value.toFixed(1)}, shared Redis ${res[2].value.toFixed(1)}. Sticky sessions survive normal traffic, but the crash and the deploy still logged out ${res[1].users.toFixed(0)}% of users.`;
+  }
+  $("sim").onclick = simulate;
+  simulate();
+})();
+</script>
+</body>
+</html>

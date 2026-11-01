@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.2 Design a URL shortener · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .steps { font-family: var(--mono); font-size: .85rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; overflow-x: auto; white-space: pre; }
+  .code-out { font-family: var(--mono); font-size: 1.3rem; font-weight: 800; color: var(--c-ca); }
+  input.txt { font: inherit; font-family: var(--mono); font-size: .9rem; padding: 4px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg2); color: var(--text); width: 260px; max-width: 100%; }
+</style>
+</head>
+<body data-lesson="s7-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 2</div>
+  <h1>Design a URL shortener</h1>
+  <p class="subtitle">Turn a long link into <code>sho.rt/4c92</code> and redirect billions of clicks in milliseconds. It looks like a toy, but it packs ID generation, caching, read-heavy scaling and async analytics into one small design.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The design framework</b>: clarify → estimate → API + data → high-level → deep dives → wrap up (Lesson 7.1).</li>
+      <li><b>Caching</b>: keep hot answers in Redis; average latency = hit rate × cache time + misses × (cache + database) (Lesson 1.3).</li>
+      <li><b>Sharding</b> splits data across machines by key; <b>Kafka</b> is a durable log you can write events to and process later (Lessons 2.4 and 3.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2018 Google stopped creating new <code>goo.gl</code> links but kept the old ones working. In July 2024 it announced that all of them would stop working after <b>August 25, 2025</b>, noting that <b>more than 99%</b> had no activity in the last month. People pushed back: those links were “embedded in countless documents, videos, posts”. In August 2025 Google changed course and kept the actively used links alive.</p>
+    <p>That's the real requirement of a URL shortener: a link printed on a poster today must still work in ten years. Writing the code is easy. Keeping a promise that long is the design.</p>
+  </div>
+
+  <h2>Step 1 · Requirements</h2>
+  <p><b>Functional</b> (what it does):</p>
+  <ul>
+    <li>Given a long URL, return a short code. Visiting <code>sho.rt/{code}</code> redirects to the long URL.</li>
+    <li>Optional <b>custom aliases</b> (<code>sho.rt/summer-sale</code>) and <b>expiry</b> dates.</li>
+    <li><b>Analytics</b>: clicks per link per day, country, referrer.</li>
+  </ul>
+  <p><b>Non-functional</b> (how well):</p>
+  <ul>
+    <li>Redirects are <b>fast</b> (a few milliseconds on our side) and <b>highly available</b>: a dead redirect breaks every place the link was shared.</li>
+    <li>Links are <b>durable</b> for years. Codes are <b>short</b>. Analytics may lag by a minute; redirects may not.</li>
+  </ul>
+  <p>The clarifying questions a senior asks, and what each answer changes:</p>
+  <table>
+    <tr><th>Question</th><th>Assumed answer</th><th>Design impact</th></tr>
+    <tr><td>How many new links per day?</td><td>100 million</td><td>Decides code length and storage (below)</td></tr>
+    <tr><td>Reads per write?</td><td>About 100 : 1</td><td>Read-heavy: the redirect path is the whole game, so cache it</td></tr>
+    <tr><td>Can a link's target be changed or deleted?</td><td>Yes (abuse takedowns, typos)</td><td>Prefer 302 redirects that browsers don't cache forever</td></tr>
+    <tr><td>Must codes be unguessable?</td><td>Yes, some links are private</td><td>Plain counters leak (code+1 is the next link): add randomness</td></tr>
+    <tr><td>Real-time analytics?</td><td>A minute of delay is fine</td><td>Count clicks asynchronously through a queue, off the redirect path</td></tr>
+  </table>
+
+  <h2>Step 2 · Estimates (by hand)</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: sizing the shortener</span>
+    <ul>
+      <li>Writes: 100M ÷ 86,400 ≈ <b>1,160 new links per second</b>.</li>
+      <li>Reads at 100:1: ≈ <b>116,000 redirects per second</b> on average, more at peak.</li>
+      <li>Links over 10 years: 100M × 365 × 10 = <b>365 billion</b>.</li>
+      <li>Storage at about 500 bytes per link (code, long URL, owner, dates): 365B × 500 B ≈ <b>183 TB</b>. Too much for one database: shard by code (Lesson 2.4).</li>
+      <li>Code length in <b>base62</b> (the characters 0–9, a–z, A–Z: 62 symbols): 62<sup>6</sup> ≈ 56.8 billion is too few; 62<sup>7</sup> ≈ <b>3.5 trillion</b> is about 10× what we need. <b>7 characters.</b></li>
+      <li>Cache: if 10% of redirects miss, the database sees 116,000 × 0.1 ≈ <b>11,600 reads/s</b>. With a 1.5 ms hit and 5 ms extra on a miss (typical numbers), average latency = 0.9 × 1.5 + 0.1 × (1.5 + 5) = <b>2 ms</b>.</li>
+    </ul>
+  </div>
+
+  <h2>Step 3 · API</h2>
+<pre><code>POST   /v1/links        {long_url, custom_alias?, expires_at?}  → 201 {code, short_url}
+GET    /{code}          → 302 Location: https://the-long-url…     <span class="c"># the hot path</span>
+GET    /v1/links/{code}/stats?from=…&amp;to=…  → 200 {clicks_by_day: […]}
+DELETE /v1/links/{code} → 204                                         <span class="c"># owner or abuse team</span></code></pre>
+  <p>Creating links needs an API key and a rate limit (Lesson 1.5): shorteners are a favourite tool for hiding spam and phishing links.</p>
+
+  <h2>Step 4 · Data model</h2>
+  <table>
+    <tr><th>Store</th><th>Key → value</th><th>Why this store</th></tr>
+    <tr><td><span class="db">links</span> (sharded key-value or SQL)</td><td><code>code</code> → long_url, owner_id, created_at, expires_at</td><td>One lookup by primary key per redirect. Shard by <code>code</code>.</td></tr>
+    <tr><td><span class="ca">Redis cache</span></td><td><code>link:{code}</code> → long_url (TTL 1 day)</td><td>Most clicks go to a few hot links</td></tr>
+    <tr><td><span class="nw">click events</span> (Kafka)</td><td>{code, time, country, referrer}</td><td>Durable log; redirects don't wait for analytics</td></tr>
+    <tr><td><span class="db">clicks_daily</span> (SQL or a warehouse)</td><td>(code, day) → count</td><td>Pre-aggregated, so stats queries are cheap</td></tr>
+  </table>
+  <p>The access pattern is pure key lookup, no joins. That's why many teams pick a key-value store (DynamoDB, Cassandra) here, while a sharded Postgres works too (Lesson 2.1).</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A URL shortener is a giant, <b>read-heavy lookup table</b>: write a link once, read it thousands of times. So the design is about two things: <b>making unique short codes cheaply</b>, and <b>serving redirects from a cache</b> so the database barely notices the traffic.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the coat check</span>
+    <p>You hand over a long coat and get a small numbered ticket. Handing out tickets has to be fast and never give two people the same number (generating codes). Most of the work is at the end of the night, when everyone shows a ticket and wants their coat back right now (redirects). A good coat check keeps the most-asked-for coats near the counter (the cache).</p>
+  </div>
+
+  <h2>Step 5 · High-level design: the redirect path</h2>
+  <p>Every click: the browser asks for <code>/4c92</code>, the redirect service checks Redis, falls back to the database on a miss, answers with a redirect, and drops a click event into Kafka without waiting. Run it and break it:</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The redirect path</span>
+    <p class="hint">1 million active links with lopsided popularity (a few links get most clicks). The sharded database cluster handles about 40,000 reads/s (a typical figure for a few shards). The chart shows the first 30 seconds after a <b>cold start</b>: the cache begins empty, as it does after a deploy or a crash.</p>
+    <svg id="rf"></svg>
+    <div class="controls">
+      <label>traffic <input type="range" id="rps" min="0" max="6" step="1" value="4"> <b class="mono" id="rpsv"></b></label>
+      <label>cache size <input type="range" id="csz" min="0" max="4" step="1" value="2"> <b class="mono" id="cszv"></b></label>
+    </div>
+    <div class="controls">
+      <span class="hint">Redirect:</span><span class="seg" id="rd"><button id="rd302" data-v="302" class="on">302 Found</button><button id="rd301" data-v="301">301 Moved Permanently</button></span>
+      <span class="hint">Analytics:</span><span class="seg" id="an"><button id="anA" data-v="async" class="on">async (Kafka)</button><button id="anS" data-v="sync">sync DB write</button></span>
+    </div>
+    <div class="controls"><button class="btn primary" id="clicks">Send 8 clicks</button><button class="btn" id="kill">💥 Cache node dies</button></div>
+    <div class="stat-row">
+      <div class="stat">cache hit rate <b id="hit">–</b></div>
+      <div class="stat">DB load <b id="dbl">–</b></div>
+      <div class="stat">avg redirect latency <b id="lat">–</b></div>
+      <div class="stat">clicks you can count <b id="cnt">–</b></div>
+    </div>
+    <canvas class="chart" id="rc" style="height:200px"></canvas>
+    <p class="hint" id="rmsg"></p>
+  </div>
+  <p>Things to try: set the cache to “none” at 100k redirects/s: the database melts. A cache holding just 1% of links (10,000) catches about two thirds of clicks within seconds. Bigger caches barely help in the first 30 seconds: most remaining misses are links nobody has clicked yet since the restart. Switch analytics to “sync DB write” and every click also writes a row: the database dies even with a big cache. Switch to 301: your traffic drops (browsers remember the redirect) but so do the clicks you can count.</p>
+
+  <h2>Deep dive 1 · Generating the short code</h2>
+  <p>This is the question interviewers care most about. Four common options:</p>
+  <table>
+    <tr><th>Method</th><th>How</th><th>✅</th><th>❌</th></tr>
+    <tr><td><b>Counter + base62</b></td><td>A global counter (1, 2, 3…) written in base62</td><td>Shortest codes, zero collisions</td><td>Guessable (next code = +1); one counter is a bottleneck → hand each server a <b>range</b> (server A gets 1–1M, B gets 1M–2M)</td></tr>
+    <tr><td><b>Hash + truncate</b></td><td>Hash the long URL (MD5, SHA-256), keep the first 7 base62 characters</td><td>Same URL → same code (free dedupe); no coordination</td><td><b>Collisions</b> (birthday math, below): must check the database and retry</td></tr>
+    <tr><td><b>Random + check</b></td><td>7 random base62 characters; insert only if the code is unused</td><td>Unguessable; no coordination</td><td>Same collision maths; every insert is a conditional write</td></tr>
+    <tr><td><b>Snowflake-style ID</b></td><td>64 bits = timestamp + machine ID + sequence (Twitter, 2010)</td><td>No coordination, roughly time-sorted, no collisions</td><td>A 64-bit number is <b>11</b> base62 characters: too long for a <i>short</i> link</td></tr>
+  </table>
+  <p><b>Base62</b> works like decimal with 62 digits. Repeatedly divide by 62; the remainders, read backwards, are the digits. 125 = 2 × 62 + 1, so 125 becomes <code>21</code>.</p>
+  <p>The <b>birthday problem</b> is why hashes collide sooner than you'd think. In a room of 23 people, two probably share a birthday, even though there are 365 days. With <i>N</i> possible codes and <i>n</i> links:</p>
+  <div class="eq">
+    P(at least one collision) ≈ 1 − e<sup>−<i>n</i>²/(2<i>N</i>)</sup>
+    <span class="say">“The chance that some two links share a code is about one minus e to the minus n squared over two N.” Collisions grow with the <i>square</i> of the number of links.</span>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Base62 encoder and collision calculator</span>
+    <p class="hint">Left: type a counter value and watch it become base62, or type a URL and watch it get hashed (FNV-1a, a simple 64-bit hash, for illustration) and truncated. Right: the birthday maths for truncated hashes or random codes.</p>
+    <div class="two-col">
+      <div>
+        <div class="controls"><label>counter <input class="txt" id="num" value="1000000" style="width:160px"></label></div>
+        <div class="steps" id="steps"></div>
+        <p>code: <span class="code-out" id="b62"></span></p>
+        <div class="controls"><label>long URL <input class="txt" id="url" value="https://example.com/blog/2026/how-we-built-it?utm_source=newsletter"></label></div>
+        <p class="hint" id="hashOut"></p>
+        <div class="controls"><button class="btn" id="snow">Make a Snowflake-style ID</button></div>
+        <p class="hint" id="snowOut"></p>
+      </div>
+      <div>
+        <div class="controls"><label>code length <input type="range" id="len" min="5" max="10" step="1" value="7"> <b class="mono" id="lenv"></b></label></div>
+        <div class="controls"><label>links stored <input type="range" id="nl" min="3" max="12" step="0.5" value="6"> <b class="mono" id="nlv"></b></label></div>
+        <div class="stat-row">
+          <div class="stat">possible codes <b id="space">–</b></div>
+          <div class="stat">P(any collision) <b id="pany">–</b></div>
+          <div class="stat">expected collisions <b id="ecol">–</b></div>
+          <div class="stat">next insert collides <b id="pnext">–</b></div>
+        </div>
+        <canvas class="chart" id="bc" style="height:180px"></canvas>
+      </div>
+    </div>
+    <p class="hint" id="bmsg"></p>
+  </div>
+  <p>With 7 characters and one million links there's already a 13% chance of some collision. At our 365 billion links, about <b>1 in 10</b> new inserts would hit a used code. That's fine with “insert if absent, else retry with a new random code”, and a disaster if you forget the check and overwrite someone's link.</p>
+  <p><b>A good answer for our numbers:</b> random 7-character codes (unguessable) with a conditional insert and retry, or counter ranges per server run through a reversible shuffle so codes don't look sequential. Some teams pre-generate unused codes in a <b>key generation service</b> and hand them out in batches.</p>
+
+  <h2>Deep dive 2 · 301 vs 302, and caching the hot links</h2>
+  <table>
+    <tr><th></th><th>301 Moved Permanently</th><th>302 Found</th></tr>
+    <tr><td>Meaning (RFC 9110, the HTTP standard)</td><td>“Assigned a new permanent URI”; clients may replace references</td><td>The target “resides temporarily under a different URI”</td></tr>
+    <tr><td>Caching</td><td>Heuristically cacheable: browsers may remember it and skip you next time</td><td>Not cached unless you send cache headers</td></tr>
+    <tr><td>Your load</td><td class="db">Lower (repeat visits never arrive)</td><td>Every click reaches you</td></tr>
+    <tr><td>Analytics and edits</td><td class="er">Miss repeat clicks; can't reliably change or expire the link</td><td class="db">Count every click; change or delete any time</td></tr>
+  </table>
+  <p>Most shorteners that sell analytics answer with 302 (or 301 plus <code>Cache-Control: private, max-age=…</code> to limit how long browsers keep it). Then caching is <i>your</i> job: Redis in front of the database, and for the very hottest links, a tiny in-process cache in each redirect server (Lesson 1.3).</p>
+
+  <h2>Deep dive 3 · Analytics, custom aliases and expiry</h2>
+  <ul>
+    <li><b>Analytics, asynchronously.</b> The redirect service writes a small event to Kafka (about a millisecond, batched) and returns. A stream processor (Lesson 3.6) groups events by (code, minute) and writes one counter update per link per minute instead of one row per click. If Kafka is slow, drop or buffer events; never slow the redirect.</li>
+    <li><b>Custom aliases.</b> Same table, same uniqueness rule: <code>INSERT … IF NOT EXISTS</code>. Reserve words (<code>api</code>, <code>admin</code>, <code>login</code>) and block lookalike phishing aliases.</li>
+    <li><b>Expiry.</b> Check <code>expires_at</code> on every read (lazy expiry, so an expired link never redirects), and clean up in the background later. Set the cache TTL no later than the link's expiry.</li>
+  </ul>
+
+  <h2>Bottlenecks and the scaling path</h2>
+  <table>
+    <tr><th>Stage</th><th>Design</th><th>What forces the next step</th></tr>
+    <tr><td><b>v1: startup</b> (thousands of links/day)</td><td>One app, one Postgres with <code>code</code> as primary key, random codes with a unique constraint, 302s, a <code>clicks</code> table</td><td>Click inserts and reads crowd the one database</td></tr>
+    <tr><td><b>v2</b> (millions of clicks/day)</td><td>Redis cache-aside for links, click events to a queue, a worker that aggregates counts, read replicas</td><td>Storage heads toward terabytes; one primary can't hold it</td></tr>
+    <tr><td><b>v3</b> (100M links/day, 100k+ redirects/s)</td><td>Key-value store sharded by code (consistent hashing, Lesson 2.4), Kafka + stream processing for analytics, redirect servers in several regions with regional caches, abuse scanning on create</td><td>Global latency, regulations, abuse at scale</td></tr>
+  </table>
+  <p>Writes are only ~1,160/s even at the top. The redirect path is the bottleneck at every stage, so every stage adds read capacity: cache first, then replicas, then shards and regions.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Redis</b> (cache, plus <code>INCR</code> for counters), <b>PostgreSQL</b> or <b>DynamoDB / Cassandra</b> for the links table, <b>Kafka</b> (or AWS Kinesis, Google Pub/Sub) for click events, and libraries like <b>Sqids</b> for short, non-sequential-looking IDs. Base62 plus a counter range in Python:</p>
+<pre><code><span class="k">import</span> redis
+ALPHA = <span class="s">"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"</span>
+r = redis.Redis()
+
+<span class="k">def</span> base62(n):
+    s = <span class="s">""</span>
+    <span class="k">while</span> n:
+        n, rem = divmod(n, <span class="n">62</span>)
+        s = ALPHA[rem] + s
+    <span class="k">return</span> s <span class="k">or</span> <span class="s">"0"</span>
+
+<span class="k">def</span> next_range(size=<span class="n">1000</span>):           <span class="c"># each server grabs 1,000 ids at a time</span>
+    end = r.incrby(<span class="s">"link:counter"</span>, size) <span class="c"># atomic, so ranges never overlap</span>
+    <span class="k">return</span> range(end - size + <span class="n">1</span>, end + <span class="n">1</span>)
+
+print(base62(<span class="n">125</span>), base62(<span class="n">1_000_000</span>))    <span class="c"># 21 4c92</span></code></pre>
+<pre><code><span class="c">-- the links table: the primary key makes "insert if absent" safe</span>
+<span class="k">CREATE TABLE</span> links (
+  code       <span class="k">varchar</span>(<span class="n">16</span>) <span class="k">PRIMARY KEY</span>,
+  long_url   <span class="k">text</span> <span class="k">NOT NULL</span>,
+  owner_id   <span class="k">bigint</span>,
+  created_at <span class="k">timestamptz</span> <span class="k">DEFAULT</span> now(),
+  expires_at <span class="k">timestamptz</span>
+);
+<span class="k">INSERT INTO</span> links (code, long_url) <span class="k">VALUES</span> (<span class="s">'aZ3k9Qx'</span>, <span class="s">'https://…'</span>)
+  <span class="k">ON CONFLICT</span> (code) <span class="k">DO NOTHING</span>;   <span class="c">-- 0 rows inserted? pick a new random code and retry</span></code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 6379:6379 redis</code>, then <code>redis-cli INCRBY link:counter 1000</code> twice and watch the ranges. Check a real redirect with <code>curl -sI https://sho.rt/abc</code> and read the <code>Location</code> and <code>Cache-Control</code> headers.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>Pick it when…</th><th>Avoid it when…</th></tr>
+      <tr><td>Counter + base62</td><td>Shortest codes matter and links are public</td><td>Links must be private or unguessable</td></tr>
+      <tr><td>Random + conditional insert</td><td>You want unguessable codes with no coordination</td><td>Your store can't do “insert if absent” cheaply</td></tr>
+      <tr><td>302 redirects</td><td>You sell analytics or links can change</td><td>You only care about minimum load and links never change</td></tr>
+      <tr><td>Key-value store</td><td>Hundreds of TB, pure key lookups</td><td>You're small: one Postgres is simpler and has transactions</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>One Postgres table with a unique constraint and random 7-character codes. 302 redirects. A <code>clicks</code> table, or better, count clicks in Redis and flush every minute. Put the redirect servers behind a CDN-friendly domain. A weekend of work; spend the rest of the time on abuse prevention, because a public shortener gets abused fast.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Multi-region redirect fleets with local caches, a replicated key-value store, click streams feeding a data warehouse, malware and phishing scanning on create, legal takedown tooling, and a durability promise measured in decades (the goo.gl story). The redirect has an SLO (service level objective, Lesson 0.5) of its own.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>What's evaluated: a <b>clean estimate</b> that justifies 7 characters, a <b>reasoned ID scheme</b> (with collision handling), a <b>fast cached read path</b>, and knowing <b>301 vs 302</b>.</p>
+    <ul>
+      <li><b>Common mistakes:</b> hashing and truncating without handling collisions; a single global counter with no plan for its failure; writing analytics synchronously in the redirect; forgetting abuse and expiry.</li>
+      <li><b>Likely follow-ups:</b> “How do you make codes unguessable?”, “What if the same long URL is submitted twice?”, “The cache cluster restarts at peak: what happens?”, “How would you serve users in Asia and Europe with low latency?”, “How do you stop phishing links?”</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Snowflake: IDs without coordination</b> <span class="tag co">🏢 Twitter · 2010</span> <a href="https://github.com/twitter-archive/snowflake/tree/snowflake-2010" target="_blank" rel="noopener">Snowflake (GitHub, 2010 README)</a></div>
+      <p><b>How:</b> each ID is 64 bits: 41 bits of milliseconds since a custom epoch (“gives us 69 years”), a 10-bit machine ID (up to 1,024 machines) and a 12-bit sequence (4,096 per machine per millisecond). Requirements listed: at least 10k IDs per second per process, roughly time-ordered, uncoordinated.</p>
+      <p><b>Why this method:</b> Twitter was moving from MySQL to Cassandra, which has no auto-increment, and machines in several datacenters had to create IDs without talking to each other.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>IDs generated inside the database</b> <span class="tag co">🏢 Instagram · 2012</span> <a href="https://medium.com/instagram-engineering/sharding-ids-at-instagram-1cf5a71e5a5c" target="_blank" rel="noopener">Sharding &amp; IDs at Instagram</a></div>
+      <p><b>How:</b> 41 bits of time, 13 bits of logical shard ID and a 10-bit sequence, computed by a PL/pgSQL function inside each Postgres shard, so 1,024 IDs per shard per millisecond. The post compares UUIDs, ticket servers and Snowflake first.</p>
+      <p><b>Why this method:</b> no extra ID service to run; the ID itself says which shard holds the row, and IDs sort by time.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Snowflake IDs as a sort key</b> <span class="tag co">🏢 Discord · 2017</span> <a href="https://discord.com/blog/how-discord-stores-billions-of-messages" target="_blank" rel="noopener">How Discord Stores Billions of Messages</a></div>
+      <p><b>How:</b> “every ID on Discord is actually a Snowflake (chronologically sortable)”, so the message table's key became <code>(channel_id, message_id)</code> and range scans by time come for free.</p>
+      <p><b>Why this method:</b> two messages can share a timestamp; a time-ordered unique ID can't collide and still sorts like one.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>What 301 and 302 promise</b> <span class="tag oss">🧰 Web standard</span> <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-301-moved-permanently" target="_blank" rel="noopener">RFC 9110: HTTP Semantics, §15.4</a></div>
+      <p><b>How:</b> 301 means the resource “has been assigned a new permanent URI” and is heuristically cacheable; 302 means it “resides temporarily under a different URI”, so clients keep using the original link.</p>
+      <p><b>Why this method:</b> the status code is a promise to every browser and cache on the internet. Pick the one whose promise you can keep.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Shutting down a shortener</b> <span class="tag co">🏢 Google · 2018–2025</span> <a href="https://developers.googleblog.com/en/google-url-shortener-links-will-no-longer-be-available/" target="_blank" rel="noopener">Google URL Shortener links will no longer be available [updated]</a></div>
+      <p><b>How:</b> new links stopped in 2018. Inactive links were first redirected to a warning page, and in 2025 only those were deactivated; links that still redirect without a message keep working.</p>
+      <p><b>Why this method:</b> you can turn off creation, but links live in documents and printed media forever. Durability is a product promise.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · same 41 bits, different years</span>
+    <p>Twitter's README says its 41-bit millisecond timestamp “gives us 69 years”. Instagram's post says its 41 bits give “41 years”. Do the math: 2<sup>41</sup> ms ÷ (1000 × 86,400 × 365.25) ≈ <b>69.7 years</b>. Twitter is right. Even good engineering blogs have typos: always check the numbers yourself.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This design is caching (Lesson 1.3) plus sharding by key (Lesson 2.4) plus an async event pipeline (Lessons 3.2 and 3.6). The same ID schemes come back as message IDs in chat (Lesson 7.4) and post IDs in the news feed (Lesson 7.3), and click events look a lot like the event streams behind notifications (Lesson 7.8). Abuse protection is rate limiting (Lesson 1.5) and security (Lesson 6.6).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://medium.com/instagram-engineering/sharding-ids-at-instagram-1cf5a71e5a5c" target="_blank" rel="noopener">Sharding &amp; IDs at Instagram</a>. A short, clear comparison of five ID strategies, with the SQL.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.rfc-editor.org/rfc/rfc9110.html#name-redirection-3xx" target="_blank" rel="noopener">RFC 9110 §15.4: Redirection 3xx</a>. 301, 302, 307 and 308 and how clients must treat each.</li>
+      <li><span class="kind">Docs</span> <a href="https://en.wikipedia.org/wiki/Birthday_problem" target="_blank" rel="noopener">The birthday problem</a>. The maths behind every hash-collision estimate.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You expect 300 billion links over the service's lifetime. How many base62 characters do the codes need?</div>
+    <div class="opts"><button class="opt">6</button><button class="opt" data-ok>7</button><button class="opt">11</button></div>
+    <div class="explain">62<sup>6</sup> ≈ 56.8 billion is too few. 62<sup>7</sup> ≈ 3.5 trillion fits 300 billion with room to spare (fewer collisions for random codes). 11 is what a 64-bit Snowflake ID needs, which is why those aren't used directly.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Marketing wants every click counted, and link owners can change a link's target later. Which redirect?</div>
+    <div class="opts"><button class="opt">301, because it reduces load</button><button class="opt" data-ok>302, because browsers won't remember it and every click reaches you</button><button class="opt">200 with the long page's content inside</button></div>
+    <div class="explain">A 301 is heuristically cacheable, so repeat clicks may never reach you (missed analytics) and old targets can stick. A 302 says “temporary”: each click comes back, so you can count it and change it.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You truncate a hash to 7 base62 characters (3.5 trillion codes) and store 1 million links. Chance of at least one collision?</div>
+    <div class="opts"><button class="opt">About 0.00003%</button><button class="opt" data-ok>About 13%</button><button class="opt">About 99.99%</button></div>
+    <div class="explain">Birthday maths: 1 − e<sup>−n²/2N</sup> = 1 − e<sup>−(10<sup>6</sup>)²/(2 × 3.5×10<sup>12</sup>)</sup> ≈ 1 − e<sup>−0.14</sup> ≈ <b>13%</b>. The naive guess n/N (0.00003%) ignores that every pair can collide. Always check and retry.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>100M links/day → ~1,160 writes/s, ~116k redirects/s, 365B links and ~183 TB over 10 years; 7 base62 characters.</li>
+      <li>Code generation: counter ranges + base62 (short, guessable) or random/hash + conditional insert (unguessable, must handle birthday collisions).</li>
+      <li>The redirect path is everything: cache-aside Redis in front of a store sharded by code; 302 if you count clicks or allow edits.</li>
+      <li>Analytics go async through Kafka and get aggregated; expiry is checked lazily on read; abuse prevention is part of the design.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const ALPHA = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+  const big = n => n >= 1e12 ? (n / 1e12).toFixed(1) + " trillion" : n >= 1e9 ? (n / 1e9).toFixed(1) + " billion" : n >= 1e6 ? (n / 1e6).toFixed(1) + " million" : Math.round(n).toLocaleString("en-US");
+  const pct = p => p >= 0.999995 ? "≈ 100%" : p >= 0.01 ? (100 * p).toFixed(1) + "%" : p >= 1e-6 ? (100 * p).toPrecision(2) + "%" : "< 0.0001%";
+
+  // ---------- base62 + hash ----------
+  const b62 = n => { n = BigInt(n); if (n === 0n) return "0"; let s = ""; while (n > 0n) { s = ALPHA[Number(n % 62n)] + s; n /= 62n; } return s; };
+  function encode() {
+    let v = $("num").value.replace(/[^0-9]/g, "").slice(0, 19) || "0";
+    let n = BigInt(v); const lines = [];
+    if (n === 0n) lines.push("0 → digit 0");
+    while (n > 0n) { const q = n / 62n, r = n % 62n; lines.push(`${n.toString().padStart(12)} ÷ 62 = ${q.toString().padEnd(12)} remainder ${String(r).padStart(2)} → '${ALPHA[Number(r)]}'`); n = q; }
+    lines.push("read the remainders bottom-up ↑");
+    $("steps").textContent = lines.join("\n");
+    $("b62").textContent = b62(v) + `  (${b62(v).length} chars)`;
+  }
+  function fnv64(str) { // FNV-1a, 64-bit, on UTF-8 bytes
+    let h = 0xcbf29ce484222325n; const P = 0x100000001b3n, M = (1n << 64n) - 1n;
+    for (const byte of new TextEncoder().encode(str)) { h ^= BigInt(byte); h = (h * P) & M; }
+    return h;
+  }
+  function hashUrl() {
+    const L = +$("len").value, h = fnv64($("url").value), full = b62(h);
+    $("hashOut").innerHTML = `FNV-1a 64-bit hash → base62 <code>${full}</code> (${full.length} chars) → keep the first ${L}: <b class="mono">${full.slice(0, L)}</b>. Change one character of the URL and the code changes completely.`;
+  }
+  let seq = 0;
+  $("snow").onclick = () => {
+    const EPOCH = 1288834974657n; // Twitter's custom epoch (Nov 2010), used here as an example
+    const t = BigInt(Date.now()) - EPOCH, machine = 37n, s = BigInt(seq++ % 4096);
+    const id = (t << 22n) | (machine << 12n) | s;
+    $("snowOut").innerHTML = `time ${t} ms since epoch · machine ${machine} · sequence ${s}<br>→ ID <code>${id}</code> → base62 <b class="mono">${b62(id)}</b> (${b62(id).length} chars: too long for a short link)`;
+  };
+  $("num").oninput = encode; $("url").oninput = hashUrl;
+  encode(); hashUrl();
+
+  // ---------- collision calculator ----------
+  function coll() {
+    const L = +$("len").value, n = Math.pow(10, +$("nl").value), N = Math.pow(62, L);
+    $("lenv").textContent = L + " chars"; $("nlv").textContent = big(n);
+    const x = n * n / (2 * N), pAny = -Math.expm1(-x);
+    $("space").textContent = big(N);
+    $("pany").textContent = pct(pAny);
+    $("ecol").textContent = x < 0.01 ? x.toPrecision(2) : x < 1e6 ? (+x.toPrecision(3)).toLocaleString("en-US") : big(x);
+    $("pnext").textContent = pct(Math.min(1, n / N));
+    const data = [];
+    for (let e = 3; e <= 12.001; e += 0.1) { const m = Math.pow(10, e); data.push([e, 100 * -Math.expm1(-m * m / (2 * N))]); }
+    Plot.line($("bc"), { series: [{ label: `P(any collision) %, ${L} chars`, color: MX.css("--c-er"), data, fill: true }], xLabel: "log10(links stored)", yMin: 0, yMax: 100, xMin: 3, xMax: 12 });
+    $("bmsg").textContent = n / N > 0.05 ? `Every new insert has a ${pct(n / N)} chance of hitting a used code: check-and-retry is essential, or add a character.` :
+      pAny > 0.5 ? "Some collision is now near certain, though each insert rarely collides. A conditional insert with retry handles it." :
+      "Collisions are unlikely at this size, but “unlikely” isn't “never”: keep the uniqueness check anyway.";
+    hashUrl();
+  }
+  $("len").oninput = coll; $("nl").oninput = coll;
+  coll();
+
+  // ---------- redirect path simulation ----------
+  const F = new Flow($("rf"), { width: 760, height: 230 });
+  F.node("u", { x: 65, y: 80, w: 110, label: "👤 Browsers", sub: "", kind: "cl" })
+   .node("lb", { x: 205, y: 80, w: 110, label: "⚖️ LB", sub: "", kind: "nw" })
+   .node("svc", { x: 365, y: 80, w: 130, label: "Redirect service", sub: "", kind: "sv" })
+   .node("ca", { x: 560, y: 35, w: 130, label: "⚡ Redis", sub: "", kind: "ca" })
+   .node("db", { x: 560, y: 125, w: 130, label: "🗄️ Links DB", sub: "", kind: "db" })
+   .node("k", { x: 365, y: 190, w: 130, label: "📨 Kafka", sub: "click events", kind: "nw" })
+   .node("ag", { x: 560, y: 200, w: 130, label: "Analytics workers", sub: "count per minute", kind: "sv" })
+   .edge("u", "lb").edge("lb", "svc").edge("svc", "ca").edge("svc", "db").edge("svc", "k", { dashed: true }).edge("k", "ag", { dashed: true }).edge("ag", "db", { dashed: true }).render();
+  const RPS = [1000, 5000, 20000, 50000, 100000, 150000, 200000], CS = [0, 0.001, 0.01, 0.05, 0.2];
+  const NL = 1000000, SKEW = 1.05, DB_CAP = 40000, REPEAT = 0.3, T_HIT = 1.5, T_DB = 5, T_SYNC = 5;
+  let cdf = null;
+  const buildCdf = () => {
+    const c = new Float64Array(NL); let acc = 0, tot = 0;
+    for (let k = 0; k < NL; k++) tot += 1 / Math.pow(k + 1, SKEW);
+    for (let k = 0; k < NL; k++) { acc += 1 / Math.pow(k + 1, SKEW) / tot; c[k] = acc; }
+    return c;
+  };
+  const pick = rng => { const u = rng(); let lo = 0, hi = NL - 1; while (lo < hi) { const m = (lo + hi) >> 1; if (cdf[m] < u) lo = m + 1; else hi = m; } return lo; };
+  const getRd = seg("rd", () => sim()), getAn = seg("an", () => sim());
+  let state = { hit: 0, rng: MX.seeded(3), cache: new Map(), cap: 0 };
+  function lruGet(c, k) { if (!c.has(k)) return false; c.delete(k); c.set(k, 1); return true; }
+  function lruPut(c, k, cap) { if (cap <= 0) return; if (c.size >= cap) c.delete(c.keys().next().value); c.set(k, 1); }
+  function sim(coldNote) {
+    if (!cdf) cdf = buildCdf();
+    const rps = RPS[+$("rps").value], frac = CS[+$("csz").value], cap = Math.round(frac * NL);
+    const r301 = getRd() === "301", sync = getAn() === "sync";
+    $("rpsv").textContent = rps.toLocaleString("en-US") + " redirects/s";
+    $("cszv").textContent = frac ? `${frac * 100}% of links (${cap.toLocaleString("en-US")})` : "none";
+    const arrive = rps * (r301 ? 1 - REPEAT : 1); // with 301, repeat clicks are answered by the browser
+    // simulate 30 s after a cold start with 2,000 sampled requests per second
+    const rng = MX.seeded(11), cache = new Map(), SAMPLES = 2000, series = [], lat = [];
+    let hitsLast = 0;
+    for (let s = 0; s < 30; s++) {
+      let h = 0;
+      for (let i = 0; i < SAMPLES; i++) { const k = pick(rng); if (lruGet(cache, k)) h++; else lruPut(cache, k, cap); }
+      const hr = h / SAMPLES; hitsLast = hr;
+      series.push([s + 1, (1 - hr) * arrive + (sync ? arrive : 0)]);
+    }
+    state = { hit: hitsLast, rng, cache, cap };
+    const dbq = (1 - hitsLast) * arrive + (sync ? arrive : 0), over = dbq / DB_CAP;
+    let avg = hitsLast * T_HIT + (1 - hitsLast) * (T_HIT + T_DB) + (sync ? T_SYNC : 0);
+    if (over > 1) avg *= 1 + 4 * (over - 1); // past capacity, queues build and latency explodes
+    $("hit").textContent = (100 * hitsLast).toFixed(1) + "%";
+    $("dbl").textContent = `${Math.round(dbq).toLocaleString("en-US")} QPS (${Math.round(100 * over)}%)`;
+    $("dbl").style.color = over > 1 ? "var(--bad)" : "";
+    $("lat").textContent = over > 1.5 ? "timeouts" : avg.toFixed(1) + " ms";
+    $("lat").style.color = over > 1 ? "var(--bad)" : "";
+    $("cnt").textContent = r301 ? `${Math.round(100 * (1 - REPEAT))}% (repeats hidden)` : "100%";
+    F.set("u", { sub: r301 ? "301: repeats cached" : `${(rps / 1000).toLocaleString("en-US")}k clicks/s` })
+     .set("svc", { sub: `${Math.round(arrive).toLocaleString("en-US")} req/s` })
+     .set("ca", { sub: cap ? `${(100 * hitsLast).toFixed(0)}% hits` : "no cache", load: cap ? Math.min(1, hitsLast) : 0 })
+     .set("db", { sub: `${Math.round(dbq).toLocaleString("en-US")} QPS`, load: Math.min(1, over), hot: over > 1, down: over > 1.5 })
+     .set("k", { sub: sync ? "unused (sync)" : "click events" });
+    F.edgeStyle("svc", "k", { hidden: sync }).edgeStyle("k", "ag", { hidden: sync }).edgeStyle("ag", "db", { hidden: sync });
+    Plot.line($("rc"), { series: [{ label: "database queries per second after a cold start", color: MX.css(over > 1 ? "--c-er" : "--c-db"), data: series, fill: true }],
+      xLabel: "seconds since cold start", yMin: 0, yMax: Math.max(DB_CAP * 1.3, ...series.map(p => p[1])) * 1.05, hlines: [{ y: DB_CAP, label: "DB capacity ~40k QPS", color: MX.css("--c-er") }] });
+    const first = series[0][1];
+    $("rmsg").textContent = (coldNote ? "💥 Cache node died: every key is gone, so this is the cold start you just caused. " : "") +
+      (sync ? "Synchronous analytics: every click is also a database write. No cache can save you; move counting to Kafka." :
+      !cap ? "No cache: every redirect is a database read." :
+      first > DB_CAP && over <= 1 ? `The first second after a cold start sends ${Math.round(first).toLocaleString("en-US")} QPS to the database, over capacity, until the cache warms. Warm caches gradually or keep a replica.` :
+      over > 1 ? "Even warm, too many misses reach the database: grow the cache or add shards." :
+      "Healthy: the cache absorbs the hot links and the database only sees the long tail.");
+  }
+  let sending = false;
+  $("clicks").onclick = async () => {
+    if (sending) return; sending = true;
+    const sync = getAn() === "sync", r301 = getRd() === "301";
+    for (let i = 0; i < 8; i++) {
+      const k = pick(state.rng);
+      if (r301 && state.rng() < REPEAT) { F.set("u", { sub: `#${k + 1}: browser cache` }); await new Promise(r => setTimeout(r, 500)); continue; }
+      const hit = lruGet(state.cache, k);
+      if (!hit) lruPut(state.cache, k, state.cap);
+      F.set("svc", { sub: `/${b62(k + 916132832)} ${hit ? "HIT" : "MISS"}` });
+      const p = hit ? F.packet(["u", "lb", "svc", "ca"], { color: "--c-ca", dur: 400, back: true }) : F.packet(["u", "lb", "svc", "db"], { color: "--c-er", dur: 550, back: true });
+      const e = sync ? F.packet(["svc", "db"], { color: "--c-lt", dur: 500 }) : F.packet(["svc", "k", "ag"], { color: "--c-nw", dur: 600 });
+      await Promise.all([p, e]);
+    }
+    sim(); sending = false;
+  };
+  $("kill").onclick = async () => {
+    F.set("ca", { down: true, sub: "restarting…" });
+    await new Promise(r => setTimeout(r, 600));
+    F.set("ca", { down: false });
+    sim(true);
+  };
+  ["rps", "csz"].forEach(id => ($(id).oninput = () => sim()));
+  sim();
+})();
+</script>
+</body>
+</html>

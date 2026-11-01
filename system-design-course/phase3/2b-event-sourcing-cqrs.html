@@ -1,0 +1,517 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.2b Event sourcing & CQRS · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .evlog { display: flex; flex-wrap: wrap; gap: 4px; max-height: 92px; overflow-y: auto; margin: 8px 0; font-size: .78rem; }
+  .ev { border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; background: var(--bg2); white-space: nowrap; }
+  .ev.dep { border-color: var(--c-db); } .ev.wd { border-color: var(--c-sv); } .ev.fee { border-color: var(--c-er); } .ev.ref { border-color: var(--c-ca); }
+  .ev.future { opacity: .3; }
+</style>
+</head>
+<body data-lesson="s3-2b" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 2b</div>
+  <h1>Event sourcing & CQRS</h1>
+  <p class="subtitle">Store every fact that happened (“Deposited $50”, “Withdrew $20”) instead of only the latest state, and build as many read-optimized views from those facts as you need. You get a perfect audit trail and the power to replay history, in exchange for eventual consistency and real extra complexity.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>A log</b> is an append-only, ordered list of records; Kafka keeps one that consumers can rewind and replay by <b>offset</b> (Lesson 3.2).</li>
+      <li><b>CDC</b> (change data capture) turns a database's own change log into a stream of events (Lessons 3.2 and 3.5).</li>
+      <li><b>Replication lag</b>: a copy that's updated asynchronously can be a little behind, so a read can be stale (Lesson 2.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2011 Martin Fowler described the architecture of LMAX, a retail financial trading platform. All of its business logic, every trade from every customer in every market, ran on <b>one thread</b> that handled <b>6 million orders per second</b> on commodity hardware, entirely in memory.</p>
+    <p>How do you trust an in-memory system with people's money? Its current state was <b>entirely derivable from the input events</b>. If the machine died, a replacement replayed the events and arrived at exactly the same state. LMAX ran three such processors, two in the main data center and one at a disaster-recovery site, all fed the same events. That idea, “the events are the truth; state is just a calculation”, is event sourcing.</p>
+  </div>
+
+  <h2>Numbers first: what does a balance of $130 tell you?</h2>
+  <p>A normal (<b>CRUD</b>: create, read, update, delete) system stores the latest state and overwrites it on every change. An event-sourced system stores the changes themselves:</p>
+  <table>
+    <tr><th></th><th>CRUD row</th><th>Event stream <code>account-42</code></th></tr>
+    <tr><td>What's stored</td><td><code>balance = 130</code></td><td class="nw">Opened · Deposited 100 · Deposited 50 · Withdrew 20</td></tr>
+    <tr><td>“Why is it 130?”</td><td class="er">No idea (unless you also built an audit table)</td><td class="db">Read the four events</td></tr>
+    <tr><td>“What was it on March 3?”</td><td class="er">Gone</td><td class="db">Replay events up to March 3</td></tr>
+    <tr><td>A bug miscalculated fees for two weeks</td><td class="er">Wrong balances already overwrote the right ones</td><td class="db">Fix the code, replay the same facts</td></tr>
+    <tr><td>Storage for 1 M accounts × 30 changes/month</td><td>1 M rows, constant</td><td>30 M events × ~200 bytes ≈ <b>6 GB/month</b>, ~72 GB/year</td></tr>
+  </table>
+  <p>The storage cost is real but modest: disks are cheap, and facts compress well. The bigger costs are elsewhere: rebuilding state takes work, and the views you read from lag behind the facts. This lesson is about paying those costs wisely.</p>
+  <div class="eq">
+    <span class="db">state</span><sub>n</sub> = apply( <span class="db">state</span><sub>n−1</sub>, <span class="nw">event</span><sub>n</sub> )
+    <span class="say">“The state after event n is what you get by applying event n to the state before it.” Start from an empty account and apply every event in order: that's a <b>replay</b>. Programmers call this a fold or reduce.</span>
+  </div>
+  <div class="legend"><span class="db">state: the current value (e.g. balance)</span><span class="nw">event: one immutable fact, in order</span></div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Event sourcing</b>: the source of truth is an append-only list of events; current state is derived by replaying them. <b>CQRS</b> (command query responsibility segregation): use one model to <b>change</b> data (commands, which check the rules) and separate models to <b>read</b> it (views shaped for each screen). They're independent ideas that fit together: the events from the write side feed every read side.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a chess score sheet</span>
+    <p>Serious chess players write down every move. They don't photograph the board after each move; the board is just what you get by replaying the moves. With the score sheet you can set up the position at move 20, find the exact move where the game went wrong, and a commentator can produce a totally different view (an annotated game, a list of captures) from the same sheet. Moves are never erased: a mistake is part of the history. And if the game is 200 moves long, a player might jot down the full position at move 150 so nobody has to replay from move 1. That's a <b>snapshot</b>.</p>
+  </div>
+
+  <h2>The words you need</h2>
+  <table>
+    <tr><th>Term</th><th>Plain meaning</th></tr>
+    <tr><td><b>Command</b></td><td>A request to change something: <code>Withdraw 80</code>. It can be <b>rejected</b> (“insufficient funds”). Named in the imperative.</td></tr>
+    <tr><td><b>Event</b></td><td>A fact that already happened: <code>Withdrew 80</code>. It can't be rejected or edited, only followed by more events. Named in the past tense.</td></tr>
+    <tr><td><b>Stream</b> / <b>aggregate</b></td><td>The events of one entity (one account, one order), in order. The aggregate is the code that loads them, enforces the rules, and emits new events.</td></tr>
+    <tr><td><b>Event store</b></td><td>The database holding streams: append-only, read by stream, with a version check on append.</td></tr>
+    <tr><td><b>Projection</b> / <b>read model</b></td><td>Code that reads events and builds a view for queries (a balance cache, a statement table, a search index), and the view itself.</td></tr>
+    <tr><td><b>Snapshot</b></td><td>A saved copy of an aggregate's state at version N, so loading means “snapshot + events after N”.</td></tr>
+    <tr><td><b>Upcasting</b></td><td>Converting an old event format to the current one while reading it, so stored events never change.</td></tr>
+  </table>
+
+  <h2>The write side: commands in, events out</h2>
+  <p>Every change follows the same four steps. Suppose <code>account-42</code> has 7 events and a balance of $100:</p>
+  <ol>
+    <li><b>Load</b>: read the stream and replay it: balance $100, version 7.</li>
+    <li><b>Decide</b>: the command <code>Withdraw 80</code> checks the rule “balance can't go below zero”. $100 ≥ $80, so it's allowed.</li>
+    <li><b>Append</b> <code>Withdrew 80</code> as event 8, <b>only if the stream is still at version 7</b>. This check is called <b>optimistic concurrency</b> (assume no conflict; detect it at write time).</li>
+    <li><b>Publish</b>: projections pick up event 8 and update their views.</li>
+  </ol>
+  <p>Step 3 is what protects the rule. Two tellers who both loaded version 7 can't both append event 8: the second append fails, reloads (balance now $20) and its <code>Withdraw 80</code> is rejected. Without the check, both succeed and the balance becomes −$60. You'll break it yourself below.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what replay costs, and what snapshots save</span>
+    <p>An account gets about 30 events a month. After 5 years: 30 × 12 × 5 = <b>1,800 events</b>. Say loading and applying one event costs about 0.02 ms (an illustrative number; measure your own).</p>
+    <ul>
+      <li>No snapshots: every command replays 1,800 events = 1,800 × 0.02 = <b>36 ms</b> before it can even check the balance. At 1,000 commands/s that's 36 CPU-seconds of replay every second.</li>
+      <li>Snapshot every 100 events: load the latest snapshot, then replay at most 99 events (about 50 on average): 50 × 0.02 = <b>1 ms</b> plus one snapshot read. Roughly 36× less work.</li>
+      <li>The snapshot is <b>disposable</b>: if its format changes or it has a bug, delete it and rebuild from events. The events stay the truth.</li>
+    </ul>
+    <p>Most streams are short (an order has maybe 10 events), and they never need snapshots. Snapshot only the long-lived ones.</p>
+  </div>
+
+  <div class="playground" id="pg1">
+    <span class="label">🎮 Playground · A bank account event store</span>
+    <p class="hint">Send commands; accepted ones append events. Drag <b>replay up to</b> to see the account at any point in its history. Add 5 years of history and switch snapshots on to watch the replay cost drop. Then try the buggy projection, and the two tellers.</p>
+    <div class="controls">
+      <button class="btn" id="dep">➕ Deposit $50</button>
+      <button class="btn" id="wd">➖ Withdraw $30</button>
+      <button class="btn" id="fee">💸 Charge $5 fee</button>
+      <button class="btn" id="ref">↩️ Refund the fee</button>
+      <button class="btn primary" id="hist">📅 Add 5 years of history</button>
+      <button class="btn" id="esreset">Reset</button>
+    </div>
+    <div class="evlog" id="evlog"></div>
+    <div class="controls">
+      <label>replay up to event <input type="range" id="upto" min="0" max="1" step="1" value="1"> <b class="mono" id="uptov"></b></label>
+    </div>
+    <div class="controls">
+      <span class="hint">Snapshot every:</span>
+      <span class="seg" id="snap"><button data-v="0" id="sn0" class="on">off</button><button data-v="10" id="sn10">10</button><button data-v="100" id="sn100">100</button><button data-v="500" id="sn500">500</button></span>
+      <span class="hint">Balance projection:</span>
+      <span class="seg" id="proj"><button data-v="2" id="pv2" class="on">v2 (correct)</button><button data-v="1" id="pv1">v1 (bug: refunds subtract)</button></span>
+    </div>
+    <div class="stat-row">
+      <div class="stat">events stored <b id="nev">–</b></div>
+      <div class="stat">balance at that point <b id="bal">–</b></div>
+      <div class="stat">events replayed to load <b id="rep">–</b></div>
+      <div class="stat">load cost (0.02 ms/event) <b id="cost">–</b></div>
+      <div class="stat">snapshots kept <b id="nsnap">–</b></div>
+    </div>
+    <canvas class="chart" id="repc" style="height:180px"></canvas>
+    <p class="hint" id="esmsg"></p>
+    <div class="controls">
+      <label><input type="checkbox" id="occ" checked> optimistic concurrency (append only if the version is unchanged)</label>
+      <button class="btn" id="race">👥 Two tellers withdraw $80 at the same moment</button>
+    </div>
+    <p class="hint" id="racemsg">Needs a balance between $80 and $159 to show the problem.</p>
+  </div>
+  <p>Things to try: add 5 years of history with snapshots off and watch the line climb: every load replays the whole account. Switch to “every 100” and it becomes a sawtooth that never goes above 99. Drag the replay slider back to see the balance on any past day. Then switch to the v1 projection and click a refund: the balance is wrong, but the events are fine, so switching back to v2 <i>is</i> the bug fix. Last, uncheck optimistic concurrency and send the two tellers in.</p>
+
+  <h2>The read side: CQRS and projections</h2>
+  <p>Replaying events is fine for one account during a command. It's hopeless for “show me all accounts in London with a balance over $10,000”. So you don't query the events. You build <b>read models</b>: separate stores, each shaped for one kind of query, kept up to date by projections that consume the event stream (often through Kafka, Lesson 3.2):</p>
+  <table>
+    <tr><th>Read model</th><th>Shape</th><th>Typical store</th><th>Serves</th></tr>
+    <tr><td><span class="ca">Balance view</span></td><td>account → balance</td><td>Redis, a key-value table</td><td>The app's home screen, thousands of reads/s</td></tr>
+    <tr><td><span class="db">Statement</span></td><td>one row per transaction, by account and date</td><td>Postgres</td><td>Monthly statements, exports</td></tr>
+    <tr><td><span class="db">Search</span></td><td>denormalized documents</td><td>Elasticsearch / OpenSearch</td><td>Support staff searching by name or amount</td></tr>
+    <tr><td><span class="lt">Fraud features</span></td><td>rolling counts per card per hour</td><td>A stream processor's state (Lesson 3.6)</td><td>Real-time scoring</td></tr>
+  </table>
+  <p>Commands go to the <b>write model</b>, which only has to enforce rules and append events. Queries go to <b>read models</b>, which never enforce anything: they're denormalized copies, rebuilt from events whenever needed. Each side can use a different database, scale separately, and change without touching the other.</p>
+  <p>You can do CQRS <i>without</i> event sourcing too: a normal database on the write side, with CDC (Lesson 3.2) streaming its changes into read models. Many teams start there.</p>
+  <p>The price: <b>read models are eventually consistent</b>. Between the append and the projection catching up (milliseconds usually, minutes during an incident), a read can return the old answer. It's exactly replication lag (Lesson 2.3), and the fixes are the same: return the new event's version with the command's response, and have the reader wait until the read model has reached it (read-your-writes), or show the user the result the command already returned.</p>
+
+  <div class="playground" id="pg2">
+    <span class="label">🎮 Playground · A CQRS pipeline with lagging read models</span>
+    <p class="hint">Deposits go through the command API into the event log; three projections update their read models after their own lag. Raise the lag, make a deposit and read all views right away to catch a stale read. Simulate 10,000 users who deposit and then reload. Finally add a brand-new read model and backfill it from 10 million historical events.</p>
+    <svg id="cq"></svg>
+    <div class="controls">
+      <label>projection lag <input type="range" id="lag" min="0" max="3000" step="100" value="800"> <b class="mono" id="lagv"></b></label>
+      <label>user reloads after <input type="range" id="rd" min="100" max="3000" step="100" value="500"> <b class="mono" id="rdv"></b></label>
+      <label><input type="checkbox" id="ryw"> read-your-writes (wait for my version)</label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="cdep">💰 Deposit $50</button>
+      <button class="btn" id="cread">👀 Read all views now</button>
+      <button class="btn" id="csim">Simulate 10,000 users</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">stale: balance view <b id="s1">–</b></div>
+      <div class="stat">stale: statement <b id="s2">–</b></div>
+      <div class="stat">stale: search <b id="s3">–</b></div>
+      <div class="stat">avg extra wait <b id="sw">–</b></div>
+    </div>
+    <p class="hint" id="cqmsg">The balance view lags 0.2× the slider, the statement 1×, search 2× (indexing is slower). Each event's lag varies randomly around that.</p>
+    <div class="controls">
+      <label>backfill replay speed <input type="range" id="rs" min="250" max="40000" step="250" value="20000"> <b class="mono" id="rsv"></b></label>
+      <button class="btn" id="badd">➕ Add “Monthly report” read model & backfill</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">history to replay <b>10,000,000</b></div>
+      <div class="stat">live events arriving <b>500/s</b></div>
+      <div class="stat">backfill progress <b id="bp">–</b></div>
+      <div class="stat">time to catch up <b id="bt">–</b></div>
+    </div>
+  </div>
+  <p>Things to try: at 800 ms lag and a 500 ms reload, the search view is stale for almost everyone and the balance view for nobody. Tick read-your-writes: stale reads drop to zero, paid for with waiting. Then backfill at 20,000 events/s: 10,000,000 ÷ (20,000 − 500) ≈ 513 s, about 8.5 minutes, and the new view is live with <i>three years of history</i> it never saw happen. Drop the replay speed below 500/s and it never catches up.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: adding a view nobody planned for</span>
+    <p>A year after launch, product wants “spending by category per month, for every customer, since day one”.</p>
+    <ul>
+      <li><b>CRUD world:</b> you only have current balances. The history is gone; the report can start from today.</li>
+      <li><b>Event-sourced world:</b> write a new projection, point it at offset 0 of the log, and let it replay. With 10 M past events at 20,000/s while 500/s keep arriving, it catches up in 10,000,000 ÷ 19,500 ≈ <b>513 s</b>. Then it simply keeps consuming live events.</li>
+      <li>Same trick for bug fixes: if a projection was wrong, deploy the fixed code to a <b>new</b> read model, backfill it next to the old one, and switch queries over when it's caught up. No migration scripts on the truth.</li>
+    </ul>
+  </div>
+
+  <h2>The hard parts nobody mentions in the talk</h2>
+  <ul>
+    <li><b>Events are forever, so their schema is forever.</b> A <code>Deposited</code> event written in 2021 must still be readable in 2031. Make changes additive (new optional fields), put a version on each event type, and use <b>upcasters</b>: small functions that turn <code>Deposited v1</code> into <code>Deposited v2</code> while reading, so the stored events never change. Microsoft's pattern guide recommends exactly these three, and warns that a bug fix in code doesn't fix events already written: you may need compensating events.</li>
+    <li><b>Deleting personal data.</b> “Immutable forever” collides with privacy laws that require erasure. Common answers: keep personal data out of events (store a reference), or encrypt it with a per-person key and delete the key.</li>
+    <li><b>Rules across entities.</b> Optimistic concurrency protects one stream. “Usernames must be unique across all accounts” spans streams, so you need a separate check (a unique index, a reservation), or accept and fix it after the fact.</li>
+    <li><b>Projections must be idempotent.</b> They consume at-least-once (Lesson 3.3): store the last event version they applied and skip anything at or below it.</li>
+  </ul>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Purpose-built event stores: <b>KurrentDB</b> (formerly EventStoreDB; managed as Kurrent Cloud). Frameworks: <b>Axon</b> (Java), <b>Marten</b> (.NET, on Postgres). Or plain <b>Postgres</b> with an append-only table, which many teams use. To feed read models: <b>Kafka</b>, <b>Debezium</b> CDC, or the event store's own subscriptions. The whole idea in Postgres:</p>
+<pre><code><span class="k">CREATE TABLE</span> events (
+  stream_id  text  <span class="k">NOT NULL</span>,             <span class="c">-- 'account-42'</span>
+  version    int   <span class="k">NOT NULL</span>,             <span class="c">-- 1, 2, 3 … within the stream</span>
+  type       text  <span class="k">NOT NULL</span>,             <span class="c">-- 'Deposited', 'Withdrew'</span>
+  data       jsonb <span class="k">NOT NULL</span>,             <span class="c">-- {"amount": 50, "v": 2}</span>
+  at         timestamptz <span class="k">DEFAULT</span> now(),
+  <span class="k">PRIMARY KEY</span> (stream_id, version)    <span class="c">-- two writers at the same version: one fails</span>
+);
+<span class="c">-- append event 8, which only works if nobody else wrote version 8 first</span>
+<span class="k">INSERT INTO</span> events (stream_id, version, type, data)
+  <span class="k">VALUES</span> (<span class="s">'account-42'</span>, <span class="n">8</span>, <span class="s">'Withdrew'</span>, <span class="s">'{"amount": 80}'</span>);
+<span class="c">-- load = latest snapshot (say at version 700) + the events after it</span>
+<span class="k">SELECT</span> type, data <span class="k">FROM</span> events
+ <span class="k">WHERE</span> stream_id = <span class="s">'account-42'</span> <span class="k">AND</span> version > <span class="n">700</span> <span class="k">ORDER BY</span> version;</code></pre>
+    <p>The same append with the KurrentDB Node.js client, where <code>streamState</code> is the optimistic-concurrency check:</p>
+<pre><code><span class="k">await</span> client.appendToStream(<span class="s">"account-42"</span>, jsonEvent({ type: <span class="s">"Withdrew"</span>, data: { amount: <span class="n">80</span> } }),
+  { streamState: <span class="n">7n</span> });   <span class="c">// fails if the stream isn't at revision 7 any more</span></code></pre>
+    <p class="hint">Try it locally: <code>docker run --name kurrentdb-node -it -p 2113:2113 docker.kurrent.io/kurrent-latest/kurrentdb:latest --insecure --run-projections=All</code>, then open <code>http://localhost:2113</code> to browse streams.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs: when it pays and when it's overkill</span>
+    <table>
+      <tr><th>✅ Worth it when…</th><th>❌ Overkill when…</th></tr>
+      <tr><td>The history <i>is</i> the business: ledgers, payments, order lifecycles, insurance claims, inventory</td><td>You only ever need the current value (a user's settings, a product catalog)</td></tr>
+      <tr><td>Audit and “why is it in this state?” questions come up weekly</td><td>An audit table or CDC into a warehouse would answer them</td></tr>
+      <tr><td>Many different read shapes over the same data, and new ones keep arriving</td><td>One database with a few indexes serves every query fine</td></tr>
+      <tr><td>Reads vastly outnumber writes and need different scaling</td><td>Every screen needs the latest data instantly (no lag tolerated)</td></tr>
+      <tr><td>The team understands the domain and its events well</td><td>It's a prototype or an MVP (minimum viable product) whose model will change monthly</td></tr>
+    </table>
+    <p>Fowler's own warning on CQRS: “for most systems CQRS adds risky complexity”. Use it in the one part of the system that needs it, not everywhere.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Default to a normal Postgres schema. If money or a legal audit trail is involved, add an append-only <code>ledger_entries</code> or <code>events</code> table next to the current-state table, written in the <b>same transaction</b>. That's 80% of the benefit. Need a new view? A CDC stream or a nightly job. Go full event sourcing only for the one aggregate where history really matters.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Event-sourced cores for ledgers and order lifecycles, events published through Kafka with a schema registry (Lesson 3.2), dozens of read models owned by different teams, backfills as a routine operation, upcasters and versioning rules in the design review checklist, and lag on every projection as a monitored metric (Lesson 6.3).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Saying “we'll use event sourcing” is a red flag unless you justify it. A senior answer:</p>
+    <ul>
+      <li>Names <b>why</b>: audit, temporal queries, or many read shapes. Otherwise proposes a simpler design.</li>
+      <li>Separates <b>commands</b> (validated, can fail) from <b>events</b> (facts), and protects invariants with <b>optimistic concurrency</b> per stream.</li>
+      <li>Explains <b>read-model lag</b> and how the UI copes (read-your-writes via a version token, or showing the command's result).</li>
+      <li>Covers <b>snapshots</b> for long streams, <b>idempotent</b> projections, <b>schema evolution</b> (upcasting) and <b>rebuilds</b> (backfill a new read model, then switch).</li>
+    </ul>
+    <p>Common follow-ups: “How do you delete a user's data?” “A projection had a bug for a week: what do you do?” “How do you enforce a rule that spans two aggregates?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Event sourcing, named and explained</b> <span class="tag hist">📜 History · 2005</span> <a href="https://martinfowler.com/eaaDev/EventSourcing.html" target="_blank" rel="noopener">Martin Fowler: Event Sourcing</a></div>
+      <p><b>How:</b> record every change to an application's state as an event, in order, then rebuild state, query it at any past time, or replay with corrected events. Fowler notes that accounting systems are some of the strongest examples, and that a version control system is a familiar one.</p>
+      <p><b>Why this method:</b> audit and “what did it look like then?” questions become a replay instead of an archaeology project.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One thread, all trades, rebuilt from events</b> <span class="tag co">🏢 LMAX · 2011</span> <a href="https://martinfowler.com/articles/lmax.html" target="_blank" rel="noopener">The LMAX Architecture</a></div>
+      <p><b>How:</b> an in-memory business logic processor whose state is entirely derivable from its input events. Three processors (two in the main data center, one for disaster recovery) process the same event stream, so a failover just switches to another one.</p>
+      <p><b>Why this method:</b> keeping everything in memory on one thread removed database and locking overhead, and event sourcing made that safe to do with money.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Download limits with a full history</b> <span class="tag co">🏢 Netflix · 2017</span> <a href="https://netflixtechblog.com/scaling-event-sourcing-for-netflix-downloads-episode-2-ce1b54d46eec" target="_blank" rel="noopener">Scaling Event Sourcing for Netflix Downloads</a></div>
+      <p><b>How:</b> for the downloads feature launched in late 2016, license, device and downloaded-title aggregates are rebuilt from events in an event store; commands go through handlers that check business rules (like download limits) and append new events.</p>
+      <p><b>Why this method:</b> the team wanted to look back in time to debug how a member's account reached a state, and to change business rules flexibly; plain current-state storage gave neither.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>CQRS from a 1980s principle</b> <span class="tag hist">📜 History · 2010</span> <a href="https://cqrs.files.wordpress.com/2010/11/cqrs_documents.pdf" target="_blank" rel="noopener">Greg Young: CQRS Documents (PDF)</a></div>
+      <p><b>How:</b> Young traces CQRS to Bertrand Meyer's command-query separation (a method either changes state or returns data, never both) and lifts it to architecture: split the object model in two, one for commands and one for queries. The same documents describe event storage and “rolling snapshots” for streams with a million events.</p>
+      <p><b>Why this method:</b> the write side can focus on behaviour and rules, while each read side is a cheap, rebuildable, denormalized view.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A database built for events</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.kurrent.io/getting-started/introduction.html" target="_blank" rel="noopener">KurrentDB docs</a></div>
+      <p><b>How:</b> an append-only log of events grouped into streams, with subscriptions and connectors that push events to other systems, and built-in projections. Appends take an expected stream state for optimistic concurrency.</p>
+      <p><b>Why this method:</b> you get stream reads, version checks and subscriptions out of the box instead of building them on a general database.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · accountants got there first</span>
+    <p>Greg Young's CQRS documents point out that a bank ledger already works this way: the current balance can be read directly <i>or</i> recomputed by adding up every change since the beginning, which is how tired accountants caught their own 3 am arithmetic mistakes. Accountants never erase an entry; they add a correcting one. Event sourcing is double-entry bookkeeping's habit, applied to software.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The event log is the Kafka idea (Lesson 3.2) applied to your own domain: a replayable log that many consumers read. Read models are caches (Lesson 1.3) and replicas (Lesson 2.3) with the same staleness problems. Projections must be idempotent (Lesson 3.3). Publishing events reliably from the write side uses the outbox (Lesson 3.5), and long business processes on top of events are sagas (Lesson 3.5). Stream processors like Flink are projections at scale (Lesson 3.6). The payment system design leans on an append-only ledger (Lesson 7.7). In AI systems, the same habit shows up as logging every prompt, tool call and result, so an agent's run can be replayed and debugged later.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing" target="_blank" rel="noopener">Azure Architecture Center: Event Sourcing pattern</a>. Snapshots, versioning, upcasting, and a clear “when not to use” list.</li>
+      <li><span class="kind">Docs</span> <a href="https://learn.microsoft.com/en-us/azure/architecture/patterns/cqrs" target="_blank" rel="noopener">Azure Architecture Center: CQRS pattern</a>. Separate models in one store vs separate stores, and keeping them in sync.</li>
+      <li><span class="kind">Blog</span> <a href="https://martinfowler.com/bliki/CQRS.html" target="_blank" rel="noopener">Martin Fowler: CQRS</a>. A short read on where it helps, and why to use it only in parts of a system.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. An account stream has 2,400 events. A snapshot is saved after every 200th event. What's the most events you'd ever replay to load it?</div>
+    <div class="opts"><button class="opt">2,400</button><button class="opt" data-ok>199</button><button class="opt">12</button></div>
+    <div class="explain">You load the latest snapshot and replay only what came after it. Just before the next snapshot that's 199 events (about 100 on average), instead of all 2,400. Twelve is the number of snapshots, not the events replayed.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Product wants a new “spending by category” dashboard covering the last three years. The system is event-sourced. What's the best plan?</div>
+    <div class="opts"><button class="opt">Add category columns to the accounts table and fill them from today on</button><button class="opt" data-ok>Write a new projection, replay the event log from the start to backfill it, then keep it updated from live events</button><button class="opt">Run the dashboard's queries by replaying every account's events on each page view</button></div>
+    <div class="explain">This is the superpower of keeping facts: a view nobody planned for can be built from full history. Backfill time ≈ history ÷ (replay speed − live rate). Replaying on every page view would be far too slow; that's what read models are for.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A user deposits $50, the page reloads, and the balance still shows the old amount. A second later it's right. What's happening, and what's the fix?</div>
+    <div class="opts"><button class="opt">The event was lost; add retries to the command API</button><button class="opt" data-ok>The read model hadn't caught up yet; return the new event's version and have the read wait for it (or show the command's result)</button><button class="opt">Event sourcing doesn't work for balances; switch to CRUD</button></div>
+    <div class="explain">Read models are eventually consistent, just like async replicas (Lesson 2.3). Read-your-writes with a version token fixes it for the user who wrote, without making every read slow.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Event sourcing stores facts in an append-only stream; state = replay (apply each event in order). You get audit, time travel and replay-after-bug-fix.</li>
+      <li>Commands can be rejected; events can't. Protect rules with optimistic concurrency (append only at the expected version).</li>
+      <li>Snapshots cap replay cost at N − 1 events; they're disposable, the events are the truth.</li>
+      <li>CQRS: one write model, many read models built by projections. Read models lag, so plan read-your-writes; new ones can be backfilled from history.</li>
+      <li>Events are forever: version them and upcast. Use all this only where history is the business.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const money = v => (v < 0 ? "−$" : "$") + Math.abs(v).toLocaleString("en-US");
+
+  // ---------- playground 1: event store ----------
+  const PER_EVENT = 0.02, SNAP_READ = 0.2;
+  let events = [], day = 0, follow = true, msg = "";
+  const LABEL = { Opened: "Opened", Deposited: "Deposited", Withdrew: "Withdrew", FeeCharged: "Fee", FeeRefunded: "Fee refunded" };
+  const CLS = { Deposited: "dep", Withdrew: "wd", FeeCharged: "fee", FeeRefunded: "ref", Opened: "" };
+  const apply = (bal, e, pv) => {
+    if (e.type === "Deposited" || (e.type === "FeeRefunded" && pv === 2)) return bal + e.amt;
+    if (e.type === "Withdrew" || e.type === "FeeCharged" || e.type === "FeeRefunded") return bal - e.amt; // v1 bug: refunds subtract
+    return bal;
+  };
+  const replay = (k, pv) => { let b = 0; for (let i = 0; i < k; i++) b = apply(b, events[i], pv); return b; };
+  const reset = () => { events = [{ type: "Opened", amt: 0, day: 0 }]; day = 0; follow = true; msg = "A new stream: one Opened event. Send some commands."; };
+  const append = (type, amt) => { day += 1; events.push({ type, amt, day }); };
+  const getSnap = seg("snap", () => paint());
+  const getProj = seg("proj", () => { msg = +getProj() === 1 ? "Projection v1 has a sign bug: it treats refunds as withdrawals. The events themselves are untouched." : "Projection v2 replays the very same events correctly. That's the whole bug fix: new code, same facts, replay."; paint(); });
+  const command = (type, amt) => {
+    const bal = replay(events.length, 2);
+    if (type === "Withdrew" && bal < amt) { msg = `Command Withdraw $${amt} REJECTED: balance is ${money(bal)}. No event was written, because nothing happened.`; return paint(); }
+    if (type === "FeeRefunded" && !events.some(e => e.type === "FeeCharged")) { msg = "Command rejected: there's no fee to refund yet."; return paint(); }
+    append(type, amt); follow = true;
+    msg = `Command accepted → event #${events.length} ${LABEL[type]} $${amt} appended.`;
+    paint();
+  };
+  $("dep").onclick = () => command("Deposited", 50);
+  $("wd").onclick = () => command("Withdrew", 30);
+  $("fee").onclick = () => command("FeeCharged", 5);
+  $("ref").onclick = () => command("FeeRefunded", 5);
+  $("hist").onclick = () => {
+    const rng = MX.seeded(events.length + 11);
+    for (let i = 0; i < 1800; i++) {
+      const bal = replay(events.length, 2), u = rng();
+      if (i % 30 === 0) append("Deposited", 2000);
+      else if (u < 0.08) append("FeeCharged", 5);
+      else if (u < 0.11 && events.some(e => e.type === "FeeCharged")) append("FeeRefunded", 5);
+      else { const a = 10 + Math.floor(rng() * 90); bal >= a ? append("Withdrew", a) : append("Deposited", a); }
+    }
+    follow = true;
+    msg = "1,800 more events: about 5 years at 30 a month. Every load now replays the whole history, unless you snapshot.";
+    paint();
+  };
+  $("esreset").onclick = () => { reset(); paint(); };
+  $("upto").oninput = () => { follow = +$("upto").value === events.length; msg = ""; paint(); };
+  $("race").onclick = () => {
+    const bal = replay(events.length, 2), v = events.length;
+    if (bal < 80) { $("racemsg").textContent = `Balance is ${money(bal)}: deposit until it's at least $80, then try again.`; return; }
+    if ($("occ").checked) {
+      append("Withdrew", 80);
+      const after = replay(events.length, 2);
+      $("racemsg").textContent = after >= 80
+        ? `Both read version ${v}. Teller 1 appended #${v + 1}. Teller 2's append was rejected (stream moved to ${v + 1}); it reloaded, saw ${money(after)} and also withdrew. Balance ${money(after - 80)}: both were legitimately allowed.`
+        : `Both read version ${v} with ${money(bal)}. Teller 1 appended event #${v + 1}. Teller 2's append was REJECTED (expected version ${v}, stream is at ${v + 1}); it reloaded, saw ${money(after)} and the command failed: insufficient funds. The rule held.`;
+      if (after >= 80) append("Withdrew", 80);
+    } else {
+      append("Withdrew", 80); append("Withdrew", 80);
+      const after = replay(events.length, 2);
+      $("racemsg").textContent = after < 0
+        ? `Both read version ${v} with ${money(bal)}, both decided “OK”, both appended. Balance is now ${money(after)}: the rule “never below zero” is broken. Turn optimistic concurrency back on.`
+        : `Both appended; the balance was high enough (${money(after)} left), so no harm this time. Try with a balance under $160.`;
+    }
+    follow = true; paint();
+  };
+  function paint() {
+    const n = events.length, up = $("upto");
+    up.max = n; if (follow) up.value = n;
+    const k = +up.value, pv = +getProj(), N = +getSnap();
+    const shownFrom = Math.max(0, n - 60);
+    $("evlog").innerHTML = (shownFrom ? `<span class="ev">… ${shownFrom} earlier</span>` : "") + events.slice(shownFrom).map((e, i) =>
+      `<span class="ev ${CLS[e.type]}${shownFrom + i >= k ? " future" : ""}">#${shownFrom + i + 1} ${LABEL[e.type]}${e.amt ? " $" + e.amt : ""}</span>`).join("");
+    $("evlog").scrollTop = 1e6;
+    const bal = replay(k, pv), good = replay(k, 2);
+    const reps = N ? k % N : k, snaps = N ? Math.floor(n / N) : 0;
+    const cost = reps * PER_EVENT + (N && k >= N ? SNAP_READ : 0);
+    $("uptov").textContent = `#${k} of ${n} (day ${k ? events[k - 1].day : 0})`;
+    $("nev").textContent = n.toLocaleString("en-US");
+    $("bal").textContent = money(bal) + (pv === 1 && bal !== good ? " ✗" : "");
+    $("bal").style.color = pv === 1 && bal !== good ? MX.css("--c-er") : "";
+    $("rep").textContent = reps.toLocaleString("en-US") + (N && k >= N ? " + 1 snapshot" : "");
+    $("cost").textContent = cost.toFixed(2) + " ms";
+    $("nsnap").textContent = snaps;
+    const step = Math.max(1, Math.ceil(n / 400)), full = [], snapd = [];
+    for (let x = 0; x <= n; x += step) { full.push([x, x]); snapd.push([x, N ? x % N : x]); }
+    Plot.line($("repc"), { series: [
+      { label: "events replayed, no snapshots", color: MX.css("--muted"), data: full, dash: [5, 4] },
+      { label: N ? `with a snapshot every ${N}` : "current setting", color: MX.css(N ? "--c-ca" : "--c-lt"), data: snapd, fill: true }],
+      xLabel: "stream length (events)", yMin: 0, xMin: 0 });
+    let m = msg;
+    if (!m) m = k < n ? `Time travel: this is the account as of event #${k}, replayed from the same facts.` : "";
+    if (pv === 1 && bal !== good) m += ` v1 says ${money(bal)}, the truth is ${money(good)}. A CRUD table written by v1 would hold ${money(bal)} now, with no way back.`;
+    $("esmsg").textContent = m;
+  }
+  reset(); paint();
+
+  // ---------- playground 2: CQRS pipeline ----------
+  const F = new Flow($("cq"), { width: 720, height: 300 });
+  F.node("u", { x: 60, y: 160, label: "👤 User", sub: "deposit / reload", kind: "cl" })
+   .node("cmd", { x: 200, y: 50, label: "Command API", sub: "write model", kind: "sv" })
+   .node("log", { x: 390, y: 50, label: "📜 Event log", sub: "v0", kind: "nw", w: 130 })
+   .node("r4", { x: 615, y: 50, label: "📊 Monthly report", sub: "not built yet", kind: "lt", w: 150 })
+   .node("r1", { x: 260, y: 160, label: "⚡ Balance view", sub: "Redis", kind: "ca", w: 140 })
+   .node("r2", { x: 430, y: 160, label: "🗄️ Statement", sub: "Postgres", kind: "db", w: 140 })
+   .node("r3", { x: 600, y: 160, label: "🔎 Search", sub: "Elasticsearch", kind: "db", w: 140 })
+   .node("qry", { x: 200, y: 265, label: "Query API", sub: "reads views only", kind: "sv", w: 130 })
+   .edge("u", "cmd").edge("cmd", "log").edge("log", "r1").edge("log", "r2").edge("log", "r3").edge("log", "r4", { dashed: true })
+   .edge("u", "qry").edge("qry", "r1").edge("qry", "r2").edge("qry", "r3").render();
+  F.edgeStyle("log", "r4", { hidden: true });
+  const RM = [{ id: "r1", mult: 0.2, name: "balance view" }, { id: "r2", mult: 1, name: "statement" }, { id: "r3", mult: 2, name: "search" }];
+  let logV = 0, rmV = [0, 0, 0], bal2 = 100;
+  const lagOf = (i, rng) => +$("lag").value * RM[i].mult * (0.5 + (rng ? rng() : Math.random()));
+  const paintRM = () => {
+    F.set("log", { sub: `v${logV} · $${100 + 50 * logV}` });
+    RM.forEach((r, i) => F.set(r.id, { sub: `v${rmV[i]} · $${100 + 50 * rmV[i]}${rmV[i] < logV ? " (stale)" : ""}`, hot: rmV[i] < logV }));
+  };
+  const labels2 = () => { $("lagv").textContent = $("lag").value + " ms"; $("rdv").textContent = $("rd").value + " ms"; $("rsv").textContent = (+$("rs").value).toLocaleString("en-US") + "/s"; };
+  $("cdep").onclick = async () => {
+    await F.packet(["u", "cmd", "log"], { color: "--c-cl", dur: 500 });
+    logV++; bal2 += 50; const v = logV; paintRM();
+    $("cqmsg").textContent = `Event v${v} appended. The command already knows the new balance ($${bal2}); the read models catch up after their lag.`;
+    RM.forEach((r, i) => setTimeout(async () => {
+      await F.packet(["log", r.id], { color: "--c-nw", dur: 350 });
+      rmV[i] = Math.max(rmV[i], v); paintRM();
+    }, lagOf(i)));
+  };
+  $("cread").onclick = async () => {
+    const stale = RM.filter((r, i) => rmV[i] < logV);
+    await Promise.all(RM.map((r, i) => F.packet(["u", "qry", r.id], { color: rmV[i] < logV ? "--c-er" : "--c-ca", dur: 400, back: true })));
+    $("cqmsg").textContent = stale.length
+      ? `Stale read from ${stale.map(r => r.name).join(" and ")}: they still show v${Math.min(...rmV)} while the log is at v${logV}. ${$("ryw").checked ? "With read-your-writes, the query would wait for v" + logV + " instead." : "Nothing is lost; they're just behind."}`
+      : `All read models are at v${logV}: consistent, for now.`;
+  };
+  $("csim").onclick = () => {
+    const rng = MX.seeded(5), U = 10000, rd = +$("rd").value, ryw = $("ryw").checked;
+    let st = [0, 0, 0], wait = 0, reads = 0;
+    for (let u = 0; u < U; u++) RM.forEach((r, i) => {
+      const l = lagOf(i, rng); reads++;
+      if (l > rd) { if (ryw) wait += l - rd; else st[i]++; }
+    });
+    ["s1", "s2", "s3"].forEach((id, i) => ($(id).textContent = (100 * st[i] / U).toFixed(1) + "%"));
+    $("sw").textContent = ryw ? Math.round(wait / reads) + " ms" : "0 ms";
+    $("cqmsg").textContent = ryw
+      ? `Read-your-writes: nobody saw their own old balance, but reads waited ${Math.round(wait / reads)} ms on average for projections to catch up.`
+      : `Each user reloads ${rd} ms after depositing. Wherever the projection lag is longer than that, they see their old balance.`;
+  };
+  let bfTimer = null;
+  $("badd").onclick = () => {
+    clearInterval(bfTimer);
+    const H = 10000000, LIVE = 500, speed = +$("rs").value, net = speed - LIVE;
+    const DT = net > 0 ? Math.max(5, Math.ceil(H / net / 80)) : 60; // simulated seconds per tick (~80 ticks to finish)
+    F.edgeStyle("log", "r4", { hidden: false, color: "--c-lt", dashed: true });
+    let done = 0, head = H, t = 0;
+    $("bt").textContent = net > 0 ? Math.round(H / net).toLocaleString("en-US") + " s (" + (H / net / 60).toFixed(1) + " min)" : "never";
+    bfTimer = setInterval(() => {
+      t += DT; head += LIVE * DT; done = Math.min(head, done + speed * DT);
+      const pct = 100 * done / head;
+      $("bp").textContent = pct.toFixed(1) + "%";
+      F.set("r4", { sub: done >= head ? "live ✅" : `backfilling ${pct.toFixed(0)}%`, load: pct / 100 });
+      if (done >= head) {
+        clearInterval(bfTimer); F.edgeStyle("log", "r4", { dashed: false, color: "--c-db" });
+        $("cqmsg").textContent = `Caught up after about ${Math.round(t).toLocaleString("en-US")} simulated seconds. The new view holds all history and now follows live events.`;
+      } else if (net <= 0 && t >= 3600) {
+        clearInterval(bfTimer);
+        $("cqmsg").textContent = `After an hour it's at ${pct.toFixed(1)}% and falling behind: replaying at ${speed.toLocaleString("en-US")}/s can't outrun ${LIVE}/s of new events. Speed it up (more partitions, more consumers).`;
+      }
+    }, 100);
+  };
+  ["lag", "rd", "rs"].forEach(id => ($(id).oninput = labels2));
+  labels2(); paintRM();
+})();
+</script>
+</body>
+</html>

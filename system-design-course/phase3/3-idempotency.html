@@ -1,0 +1,429 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.3 Retries, idempotency & exactly-once · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .btn.tog.on { background: var(--c-er); border-color: var(--c-er); color: #fff; }
+  .rows { font-family: var(--mono); font-size: .82rem; display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 10px; margin: 8px 0; }
+  .rows .tbl { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--bg2); min-height: 60px; }
+  .rows .tbl b { font-family: var(--font); }
+</style>
+</head>
+<body data-lesson="s3-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 3</div>
+  <h1>Retries, idempotency & exactly-once</h1>
+  <p class="subtitle">Networks fail, so clients retry, and retries cause two classic disasters: storms that keep a sick server down, and duplicates that charge a customer twice. Backoff with jitter fixes the first; idempotency keys fix the second.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Timeouts</b>: if no answer comes in time, the caller gives up; it can't tell “slow” from “lost” (Lesson 0.2).</li>
+      <li><b>At-least-once delivery</b>: queues and Kafka redeliver after a crash, so duplicates happen (Lessons 3.1 and 3.2).</li>
+      <li><b>Transactions</b>: several database writes that succeed or fail together (Lesson 2.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>At 2:19 am PDT on Sunday, September 20, 2015, a brief network disruption hit some of DynamoDB's storage servers in AWS's US-East region. They asked an internal metadata service for their membership data, didn't get answers in time, and kept <b>retrying</b>. The retries kept the metadata service overloaded, and DynamoDB's error rate climbed to about <b>55%</b>.</p>
+    <p>The overload even blocked the requests needed to add capacity. At 5:06 am the team <b>paused requests to the metadata service</b>, which “decreased retry activity”. Only then could they add capacity. DynamoDB was back to normal error rates at 7:10 am. A brief network glitch became nearly five hours of trouble, and retries were the amplifier.</p>
+  </div>
+
+  <h2>Numbers first: retries multiply</h2>
+  <p>Retrying is selfish: the client spends more of the server's time to raise its own chance of success. That's fine when failures are rare. It's a disaster when the server is failing <i>because</i> it's overloaded, and it compounds through layers:</p>
+  <table>
+    <tr><th>Layers that each retry 3 times</th><th>Calls hitting the database per user request</th></tr>
+    <tr><td>1 (just the client)</td><td>3</td></tr>
+    <tr><td>3 (client → API → service → database)</td><td>3 × 3 × 3 = 27</td></tr>
+    <tr><td>5</td><td>3<sup>5</sup> = <b class="er">243</b></td></tr>
+  </table>
+  <p>That 243× figure comes from the AWS Builders' Library: if every layer retries independently, a struggling database sees 243 times the load and is unlikely to ever recover. Their fix: <b>retry at one layer only</b>, back off, and add jitter.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Two rules make retries safe. <b>1. Retry politely</b>: wait longer after each failure (exponential backoff), add randomness (jitter) so clients don't retry in sync, and cap the number of attempts. <b>2. Make the operation idempotent</b>: doing it twice has the same effect as doing it once, so a retry can never double-charge, double-send or double-book.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the crowded shop door, and the lift button</span>
+    <p><b>Jitter:</b> a shop opens late and 500 people are waiting. If they all push the door at the same second, nobody gets in. If each waits a random few seconds, they flow in. <b>Idempotency:</b> pressing the lift's call button five times doesn't call five lifts. The button is idempotent: once is the same as many. A good payment API should behave like the lift button, not like a vending machine that takes your coin every time.</p>
+  </div>
+
+  <h2>Backoff and jitter</h2>
+  <p>Exponential backoff doubles the wait after each failure: 100 ms, 200 ms, 400 ms, 800 ms, … up to a cap. But if 2,000 clients all failed at the same moment, they all wait exactly 100 ms and all retry at the same moment again: a synchronized wave. <b>Full jitter</b> picks a random wait between zero and the backoff value, which spreads the wave out.</p>
+  <div class="eq">
+    sleep = random(0, min(<span class="lt">cap</span>, <span class="lt">base</span> × 2<sup>attempt</sup>))
+    <span class="say">“Sleep a random time between zero and the backoff, where the backoff doubles each attempt but never exceeds the cap.” This is “Full Jitter” from the AWS Architecture Blog.</span>
+  </div>
+  <div class="legend"><span class="lt">base: first wait (e.g. 100 ms)</span><span class="lt">cap: longest wait (e.g. 20 s)</span></div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how long do 8 retries take?</span>
+    <p>Base 100 ms, cap 20 s, up to 8 retries.</p>
+    <ul>
+      <li>Plain backoff waits 0.1 + 0.2 + 0.4 + 0.8 + 1.6 + 3.2 + 6.4 + 12.8 = <b>25.5 s</b> in total before giving up.</li>
+      <li>With full jitter, each wait is on average half its backoff, so about <b>12.75 s</b> on average, and different for every client.</li>
+      <li>A user-facing request usually can't wait 25 s. That's why user-facing calls retry only 2–3 times with a short cap, while background jobs can retry for minutes.</li>
+    </ul>
+  </div>
+
+  <div class="playground" id="pg1">
+    <span class="label">🎮 Playground · The retry storm</span>
+    <p class="hint">A deploy restarts an API, and all clients reconnect at t = 0. The server can do <b>1,000 requests per second</b>. Past that it wastes time on requests it can't finish, so it gets <i>less</i> useful work done the more overloaded it is (here, as low as 30%). Each client retries up to 10 times. Pick a strategy and compare.</p>
+    <div class="controls">
+      <label>clients <input type="range" id="nc" min="500" max="8000" step="500" value="2000"> <b class="mono" id="ncv"></b></label>
+      <span class="seg" id="rmode"><button id="r-none" data-v="none">No retries</button><button id="r-imm" data-v="imm" class="on">Retry immediately</button><button id="r-exp" data-v="exp">Exponential backoff</button><button id="r-jit" data-v="jit">Backoff + full jitter</button></span>
+    </div>
+    <canvas class="chart" id="rc" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">succeeded <b id="rs">–</b></div>
+      <div class="stat">gave up <b id="rg">–</b></div>
+      <div class="stat">calls per client <b id="rp">–</b></div>
+      <div class="stat">time until 99% done <b id="rt">–</b></div>
+    </div>
+    <p class="hint" id="rmsg"></p>
+  </div>
+  <p>Things to try: with 2,000 clients, immediate retries keep the server pinned far above capacity until most clients give up. Plain backoff is barely better: the clients still move in lockstep, so every wave overloads the server again (watch the spikes). Full jitter turns the waves into a smooth line just under capacity, and everyone gets served in a few seconds with half the calls. Then try 500 clients: when overload is mild, everything works and jitter just finishes faster.</p>
+
+  <h2>The other problem: duplicates</h2>
+  <p>A client sends “charge $50”. The server charges the card and replies, but the reply is lost (a phone switching from Wi-Fi to 4G, a timeout at a load balancer). The client can't tell whether the charge happened. If it retries a plain request, the customer pays <b>$100</b>.</p>
+  <table>
+    <tr><th>Delivery guarantee</th><th>What it means</th><th>Typical source</th></tr>
+    <tr><td><b>At-most-once</b></td><td>Never retried. Maybe lost, never duplicated.</td><td>Fire-and-forget pub/sub, “no retries”</td></tr>
+    <tr><td><b>At-least-once</b></td><td>Retried until acknowledged. Never lost, maybe duplicated.</td><td>Queues, Kafka consumers, any client that retries</td></tr>
+    <tr><td><b>Exactly-once</b> (effectively once)</td><td>The <i>effect</i> happens once, even though delivery may repeat.</td><td>At-least-once delivery + idempotent processing</td></tr>
+  </table>
+  <p>True exactly-once <i>delivery</i> over an unreliable network isn't possible in general: you can't tell a lost reply from a lost request. What systems actually build is <b>at-least-once delivery plus deduplication</b>, which gives an exactly-once <i>effect</i>.</p>
+
+  <h3>Idempotency keys</h3>
+  <p>The client generates a unique key (a random UUID) for each <i>intended</i> operation and sends it with every attempt. The server stores the key with the result. A retry with the same key gets the stored result back instead of running again.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how many double charges?</span>
+    <p>A shop takes <b>1,000,000 payments a day</b>. Suppose (typical numbers) <b>0.1%</b> of requests time out on the client side and get retried, and in half of those the server had actually charged the card.</p>
+    <ul>
+      <li>Retries per day: 1,000,000 × 0.001 = <b>1,000</b>.</li>
+      <li>Double charges without idempotency: 1,000 × 0.5 = <b>500 angry customers a day</b>, plus support tickets and refunds.</li>
+      <li>With idempotency keys: <b>0</b>. Storage cost: 1,000,000 keys a day × ~200 bytes ≈ 200 MB/day, deleted after a day or so.</li>
+    </ul>
+  </div>
+
+  <div class="playground" id="pg2">
+    <span class="label">🎮 Playground · The double charge</span>
+    <p class="hint">Press <b>Pay $50</b>. Turn on “drop the reply” to lose the server's answer: the app times out and retries. Then try a double-tap: two identical requests at the same instant. Compare no key, a key that's checked and then inserted, and a key inserted atomically (a unique constraint, so only one insert can win).</p>
+    <svg id="pf"></svg>
+    <div class="controls">
+      <span class="seg" id="kmode"><button id="k-none" data-v="none" class="on">No idempotency key</button><button id="k-check" data-v="check">Key: check, then insert</button><button id="k-atomic" data-v="atomic">Key: atomic insert (unique)</button></span>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="pay">💳 Pay $50</button>
+      <button class="btn" id="dbl">👆👆 Double-tap (2 at once)</button>
+      <button class="btn tog" id="drop">📶 Drop the reply</button>
+      <button class="btn" id="preset">Reset</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">requests sent <b id="ps">0</b></div>
+      <div class="stat">charges created <b id="pc">0</b></div>
+      <div class="stat">customer paid <b id="pm">$0</b></div>
+      <div class="stat">customer meant to pay <b id="pi">$0</b></div>
+    </div>
+    <div class="rows"><div class="tbl" id="tch"><b>charges</b><br>(empty)</div><div class="tbl" id="tkey"><b>idempotency_keys</b><br>(empty)</div></div>
+    <p class="hint" id="pmsg"></p>
+  </div>
+  <p>Notice the race: “check, then insert” works for a slow retry but fails a double-tap, because both requests check before either inserts. The fix is to let the database decide: insert the key with a <b>unique constraint</b> in the same transaction as the charge, and whoever loses the insert returns the stored result.</p>
+
+  <h3>Idempotency without keys</h3>
+  <ul>
+    <li><b>Natural idempotency:</b> “set the status to SHIPPED” is safe to repeat; “add 1 to the counter” isn't. Prefer setting values to incrementing them.</li>
+    <li><b>Dedupe on message ID</b> for queue and Kafka consumers: store processed message IDs (with a TTL) and skip repeats.</li>
+    <li><b>Conditional writes</b>: “update the order only if its version is still 7” (optimistic concurrency, Lesson 2.5).</li>
+    <li><b>Broker features</b>: Kafka's idempotent producer stops duplicate writes from producer retries, and its transactions tie consuming, processing and producing together. SQS FIFO queues drop a re-sent message with the same deduplication ID within a 5-minute window.</li>
+  </ul>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Retry libraries: <b>tenacity</b> (Python), <b>Resilience4j</b> (Java), <b>Polly</b> (.NET), <b>cockatiel</b>/<b>p-retry</b> (Node); the <b>AWS SDKs</b> have retries built in (with token-bucket retry throttling since 2016). Idempotency: a table in your database, or <b>Redis</b> <code>SET key value NX EX 86400</code> (set only if it doesn't exist). <b>Stripe</b>'s API takes an <code>Idempotency-Key</code> header; Kafka has <code>enable.idempotence</code>. Full-jitter backoff in plain Python:</p>
+<pre><code><span class="k">import</span> random, time
+
+<span class="k">def</span> call_with_retries(fn, attempts=<span class="n">4</span>, base=<span class="n">0.1</span>, cap=<span class="n">5.0</span>):
+    <span class="k">for</span> n <span class="k">in</span> range(attempts):
+        <span class="k">try</span>:
+            <span class="k">return</span> fn()
+        <span class="k">except</span> (TimeoutError, ConnectionError):          <span class="c"># retry only errors that might succeed next time</span>
+            <span class="k">if</span> n == attempts - <span class="n">1</span>:
+                <span class="k">raise</span>
+            time.sleep(random.uniform(<span class="n">0</span>, min(cap, base * <span class="n">2</span> ** n)))   <span class="c"># full jitter</span></code></pre>
+    <p>The server side: an idempotency table, written in the same transaction as the charge (Postgres):</p>
+<pre><code><span class="k">CREATE TABLE</span> idempotency_keys (
+  key          text <span class="k">PRIMARY KEY</span>,            <span class="c">-- the unique constraint does the hard part</span>
+  request_hash text <span class="k">NOT NULL</span>,               <span class="c">-- reject the same key with different parameters</span>
+  response     jsonb,
+  created_at   timestamptz <span class="k">NOT NULL DEFAULT</span> now()
+);
+<span class="k">BEGIN</span>;
+<span class="k">INSERT INTO</span> idempotency_keys (key, request_hash) <span class="k">VALUES</span> ($1, $2)
+  <span class="k">ON CONFLICT</span> (key) <span class="k">DO NOTHING</span>;           <span class="c">-- 0 rows inserted? It's a repeat: return the stored response</span>
+<span class="k">INSERT INTO</span> charges (customer_id, amount_cents) <span class="k">VALUES</span> ($3, <span class="n">5000</span>);
+<span class="k">UPDATE</span> idempotency_keys <span class="k">SET</span> response = $4 <span class="k">WHERE</span> key = $1;
+<span class="k">COMMIT</span>;</code></pre>
+    <p class="hint">Try it: Stripe's test mode accepts <code>curl https://api.stripe.com/v1/charges -u sk_test_… -H "Idempotency-Key: &lt;uuid&gt;" -d amount=2000 -d currency=usd …</code>; send it twice and you get the same charge back. Locally, <code>docker run -p 5432:5432 -e POSTGRES_PASSWORD=dev postgres</code> and run the SQL above twice with the same key.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>Good</th><th>Cost / risk</th></tr>
+      <tr><td>More retry attempts</td><td>Rides out longer blips</td><td>Multiplies load during overload; slower failure for users</td></tr>
+      <tr><td>Retry at every layer</td><td>Each layer looks “robust”</td><td>Multiplicative storms (3<sup>5</sup> = 243×). Retry at one layer.</td></tr>
+      <tr><td>Retry budget / token bucket</td><td>Caps retries to a share of traffic</td><td>Some requests fail fast instead of retrying</td></tr>
+      <tr><td>Idempotency keys</td><td>Safe retries for anything with side effects</td><td>A storage table, an expiry policy, and clients that must send keys</td></tr>
+      <tr><td>Kafka transactions / exactly-once</td><td>No duplicates inside Kafka pipelines</td><td>Only covers Kafka-to-Kafka; external side effects (email, card charge) still need idempotency</td></tr>
+    </table>
+    <p class="hint">Never retry errors that won't change (400 Bad Request, 403 Forbidden). Retry timeouts, 503s and 429s (respect any <code>Retry-After</code> header), and stop retrying when a circuit breaker opens (Lesson 4.4).</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Use your SDK's built-in retries (check that they back off with jitter), retry in one layer, keep user-facing retries to 2–3. Put an idempotency key on every payment, order and signup endpoint from day one: one Postgres table with a unique key. Make every queue consumer safe to run twice.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Shared retry policies in client libraries and the service mesh, retry budgets and token buckets per client, circuit breakers, load shedding on servers, idempotency frameworks used across services (Airbnb's Orpheus), dedupe stores with TTLs, and exactly-once stream processing inside Kafka/Flink pipelines.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Whenever your design has a retry or a queue, expect “what if this happens twice?”. A senior answer covers:</p>
+    <ul>
+      <li>Which operations have side effects, and how each is made <b>idempotent</b> (key, dedupe table, conditional write).</li>
+      <li>Where retries happen (one layer), with <b>exponential backoff + jitter</b>, a cap and a retry budget.</li>
+      <li>The difference between exactly-once <b>delivery</b> (not achievable in general) and exactly-once <b>effect</b> (at-least-once + dedupe).</li>
+      <li>How long you keep keys (e.g. 24 hours) and what happens to a retry after that.</li>
+    </ul>
+    <p class="hint">Common follow-ups: “Two retries arrive at the same millisecond: now what?” “Who generates the key, client or server?” “Your consumer crashed after charging but before committing its offset. What happens on restart?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Idempotency keys on every write</b> <span class="tag co">🏢 Stripe · 2017</span> <a href="https://stripe.com/blog/idempotency" target="_blank" rel="noopener">Designing robust and predictable APIs with idempotency</a></div>
+      <p><b>How:</b> clients send an <code>Idempotency-Key</code> header on POST requests; a retry with the same key is safe. Stripe's docs suggest V4 UUIDs, allow keys up to 255 characters, and (for API v1) prune keys after they're at least 24 hours old.</p>
+      <p><b>Why this method:</b> payment requests cross unreliable networks; the key lets clients retry aggressively without ever charging twice.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Full jitter</b> <span class="tag co">🏢 AWS · 2015</span> <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">Exponential Backoff And Jitter (AWS Architecture Blog)</a></div>
+      <p><b>How:</b> Marc Brooker simulated clients competing for a resource and compared no jitter, “Full Jitter”, “Equal Jitter” and “Decorrelated Jitter”. Backoff alone still left clients clustered; jitter spread them and cut the total work.</p>
+      <p><b>Why this method:</b> randomness is the cheapest way to break synchronization between thousands of clients that failed at the same moment.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Retry at one layer, with a token bucket</b> <span class="tag co">🏢 Amazon</span> <a href="https://aws.amazon.com/builders-library/timeouts-retries-and-backoff-with-jitter/" target="_blank" rel="noopener">Timeouts, retries and backoff with jitter (Builders' Library)</a></div>
+      <p><b>How:</b> retrying at a single point in the stack avoids the 243× multiplication; a local token bucket lets calls retry while tokens last, then at a fixed rate. AWS added that behavior to its SDK in 2016.</p>
+      <p><b>Why this method:</b> retries help when failures are rare and hurt when they're caused by overload; a budget keeps them in the first case.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>An idempotency framework for payments</b> <span class="tag co">🏢 Airbnb · 2019</span> <a href="https://medium.com/airbnb-engineering/avoiding-double-payments-in-a-distributed-payments-system-2981f6b070bb" target="_blank" rel="noopener">Avoiding double payments in a distributed payments system</a></div>
+      <p><b>How:</b> a shared library, Orpheus, splits each request into pre-RPC, RPC and post-RPC phases, with database commits around them, and reads and writes idempotency data on the primary database, not a replica.</p>
+      <p><b>Why this method:</b> a replica that lags behind could miss a recorded key and allow a duplicate payment; the primary is always current.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Exactly-once inside Kafka</b> <span class="tag oss">🧰 Open source · 2017</span> <a href="https://www.confluent.io/blog/exactly-once-semantics-are-possible-heres-how-apache-kafka-does-it/" target="_blank" rel="noopener">Exactly-once Semantics are Possible: Here's How Kafka Does It</a></div>
+      <p><b>How:</b> Kafka 0.11 added an idempotent producer (the broker drops duplicate writes from retries) and transactions that commit output records and consumer offsets atomically.</p>
+      <p><b>Why this method:</b> stream pipelines that read, transform and write Kafka topics can avoid duplicates without every consumer building its own dedupe.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · Orpheus</span>
+    <p>Airbnb named its idempotency library Orpheus, after the hero of Greek myth who could charm all living things. In their words, they wanted a library that could orchestrate requests across many payment services the same way.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Queues (3.1) and Kafka (3.2) deliver at least once; this lesson makes that safe. Sagas need idempotent steps and compensations (Lesson 3.5). Circuit breakers and load shedding are the server-side partners of client backoff (Lesson 4.4), and rate limits return the 429s that clients should back off from (Lesson 1.5). The payment system design leans on idempotency keys everywhere (Lesson 7.7). In AI systems, LLM APIs return 429 rate-limit errors under load; agents and batch jobs that retry them need the same backoff, jitter and dedupe of tool calls with side effects.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">Exponential Backoff And Jitter</a>. Short, with charts comparing the jitter strategies.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener">Stripe: idempotent requests</a>. A production idempotency contract: key format, expiry, parameter checks.</li>
+      <li><span class="kind">Book</span> <a href="https://sre.google/sre-book/addressing-cascading-failures/" target="_blank" rel="noopener">Google SRE book: Addressing Cascading Failures</a>. Retry budgets, limiting retries per request, and load shedding.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A request passes through 4 layers (app → gateway → service → database client), and each layer retries up to 3 attempts. In the worst case, how many calls reach the database for one user action?</div>
+    <div class="opts"><button class="opt">12</button><button class="opt" data-ok>81</button><button class="opt">4</button></div>
+    <div class="explain">Each layer multiplies: 3 × 3 × 3 × 3 = 3<sup>4</sup> = <b>81</b>. Retries at each layer multiply, they don't add. That's why the advice is to retry at one layer only.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. An order API sometimes creates duplicate orders when the mobile app retries after a timeout. What's the best fix?</div>
+    <div class="opts"><button class="opt">Remove retries from the app</button><button class="opt">Retry with exponential backoff and jitter</button><button class="opt" data-ok>The app sends a unique idempotency key per order; the server stores it with a unique constraint and returns the saved result for repeats</button></div>
+    <div class="explain">Removing retries loses orders when the network blips. Backoff and jitter reduce load but don't stop duplicates. An idempotency key makes the retry safe: same key → same order, enforced atomically by the database.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. 3,000 clients lost their connections at the same moment. They all retry with exponential backoff (100 ms, 200 ms, 400 ms…) but no jitter. What happens?</div>
+    <div class="opts"><button class="opt">Load spreads out evenly over time</button><button class="opt" data-ok>They retry in synchronized waves, each wave overloading the server again</button><button class="opt">The server gets exactly one retry per client</button></div>
+    <div class="explain">Same failure time + same schedule = everyone retries at the same instant. Backoff makes the waves rarer but not smaller. Jitter (a random wait up to the backoff) spreads each wave out.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Retries are selfish and multiply across layers (3 per layer × 5 layers = 243×). Retry at one layer.</li>
+      <li>Use exponential backoff + full jitter: sleep = random(0, min(cap, base × 2<sup>n</sup>)), with a cap on attempts or a retry budget.</li>
+      <li>Exactly-once delivery isn't achievable over an unreliable network; exactly-once <i>effect</i> = at-least-once + idempotency.</li>
+      <li>Idempotency keys: client-generated per intended operation, stored atomically (unique constraint) with the result, expired after ~24 h.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = n => Math.round(n).toLocaleString("en-US");
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- retry storm ----------
+  const CAP = 1000, MAXA = 10, BASE = 0.1, MAXD = 20, DT = 0.1, END = 30;
+  const getMode = seg("rmode", () => storm());
+  function storm() {
+    const N = +$("nc").value, mode = getMode(), rng = MX.seeded(5);
+    $("ncv").textContent = fmt(N);
+    const B = Math.round(END / DT), buckets = Array.from({ length: B + 1 }, () => []);
+    for (let i = 0; i < N; i++) buckets[0].push(0);
+    let calls = 0, done = 0, gaveUp = 0, t99 = null;
+    const offered = [], good = [];
+    for (let b = 0; b < B; b++) {
+      const list = buckets[b], L = list.length, c = CAP * DT, x = L / c;
+      calls += L;
+      const gp = x <= 1 ? L : c * Math.max(0.3, 1 - 0.08 * (x - 1));   // overloaded: useful work drops
+      const p = L ? gp / L : 1;
+      let s = 0;
+      for (const a of list) {
+        if (rng() < p) { s++; done++; continue; }
+        if (mode === "none" || a + 1 >= MAXA) { gaveUp++; continue; }
+        let d;
+        if (mode === "imm") d = BASE;
+        else { const cap = Math.min(MAXD, BASE * 2 ** (a + 1)); d = mode === "exp" ? cap : rng() * cap; }
+        const nb = b + Math.max(1, Math.round(d / DT));
+        if (nb <= B) buckets[nb].push(a + 1); else gaveUp++;
+      }
+      offered.push([b * DT, L / DT]); good.push([b * DT, s / DT]);
+      if (t99 === null && done >= 0.99 * N) t99 = (b + 1) * DT;
+    }
+        Plot.line($("rc"), {
+      series: [
+        { label: "requests arriving per second", color: MX.css("--c-er"), data: offered, fill: true },
+        { label: "succeeded per second", color: MX.css("--c-db"), data: good },
+      ],
+      xLabel: "seconds after restart (chart cut off at 5,000/s)", yMin: 0, yMax: 5000,
+      hlines: [{ y: CAP, label: "capacity 1,000/s", color: MX.css("--c-lt") }],
+    });
+    $("rs").textContent = fmt(done) + " (" + Math.round(100 * done / N) + "%)";
+    $("rg").textContent = fmt(gaveUp);
+    $("rp").textContent = (calls / N).toFixed(1);
+    $("rt").textContent = t99 === null ? "never" : t99.toFixed(1) + " s";
+    $("rmsg").textContent = mode === "none" ? `Without retries, only the first ${fmt(done)} lucky requests got through; everyone else just failed.`
+      : mode === "imm" ? (done < 0.99 * N ? `Immediate retries kept the server far above capacity, so it did little useful work; ${fmt(gaveUp)} clients gave up after ${MAXA} attempts. A storm.` : "Mild overload: immediate retries got everyone through, at the cost of extra calls.")
+      : mode === "exp" ? (done < 0.99 * N ? "Backoff spaced the attempts out, but every client waits exactly the same time, so they return in synchronized waves (the spikes) and overload the server every time." : "Backoff without jitter got through, but notice the synchronized spikes.")
+      : `Jitter spread the retries into a smooth flow near capacity: ${Math.round(100 * done / N)}% succeeded with ${(calls / N).toFixed(1)} calls per client.`;
+  }
+  $("nc").oninput = storm;
+  storm();
+
+  // ---------- double charge ----------
+  const F = new Flow($("pf"), { width: 720, height: 190 });
+  F.node("app", { x: 80, y: 95, label: "📱 Shop app", sub: "client", kind: "cl" })
+   .node("api", { x: 330, y: 95, w: 140, label: "💳 Payments API", sub: "", kind: "sv" })
+   .node("keys", { x: 590, y: 40, w: 170, label: "🔑 idempotency_keys", sub: "0 rows", kind: "db" })
+   .node("ch", { x: 590, y: 150, w: 170, label: "🗄️ charges", sub: "0 rows", kind: "db" })
+   .edge("app", "api").edge("api", "keys").edge("api", "ch").render();
+  let keys = new Map(), charges = [], sent = 0, intended = 0, busy = false, nextCh = 1;
+  const getK = seg("kmode", () => {});
+  const uid = () => "k_" + Math.random().toString(36).slice(2, 8);
+  function paint() {
+    $("ps").textContent = sent; $("pc").textContent = charges.length;
+    $("pm").textContent = "$" + charges.length * 50; $("pi").textContent = "$" + intended * 50;
+    $("tch").innerHTML = "<b>charges</b><br>" + (charges.length ? charges.map(c => `${c.id} · $50 · key ${c.key || "–"}`).join("<br>") : "(empty)");
+    $("tkey").innerHTML = "<b>idempotency_keys</b><br>" + (keys.size ? [...keys].map(([k, v]) => `${k} → ${v}`).join("<br>") : "(empty)");
+    F.set("keys", { sub: keys.size + " rows" }).set("ch", { sub: charges.length + " rows", hot: charges.length > intended });
+    const over = charges.length - intended;
+    $("pmsg").textContent = over > 0 ? `❌ The customer was charged ${over} extra time(s): $${over * 50} too much.` : intended ? "✅ Every intended payment was charged exactly once." : "";
+  }
+  // the server: returns the charge id (or the saved one for a repeat)
+  async function server(key, mode) {
+    if (mode === "none") { await wait(250); const id = "ch_" + nextCh++; charges.push({ id }); return id; }
+    if (mode === "check") {
+      const seen = keys.has(key);          // 1. check …
+      await wait(250);                      //    (another request can sneak in here)
+      if (seen && keys.get(key) !== "in progress") return keys.get(key);
+      const id = "ch_" + nextCh++; charges.push({ id, key }); keys.set(key, id);  // 2. … then insert
+      return id;
+    }
+    // atomic: the insert itself decides who wins (INSERT … ON CONFLICT DO NOTHING)
+    if (keys.has(key)) { while (keys.get(key) === "in progress") await wait(50); return keys.get(key); }
+    keys.set(key, "in progress");
+    await wait(250);
+    const id = "ch_" + nextCh++; charges.push({ id, key }); keys.set(key, id);
+    return id;
+  }
+  async function attempt(key, mode, dropReply) {
+    sent++; paint();
+    F.set("api", { sub: "charging…" });
+    await F.packet(["app", "api"], { color: "--c-cl", dur: 350 });
+    const id = await server(key, mode);
+    if (mode !== "none") await F.packet(["api", "keys"], { color: "--c-db", dur: 250, back: true });
+    paint();
+    if (dropReply) {
+      F.set("api", { sub: `${id} done, reply lost 📶` });
+      await F.packet(["api", "app"], { color: "--c-er", dur: 200 });
+      F.set("app", { sub: "timeout… retrying" });
+      return null;
+    }
+    await F.packet(["api", "app"], { color: "--c-db", dur: 350 });
+    F.set("api", { sub: "returned " + id }).set("app", { sub: "paid ✓ " + id });
+    return id;
+  }
+  $("pay").onclick = async () => {
+    if (busy) return; busy = true;
+    const mode = getK(), drop = $("drop").classList.contains("on");
+    intended++;
+    const key = mode === "none" ? null : uid();
+    const r = await attempt(key, mode, drop);
+    if (r === null) { await wait(500); await attempt(mode === "none" ? null : key, mode, false); }
+    paint(); busy = false;
+  };
+  $("dbl").onclick = async () => {
+    if (busy) return; busy = true;
+    const mode = getK();
+    intended++;
+    const key = mode === "none" ? null : uid();
+    await Promise.all([attempt(key, mode, false), attempt(key, mode, false)]);
+    paint();
+    if (mode === "check" && charges.length > intended) $("pmsg").textContent += " Both requests checked the table before either inserted: a race.";
+    if (mode === "atomic") $("pmsg").textContent += " The second insert hit the unique key, so it waited and returned the first charge.";
+    busy = false;
+  };
+  $("drop").onclick = () => $("drop").classList.toggle("on");
+  $("preset").onclick = () => { if (busy) return; keys = new Map(); charges = []; sent = intended = 0; nextCh = 1; F.set("api", { sub: "" }).set("app", { sub: "client" }); paint(); };
+  paint();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.6 Auth at scale: OAuth2, OIDC, JWT, mTLS · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .tok { font-family: var(--mono); font-size: .8rem; word-break: break-all; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .tok .h { color: var(--c-er); } .tok .p { color: var(--c-nw); } .tok .g { color: var(--c-ca); }
+  .dec { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; margin: 10px 0; }
+  .dec pre { margin: 0; font-size: .78rem; }
+  .verdicts { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+  .verdict { border: 2px solid var(--line); border-radius: 12px; padding: 8px 12px; background: var(--bg2); font-size: .88rem; }
+  .verdict.ok { border-color: var(--c-db); } .verdict.bad { border-color: var(--c-er); }
+  .oastep { white-space: pre-wrap; font-family: var(--mono); font-size: .8rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; word-break: break-all; min-height: 3em; }
+  select { font: inherit; padding: 3px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); }
+</style>
+</head>
+<body data-lesson="s4-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 6</div>
+  <h1>Auth at scale: OAuth2, OIDC, JWT, mTLS</h1>
+  <p class="subtitle">Who is calling, and are they allowed to do this? With millions of users and hundreds of services, answering both questions on every request, quickly and safely, is its own piece of architecture.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>TLS</b> encrypts a connection and proves the server's identity with a certificate (Lesson 0.2).</li>
+      <li><b>API gateways</b> sit at the edge and handle cross-cutting work for every request (Lesson 1.6).</li>
+      <li><b>Service mesh sidecars</b> can encrypt and authenticate service-to-service traffic with mTLS (Lesson 4.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>For decades, company security meant a wall: a firewall around the office network, and anyone inside was trusted. In 2014 Google published <b>BeyondCorp</b>, describing the problem bluntly: once that perimeter is breached, an attacker has relatively easy access to the privileged intranet.</p>
+    <p>Google's answer was to remove the privileged intranet entirely and move its corporate apps onto the Internet, checking <b>every request</b> by who the user is and which device they're on, never by which network they came from. That idea, now called <b>zero trust</b>, is how modern systems treat calls between their own services too.</p>
+  </div>
+
+  <h2>Numbers first: checking identity on every request</h2>
+  <p>Your app has <b>1 million</b> active users, each making a request about every 10 seconds: <b>100,000 requests per second</b>. Every one must carry proof of who sent it. Two classic designs:</p>
+  <table>
+    <tr><th></th><th>Server-side session</th><th>Signed token (JWT), 15-minute lifetime</th></tr>
+    <tr><td>What the client holds</td><td>A random session ID in a cookie</td><td>A signed token listing who the user is and when it expires</td></tr>
+    <tr><td><span class="db">Lookups in a central store</span></td><td>Every request: <b>100,000/s</b> to Redis or the database</td><td>None per request; only refreshes: 1,000,000 ÷ 900 s ≈ <b>1,111/s</b></td></tr>
+    <tr><td><span class="lt">Cost per check</span></td><td>A network round trip (~1 ms)</td><td>A signature check in memory (microseconds)</td></tr>
+    <tr><td><span class="er">Log out / ban a user</span></td><td>Delete the session: <b>instant</b></td><td>The token keeps working until it expires: up to <b>15 minutes</b></td></tr>
+  </table>
+  <p>Tokens trade instant revocation for scale and independence: any service can check a token without calling anyone. Most big systems use both: short-lived tokens for speed, plus a refresh step where the central system can say no.</p>
+
+  <h2>Two questions: authentication and authorization</h2>
+  <ul>
+    <li><b>Authentication</b> (often “authn”): <i>who are you?</i> Proven with a password, a passkey, a certificate, a token. Failing it should give HTTP <code>401 Unauthorized</code>.</li>
+    <li><b>Authorization</b> (“authz”): <i>what may you do?</i> “Alice may read order 42 but not refund it.” Failing it gives <code>403 Forbidden</code>.</li>
+  </ul>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Centralize <b>authentication</b> (one identity provider issues short-lived, signed tokens), but enforce <b>authorization</b> close to the data (each service checks what this caller may do). Trust nothing because of where it comes from on the network: every call, from a user or a service, carries a verifiable identity.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the hotel</span>
+    <p>At check-in you show your passport once (<b>authentication</b> at the identity provider). You get a key card (<b>a token</b>) that opens your room and the gym until Friday (<b>scopes and expiry</b>). Doors check the card themselves without phoning the front desk (<b>local token verification</b>). If you lose the card, the front desk can cancel it, but some doors only learn about that when they next sync (<b>the revocation problem</b>).</p>
+    <p><b>OAuth</b> is the valet key: you let the parking attendant drive your car without handing over your house keys. A third-party app gets limited access to your photos without ever seeing your password.</p>
+  </div>
+
+  <h2>JWT: a signed note anyone can read</h2>
+  <p>A <b>JWT</b> (JSON Web Token, RFC 7519) is three base64url-encoded parts joined by dots: <code><span class="er">header</span>.<span class="nw">payload</span>.<span class="ca">signature</span></code>.</p>
+  <ul>
+    <li><b>Header:</b> the signing algorithm, for example <code>HS256</code> (a shared secret) or <code>RS256</code>/<code>ES256</code> (a private key signs, a public key verifies).</li>
+    <li><b>Payload:</b> “claims”: <code>iss</code> (who issued it), <code>sub</code> (the user), <code>aud</code> (which service it's for), <code>exp</code> (expiry time), plus your own (roles, scopes).</li>
+    <li><b>Signature:</b> proves nobody changed the header or payload. It is <b>not encryption</b>: anyone holding the token can read the payload. Never put secrets in it.</li>
+  </ul>
+  <p>With public-key algorithms, the identity provider publishes its public keys at a JWKS (JSON Web Key Set) URL, so every service can verify tokens on its own. That is what makes JWTs scale.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Break a JWT</span>
+    <p class="hint">A real HS256 token, signed in your browser with a demo secret. Try to become an admin: edit the payload without the secret, or use the infamous <code>alg: none</code> trick. Two verifiers judge each token: a <b>strict</b> one, and a <b>naive</b> one like the vulnerable libraries of 2015. Then set the lifetime and see what it costs.</p>
+    <div class="controls">
+      <button class="btn primary" id="jwIssue">Issue a fresh token</button>
+      <button class="btn" id="jwTamper">Tamper: set role to admin</button>
+      <button class="btn" id="jwNone">Attack: alg none</button>
+      <button class="btn" id="jwAud">Use a token meant for another service</button>
+    </div>
+    <div class="tok" id="jwTok"></div>
+    <div class="dec"><pre><code id="jwHead"></code></pre><pre><code id="jwPay"></code></pre></div>
+    <div class="controls">
+      <label>access-token lifetime <input type="range" id="jwLife" min="0" max="6" step="1" value="2"> <b class="mono" id="jwLifev"></b></label>
+      <label>time since issued <input type="range" id="jwAge" min="0" max="100" step="1" value="10"> <b class="mono" id="jwAgev"></b></label>
+      <label>active users <input type="range" id="jwUsers" min="0" max="4" step="1" value="2"> <b class="mono" id="jwUsersv"></b></label>
+    </div>
+    <div class="verdicts">
+      <div class="verdict" id="vStrict"></div>
+      <div class="verdict" id="vNaive"></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">refresh calls to auth server <b id="jwRef">–</b></div>
+      <div class="stat">a stolen token works for up to <b id="jwSteal">–</b></div>
+      <div class="stat">session lookups instead <b id="jwSess">–</b></div>
+    </div>
+    <p class="hint" id="jwmsg"></p>
+  </div>
+  <p>The strict verifier does four things every service must do: accept only the algorithms <b>it</b> expects (never the one the token asks for), check the signature, check <code>exp</code>, and check <code>aud</code> so a token minted for the photo service can't be replayed against the payments service. Then look at the lifetime slider: 5-minute tokens mean a stolen token dies fast but the auth server handles 3,333 refreshes a second for a million users; 24-hour tokens mean 12 a second, and a stolen token works all day.</p>
+
+  <div class="box incident">
+    <span class="label">🔥 Real vulnerability · JWT libraries trusting “alg”, 2015</span>
+    <p>The JWT standard includes an algorithm called <code>none</code>, meaning “no signature”, intended for tokens whose integrity is already checked some other way. Researcher Tim McLean found that some libraries treated a token with <code>"alg": "none"</code> as validly signed. Anyone could write their own token with any payload. A second flaw let attackers sign with a server's <i>public</i> RSA key using HS256. (<a href="https://auth0.com/blog/critical-vulnerabilities-in-json-web-token-libraries/" target="_blank" rel="noopener">Auth0 write-up</a>.)</p>
+    <p><b>Lesson:</b> never let the token choose how it's verified. Pin the expected algorithm in the verifier, and use a well-maintained library.</p>
+  </div>
+
+  <h2>OAuth 2.0 and PKCE: letting an app act for you</h2>
+  <p><b>OAuth 2.0</b> (RFC 6749, 2012) is about <b>delegated authorization</b>: you let an app access your data at some service without giving the app your password. Four roles: the <b>resource owner</b> (you), the <b>client</b> (the app), the <b>authorization server</b> (where you log in), and the <b>resource server</b> (the API with your data).</p>
+  <p>The recommended flow is the <b>authorization code flow with PKCE</b> (Proof Key for Code Exchange, RFC 7636, which says it is pronounced “pixy”). PKCE stops an attacker who intercepts the one-time code from trading it for tokens. The 2025 OAuth security best practice (RFC 9700) says public clients like mobile and single-page apps <b>must</b> use PKCE, and that the old “implicit” flow should not be used.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The authorization code flow, step by step</span>
+    <p class="hint">A photo-printing app wants to read your photos. Step through the flow; the code verifier and challenge are computed live with SHA-256 in your browser. Then turn on the attacker: a malicious app on the same phone intercepts the authorization code at step 4. Try it with PKCE on and off.</p>
+    <svg id="oaf"></svg>
+    <div class="controls">
+      <button class="btn" id="oaPrev">◀ Back</button>
+      <button class="btn primary" id="oaNext">Next step ▶</button>
+      <button class="btn" id="oaPkce">PKCE: on</button>
+      <button class="btn" id="oaAttack">Attacker: off</button>
+      <button class="btn" id="oaReset">Restart</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">step <b id="oaStep">–</b></div>
+      <div class="stat">app has your password? <b id="oaPw">never</b></div>
+      <div class="stat">attacker got tokens? <b id="oaStolen">–</b></div>
+    </div>
+    <p id="oaDesc"></p>
+    <div class="oastep" id="oaMsg"></div>
+  </div>
+  <p>The core trick of PKCE: the app proves at step 5 that it's the same app that started the flow at step 1, using a secret (the verifier) that never travelled through the browser. Only its hash did. An intercepted code is useless without it.</p>
+
+  <h2>OIDC and SSO: logging in, not just granting access</h2>
+  <p>OAuth answers “may this app access the API?”. It doesn't say who the user is. <b>OpenID Connect</b> (OIDC) is an identity layer on top of OAuth 2.0: the same flow also returns an <b>ID token</b>, a JWT describing the user (<code>sub</code>, <code>email</code>, <code>name</code>). That's what “Sign in with Google” is. <b>Single sign-on</b> (SSO) uses OIDC or the older SAML (Security Assertion Markup Language) standard so employees log in once at an identity provider (Okta, Microsoft Entra ID, Google Workspace) and reach every internal app.</p>
+
+  <h2>Service to service: mTLS, zero trust and policy</h2>
+  <ul>
+    <li><b>mTLS</b> (mutual TLS): in normal TLS only the server shows a certificate; in mTLS the client does too. Each <b>workload</b> gets its own identity, for example a SPIFFE (Secure Production Identity Framework for Everyone) ID like <code>spiffe://shop.example/ns/prod/sa/orders</code>, issued and rotated automatically by the mesh or by SPIRE.</li>
+    <li><b>Zero trust</b>: being inside the network proves nothing. The payments service accepts calls only from identities that are allowed to call it, and still checks the end user's token for what they may do.</li>
+    <li><b>Passing the user along</b>: the gateway verifies the user's token at the edge, then forwards it (or a narrower token issued for the downstream service) so each service can make its own authorization decision.</li>
+  </ul>
+  <table>
+    <tr><th>Authorization model</th><th>Rule looks like</th><th>Good for</th></tr>
+    <tr><td><b>RBAC</b> (role-based)</td><td>“support agents may read orders”</td><td>Most business apps; simple to audit</td></tr>
+    <tr><td><b>ABAC</b> (attribute-based)</td><td>“may read if user.region == order.region and it's working hours”</td><td>Rules that depend on data, time, device</td></tr>
+    <tr><td><b>ReBAC</b> (relationship-based)</td><td>“may edit if user is an editor of the folder containing this doc”</td><td>Sharing models (Google Drive, GitHub); Google's Zanzibar</td></tr>
+  </table>
+  <p>A <b>policy engine</b> like Open Policy Agent (OPA) moves these rules out of application code into one place: the service asks “allow?” with the request details, and the engine answers from policies written in a language called Rego.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: picking a token lifetime</span>
+    <p>2 million active users. Each access token lives T minutes; when it expires, the app calls the auth server with its refresh token.</p>
+    <table>
+      <tr><th>Lifetime T</th><th>Refreshes per second (2,000,000 ÷ 60T)</th><th>Stolen token window</th></tr>
+      <tr><td>5 min</td><td>2,000,000 ÷ 300 ≈ <b>6,667/s</b></td><td>5 min</td></tr>
+      <tr><td>15 min</td><td>2,000,000 ÷ 900 ≈ <b>2,222/s</b></td><td>15 min</td></tr>
+      <tr><td>60 min</td><td>2,000,000 ÷ 3,600 ≈ <b>556/s</b></td><td>1 hour</td></tr>
+    </table>
+    <p>A few thousand refreshes per second is easy for a replicated auth service, and the refresh is your chance to check for bans and password changes. That's why 5–15 minutes is a common default. For emergencies, keep a small <b>deny-list</b> of revoked token IDs (<code>jti</code>) that services check; it only needs to hold entries until they would have expired anyway.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Identity providers:</b> Keycloak (open source), Auth0 / Okta, AWS Cognito, Microsoft Entra ID, Google Identity Platform. <b>Token libraries:</b> <code>jose</code> (Node), PyJWT / Authlib (Python), Nimbus (Java). <b>Workload identity:</b> SPIFFE / SPIRE, or your mesh (Istio, Linkerd issue mTLS certificates automatically). <b>Policy:</b> Open Policy Agent; Zanzibar-style systems for relationship-based checks.</p>
+<pre><code><span class="c">// Node: verify an access token at a service, the strict way (jose library)</span>
+<span class="k">import</span> { createRemoteJWKSet, jwtVerify } <span class="k">from</span> <span class="s">"jose"</span>;
+<span class="k">const</span> JWKS = createRemoteJWKSet(<span class="k">new</span> URL(<span class="s">"https://auth.example.com/.well-known/jwks.json"</span>));
+
+<span class="k">const</span> { payload } = <span class="k">await</span> jwtVerify(token, JWKS, {
+  issuer: <span class="s">"https://auth.example.com"</span>,   <span class="c">// who must have issued it</span>
+  audience: <span class="s">"orders-api"</span>,               <span class="c">// it must be meant for THIS service</span>
+  algorithms: [<span class="s">"RS256"</span>],                <span class="c">// never trust the token's own "alg"</span>
+});                                        <span class="c">// exp is checked automatically</span></code></pre>
+<pre><code><span class="c"># orders.rego: an OPA policy, kept outside the service's code</span>
+<span class="k">package</span> orders.authz
+
+<span class="k">default</span> allow := <span class="k">false</span>
+
+allow <span class="k">if</span> {                                 <span class="c"># customers may read their own orders</span>
+  input.method == <span class="s">"GET"</span>
+  input.order.owner == input.user.sub
+}
+allow <span class="k">if</span> {                                 <span class="c"># support staff may read any order</span>
+  input.method == <span class="s">"GET"</span>
+  <span class="s">"support"</span> <span class="k">in</span> input.user.roles
+}</code></pre>
+    <p class="hint">Try it cheaply: <code>docker run --rm -it openpolicyagent/opa:latest version</code>, then paste the policy into OPA's online Rego playground with a sample <code>input</code>. To read any test token's payload in a terminal: <code>echo "$TOKEN" | cut -d. -f2 | base64 -d</code> (it isn't encrypted).</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Good</th><th>❌ Costs</th></tr>
+      <tr><td>Server-side sessions</td><td>Instant logout and bans; tiny cookie</td><td>A store lookup on every request; every service depends on that store</td></tr>
+      <tr><td>Short-lived JWTs + refresh</td><td>Local verification, scales across services</td><td>Revocation delayed by the lifetime; key rotation and JWKS caching to manage</td></tr>
+      <tr><td>Long-lived JWTs</td><td>Few refreshes</td><td>A stolen token is a long-lived skeleton key; avoid</td></tr>
+      <tr><td>Auth at the gateway only</td><td>One place to get right</td><td>Anything that bypasses the gateway is unprotected; services can't make fine-grained decisions</td></tr>
+      <tr><td>mTLS everywhere</td><td>Strong service identity, encryption in transit</td><td>Certificate issuing and rotation (use a mesh or SPIRE, never by hand)</td></tr>
+      <tr><td>Central policy engine</td><td>Consistent, auditable rules; change without redeploying</td><td>One more dependency on the request path (run it as a sidecar or library)</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Don't build auth. Use a managed identity provider (or your framework's battle-tested sessions), offer “Sign in with Google” via OIDC, store sessions in Redis or use short-lived tokens, and check permissions in one well-tested module. Add SSO (SAML/OIDC) when your first enterprise customer asks; they will.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>A central identity platform issuing short-lived tokens, mTLS for every workload with automatic rotation, zero-trust access for employees (BeyondCorp-style), authorization as a service (Zanzibar-style systems or OPA), and security reviews for any new token type or scope.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Most designs need one or two sentences on auth. A senior version:</p>
+    <ul>
+      <li>Users authenticate with an <b>identity provider</b> via OIDC; the API gets <b>short-lived access tokens</b> (5–15 min) plus refresh tokens.</li>
+      <li>The <b>gateway</b> verifies tokens; <b>services still authorize</b> each action (and check <code>aud</code>).</li>
+      <li><b>Service-to-service</b> calls use mTLS identities from the mesh; nothing is trusted for being “inside”.</li>
+      <li>You can explain the <b>revocation</b> trade-off and how you'd ban a user right now (deny-list, short lifetime, refresh checks).</li>
+    </ul>
+    <p class="hint">Common follow-ups: “Why not just use the user's session cookie between services?” · “How does a mobile app do OAuth safely?” · “Where do permissions live, and how do you change them without a deploy?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Zero trust for employees</b> <span class="tag co">🏢 Google · 2014</span> <a href="https://research.google/pubs/beyondcorp-a-new-approach-to-enterprise-security/" target="_blank" rel="noopener">BeyondCorp: A New Approach to Enterprise Security</a></div>
+      <p><b>How:</b> Google removed the requirement for a privileged corporate network and moved its corporate applications to the Internet, granting access based on the user and device rather than the network location.</p>
+      <p><b>Why this method:</b> with mobile and cloud work, the perimeter was becoming impossible to enforce, and a breached perimeter gave attackers easy access to everything inside.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Authorization code + PKCE</b> <span class="tag hist">📜 IETF · 2012 / 2015 / 2025</span> <a href="https://www.rfc-editor.org/rfc/rfc7636" target="_blank" rel="noopener">RFC 7636: PKCE</a></div>
+      <p><b>How:</b> OAuth 2.0 (<a href="https://www.rfc-editor.org/rfc/rfc6749" target="_blank" rel="noopener">RFC 6749</a>) defines the roles and grants; PKCE adds a one-time verifier whose SHA-256 hash is sent first. The OAuth security best practice (<a href="https://www.rfc-editor.org/rfc/rfc9700" target="_blank" rel="noopener">RFC 9700</a>) requires PKCE for public clients.</p>
+      <p><b>Why this method:</b> public clients like mobile apps can't keep a secret, and their redirect can be intercepted; PKCE binds the code to the app that asked for it.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Authorization for billions of users</b> <span class="tag co">🏢 Google · 2019</span> <a href="https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/" target="_blank" rel="noopener">Zanzibar (USENIX ATC)</a></div>
+      <p><b>How:</b> one global system stores access-control relationships for services like Calendar, Cloud, Drive, Maps, Photos and YouTube. The paper reports trillions of access control lists, millions of checks per second, 95th-percentile latency under 10 ms and over 99.999% availability across 3 years.</p>
+      <p><b>Why this method:</b> one consistent authorization service means every product shares the same sharing model and nobody reinvents permission checks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Policy as code</b> <span class="tag oss">🧰 Open source · CNCF graduated</span> <a href="https://www.openpolicyagent.org/docs/latest/" target="_blank" rel="noopener">Open Policy Agent</a></div>
+      <p><b>How:</b> OPA decouples policy decisions from enforcement: services, Kubernetes, CI pipelines and API gateways send structured input and get decisions back, evaluated from Rego policies.</p>
+      <p><b>Why this method:</b> one policy language for many systems makes rules reviewable, testable and changeable without redeploying every service.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Identity for workloads</b> <span class="tag oss">🧰 Open source · SPIFFE</span> <a href="https://spiffe.io/docs/latest/spiffe-about/overview/" target="_blank" rel="noopener">SPIFFE overview</a></div>
+      <p><b>How:</b> SPIFFE defines identities for services and short-lived identity documents (SVIDs, SPIFFE Verifiable Identity Documents, as X.509 certificates or JWTs); SPIRE issues them, and meshes like Envoy can use them for mTLS.</p>
+      <p><b>Why this method:</b> services move between machines constantly, so identity is tied to the workload, not to an IP address.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · say it right</span>
+    <p>RFC 7519 itself says the suggested pronunciation of JWT is the same as the English word “jot”. And RFC 7636 says PKCE is pronounced “pixy”. Standards authors clearly enjoy this.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>TLS basics come from Lesson 0.2, gateways from Lesson 1.6, mesh mTLS from Lesson 4.3. Rate limiting per user or API key (Lesson 1.5) depends on knowing who's calling. Secrets management, key rotation and the OWASP (Open Worldwide Application Security Project) top risks are in Lesson 6.6, and payments (Lesson 7.7) raise the stakes. The browser side, cookie flags, CORS and CSRF, is Lesson 4.6b. For AI systems, the same rules apply to agents: give an agent its own scoped, short-lived credentials via OAuth rather than a user's password, and check every tool call against a policy.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://oauth.net/2/pkce/" target="_blank" rel="noopener">oauth.net: PKCE</a>. Short explanation with links to every relevant spec.</li>
+      <li><span class="kind">Docs</span> <a href="https://jwt.io/introduction" target="_blank" rel="noopener">jwt.io introduction</a>. JWT structure and claims; its debugger decodes test tokens.</li>
+      <li><span class="kind">Paper</span> <a href="https://research.google/pubs/zanzibar-googles-consistent-global-authorization-system/" target="_blank" rel="noopener">Zanzibar</a>. How Google does authorization as one global service.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 3 million active users; access tokens last 10 minutes and are refreshed on expiry. Roughly how many refresh requests per second hit the auth server?</div>
+    <div class="opts"><button class="opt">500</button><button class="opt" data-ok>5,000</button><button class="opt">50,000</button></div>
+    <div class="explain">3,000,000 ÷ 600 s = <b>5,000/s</b>. Shorter lifetimes mean more refreshes but a smaller window for stolen tokens; that's the dial you're choosing.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A single-page web app needs to call your API on behalf of logged-in users. Which approach is recommended?</div>
+    <div class="opts"><button class="opt">The app asks for the user's password and sends it with every API call</button><button class="opt">The implicit flow: the access token comes back directly in the browser redirect</button><button class="opt" data-ok>Authorization code flow with PKCE, short-lived access tokens, and refresh tokens</button></div>
+    <div class="explain">RFC 9700 says public clients must use PKCE and the implicit flow should not be used, because tokens in redirects can leak. Sharing passwords with apps is exactly what OAuth exists to avoid.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your services verify JWTs at the API gateway and then trust all internal traffic. An attacker gets into one internal service. What's the best improvement?</div>
+    <div class="opts"><button class="opt">Make access tokens last longer so users log in less</button><button class="opt" data-ok>Zero trust inside too: mTLS identities between services, and each service checks the caller's identity and the user token's audience and permissions</button><button class="opt">Move all services into one monolith</button></div>
+    <div class="explain">“Inside the network” isn't proof of anything. With workload identities and per-service authorization, a compromised service can only make the calls its own identity is allowed to make.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Authentication = who you are (401); authorization = what you may do (403). Centralize the first, enforce the second near the data.</li>
+      <li>Sessions: instant revocation, a lookup per request. JWTs: local verification, revocation delayed by the lifetime. Use short-lived access tokens + refresh.</li>
+      <li>Verify strictly: pinned algorithm, signature, <code>exp</code>, <code>iss</code>, <code>aud</code>. A JWT is signed, not encrypted.</li>
+      <li>OAuth 2.0 authorization code + PKCE for apps; OIDC adds login (ID token); SSO for employees.</li>
+      <li>Zero trust between services: mTLS workload identities, policy engines (OPA), relationship-based checks at scale (Zanzibar).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // ---------- SHA-256 and HMAC (checked against Node's crypto and RFC 7636's example) ----------
+  const K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  function sha256(bytes) {
+    const l = bytes.length, len = ((l + 9 + 63) >> 6) << 6, m = new Uint8Array(len);
+    m.set(bytes); m[l] = 0x80; const bits = l * 8;
+    for (let i = 0; i < 8; i++) m[len - 1 - i] = Math.floor(bits / Math.pow(2, 8 * i)) & 255;
+    let h = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19];
+    const w = new Uint32Array(64), r = (x, n) => (x >>> n) | (x << (32 - n));
+    for (let o = 0; o < len; o += 64) {
+      for (let i = 0; i < 16; i++) w[i] = (m[o + 4 * i] << 24) | (m[o + 4 * i + 1] << 16) | (m[o + 4 * i + 2] << 8) | m[o + 4 * i + 3];
+      for (let i = 16; i < 64; i++) { const s0 = r(w[i - 15], 7) ^ r(w[i - 15], 18) ^ (w[i - 15] >>> 3), s1 = r(w[i - 2], 17) ^ r(w[i - 2], 19) ^ (w[i - 2] >>> 10); w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0; }
+      let [a, b, c, d, e, f, g, hh] = h;
+      for (let i = 0; i < 64; i++) {
+        const t1 = (hh + (r(e, 6) ^ r(e, 11) ^ r(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) | 0;
+        const t2 = ((r(a, 2) ^ r(a, 13) ^ r(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+        hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+      }
+      h = [a, b, c, d, e, f, g, hh].map((v, i) => (v + h[i]) | 0);
+    }
+    const out = []; h.forEach(v => out.push((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255)); return out;
+  }
+  const utf8 = s => [...new TextEncoder().encode(s)];
+  const hmac = (key, msg) => { let k = utf8(key); if (k.length > 64) k = sha256(k); k = k.concat(Array(64 - k.length).fill(0));
+    return sha256(k.map(b => b ^ 0x5c).concat(sha256(k.map(b => b ^ 0x36).concat(utf8(msg))))); };
+  const b64u = bytes => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  const b64uStr = s => b64u(utf8(s));
+  const unb64u = s => { try { return new TextDecoder().decode(Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), c => c.charCodeAt(0))); } catch (e) { return "?"; } };
+
+  // ---------- JWT playground ----------
+  const SECRET = "course-demo-secret-do-not-use", IAT = 1767225600; // 2026-01-01T00:00:00Z
+  const LIVES = [1, 5, 15, 60, 240, 720, 1440], USERS = [10000, 100000, 1000000, 5000000, 10000000];
+  let token = "", label = "fresh";
+  const lifeMin = () => LIVES[+$("jwLife").value];
+  const sign = (h, p) => { const hp = b64uStr(JSON.stringify(h)) + "." + b64uStr(JSON.stringify(p)); return hp + "." + b64u(hmac(SECRET, hp)); };
+  const basePayload = aud => ({ iss: "https://auth.example.com", sub: "user_8231", aud, role: "user", iat: IAT, exp: IAT + 60 * lifeMin() });
+  const issue = () => { token = sign({ alg: "HS256", typ: "JWT" }, basePayload("orders-api")); label = "fresh"; jwPaint(); };
+  function verify(tok, naive) {
+    const parts = tok.split(".");
+    if (parts.length !== 3) return [false, "not a JWT"];
+    let h, p; try { h = JSON.parse(unb64u(parts[0])); p = JSON.parse(unb64u(parts[1])); } catch (e) { return [false, "unreadable"]; }
+    const now = IAT + Math.round(60 * lifeMin() * 2 * (+$("jwAge").value / 100));
+    if (naive && h.alg === "none") return [true, "accepted: alg none means “no signature needed” 😱"];
+    if (h.alg !== "HS256") return [false, `rejected: algorithm ${h.alg} is not on the allow-list`];
+    if (b64u(hmac(SECRET, parts[0] + "." + parts[1])) !== parts[2]) return [false, "rejected: signature doesn't match (payload was changed)"];
+    if (now >= p.exp) return [false, "rejected: expired (exp is in the past)"];
+    if (!naive && p.aud !== "orders-api") return [false, `rejected: audience is ${p.aud}, not orders-api`];
+    return [true, `accepted: ${p.sub}, role ${p.role}` + (naive && p.aud !== "orders-api" ? " (never checked the audience!)" : "")];
+  }
+  const fmtDur = m => (m < 60 ? m + " min" : m < 1440 ? +(m / 60).toFixed(1) + " h" : +(m / 1440).toFixed(1) + (m === 1440 ? " day" : " days"));
+  function jwPaint() {
+    const [h, p, g] = token.split(".");
+    $("jwTok").innerHTML = `<span class="h">${h}</span>.<span class="p">${p}</span>.<span class="g">${g || ""}</span>`;
+    $("jwHead").textContent = "header\n" + JSON.stringify(JSON.parse(unb64u(h)), null, 2);
+    $("jwPay").textContent = "payload (readable by anyone!)\n" + JSON.stringify(JSON.parse(unb64u(p)), null, 2);
+    const L = lifeMin(), age = Math.round(L * 2 * (+$("jwAge").value / 100)), U = USERS[+$("jwUsers").value];
+    $("jwLifev").textContent = fmtDur(L); $("jwAgev").textContent = fmtDur(age); $("jwUsersv").textContent = U.toLocaleString();
+    const [sOk, sWhy] = verify(token, false), [nOk, nWhy] = verify(token, true);
+    $("vStrict").className = "verdict " + (sOk ? "ok" : "bad"); $("vStrict").innerHTML = `<b>Strict verifier</b><br>${sOk ? "✅" : "❌"} ${sWhy}`;
+    $("vNaive").className = "verdict " + (nOk ? "ok" : "bad"); $("vNaive").innerHTML = `<b>Naive verifier</b><br>${nOk ? "✅" : "❌"} ${nWhy}`;
+    $("jwRef").textContent = Math.round(U / (60 * L)).toLocaleString() + "/s";
+    $("jwSteal").textContent = fmtDur(L);
+    $("jwSess").textContent = Math.round(U / 10).toLocaleString() + "/s";
+    $("jwmsg").textContent = label === "none" ? "The naive verifier let the token choose “no signature”. The strict one only accepts HS256, so the trick fails." :
+      label === "tamper" ? "Changing one character of the payload changes what the signature should be. Without the secret you can't fix it." :
+      label === "aud" ? "Validly signed, but minted for photos-api. Only the strict verifier checks that it was meant for this service." :
+      `Each of ${U.toLocaleString()} users refreshes every ${fmtDur(L)}. Sessions would need ${Math.round(U / 10).toLocaleString()} store lookups per second instead (one request per user every 10 s).`;
+  }
+  $("jwIssue").onclick = issue;
+  $("jwTamper").onclick = () => { const [h, p, g] = token.split("."); const pl = JSON.parse(unb64u(p)); pl.role = "admin"; token = h + "." + b64uStr(JSON.stringify(pl)) + "." + g; label = "tamper"; jwPaint(); };
+  $("jwNone").onclick = () => { const pl = basePayload("orders-api"); pl.role = "admin"; token = b64uStr(JSON.stringify({ alg: "none", typ: "JWT" })) + "." + b64uStr(JSON.stringify(pl)) + "."; label = "none"; jwPaint(); };
+  $("jwAud").onclick = () => { token = sign({ alg: "HS256", typ: "JWT" }, basePayload("photos-api")); label = "aud"; jwPaint(); };
+  $("jwLife").oninput = () => { if (label === "fresh") issue(); else jwPaint(); };
+  ["jwAge", "jwUsers"].forEach(id => ($(id).oninput = jwPaint));
+  issue();
+
+  // ---------- OAuth 2.0 authorization code + PKCE ----------
+  const F = new Flow($("oaf"), { width: 720, height: 250 });
+  F.node("u", { x: 90, y: 60, w: 140, label: "👤 You (browser)", kind: "cl" })
+   .node("app", { x: 90, y: 190, w: 140, label: "📸 Print app", sub: "the client", kind: "sv" })
+   .node("as", { x: 400, y: 60, w: 170, label: "🔐 Auth server", sub: "accounts.example", kind: "nw" })
+   .node("api", { x: 400, y: 190, w: 170, label: "🖼️ Photos API", sub: "resource server", kind: "db" })
+   .node("evil", { x: 630, y: 125, w: 130, label: "😈 Malicious app", sub: "same phone", kind: "er" })
+   .edge("u", "as").edge("app", "u").edge("app", "as", { dashed: true }).edge("app", "api").edge("u", "evil", { dashed: true }).edge("evil", "as", { dashed: true }).render();
+  const rand = n => { const a = new Uint8Array(n); (window.crypto || {}).getRandomValues ? crypto.getRandomValues(a) : a.forEach((_, i) => (a[i] = Math.floor(Math.random() * 256))); return b64u([...a]); };
+  let st = 0, pkce = true, attack = false, verifier = "", challenge = "", state = "", busy = false, stolen = "no";
+  const STEPS = [
+    () => ({ d: "Ready. You tap “Connect your photos” in the print app.", m: "", path: null }),
+    () => { verifier = rand(32); challenge = b64u(sha256(utf8(verifier))); state = rand(8);
+      return { d: "1 · The app makes a random secret, the code_verifier, and keeps it to itself. It sends only its SHA-256 hash, the code_challenge.", m: pkce ? `code_verifier  = ${verifier}\ncode_challenge = BASE64URL(SHA256(verifier)) = ${challenge}` : "PKCE is off: no verifier, no challenge.", path: ["app", "u"] }; },
+    () => ({ d: "2 · The app redirects your browser to the auth server, saying what it wants (scope) and where to send you back.", m: `GET https://accounts.example/authorize?response_type=code&client_id=print-app&redirect_uri=printapp://cb&scope=photos.read&state=${state}` + (pkce ? `&code_challenge=${challenge}&code_challenge_method=S256` : ""), path: ["u", "as"] }),
+    () => ({ d: "3 · You log in at the auth server (the app never sees your password) and approve “Print app wants to read your photos”.", m: "POST https://accounts.example/login   (your password goes only here)\n→ consent screen: ✅ photos.read", path: ["u", "as"], back: true }),
+    () => ({ d: "4 · The auth server redirects back with a one-time authorization code. The app checks state matches (stops cross-site forgery)." + (attack ? " ⚠️ The malicious app registered the same printapp:// link and receives a copy of the code!" : ""), m: `printapp://cb?code=SplxlOBeZQQYbYS6WxSbIA&state=${state}`, path: attack ? ["u", "evil"] : ["as", "u", "app"] }),
+    () => { if (attack) {
+        const ok = !pkce; stolen = ok ? "YES 😱" : "no";
+        return { d: ok ? "5 · The attacker trades the stolen code for tokens. Without PKCE, the auth server can't tell it isn't the real app. It now reads your photos." : "5 · The attacker tries to trade the stolen code, but it doesn't have the code_verifier. The auth server hashes nothing that matches the challenge and refuses.",
+          m: ok ? "POST /token  grant_type=authorization_code&code=SplxlOBeZQQYbYS6WxSbIA\n← 200 OK  {\"access_token\": \"…\"}  (attacker wins)" : "POST /token  grant_type=authorization_code&code=SplxlOBeZQQYbYS6WxSbIA   (no code_verifier)\n← 400 {\"error\": \"invalid_grant\"}  (attacker loses)",
+          path: ["evil", "as"], color: ok ? "--c-er" : "--c-db" }; }
+      return { d: "5 · The app sends the code plus the code_verifier to the token endpoint, server to server. The auth server checks SHA256(verifier) equals the challenge from step 2.", m: `POST https://accounts.example/token\ngrant_type=authorization_code&code=SplxlOBeZQQYbYS6WxSbIA` + (pkce ? `&code_verifier=${verifier}` : ""), path: ["app", "as"] }; },
+    () => ({ d: "6 · The auth server returns a short-lived access token (a JWT, 15 minutes), a refresh token, and with OIDC an ID token describing you.", m: "{ \"access_token\": \"eyJhbGciOiJSUzI1NiIs…\", \"expires_in\": 900,\n  \"refresh_token\": \"8xLOxBtZp8\", \"id_token\": \"eyJ…\" }", path: ["as", "app"] }),
+    () => ({ d: "7 · The app calls the API with the access token. The API verifies signature, expiry, audience and the photos.read scope, without calling the auth server.", m: "GET https://photos.example/v1/photos\nAuthorization: Bearer eyJhbGciOiJSUzI1NiIs…\n← 200 OK  [ 312 photos ]", path: ["app", "api"], back: true }),
+    () => ({ d: "8 · 15 minutes later the access token expires. The app uses the refresh token to get a new one. This is where the auth server can say no if you revoked access.", m: "POST /token  grant_type=refresh_token&refresh_token=8xLOxBtZp8\n← { \"access_token\": \"eyJ…(new)\", \"expires_in\": 900 }", path: ["app", "as"], back: true }),
+  ];
+  let last = null;
+  async function show(animate) {
+    const s = last = STEPS[st]();
+    $("oaStep").textContent = st + " / " + (STEPS.length - 1);
+    $("oaDesc").textContent = s.d; $("oaMsg").textContent = s.m || "–";
+    $("oaStolen").textContent = stolen;
+    F.set("evil", { down: !attack, hot: attack && stolen !== "no" });
+    F.edgeStyle("u", "evil", { hidden: !attack }).edgeStyle("evil", "as", { hidden: !attack });
+    F.set("as", { sub: pkce ? "PKCE required" : "no PKCE check" });
+    if (animate && s.path) await F.packet(s.path, { color: s.color || "--c-cl", dur: 600, back: !!s.back });
+  }
+  $("oaNext").onclick = async () => { if (busy || st >= STEPS.length - 1) return; if (attack && st >= 5) return; busy = true; st++; await show(true); busy = false; };
+  $("oaPrev").onclick = async () => { if (busy || st === 0) return; st--; if (st < 5) stolen = "no"; await show(false); };
+  $("oaPkce").onclick = () => { pkce = !pkce; $("oaPkce").textContent = "PKCE: " + (pkce ? "on" : "off"); st = 0; stolen = "no"; show(false); };
+  $("oaAttack").onclick = () => { attack = !attack; $("oaAttack").textContent = "Attacker: " + (attack ? "on" : "off"); st = 0; stolen = "no"; show(false); };
+  $("oaReset").onclick = () => { st = 0; stolen = "no"; show(false); };
+  show(false);
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,440 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.4 Agent memory: short-term, long-term & summarization · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .convo { max-height: 260px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; background: var(--bg2); font-size: .86rem; }
+  .convo .t { padding: 3px 0; border-bottom: 1px dashed var(--line); }
+  .convo .t.gone { opacity: .35; text-decoration: line-through; }
+  .convo .t.sum { opacity: .6; font-style: italic; }
+  .convo .t .n { font-family: var(--mono); font-size: .75rem; color: var(--muted); margin-right: 6px; }
+  .summary { font-family: var(--mono); font-size: .82rem; border: 1px dashed var(--c-cx); border-radius: 10px; padding: 6px 10px; margin: 6px 0; }
+  .probe { display: flex; gap: 8px; align-items: baseline; padding: 3px 0; font-size: .9rem; }
+  .mem { display: grid; grid-template-columns: 1fr auto auto auto; gap: 4px 10px; align-items: center; font-size: .86rem; }
+  .mem .h { font-weight: 700; color: var(--muted); font-size: .78rem; text-transform: uppercase; }
+  .mem .off { opacity: .4; text-decoration: line-through; }
+  .mem button { font: inherit; font-size: .75rem; padding: 2px 8px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg); color: var(--text); cursor: pointer; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .row-in { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; margin: 6px 0; }
+  .row-in input[type=text] { font: inherit; font-size: .88rem; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); flex: 1 1 260px; }
+</style>
+</head>
+<body data-lesson="a6-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 4</div>
+  <h1>Agent memory: short-term, long-term & summarization</h1>
+  <p class="subtitle">Models remember nothing between calls. Everything an agent “remembers” is text you chose to put back into the prompt. Memory design is deciding what to keep, what to compress, what to store for later, and what to forget.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Context window</b>: the maximum tokens a model can read in one call; you pay for all of them, every call (Lesson 0.3).</li>
+      <li><b>Context engineering</b>: choosing and ordering what goes into the prompt (Lesson 1.4).</li>
+      <li><b>Embeddings and vector search</b>: store text as vectors and retrieve the most similar ones to a query (Lessons 2.1, 2.3).</li>
+      <li><b>The agent loop</b>: each step adds a call and an observation to the context (Lesson 6.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>“Just use a bigger context window” sounds like the end of the memory problem. In July 2025, Chroma tested <b>18 LLMs</b> on simple tasks while growing the input, and found their performance <b>grows increasingly unreliable as input length grows</b>, even on tasks they solved easily with short inputs. They called it <b>context rot</b>.</p>
+    <p>It echoes a 2023 finding (“Lost in the Middle”): models use information best when it's at the <b>beginning or end</b> of the context, and worse when it's buried in the middle. A long context is a big desk, not a good memory. What you put on it, and where, still matters.</p>
+  </div>
+
+  <h2>Numbers first: how much is there to remember?</h2>
+  <table>
+    <tr><th>Situation</th><th>Raw history</th><th>Fits in one prompt?</th></tr>
+    <tr><td>A support chat, 40 turns × 200 tokens</td><td class="tk">8,000 tokens</td><td class="ev">Easily; just send it</td></tr>
+    <tr><td>A coding agent session, 200 tool steps × 1,500 tokens</td><td class="tk">300,000 tokens</td><td class="rk">Over many context windows, and slow and costly long before that: compact</td></tr>
+    <tr><td>A personal assistant over a year, 300 conversations × 5,000 tokens</td><td class="tk">1,500,000 tokens</td><td class="rk">No: store it, and retrieve only what matters</td></tr>
+  </table>
+  <p>So there are two different problems. <b>Short-term memory</b>: keep the current task's context small and sharp. <b>Long-term memory</b>: carry useful facts across sessions without resending everything.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Memory = <b>write</b> (what to save, when) + <b>store</b> (where) + <b>read</b> (what to pull back into the prompt, when) + <b>forget</b> (what to drop, update or delete). Every memory bug is a bug in one of these four: the fact was never written, was stored stale, wasn't retrieved, or wasn't forgotten.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a doctor's desk and filing cabinet</span>
+    <p>During an appointment, the doctor has your recent notes open on the desk (the <b>context window</b>). Old pages get summarised into a one-line “history” at the top of the file (<b>summarisation</b>). Facts that matter for years, like your allergies, go on the front cover where they're always seen (<b>semantic memory</b>, a profile). Records of past visits stay in the cabinet and are pulled when relevant (<b>episodic memory</b>, retrieved on demand). When you move house, the old address is crossed out, not kept beside the new one (<b>update, don't append</b>). And some things you only share if you agree they can be written down (<b>consent</b>).</p>
+  </div>
+
+  <h2>The kinds of memory</h2>
+  <table>
+    <tr><th>Kind</th><th>What it holds</th><th>Where it usually lives</th><th>Read how</th></tr>
+    <tr><td><b>Working / short-term</b></td><td>The current conversation or task: recent turns, tool results</td><td>The context window</td><td>Always (it <i>is</i> the prompt)</td></tr>
+    <tr><td><b>Compacted</b></td><td>A summary of older turns, or notes the agent wrote to itself</td><td>A summary block in the prompt, or a notes file</td><td>Always, in place of the old turns</td></tr>
+    <tr><td><b>Semantic</b> (facts)</td><td>Stable facts and preferences: “allergic to peanuts”, “prefers short answers”</td><td>Key-value profile, a table, or files</td><td>Always (small profile) or retrieved by topic</td></tr>
+    <tr><td><b>Episodic</b> (events)</td><td>What happened: “last time, we fixed Kafka lag by adding partitions”</td><td>A vector store of past episodes with timestamps</td><td>Retrieved by similarity (+ recency)</td></tr>
+    <tr><td><b>Procedural</b> (how-to)</td><td>Instructions and learned rules: “in this repo, run tests with make test”</td><td>System prompt, rules files (e.g. AGENTS.md)</td><td>Always loaded for that project</td></tr>
+  </table>
+
+  <h2>Short-term memory: windows, summaries and compaction</h2>
+  <p>The simplest strategy is to send the <b>full history</b>. It's perfect until it isn't: cost per turn grows, and quality drops as the context gets long. A <b>sliding window</b> keeps only the last N turns: cheap and bounded, but it forgets anything older, including the user's name. <b>Window + summary</b> replaces old turns with a running summary: bounded cost, and it keeps what the summary keeps. That last clause is the whole game: a generic summary (“the user discussed their trip”) silently drops the numbers and allergies that matter. Anthropic calls the agent version <b>compaction</b>: when the context nears its limit, summarise the history into the critical details and continue in a fresh context.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · What does the assistant still know?</span>
+    <p class="hint">A 16-turn travel-planning chat. Pick a memory strategy; the list shows what is still in the prompt at the final turn (struck out = forgotten, italic = replaced by the summary). The summariser is a <b>rule-based stand-in</b> for an LLM summary call: the “generic” prompt keeps only topics, the “fact-preserving” prompt keeps user facts with their latest values. Then check what the assistant can still answer.</p>
+    <div class="controls">
+      <span class="seg" id="sStrat"><button data-v="full">Full history</button><button data-v="window" class="on">Sliding window</button><button data-v="summary">Window + summary</button></span>
+      <label>keep last <input type="range" id="sWin" min="2" max="16" step="1" value="4"> <b class="mono" id="sWinv"></b> turns</label>
+    </div>
+    <div class="controls"><span class="muted">summary prompt</span> <span class="seg" id="sStyle"><button data-v="generic" class="on">“Summarise the conversation”</button><button data-v="facts">“Keep user facts, latest values”</button></span></div>
+    <div class="summary" id="sSum"></div>
+    <div class="convo" id="sConvo"></div>
+    <h4 style="margin:10px 0 4px">Final turn: “Can you make a day-by-day plan?” Can the assistant use…</h4>
+    <div id="sProbes"></div>
+    <canvas class="chart" id="sChart" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">facts usable <b id="sScore">–</b></div>
+      <div class="stat">input tokens, final turn <b id="sLast">–</b></div>
+      <div class="stat">input tokens, whole chat <b id="sTot">–</b></div>
+      <div class="stat">summary calls <b id="sCalls">–</b></div>
+    </div>
+  </div>
+  <p>What you should see: a 4-turn window forgets every fact, including the peanut allergy; the plan might include a satay stall. A generic summary is cheap but keeps only topics (“discussed food needs, budget”), so it recovers none of the facts. The fact-preserving summary keeps all five facts, including the <b>updated</b> $4,500 budget, at a fraction of full history's tokens. Full history also works here, but its cost grows every turn and, in long sessions, quality degrades (context rot).</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what summarisation saves</span>
+    <p>A chat where every turn (user + assistant) adds 200 tokens. Option A: full history. Option B: keep the last 10 turns (2,000 tokens) plus a 300-token summary, refreshed every turn once older turns drop out (each refresh reads the old summary plus the dropped turn: ≈500 tokens).</p>
+    <ul>
+      <li>Full history, 30 turns: 200 × (1 + 2 + … + 30) = 200 × 465 = <b>93,000</b> input tokens.</li>
+      <li>Window + summary, 30 turns: turns 1–10 cost 200 × 55 = 11,000; turns 11–30 cost 20 × (2,000 + 300) = 46,000; summaries 20 × 500 = 10,000. Total <b>67,000</b> (28% less).</li>
+      <li>At 100 turns: full = 200 × 5,050 = <b>1,010,000</b>; window + summary = 11,000 + 90 × 2,300 + 90 × 500 = <b>263,000</b> (74% less).</li>
+    </ul>
+    <p>Summaries barely pay off in short chats and win big in long ones. Refreshing every 5 turns instead of every turn cuts the summary cost further.</p>
+  </div>
+
+  <h2>Long-term memory: write, retrieve, update, forget</h2>
+  <ul>
+    <li><b>Write</b>: after a turn or at the end of a session, an LLM call extracts memory-worthy facts (“user is vegetarian”) and episodes (“fixed Kafka lag”). Save the source and a timestamp. Don't save every message: save what will matter later.</li>
+    <li><b>Read</b>: retrieve by similarity to the current request, plus <b>recency</b> and <b>importance</b>. The Generative Agents paper scored memories as a weighted sum of all three. Always-on facts (a small profile) can simply sit in the system prompt.</li>
+    <li><b>Update</b>: when a new fact conflicts with an old one (moved city, changed job), <b>supersede</b> the old one. Two contradictory facts in a store means retrieval will sometimes pick the wrong one.</li>
+    <li><b>Forget</b>: let users see and delete memories; expire time-limited facts; never store secrets; treat health, finance and similar sensitive categories as opt-in. Long-term memory of personal data is regulated data (Lesson 8.5).</li>
+  </ul>
+
+  <h3>Forgetting and aging: memory that doesn't rot</h3>
+  <p>A store that only grows gets worse over time: more stale facts, more near-duplicates, more noise competing at retrieval. Production memory systems age and prune deliberately.</p>
+  <table>
+    <tr><th>Strategy</th><th>How it works</th><th>Good for</th></tr>
+    <tr><td><b>TTL</b> (time to live)</td><td>Each memory gets an expiry date; expired ones are deleted or hidden</td><td>Time-bound facts: “travelling this week”, “waiting for a refund”, session notes</td></tr>
+    <tr><td><b>Decay</b></td><td>Recency score falls exponentially with time since the memory was last used (e.g. 0.995 per hour); unused memories sink in the ranking</td><td>Episodes whose relevance fades naturally</td></tr>
+    <tr><td><b>Importance scores</b></td><td>An LLM rates each memory (e.g. 1–10) at write time; low-importance ones are pruned first, high-importance ones (allergies) are kept despite age</td><td>Keeping “never forget” facts while trimming small talk</td></tr>
+    <tr><td><b>Consolidation</b></td><td>Periodically, an LLM merges many episodes into fewer, higher-level facts (“five chats about Kafka” → “user runs Kafka in production”), then archives the originals</td><td>Long-lived assistants with years of history (the Generative Agents “reflection” step is a version of this)</td></tr>
+    <tr><td><b>Caps + eviction</b></td><td>A maximum number of memories per user; evict the lowest score (importance × recency) when full</td><td>Bounding storage and retrieval noise</td></tr>
+    <tr><td><b>User deletion</b></td><td>“Forget this” and “delete all” controls, honoured in every copy (vector index, caches, backups by policy)</td><td>Trust and privacy law (Lesson 8.5)</td></tr>
+  </table>
+
+  <h3>Where to keep the user profile</h3>
+  <table>
+    <tr><th></th><th>Structured profile (SQL / key-value)</th><th>Vector memory</th></tr>
+    <tr><td>Shape</td><td>Typed fields: <code>name</code>, <code>home_city</code>, <code>diet</code>, <code>timezone</code>, <code>preferred_language</code></td><td>Free-text memories with embeddings</td></tr>
+    <tr><td>Updates</td><td>Exact: overwrite <code>home_city</code>, so no stale duplicates</td><td>Append by default; conflicts need detection</td></tr>
+    <tr><td>Read</td><td>Always in the prompt (small), or by key</td><td>Retrieved by similarity, can miss</td></tr>
+    <tr><td>User control</td><td>Easy to show, edit and delete field by field</td><td>Harder: memories are fuzzy and numerous</td></tr>
+    <tr><td>Best for</td><td>Stable facts every request needs</td><td>Open-ended episodes and details you can't predict</td></tr>
+  </table>
+  <p>The common production design uses both: a <b>small structured profile</b> (tens of fields, always loaded) plus a <b>vector store of episodes</b> (retrieved when relevant), with an extraction step that decides which one each new fact belongs in.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · A long-term memory store</span>
+    <p class="hint">Nine memories from 18 months of chats, retrieved with this course's toy embedding (real systems use a real embedding model and a vector or key-value store). The “answer” is a <b>stand-in</b> that trusts the top retrieved memory. Ask “Where do I live?”: the store holds both Paris (2025) and Berlin (2026). Then try recency weighting, superseding on write, deleting a memory, or teaching it something new.</p>
+    <div class="row-in">
+      <label>ask <select id="rQ" class="btn small"></select></label>
+      <label><input type="checkbox" id="rRec"> recency weighting</label>
+      <label><input type="checkbox" id="rSup"> supersede conflicting facts on write</label>
+    </div>
+    <div class="verdict" id="rVerdict"></div>
+    <div id="rHits"></div>
+    <div class="row-in">
+      <input type="text" id="rNew" placeholder="Teach it something, e.g. I moved to Munich last week" aria-label="new memory">
+      <button class="btn" id="rAdd">💾 Remember</button>
+      <label><input type="checkbox" id="rConsent"> user consented to sensitive memories</label>
+    </div>
+    <div class="row-in"><span class="muted">try:</span> <button class="btn small" id="rT0">I moved to Munich last week</button><button class="btn small" id="rT1">My password is hunter2</button><button class="btn small" id="rT2">I have type 1 diabetes</button></div>
+    <div class="verdict" id="rWrite"></div>
+    <div class="mem" id="rStore"></div>
+  </div>
+  <p>What you should see: without help, similarity alone picks <b>Paris</b> (that memory happens to share more words with “live” and “home”). Recency weighting fixes it by preferring newer memories; superseding on write fixes it at the source, so the stale fact can't be retrieved at all. The write path also matters: a password is refused outright, and a health fact is only stored with explicit consent.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Short-term: your framework's session or checkpointer (OpenAI Agents SDK sessions, LangGraph checkpointers keyed by thread ID) plus compaction. Long-term: a vector store (pgvector, Qdrant, Lesson 2.3) or a key-value profile, or a memory layer such as <b>Mem0</b>, <b>Letta</b> (from the MemGPT authors) or LangGraph's long-term stores. Anthropic's API offers a client-side <b>memory tool</b> (type <code>memory_20250818</code>): the model asks to read and write files under <code>/memories</code> and your code performs the file operations.</p>
+<pre><code><span class="c"># Short-term: the session stores the conversation and replays it each turn</span>
+<span class="k">from</span> agents <span class="k">import</span> Agent, Runner, SQLiteSession
+
+agent = Agent(name=<span class="s">"Travel assistant"</span>, instructions=<span class="s">"Be concise. Respect dietary needs."</span>)
+session = SQLiteSession(<span class="s">"user_42"</span>)
+<span class="k">await</span> Runner.run(agent, <span class="s">"I'm vegetarian and allergic to peanuts."</span>, session=session)
+result = <span class="k">await</span> Runner.run(agent, <span class="s">"Suggest dinner in Kyoto."</span>, session=session)  <span class="c"># remembers</span>
+
+<span class="c"># Long-term: retrieval score = relevance + recency + importance (Generative Agents style)</span>
+<span class="k">import</span> math, time
+<span class="k">def</span> score(mem, query_vec, now=time.time()):
+    hours = (now - mem[<span class="s">"last_access"</span>]) / <span class="n">3600</span>
+    recency = <span class="n">0.995</span> ** hours                       <span class="c"># exponential decay</span>
+    relevance = cosine(query_vec, mem[<span class="s">"vec"</span>])
+    <span class="k">return</span> relevance + recency + mem[<span class="s">"importance"</span>]   <span class="c"># each normalised to [0, 1]</span>
+
+<span class="k">def</span> remember(store, fact, slot=<span class="k">None</span>):
+    <span class="k">if</span> slot:                                         <span class="c"># e.g. "home_city": supersede, don't append</span>
+        store.mark_superseded(user_id, slot)
+    store.add(user_id, fact, slot=slot, vec=embed(fact), importance=rate(fact), last_access=time.time())</code></pre>
+    <p class="hint"><code>cosine</code>, <code>embed</code>, <code>rate</code> (an LLM call returning 0–1 importance) and <code>store</code> are your own helpers. Sessions grow forever: pair them with a trimming or summarising strategy.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Full history</td><td>Nothing lost; simplest</td><td>Cost grows every turn; context rot in long sessions</td></tr>
+      <tr><td>Sliding window</td><td>Bounded, predictable cost</td><td>Forgets early facts completely</td></tr>
+      <tr><td>Summaries / compaction</td><td>Bounded cost, keeps the gist</td><td>Extra calls; summaries can drop or distort facts; hard to debug what was lost</td></tr>
+      <tr><td>Long-term vector memory</td><td>Scales to years of history</td><td>Retrieval misses, stale or conflicting facts, privacy obligations</td></tr>
+      <tr><td>Always-on profile in the prompt</td><td>Key facts never missed</td><td>Tokens on every call; must stay small and current</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Full history with a token cap, then window + a fact-preserving summary when chats get long. For cross-session memory, a small per-user profile table (5–20 facts) written by one extraction call per session and shown to users, who can edit and delete it.</p></div>
+      <div><h4>At scale</h4><p>Separate stores for profile facts and episodes, conflict resolution on write, retrieval evals (“did it recall the allergy?”), per-region storage, retention policies, user-facing memory controls and audit logs, and memory poisoning defences (Lesson 8.3): a stored “fact” injected by a malicious document is a persistent prompt injection.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Design memory for a personal assistant.” A senior answer:</p>
+    <ul>
+      <li>Separates <b>short-term</b> (window + compaction) from <b>long-term</b> (profile facts + episodic store), with numbers for each.</li>
+      <li>Designs the <b>write path</b>: what gets extracted, timestamps, slots for facts that change, conflict resolution, and what is never stored.</li>
+      <li>Designs the <b>read path</b>: always-on profile vs retrieved episodes, relevance + recency, a token budget for memories.</li>
+      <li>Covers <b>user control and privacy</b> (view, edit, delete, consent for sensitive categories) and how to <b>evaluate</b> recall and staleness.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Memory as an operating system</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2310.08560" target="_blank" rel="noopener">MemGPT: Towards LLMs as Operating Systems (Packer et al.)</a></div>
+      <p><b>How:</b> treats the context window like RAM and external storage like disk; the model itself calls functions to move information in and out (page in, page out).</p>
+      <p><b>Why this method:</b> borrowed from hierarchical memory in operating systems, it gives the illusion of unbounded memory with a fixed window; the authors went on to found Letta.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Recency + importance + relevance</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2304.03442" target="_blank" rel="noopener">Generative Agents (Park et al.)</a></div>
+      <p><b>How:</b> simulated characters store every observation in a memory stream and retrieve by a weighted sum of recency (exponential decay, factor 0.995), importance (rated by the LLM) and relevance (embedding similarity), each normalised.</p>
+      <p><b>Why this method:</b> similarity alone retrieves stale or trivial memories; mixing in recency and importance made the agents' behaviour more believable.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Memory in a consumer product</b> <span class="tag co">🏢 OpenAI · 2024–2025</span> <a href="https://openai.com/index/memory-and-new-controls-for-chatgpt/" target="_blank" rel="noopener">Memory and new controls for ChatGPT</a></div>
+      <p><b>How:</b> saved memories (from Feb 2024), then from April 2025 the option to reference all past conversations, with settings to turn each off, plus temporary chats.</p>
+      <p><b>Why this method:</b> users want continuity, but memory of personal data needs visible, user-controlled switches.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Memory and context editing in the API</b> <span class="tag co">🏢 Anthropic · 2025</span> <a href="https://www.anthropic.com/news/context-management" target="_blank" rel="noopener">Managing context on the Claude Developer Platform</a></div>
+      <p><b>How:</b> a memory tool that stores files under <code>/memories</code> on the developer's side, plus context editing that clears stale tool results as the context fills.</p>
+      <p><b>Why this method:</b> long-running agents need both a persistent notebook and a way to drop bulky, outdated observations; keeping storage client-side leaves the data under the developer's control.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Extract-and-update memory layer</b> <span class="tag res">🧪 Research · 2025</span> <a href="https://arxiv.org/abs/2504.19413" target="_blank" rel="noopener">Mem0 (Chhikara et al.)</a></div>
+      <p><b>How:</b> extracts salient facts from conversations, then decides per fact whether to add, update, delete or ignore against existing memories.</p>
+      <p><b>Why this method:</b> on the LOCOMO long-conversation benchmark it reported a 26% relative gain over OpenAI's memory on an LLM-judge metric, and 91% lower p95 latency and over 90% fewer tokens than sending the full context.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 0.995</span>
+    <p>The Generative Agents paper's recency decay factor was 0.995 per sandbox game hour since a memory was last retrieved, so a memory loses half its recency score after about 138 hours (0.995<sup>138</sup> ≈ 0.50), a bit under six game days. Tuning that one number changes how “forgetful” an agent feels.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Memory is context engineering (Lesson 1.4) stretched over time. Long-term memory reuses embeddings and vector stores (2.1–2.3) and retrieval ideas from RAG (Phase 3); permissions and freshness (4.7) apply to memories too. The agent loop's growing context (6.1) is why compaction exists; multi-agent systems (6.5) are partly a way to give each agent a smaller context; memory poisoning and privacy rules are in 8.3 and 8.5. Caching and eviction policies (LRU, TTL) are covered in the System Design course: <a href="../../system-design-course/phase1/3-caching.html">caching</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" target="_blank" rel="noopener">Anthropic: Effective context engineering for AI agents</a>. Compaction, structured note-taking and sub-agents.</li>
+      <li><span class="kind">Research</span> <a href="https://research.trychroma.com/context-rot" target="_blank" rel="noopener">Chroma: Context Rot</a>. How 18 models degrade as input grows.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2310.08560" target="_blank" rel="noopener">MemGPT</a>. The OS analogy for agent memory.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Each turn adds 200 tokens and you send the full history every time. How many input tokens does a 30-turn chat send in total?</div>
+    <div class="opts"><button class="opt">6,000</button><button class="opt" data-ok>93,000</button><button class="opt">180,000</button></div>
+    <div class="explain">Turn <i>k</i> sends 200 × k tokens: 200 × (1 + … + 30) = 200 × 465 = <b>93,000</b>. 6,000 is only the last turn. The total grows with the square of the number of turns.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A user told your assistant they moved from Paris to Berlin. A month later it still recommends Paris restaurants. What's the root cause and fix?</div>
+    <div class="opts"><button class="opt">The embedding model is too small: upgrade it</button><button class="opt" data-ok>Both facts are stored and retrieval picks the old one: give facts a slot and timestamp, supersede on write, and weight recency on read</button><button class="opt">Increase top-k so both are retrieved</button></div>
+    <div class="explain">Contradictory facts in the store make retrieval a coin flip. Fix the write path (update, don't append) and add recency on the read path. Retrieving both just hands the contradiction to the model.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Which of these should a personal assistant save to long-term memory automatically?</div>
+    <div class="opts"><button class="opt">Every message, so nothing is lost</button><button class="opt">The user's password, so it can log in for them</button><button class="opt" data-ok>Stable preferences and facts like “prefers short answers” and “vegetarian”, with timestamps, visible and deletable by the user</button></div>
+    <div class="explain">Save what will be useful later, in a form you can update and the user can control. Never store secrets, and treat sensitive categories (health, finances) as opt-in.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>The model remembers nothing; memory is what you put back into the prompt. Bigger windows rot: keep context small and sharp.</li>
+      <li>Short-term: full history → sliding window → window + fact-preserving summary / compaction as sessions grow.</li>
+      <li>Long-term: write (extract facts and episodes), read (relevance + recency + importance), update (supersede conflicts), forget (TTL, decay, importance pruning, consolidation, user deletion; no secrets, consent).</li>
+      <li>Keep stable facts in a small structured profile (SQL/KV, always loaded); keep open-ended episodes in a vector store.</li>
+      <li>Most memory bugs are stale facts, generic summaries, or facts never written. Evaluate recall like retrieval.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  document.querySelectorAll(".seg button").forEach(b => { if (!b.id) b.id = b.parentElement.id + "-" + b.dataset.v; });
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  // ---------- Playground 1: short-term memory ----------
+  // [user turn, facts: {key: value}]
+  const TURNS = [
+    ["Hi, I'm Priya.", { name: "Priya" }],
+    ["I'm planning a trip to Japan in April.", { trip: "Japan, April" }],
+    ["I'm vegetarian, and allergic to peanuts.", { diet: "vegetarian, peanut allergy" }],
+    ["What's the weather like in Kyoto then?", {}],
+    ["My budget is about $3,000 for the whole trip.", { budget: "$3,000" }],
+    ["Can you suggest a rail pass?", {}],
+    ["I prefer quiet places to big crowds.", { pref: "quiet places" }],
+    ["What about day trips from Kyoto?", {}],
+    ["Actually, I got a bonus: my budget is now $4,500.", { budget: "$4,500" }],
+    ["Any onsen recommendations?", {}],
+    ["How do I get from the airport to the city?", {}],
+    ["What should I pack?", {}],
+    ["Is tipping expected?", {}],
+    ["Good restaurants in Osaka?", {}],
+    ["How much cash should I carry?", {}],
+    ["Thanks! Can you make a day-by-day plan?", {}],
+  ];
+  const TOPIC = ["introductions", "trip dates", "food needs", "weather", "budget", "rail passes", "travel style", "day trips", "budget", "onsen", "airport transfer", "packing", "tipping", "restaurants", "cash", "itinerary"];
+  const PROBES = [["name", "the user's name (Priya)"], ["trip", "destination and month (Japan, April)"], ["diet", "vegetarian + peanut allergy"], ["budget", "the current budget ($4,500)"], ["pref", "prefers quiet places"]];
+  const SYS = 300, ASSIST = 150;
+  let strat = "window", style = "generic";
+  function stateAt(t, o) { // what's in the prompt when answering turn t (1-based)
+    const keepFrom = o.strat === "full" ? 0 : Math.max(0, t - o.win);
+    const kept = TURNS.slice(keepFrom, t), dropped = TURNS.slice(0, keepFrom);
+    let summary = "";
+    if (o.strat === "summary" && dropped.length) {
+      if (o.style === "generic") summary = "The user is planning a trip and discussed " + [...new Set(TOPIC.slice(0, keepFrom))].join(", ") + ".";
+      else { const f = {}; dropped.forEach(d => Object.assign(f, d[1])); summary = "User facts: " + (Object.entries(f).map(([k, v]) => `${k} = ${v}`).join("; ") || "none yet") + "."; }
+    }
+    const tok = SYS + (summary ? AI.countTokens(summary) + 20 : 0) + kept.reduce((s, d, i) => s + AI.countTokens(d[0]) + (i < kept.length - 1 ? ASSIST : 0), 0);
+    return { keepFrom, kept, summary, tok };
+  }
+  function known(st, key) {
+    const facts = {}; // later turns overwrite earlier ones
+    if (st.summary && style === "facts") TURNS.slice(0, st.keepFrom).forEach(d => Object.assign(facts, d[1]));
+    st.kept.forEach(d => Object.assign(facts, d[1]));
+    return facts[key];
+  }
+  function mem() {
+    const o = { strat, style, win: +$("sWin").value };
+    $("sWinv").textContent = o.win;
+    const T = TURNS.length, st = stateAt(T, o);
+    $("sSum").style.display = st.summary ? "" : "none";
+    $("sSum").innerHTML = st.summary ? "<b>Summary block:</b> " + esc(st.summary) : "";
+    $("sConvo").innerHTML = TURNS.map((d, i) => {
+      const inCtx = i >= st.keepFrom, cls = inCtx ? "" : strat === "summary" ? " sum" : " gone";
+      return `<div class="t${cls}"><span class="n">${i + 1}</span><span class="in">${esc(d[0])}</span>${Object.keys(d[1]).length ? ' <span class="tk">★ fact</span>' : ""}</div>`;
+    }).join("");
+    let ok = 0;
+    $("sProbes").innerHTML = PROBES.map(([k, label]) => {
+      const v = known(st, k), right = k === "budget" ? v === "$4,500" : !!v;
+      ok += right;
+      return `<div class="probe">${right ? "✅" : v ? "⚠️" : "❌"} <span>${label}</span> <span class="muted">${right ? "" : v ? "stale value: " + esc(v) : "forgotten"}</span></div>`;
+    }).join("");
+    $("sScore").textContent = ok + " / " + PROBES.length;
+    const series = [], full = [];
+    let tot = 0, calls = 0;
+    for (let t = 1; t <= T; t++) { const s = stateAt(t, o), f = stateAt(t, { strat: "full" }); series.push([t, s.tok]); full.push([t, f.tok]); tot += s.tok; if (o.strat === "summary" && s.keepFrom > 0) calls++; }
+    $("sLast").textContent = st.tok.toLocaleString();
+    $("sTot").textContent = tot.toLocaleString();
+    $("sCalls").textContent = calls;
+    Plot.line($("sChart"), { series: [{ label: "full history", color: MX.css("--muted"), data: full, dash: [5, 4] }, { label: "this strategy", color: MX.css("--c-tk"), data: series, width: 3 }], xLabel: "turn", yLabel: "input tokens", yMin: 0 });
+  }
+  const segs = (id, fn) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); fn(b.dataset.v); mem(); })); };
+  segs("sStrat", v => (strat = v));
+  segs("sStyle", v => (style = v));
+  $("sWin").oninput = mem;
+  mem();
+
+  // ---------- Playground 2: long-term memory store ----------
+  AI.addConcept(["live", "lives", "living", "moved", "move", "home", "address", "based in", "relocated", "city"]);
+  AI.addConcept(["vegetarian", "vegan", "allergic", "allergy", "allergies", "diet", "eat", "food", "meat", "peanuts", "nuts", "avoid"]);
+  AI.addConcept(["coffee", "tea", "drink", "espresso", "latte"]);
+  AI.addConcept(["job", "work", "works", "employer", "company", "role", "engineer"]);
+  let MEM = [
+    { text: "I live in Paris; my home is near the Canal Saint-Martin.", date: "2025-03-02", type: "semantic", slot: "home" },
+    { text: "User prefers short answers with code examples.", date: "2025-04-11", type: "semantic" },
+    { text: "I'm allergic to peanuts.", date: "2025-05-20", type: "semantic" },
+    { text: "Asked for help debugging Kafka consumer lag; fixed by adding partitions.", date: "2025-06-14", type: "episodic" },
+    { text: "I work as a backend engineer at a fintech startup.", date: "2025-07-01", type: "semantic", slot: "job" },
+    { text: "I drink my coffee black, no sugar.", date: "2025-08-09", type: "semantic" },
+    { text: "Booked a trip to Lisbon for the conference; hotel near the river.", date: "2026-02-03", type: "episodic" },
+    { text: "I just moved to Berlin for a new job.", date: "2026-09-18", type: "semantic", slot: "home" },
+    { text: "I started a new role as staff engineer at a health-tech company.", date: "2026-09-20", type: "semantic", slot: "job" },
+  ];
+  const QS = [["Where do I live?", "home"], ["Where do I work?", "job"], ["Any food I should avoid?", /peanut/i], ["How do I like my coffee?", /coffee/i], ["What did we fix last time with Kafka?", /kafka/i], ["Recommend a restaurant near my home.", "home"]];
+  $("rQ").innerHTML = QS.map((q, i) => `<option value="${i}">${q[0]}</option>`).join("");
+  const TODAY = new Date("2026-10-31");
+  const slotOf = t => (/\b(moved|live in|living in|relocated)\b/i.test(t) ? "home" : /\b(work as|new role|job as|started at|joined)\b/i.test(t) ? "job" : null);
+  const superseded = (m, i) => $("rSup").checked && m.slot && MEM.some((n, j) => j !== i && n.slot === m.slot && !n.deleted && n.date > m.date);
+  function retrieve() {
+    const [q, gold] = QS[+$("rQ").value], qv = AI.embed(q), rec = $("rRec").checked;
+    const live = MEM.map((m, i) => ({ m, i })).filter(({ m, i }) => !m.deleted && !superseded(m, i));
+    const hits = live.map(({ m, i }) => {
+      const rel = AI.cosine(qv, AI.embed(m.text)), days = (TODAY - new Date(m.date)) / 864e5;
+      return { m, i, rel, s: rel + (rec ? 0.5 * Math.pow(0.995, days) : 0) };
+    }).filter(h => h.rel >= 0.25).sort((a, b) => b.s - a.s).slice(0, 2);
+    const goldIdx = typeof gold === "string" ? MEM.map((m, i) => ({ m, i })).filter(({ m }) => m.slot === gold && !m.deleted).sort((a, b) => (a.m.date < b.m.date ? 1 : -1))[0]?.i : MEM.findIndex(m => !m.deleted && gold.test(m.text));
+    const top = hits[0];
+    $("rHits").innerHTML = hits.length ? hits.map((h, n) => `<div class="hit${h.i === goldIdx ? "" : " miss"}"><span class="sc">#${n + 1} · similarity ${h.rel.toFixed(2)}${rec ? ` · score ${h.s.toFixed(2)}` : ""} · ${h.m.date}</span>${esc(h.m.text)}</div>`).join("") : `<div class="hit miss">nothing relevant retrieved</div>`;
+    const stale = top && goldIdx != null && top.i !== goldIdx && top.m.slot && top.m.slot === MEM[goldIdx].slot;
+    $("rVerdict").innerHTML = !top ? `<span class="rk">❌ Nothing retrieved: the assistant has to say it doesn't know${goldIdx == null || goldIdx < 0 ? " (you deleted it)" : ""}.</span>`
+      : top.i === goldIdx ? `<span class="ev">✅ Answers from: “${esc(top.m.text)}”</span>`
+      : stale ? `<span class="rk">❌ Stale fact: it answers from “${esc(top.m.text)}” (${top.m.date}), but a newer memory says otherwise.</span>`
+      : `<span class="rk">❌ Answers from the wrong memory: “${esc(top.m.text)}”.</span>`;
+    $("rStore").innerHTML = `<span class="h">memory</span><span class="h">date</span><span class="h">type</span><span class="h"></span>` + MEM.map((m, i) => {
+      const off = m.deleted || superseded(m, i);
+      return `<span class="${off ? "off" : ""}">${esc(m.text)}${superseded(m, i) && !m.deleted ? ' <span class="muted">(superseded)</span>' : ""}</span><span class="mono">${m.date}</span><span class="muted">${m.type}</span><span>${m.deleted ? "" : `<button id="rDel${i}" aria-label="forget memory ${i + 1}">🗑 forget</button>`}</span>`;
+    }).join("");
+    MEM.forEach((m, i) => { const b = $("rDel" + i); if (b) b.onclick = () => { m.deleted = true; retrieve(); }; });
+  }
+  function write(text) {
+    text = text.trim(); if (!text) return;
+    if (/password|api key|card number|\bssn\b|secret/i.test(text)) { $("rWrite").innerHTML = `<span class="rk">🚫 Not stored: looks like a secret. Never write credentials to memory.</span>`; return; }
+    if (/diabetes|therap|diagnos|medication|pregnan|depress|anxiety/i.test(text) && !$("rConsent").checked) { $("rWrite").innerHTML = `<span class="tk">⚠️ Not stored: sensitive (health) category without the user's consent. Tick the consent box to store it.</span>`; return; }
+    const slot = slotOf(text);
+    MEM.push({ text, date: "2026-10-31", type: "semantic", slot });
+    $("rWrite").innerHTML = `<span class="ev">💾 Stored${slot ? ` in slot “${slot}”${$("rSup").checked ? ": older facts in that slot are superseded" : ": the old fact is still there (turn on supersede)"}` : ""}.</span>`;
+    retrieve();
+  }
+  ["rQ", "rRec", "rSup"].forEach(id => ($(id).onchange = retrieve));
+  $("rAdd").onclick = () => { write($("rNew").value); $("rNew").value = ""; };
+  ["rT0", "rT1", "rT2"].forEach(id => ($(id).onclick = () => write($(id).textContent)));
+  retrieve();
+})();
+</script>
+</body>
+</html>

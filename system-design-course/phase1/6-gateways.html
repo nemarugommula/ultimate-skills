@@ -1,0 +1,431 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.6 Reverse proxies & API gateways (Nginx, Envoy, Kong) · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+</style>
+</head>
+<body data-lesson="s1-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 1 · Lesson 6</div>
+  <h1>Reverse proxies & API gateways (Nginx, Envoy, Kong)</h1>
+  <p class="subtitle">One front door for all your services: it decrypts traffic, checks who you are, enforces limits, caches, and routes each request to the right place. It turns 30 services into one API, and done badly, into one bottleneck.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>L7 load balancers</b> read HTTP requests and can route by path (Lesson 1.2).</li>
+      <li><b>Rate limiting</b> with token buckets, and <b>caching</b> with hit ratios (Lessons 1.5 and 1.3).</li>
+      <li><b>TLS</b> encrypts HTTP; setting it up costs round trips and CPU (Lesson 0.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>When you open Netflix, nearly every request from your TV or phone first goes through <b>Zuul</b>, Netflix's open-source gateway. In 2018, Netflix ran more than <b>80 Zuul clusters</b>, routing over <b>1 million requests per second</b> to about 100 backend clusters.</p>
+    <p>Zuul's job is in its filters: some run before the request is proxied (authentication, routing), some after (compressing the response, adding headers). That “chain of filters at the front door” is what every API gateway is.</p>
+  </div>
+
+  <h2>Numbers first: the cost of not having a front door</h2>
+  <p>You have <b>30 services</b>. Every one of them needs TLS certificates, token checks, rate limits, request logging and compression.</p>
+  <ul>
+    <li>Without a gateway: 30 teams build these 5 things, 150 implementations in different languages. One team forgets the auth check and you have a security hole.</li>
+    <li>With a gateway: build them <b>once</b>, at the edge. Each costs a little time per request, typically well under a millisecond to a couple of milliseconds (a local token check is fast; a call to Redis for a rate limit is about 1 ms).</li>
+    <li>And it can <i>save</i> time: a cache hit at the gateway skips a backend call of, say, 40 ms. Gzip shrinks a typical JSON response several times over, which matters on a phone.</li>
+  </ul>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A <b>reverse proxy</b> stands in front of your servers and speaks to clients on their behalf. An <b>API gateway</b> is a reverse proxy that also handles API concerns: authentication, rate limits, routing, transformation. Put <b>cross-cutting</b> work (the same for every service) at the gateway, and keep <b>business logic</b> in the services.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: an office building's reception desk</span>
+    <p>Visitors don't wander the floors looking for the person they're meeting. Reception checks their ID (authentication), turns away people who've been in ten times today (rate limiting), answers common questions itself (caching: “the cafeteria is on floor 2”), and sends everyone else to the right floor (routing). The departments upstairs never deal with any of that. But if reception starts deciding salaries, something has gone wrong.</p>
+  </div>
+
+  <h2>Proxy, gateway, load balancer, mesh: who's who</h2>
+  <table>
+    <tr><th></th><th>What it is</th><th>Typical jobs</th><th>Examples</th></tr>
+    <tr><td><b>Forward proxy</b></td><td>Sits in front of <i>clients</i>; the server sees the proxy</td><td>Corporate web filtering, egress control</td><td>Squid, office proxies</td></tr>
+    <tr><td><b>Reverse proxy</b></td><td>Sits in front of <i>servers</i>; the client sees the proxy</td><td>TLS termination, compression, static files, load balancing</td><td>nginx, HAProxy, Envoy</td></tr>
+    <tr><td><b>API gateway</b></td><td>A reverse proxy with API features</td><td>Auth, API keys, rate limits, routing by path/version, request/response transformation</td><td>Kong, AWS API Gateway, Zuul, Envoy-based gateways</td></tr>
+    <tr><td><b>Backend for frontend</b> (BFF)</td><td>A gateway built for one kind of client (iOS, web, TV)</td><td>Calling several services and combining the results into one response</td><td>Netflix device adapters, SoundCloud</td></tr>
+    <tr><td><b>Service mesh</b></td><td>A proxy next to every service, for service-to-service traffic</td><td>Retries, mutual TLS, metrics between services (Lesson 4.3)</td><td>Envoy sidecars</td></tr>
+  </table>
+  <p>The lines blur: Envoy can be all of the last four. What matters is the <b>job</b>: “north-south” traffic (users coming in) goes through the gateway, “east-west” traffic (services calling each other) goes through the mesh.</p>
+
+  <h2>The filter chain</h2>
+  <p>A gateway processes each request through a chain of steps. Order matters:</p>
+  <ol>
+    <li><b>TLS termination</b>: decrypt HTTPS here, so certificates live in one place. Traffic inside your network may be re-encrypted (Lesson 4.6).</li>
+    <li><b>Authentication</b>: check the API key or token (for example a JWT, a signed token, Lesson 4.6). Reject with 401 before doing anything expensive.</li>
+    <li><b>Rate limiting</b>: per key or user, 429 when over (Lesson 1.5). After auth, so you know <i>who</i> to count.</li>
+    <li><b>Caching</b>: answer repeated public GETs without touching a service. After auth, or you'll hand cached data to strangers.</li>
+    <li><b>Routing</b>: <code>/orders/*</code> to the orders service, <code>/v2/*</code> to the new version, 5% of traffic to a canary (Lesson 6.2).</li>
+    <li><b>On the way back</b>: compress, add security headers, log and measure every request (Lesson 6.3). CORS headers and preflights belong here too, answered once at the edge (Lesson 4.6b).</li>
+  </ol>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Build the front door</span>
+    <p class="hint">10,000 requests/s arrive. Mixed in: <b>400/s with invalid tokens</b> (bots, expired logins) and <b>one runaway client sending 2,000/s</b> against a limit of 100/s. Half of all requests are public GETs, and the cache answers 80% of those. The services behind can handle <b>8,000 requests/s</b> and take 40 ms when relaxed. Filter costs are typical, illustrative numbers. Turn filters off and see what reaches the services.</p>
+    <svg id="fg"></svg>
+    <div class="controls">
+      <label><input type="checkbox" id="fa" checked> 🪪 auth</label>
+      <label><input type="checkbox" id="fr" checked> 🚦 rate limit</label>
+      <label><input type="checkbox" id="fc" checked> ⚡ cache</label>
+      <label><input type="checkbox" id="fz"> 🗜️ gzip responses</label>
+      <button class="btn" id="send">Send 10 requests</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">reaching services <b id="bl">–</b></div>
+      <div class="stat">rejected 401 / 429 <b id="blk">–</b></div>
+      <div class="stat">avg latency (real users) <b id="lat">–</b></div>
+      <div class="stat">errors (overload) <b id="err">–</b></div>
+      <div class="stat">bytes out <b id="eg">–</b></div>
+    </div>
+    <canvas class="chart" id="gc" style="height:190px"></canvas>
+    <p class="hint" id="gmsg"></p>
+  </div>
+  <p>Things to try: turn off the cache and the services run at 96% of capacity; latency jumps more than tenfold, because queues explode near full load (Lesson 1.2). Turn off the rate limiter as well and you're over capacity: one runaway client is now causing errors for everyone. Turn off auth and the gateway forwards invalid requests, so every service must reject them itself, and any service that forgets is open.</p>
+
+  <h2>Backend for frontend: one call instead of five</h2>
+  <p>A phone's home screen needs data from five services: profile, feed, notifications, recommendations, cart. On a phone network each round trip costs <b>50 to 300 ms</b>, and inside your data center it's about <b>1 ms</b>. So the trick is to make the many small calls where they're cheap.</p>
+  <p>A <b>BFF</b> is a small service made for one client type. The phone sends <b>one</b> request; the BFF calls the five services in parallel next door, trims the fields this screen doesn't need, and returns one response. Netflix built this in 2012 for its 800+ device types: device teams write adapters on the server that fan one request out into many internal calls.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the home screen on 4G</span>
+    <p>Phone round trip 100 ms, 5 Mbps of bandwidth. Server times: profile 30 ms, feed 120, notifications 25, recommendations 180, cart 40. Feed, recommendations and cart need the profile first. Each raw response is 30 KB; the BFF's trimmed response is 25 KB in total.</p>
+    <ul>
+      <li><b>One by one from the phone:</b> 5 × 100 ms + (30 + 120 + 25 + 180 + 40) ms + 150 KB at 5 Mbps (240 ms) ≈ <b>1,135 ms</b>.</li>
+      <li><b>Phone in parallel</b> (profile first, then the rest at once): (100 + 30) + (100 + 180) + 240 ≈ <b>650 ms</b>.</li>
+      <li><b>BFF</b>: 100 ms to reach it; inside, profile (1 + 30 ms) then the rest in parallel (1 + 180 ms), +2 ms to assemble; 25 KB takes 40 ms: ≈ <b>354 ms</b>, and one request instead of five.</li>
+    </ul>
+    <p>The slower the network, the bigger the win. Try it:</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The home screen, three ways</span>
+    <p class="hint">Bars show when each call happens (time flows left to right). Change the phone network, then make the recommendations service slow and see who suffers. A BFF can set a <b>timeout</b> and return the screen without recommendations rather than make the user wait.</p>
+    <div class="controls">
+      <span class="seg" id="bm"><button data-v="serial" class="on">Phone: one by one</button><button data-v="par">Phone: in parallel</button><button data-v="bff">BFF: one call</button></span>
+    </div>
+    <div class="controls">
+      <label>phone round trip <input type="range" id="rtt" min="20" max="400" step="10" value="100"> <b class="mono" id="rttv"></b></label>
+      <label>bandwidth <input type="range" id="bw" min="1" max="50" step="1" value="5"> <b class="mono" id="bwv"></b></label>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="slow"> 🐢 recommendations takes 2 s today</label>
+      <label><input type="checkbox" id="tmo"> ⏱️ BFF timeout 300 ms (partial response)</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">screen ready <b id="tt">–</b></div>
+      <div class="stat">requests from the phone <b id="nq">–</b></div>
+      <div class="stat">downloaded on the phone <b id="kb">–</b></div>
+    </div>
+    <canvas class="chart" id="bc" style="height:230px"></canvas>
+    <p class="hint" id="bmsg"></p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Self-hosted: <b>nginx</b> (and OpenResty), <b>Envoy</b> (and gateways built on it), <b>Kong</b> (plugins for auth, rate limiting, transformations, logging), <b>HAProxy</b>, <b>Traefik</b>. Managed: <b>AWS API Gateway</b>, <b>Google Cloud API Gateway / Apigee</b>, <b>Azure API Management</b>, <b>Cloudflare</b>. In Kubernetes, an <b>Ingress</b> or Gateway API controller (Lesson 5.3). A small gateway in nginx:</p>
+<pre><code><span class="k">limit_req_zone</span> $binary_remote_addr zone=perip:10m rate=20r/s;
+<span class="k">proxy_cache_path</span> /var/cache/nginx keys_zone=api_cache:50m;
+
+<span class="k">server</span> {
+    listen <span class="n">443</span> ssl;                           <span class="c"># 1. TLS terminates here</span>
+    ssl_certificate     /etc/ssl/api.crt;
+    ssl_certificate_key /etc/ssl/api.key;
+    gzip on;  gzip_types application/json;       <span class="c"># 6. compress JSON on the way out</span>
+
+    <span class="k">location</span> /orders/ {
+        auth_request /_auth;                    <span class="c"># 2. ask an auth service: 2xx = allow, 401/403 = deny</span>
+        limit_req zone=perip burst=<span class="n">40</span> nodelay;   <span class="c"># 3. rate limit</span>
+        limit_req_status <span class="n">429</span>;
+        proxy_pass http://orders;               <span class="c"># 5. route by path</span>
+    }
+    <span class="k">location</span> /catalog/ {
+        proxy_cache api_cache;                  <span class="c"># 4. cache public GETs for a minute</span>
+        proxy_cache_valid <span class="n">200</span> <span class="n">1m</span>;
+        proxy_pass http://catalog;
+    }
+    <span class="k">location</span> = /_auth {
+        internal;
+        proxy_pass http://auth/verify;
+        proxy_pass_request_body off;
+        proxy_set_header Content-Length <span class="s">""</span>;
+    }
+}</code></pre>
+    <p class="hint"><code>auth_request</code> lives in a module that isn't built by default when compiling nginx from source; check <code>nginx -V</code>. Try it locally: put this in a file and run <code>docker run -p 8443:443 -v $PWD/gw.conf:/etc/nginx/conf.d/default.conf:ro nginx</code> (with your own self-signed certificate and upstreams).</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>✅ A gateway buys you…</th><th>⚠️ …and costs you</th></tr>
+      <tr><td>One place for TLS, auth, limits, logging</td><td>A critical component: if it's down, everything is down. Run several instances behind a load balancer.</td></tr>
+      <tr><td>Services that are simpler and safer</td><td>An extra hop on every request (usually a millisecond or two)</td></tr>
+      <tr><td>Freedom to move and split services behind a stable URL</td><td>A tempting place to dump logic. A gateway full of business rules becomes a shared monolith every team must change.</td></tr>
+      <tr><td>BFFs: fast screens, small payloads, partial responses</td><td>One more service per client type to build and own; duplicated logic between BFFs</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Your “gateway” is the managed load balancer plus middleware in your one app: TLS at the balancer, auth and rate limits as framework middleware. Add a real gateway (managed, or Kong/nginx) when you have several services or a public API with keys. Build a BFF only when two clients genuinely need different shapes of data.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>A fleet of edge gateways (Zuul, Envoy-based) owned by a platform team, configured as code, with per-team routes and filters; BFFs owned by the client teams (web, iOS, TV); a service mesh for east-west traffic; and the gateway's logs and metrics as the main view of what users experience.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Most designs start “client → API gateway → services”. A senior answer says what the gateway <b>does</b>:</p>
+    <ul>
+      <li>TLS termination, authentication, per-client rate limits, routing, maybe caching, and the <b>order</b> of those steps.</li>
+      <li>That it's <b>horizontally scaled and stateless</b> (Lesson 1.1), with limits in Redis (Lesson 1.5).</li>
+      <li>For mobile-heavy products, a <b>BFF</b> that aggregates calls, with timeouts and partial responses.</li>
+      <li>What does <b>not</b> belong there: business logic.</li>
+    </ul>
+    <p>Common follow-ups: “Isn't the gateway a single point of failure?” · “Where do you validate the JWT, and do services trust the gateway?” · “How would you roll out v2 of an endpoint?” (route by version or header, Lesson 4.5).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>A filter-based edge gateway</b> <span class="tag co">🏢 Netflix · 2018</span> <a href="https://netflixtechblog.com/open-sourcing-zuul-2-82ea476cb2b3" target="_blank" rel="noopener">Open Sourcing Zuul 2</a></div>
+      <p><b>How:</b> Netty handles the networking; inbound filters do authentication, routing and decoration, endpoint filters proxy to the backend (or answer directly), outbound filters do things like gzipping and adding headers. More than 80 clusters, over 1 million requests per second.</p>
+      <p><b>Why this method:</b> Zuul's behavior is almost entirely the filters you load, so the same core can run in different places doing different jobs.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>From front proxy to every host</b> <span class="tag co">🏢 Lyft · 2016</span> <a href="https://eng.lyft.com/announcing-envoy-c-l7-proxy-and-communication-bus-92520b6c8191" target="_blank" rel="noopener">Announcing Envoy: C++ L7 proxy and communication bus</a></div>
+      <p><b>How:</b> Lyft first used Envoy as its front proxy, then gradually replaced its AWS ELBs with local Envoys on every service node.</p>
+      <p><b>Why this method:</b> with about 30 services, failures were so hard to trace that developers were wary of high-volume calls in critical paths. One proxy with good stats at the edge and between services made the network observable.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One backend per user experience</b> <span class="tag hist">📜 Pattern · SoundCloud</span> <a href="https://samnewman.io/patterns/architectural/bff/" target="_blank" rel="noopener">Sam Newman: Backends For Frontends</a></div>
+      <p><b>How:</b> instead of one general-purpose API for every client, each user experience (mobile, web) gets its own backend; Newman credits ex-SoundClouder Phil Calçado with the name and saw it used at REA and SoundCloud.</p>
+      <p><b>Why this method:</b> mobile screens show less data and suffer from many round trips and battery drain, so their backend should be shaped for them.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Device adapters on the server</b> <span class="tag co">🏢 Netflix · 2012</span> <a href="https://netflixtechblog.com/embracing-the-differences-inside-the-netflix-api-redesign-15fd8b3dc49d" target="_blank" rel="noopener">Embracing the Differences: Inside the Netflix API Redesign</a></div>
+      <p><b>How:</b> a device sends one request to its own server-side adapter, which fans it out into many internal API calls (concurrently when possible), prunes unwanted fields and formats the response for that device.</p>
+      <p><b>Why this method:</b> one-size-fits-all REST didn't fit 800+ device types; moving “client code” to the server cut chattiness and let device teams move independently.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A plugin-based open-source gateway</b> <span class="tag oss">🧰 Open source · Kong</span> <a href="https://github.com/Kong/kong" target="_blank" rel="noopener">Kong Gateway on GitHub</a></div>
+      <p><b>How:</b> proxying, routing, load balancing and health checks, with plugins for traffic control, rate limiting, request/response transformation and logging. Its rate limiter can keep counters locally, in the cluster, or in Redis.</p>
+      <p><b>Why this method:</b> teams switch features on per route with configuration instead of writing proxy code.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 800 kinds of screens</span>
+    <p>When Netflix redesigned its API in 2012, its streaming service ran on <b>more than 800 different device types</b>, almost all talking to its private APIs. That's why it let device teams write their own server-side endpoints: a single API couldn't be ideal for a game console and a phone at the same time.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>A gateway combines this whole phase: L7 balancing (1.2), caching (1.3), edge delivery (1.4) and rate limiting (1.5), in front of stateless services (1.1). Its inside-the-network twin is the <b>service mesh</b> (4.3); token checks are covered in <b>auth at scale</b> (4.6); routing by version supports <b>API evolution</b> (4.5) and <b>canary deploys</b> (6.2). In AI systems, “AI gateways” sit in front of LLM providers to route between models, cache answers and enforce token budgets.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://netflixtechblog.com/open-sourcing-zuul-2-82ea476cb2b3" target="_blank" rel="noopener">Open Sourcing Zuul 2</a>. How a big edge gateway is structured, and what it's used for.</li>
+      <li><span class="kind">Blog</span> <a href="https://samnewman.io/patterns/architectural/bff/" target="_blank" rel="noopener">Backends For Frontends</a>. When a BFF helps, and when one general API is fine.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.envoyproxy.io/docs/envoy/latest/intro/what_is_envoy" target="_blank" rel="noopener">What is Envoy</a>. A one-page tour of a modern L7 proxy's features.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A phone with a 150 ms round trip makes 5 calls one after another, each taking 50 ms on the server. A BFF would make the same 5 calls in parallel inside the data center (1 ms away). Roughly how long does the screen take, before vs after?</div>
+    <div class="opts"><button class="opt" data-ok>About 1,000 ms → about 200 ms</button><button class="opt">About 250 ms → about 200 ms</button><button class="opt">About 1,000 ms → about 950 ms</button></div>
+    <div class="explain">Before: 5 × (150 + 50) = 1,000 ms. After: one phone round trip (150) + one parallel internal call (1 + 50) ≈ <b>200 ms</b>. Round trips on slow networks dominate; a BFF moves them to where they're cheap.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You have 30 microservices, and an audit finds two of them never check access tokens. What's the best structural fix?</div>
+    <div class="opts"><button class="opt">Send a reminder to all teams</button><button class="opt" data-ok>Validate tokens once at the API gateway, reject bad ones there, and pass the verified identity to services</button><button class="opt">Put each service on its own domain name</button></div>
+    <div class="explain">Cross-cutting rules belong in one place every request passes through. Services can still check what the user is allowed to do, but nothing unauthenticated reaches them.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Which of these does <b>not</b> belong in an API gateway?</div>
+    <div class="opts"><button class="opt">Rejecting requests over a client's rate limit</button><button class="opt">Routing <code>/v2/orders</code> to the new orders service</button><button class="opt" data-ok>Calculating the discount for an order</button></div>
+    <div class="explain">Discounts are business logic: they belong to the orders (or pricing) service and its team. A gateway that accumulates business rules turns into a shared monolith that every team has to change and nobody owns.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>A <b>reverse proxy</b> fronts servers; an <b>API gateway</b> adds auth, rate limits, routing and transformation; a <b>service mesh</b> does it between services.</li>
+      <li>Filter order matters: TLS → auth → rate limit → cache → route; compress and log on the way out.</li>
+      <li>A <b>BFF</b> turns many phone round trips into one, trims payloads, and can return partial results on timeout.</li>
+      <li>Keep gateways stateless, redundant and free of business logic.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const n0 = v => Math.round(v).toLocaleString("en-US");
+
+  // ---------- playground 1: the filter chain ----------
+  const G = new Flow($("fg"), { width: 720, height: 220 });
+  G.node("c", { x: 46, y: 110, w: 76, label: "👤 Clients", sub: "10k/s", kind: "cl" })
+   .node("tls", { x: 140, y: 110, w: 80, label: "🔒 TLS", sub: "", kind: "nw" })
+   .node("auth", { x: 232, y: 110, w: 84, label: "🪪 Auth", sub: "", kind: "nw" })
+   .node("rl", { x: 328, y: 110, w: 88, label: "🚦 Limit", sub: "", kind: "nw" })
+   .node("cache", { x: 424, y: 110, w: 84, label: "⚡ Cache", sub: "", kind: "ca" })
+   .node("route", { x: 516, y: 110, w: 80, label: "🔀 Route", sub: "", kind: "nw" })
+   .node("s0", { x: 650, y: 40, w: 116, h: 40, label: "orders", kind: "sv" })
+   .node("s1", { x: 650, y: 110, w: 116, h: 40, label: "users", kind: "sv" })
+   .node("s2", { x: 650, y: 180, w: 116, h: 40, label: "catalog", kind: "sv" })
+   .edge("c", "tls").edge("tls", "auth").edge("auth", "rl").edge("rl", "cache").edge("cache", "route")
+   .edge("route", "s0").edge("route", "s1").edge("route", "s2").render();
+
+  const TOTAL = 10000, BAD = 400, ABUSE = 2000, ABUSE_LIMIT = 100, LEGIT = TOTAL - BAD - ABUSE, CAP = 8000, BASE = 40, CACHED = 0.5 * 0.8;
+  const COST = { tls: 0.3, auth: 0.5, rl: 1.0, cache: 1.0, route: 0.2, gz: 0.5 };
+  let lastG = null;
+  function gate() {
+    const auth = $("fa").checked, rl = $("fr").checked, cache = $("fc").checked, gz = $("fz").checked;
+    const passing = LEGIT + (rl ? ABUSE_LIMIT : ABUSE) + (auth ? 0 : BAD);
+    const hits = cache ? CACHED * passing : 0, load = passing - hits, u = load / CAP;
+    const back = u < 1 ? BASE / (1 - u ** 3) : 2000;
+    const filt = COST.tls + (auth ? COST.auth : 0) + (rl ? COST.rl : 0) + (cache ? COST.cache : 0) + COST.route + (gz ? COST.gz : 0);
+    const userLat = filt + (cache ? CACHED * 1 + (1 - CACHED) * back : back);
+    const errs = Math.max(0, load - CAP), kb = gz ? 10 : 40, gbps = (TOTAL - (auth ? BAD : 0) - (rl ? ABUSE - ABUSE_LIMIT : 0)) * kb * 1000 * 8 / 1e9;
+    $("bl").textContent = `${n0(load)}/s (${Math.round(u * 100)}%)`;
+    $("blk").textContent = `${auth ? n0(BAD) : 0} / ${rl ? n0(ABUSE - ABUSE_LIMIT) : 0}`;
+    $("lat").textContent = u < 1 ? userLat.toFixed(0) + " ms" : "timeouts (2 s)";
+    $("err").textContent = n0(errs) + "/s";
+    $("eg").textContent = gbps.toFixed(1) + " Gbps";
+    G.set("auth", { sub: auth ? `401: ${n0(BAD)}/s` : "off", down: !auth })
+     .set("rl", { sub: rl ? `429: ${n0(ABUSE - ABUSE_LIMIT)}/s` : "off", down: !rl })
+     .set("cache", { sub: cache ? `${n0(hits)}/s hits` : "off", down: !cache })
+     .set("tls", { sub: gz ? "+ gzip" : "" })
+     .set("route", { sub: `${n0(load)}/s`, load: Math.min(1, u) });
+    ["s0", "s1", "s2"].forEach(s => G.set(s, { load: Math.min(1, u), sub: u >= 1 ? "OVERLOADED" : `${Math.round(back)} ms`, hot: u >= 1 }));
+    Plot.bars($("gc"), { bars: [
+      { label: "arrived", value: TOTAL, color: MX.css("--c-cl") },
+      { label: "401 auth", value: auth ? BAD : 0, color: MX.css("--c-er") },
+      { label: "429 limit", value: rl ? ABUSE - ABUSE_LIMIT : 0, color: MX.css("--c-er") },
+      { label: "cache hits", value: hits, color: MX.css("--c-ca") },
+      { label: "to services", value: load, color: MX.css(u >= 1 ? "--c-er" : "--c-sv") },
+      { label: "capacity", value: CAP, color: MX.css("--muted") },
+    ], yMin: 0, yMax: 10500, yLabel: "requests / s" });
+    $("gmsg").textContent = u >= 1 ? `Services get ${n0(load)}/s but can do ${n0(CAP)}/s: ${n0(errs)} requests/s fail, for real users too.` :
+      !auth ? `${n0(BAD)} unauthenticated requests/s reach the services. Each one must reject them itself, and any that forgets is wide open.` :
+      u > 0.9 ? `Services at ${Math.round(u * 100)}% of capacity: queues build and latency balloons to ${Math.round(userLat)} ms.` :
+      `Services at ${Math.round(u * 100)}%: the gateway turned 10,000 requests/s into ${n0(load)} that need real work. The filters cost ${filt.toFixed(1)} ms per request.`;
+    lastG = { auth, rl, cache };
+  }
+  ["fa", "fr", "fc", "fz"].forEach(id => ($(id).onchange = gate));
+  const SEQ = ["hit", "ok", "bad", "abuse", "hit", "ok", "abuse", "ok", "hit", "ok"];
+  let sending = false;
+  $("send").onclick = async () => {
+    if (sending) return;
+    sending = true;
+    const g = lastG, chain = ["c", "tls", "auth", "rl", "cache", "route"];
+    for (let k = 0; k < SEQ.length; k++) {
+      const t = SEQ[k], svc = "s" + (k % 3);
+      let path, color;
+      if (t === "bad" && g.auth) { path = chain.slice(0, 3); color = "--c-er"; }
+      else if (t === "abuse" && g.rl) { path = chain.slice(0, 4); color = "--c-er"; }
+      else if (t === "hit" && g.cache) { path = chain.slice(0, 5); color = "--c-ca"; }
+      else { path = [...chain, svc]; color = t === "bad" ? "--c-er" : t === "abuse" ? "--c-lt" : "--c-cl"; }
+      G.set("c", { sub: { hit: "public GET", ok: "normal", bad: "bad token", abuse: "runaway" }[t] });
+      await G.packet(path, { color, dur: 200, back: true });
+    }
+    G.set("c", { sub: "10k/s" });
+    sending = false;
+  };
+  gate();
+
+  // ---------- playground 2: BFF timeline ----------
+  const SVC = [["profile", 30], ["feed", 120], ["notifications", 25], ["recommendations", 180], ["cart", 40]];
+  const RAW_KB = 30, BFF_KB = 25, INNER = 1, ASSEMBLE = 2, TIMEOUT = 300;
+  const getMode = seg("bm", () => bff());
+  function timeline(mode, rtt, mbps, slow, tmo) {
+    const t = SVC.map(([n, v]) => [n, n === "recommendations" && slow ? 2000 : v]);
+    const rows = []; let end = 0, kb, nreq, partial = false;
+    const xfer = k => k * 8 / mbps; // ms for k KB at mbps
+    if (mode === "serial") {
+      let at = 0;
+      t.forEach(([n, v]) => { rows.push({ label: n, a: at, b: at + rtt + v, kind: "phone" }); at += rtt + v; });
+      kb = RAW_KB * 5; nreq = 5; rows.push({ label: "download", a: at, b: at + xfer(kb), kind: "xfer" }); end = at + xfer(kb);
+    } else if (mode === "par") {
+      const p = t[0][1]; rows.push({ label: "profile", a: 0, b: rtt + p, kind: "phone" });
+      let mx = 0; t.slice(1).forEach(([n, v]) => { rows.push({ label: n, a: rtt + p, b: 2 * rtt + p + v, kind: "phone" }); mx = Math.max(mx, v); });
+      const at = 2 * rtt + p + mx; kb = RAW_KB * 5; nreq = 5;
+      rows.push({ label: "download", a: at, b: at + xfer(kb), kind: "xfer" }); end = at + xfer(kb);
+    } else {
+      const half = rtt / 2, p = t[0][1];
+      rows.push({ label: "phone → BFF", a: 0, b: half, kind: "phone" });
+      rows.push({ label: "profile", a: half, b: half + INNER + p, kind: "dc" });
+      const s2 = half + INNER + p; let mx = 0;
+      t.slice(1).forEach(([n, v]) => {
+        let dur = INNER + v, cut = false;
+        if (tmo && dur > TIMEOUT) { dur = TIMEOUT; cut = true; partial = true; }
+        rows.push({ label: n + (cut ? " (timed out)" : ""), a: s2, b: s2 + dur, kind: cut ? "cut" : "dc" }); mx = Math.max(mx, dur);
+      });
+      const done = s2 + mx + ASSEMBLE; kb = BFF_KB; nreq = 1;
+      rows.push({ label: "BFF → phone", a: done, b: done + half + xfer(kb), kind: "phone" }); end = done + half + xfer(kb);
+    }
+    return { rows, end, kb, nreq, partial };
+  }
+  const canvas = $("bc");
+  function drawGantt(R) {
+    const dpr = window.devicePixelRatio || 1, w = canvas.clientWidth || 600, h = canvas.clientHeight || 230;
+    canvas.width = w * dpr; canvas.height = h * dpr;
+    const ctx = canvas.getContext("2d"); ctx.setTransform(dpr, 0, 0, dpr, 0, 0); ctx.clearRect(0, 0, w, h);
+    const L = 150, Rm = 16, top = 8, bottom = 24, n = R.rows.length, rowH = (h - top - bottom) / n;
+    const maxT = Math.max(400, Math.ceil(R.end / 200) * 200), X = v => L + v / maxT * (w - L - Rm);
+    ctx.font = "12px " + MX.css("--font"); ctx.textBaseline = "middle";
+    ctx.strokeStyle = MX.css("--line"); ctx.fillStyle = MX.css("--muted"); ctx.textAlign = "center";
+    const step = maxT > 2000 ? 500 : maxT > 1000 ? 250 : 100;
+    for (let v = 0; v <= maxT; v += step) { ctx.beginPath(); ctx.moveTo(X(v), top); ctx.lineTo(X(v), h - bottom); ctx.stroke(); ctx.fillText(v + " ms", X(v), h - bottom / 2); }
+    const col = { phone: "--c-lt", dc: "--c-sv", xfer: "--c-nw", cut: "--c-er" };
+    R.rows.forEach((r, i) => {
+      const y = top + i * rowH;
+      ctx.fillStyle = MX.css("--text"); ctx.textAlign = "right"; ctx.fillText(r.label, L - 8, y + rowH / 2);
+      ctx.fillStyle = MX.css(col[r.kind]); ctx.fillRect(X(r.a), y + rowH * 0.18, Math.max(2, X(r.b) - X(r.a)), rowH * 0.64);
+    });
+    ctx.strokeStyle = MX.css("--c-er"); ctx.setLineDash([5, 4]); ctx.beginPath(); ctx.moveTo(X(R.end), top); ctx.lineTo(X(R.end), h - bottom); ctx.stroke(); ctx.setLineDash([]);
+  }
+  let lastB = null;
+  function bff() {
+    const rtt = +$("rtt").value, mbps = +$("bw").value, slow = $("slow").checked, tmo = $("tmo").checked, mode = getMode();
+    $("rttv").textContent = rtt + " ms"; $("bwv").textContent = mbps + " Mbps";
+    const R = timeline(mode, rtt, mbps, slow, tmo);
+    lastB = R; drawGantt(R);
+    $("tt").textContent = Math.round(R.end) + " ms"; $("nq").textContent = R.nreq; $("kb").textContent = R.kb + " KB";
+    const others = ["serial", "par", "bff"].filter(m => m !== mode).map(m => `${{ serial: "one by one", par: "parallel", bff: "BFF" }[m]} ${Math.round(timeline(m, rtt, mbps, slow, tmo).end)} ms`).join(", ");
+    $("bmsg").textContent = (R.partial ? "The BFF gave up on recommendations after 300 ms and returned the rest; the app shows the screen without that row. " :
+      slow && mode !== "bff" ? "A single slow service holds the whole screen hostage. " : "") + `Compare: ${others}. Gold = phone network, orange = inside the data center, purple = download, red = timed out.`;
+  }
+  ["rtt", "bw"].forEach(id => ($(id).oninput = bff));
+  ["slow", "tmo"].forEach(id => ($(id).onchange = bff));
+  window.addEventListener("resize", () => lastB && drawGantt(lastB));
+  window.addEventListener("themechange", () => lastB && drawGantt(lastB));
+  bff();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.7 Building eval datasets · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .cov { width: 100%; border-collapse: separate; border-spacing: 4px; font-size: .85rem; }
+  .cov th { font-weight: 700; font-size: .78rem; color: var(--muted); text-align: center; padding: 2px 4px; }
+  .cov th.rowh { text-align: right; white-space: nowrap; }
+  .cov td { text-align: center; border-radius: 8px; padding: 6px 4px; font-family: var(--mono); border: 2px solid transparent; }
+  .cov td small { display: block; font-family: var(--font); color: var(--muted); font-size: .72rem; }
+  .cov td.gap { border: 2px dashed var(--c-rk); background: transparent; }
+  .cov td.tot { background: var(--panel); }
+  .qlist { max-height: 300px; overflow-y: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--bg2); padding: 4px 8px; }
+  .qrow { display: flex; gap: 8px; align-items: baseline; padding: 4px 0; border-bottom: 1px dashed var(--line); font-size: .88rem; }
+  .qrow:last-child { border-bottom: 0; }
+  .qrow .st { flex: none; width: 92px; font-size: .72rem; font-weight: 800; text-transform: uppercase; letter-spacing: .03em; }
+  .qrow.drop { opacity: .45; text-decoration: line-through; }
+  .qrow .why { flex: none; margin-left: auto; font-size: .75rem; color: var(--muted); }
+  @media (max-width: 640px) { .cov { font-size: .72rem; } .qrow .st { width: 70px; } }
+</style>
+</head>
+<body data-lesson="a5-7" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 5 · Lesson 7</div>
+  <h1>Building eval datasets: real logs, synthetic &amp; adversarial cases, coverage</h1>
+  <p class="subtitle">An eval can only find the failures its dataset contains. This lesson is about choosing the cases: where they come from, how to cover what matters, and how to stop the set from going stale or leaking.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>A <b>golden dataset</b> is your curated set of eval cases, each with an expected answer or pass criteria; Lesson 5.1 listed the five sources (logs, failures, experts, synthetic, adversarial) and how error bars shrink with more cases.</li>
+      <li><b>Pass rate ± error bar</b>: with n cases at pass rate p, the 95% range is about ±1.96 × √(p(1 − p) ÷ n) (Lesson 5.1).</li>
+      <li><b>Embeddings</b> place similar texts close together, so you can measure how alike two questions are (Lesson 2.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2019 researchers at Stanford and elsewhere looked closely at a chest X-ray model that detects a collapsed lung (pneumothorax). Its overall score looked respectable: an AUC of <b>0.87</b> (AUC is a 0-to-1 score of how well a model ranks sick cases above healthy ones; 0.5 is a coin flip).</p>
+    <p>Then a radiologist labelled one extra detail: whether each scan already showed a <b>chest drain</b>, the tube doctors insert to <i>treat</i> the condition. 80% of the positive scans had one. On those, the model scored 0.94. On scans without a drain, the untreated patients who most need the alert, it scored only <b>0.77</b>. Part of its apparent skill came from spotting the tube, not the disease. The authors called this <b>hidden stratification</b>: a subgroup that's failing, invisible because nobody sliced the test set that way.</p>
+  </div>
+
+  <h2>Numbers first: 92% that hides 40%</h2>
+  <p>A support bot's eval set: 500 cases sampled from last month's logs, in the same proportions users ask. Overall pass rate: <b class="ev">92%</b>. Ship it? Here's the same run, sliced by what users wanted:</p>
+  <table>
+    <tr><th>Slice</th><th>Cases</th><th>Pass rate</th><th>95% error bar</th></tr>
+    <tr><td>Refunds</td><td>200</td><td class="ev">97%</td><td>±2.4 points</td></tr>
+    <tr><td>Shipping</td><td>150</td><td class="ev">96%</td><td>±3.1</td></tr>
+    <tr><td>Account &amp; login</td><td>100</td><td class="ev">92%</td><td>±5.3</td></tr>
+    <tr><td>Billing disputes</td><td>40</td><td>65%</td><td>±14.8</td></tr>
+    <tr><td>Cancellations written in Spanish</td><td>10</td><td class="rk">40%</td><td class="rk">±30</td></tr>
+    <tr><td><b>All</b></td><td><b>500</b></td><td><b>92%</b></td><td>±2.4</td></tr>
+  </table>
+  <p>Two problems in one table. Billing disputes and non-English cancellations are failing badly, but they're only 10% of traffic, so the average barely notices. And the worst slice has <b>10 cases</b>: its error bar is ±30 points, so you can't even say how bad it is. A random sample from logs copies the traffic mix, which is right for the headline number and wrong for finding problems in small slices.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    An eval dataset is a <b>designed sample</b>, not a pile of examples. Decide the slices that matter (intents, difficulty, languages, risk), make sure each slice has enough cases to be measured on its own, and report slice scores next to the overall one. A single number is a summary; the slices are the diagnosis.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the crash-test programme</span>
+    <p>A car maker doesn't crash 500 cars in whatever way crashes happen most often (mostly slow rear bumps). It designs a matrix: front, side, rollover, small overlap, child seat, at several speeds, and makes sure every cell is tested. Real accident reports add new cells over time. Your eval set works the same way: logs tell you what's common, the matrix tells you what's covered, and every new production failure becomes a new test.</p>
+  </div>
+
+  <h2>Where cases come from</h2>
+  <p>Lesson 5.1 listed the sources. Here's how to mine each one well:</p>
+  <table>
+    <tr><th>Source</th><th>How to mine it</th><th>What it's best at</th></tr>
+    <tr><td><b>Production logs and traces</b></td><td>Sample conversations from your tracing tool (tracing is Lesson 8.1); include the retrieved context and tool calls, not just the question. Scrub personal data first.</td><td>Realistic wording and the real mix of requests.</td></tr>
+    <tr><td><b>Support tickets and escalations</b></td><td>Tickets where a human had to step in, or that mention the bot. Each comes with the right answer, written by the agent who solved it.</td><td>Hard cases with a reference answer already attached.</td></tr>
+    <tr><td><b>Failure reports</b></td><td>Thumbs-down, bug reports, red-team findings (Lesson 5.10). Turn each into a case before fixing it.</td><td>Regression tests: the bug can't come back silently.</td></tr>
+    <tr><td><b>Expert-written cases</b></td><td>Give a domain expert the coverage matrix and ask them to fill empty cells: policy corners, rare but costly situations.</td><td>Cases your logs haven't seen yet (new features, rare risks).</td></tr>
+    <tr><td><b>Synthetic</b></td><td>LLM-generated from your documents, personas or scenarios (below).</td><td>Cheap coverage before launch and for rare cells.</td></tr>
+    <tr><td><b>Adversarial and edge</b></td><td>Deliberate perturbations of real cases (below), plus attacks from Lesson 5.10.</td><td>Robustness: does it hold up when users are messy?</td></tr>
+  </table>
+
+  <h2>Design the coverage matrix first</h2>
+  <p>Before collecting anything, write down the <b>dimensions</b> along which your system's behaviour should differ. Typical ones:</p>
+  <ul>
+    <li><b>Intent or task type</b>: what the user wants (refund, track order, change password, off-topic). Derive it from error analysis of 100 real traces (Lesson 5.1), not from guessing.</li>
+    <li><b>Difficulty</b>: single fact, multi-part (needs two facts), needs reasoning, ambiguous, unanswerable.</li>
+    <li><b>Input form</b>: language, typos, length, formality, attachments.</li>
+    <li><b>User or context</b>: plan tier, region, new vs returning, persona (an angry customer writes differently).</li>
+    <li><b>Risk</b>: a wrong answer about money or health matters more than one about shipping times.</li>
+  </ul>
+  <p>Crossing two or three of these gives a grid. Then fill it with <b>stratified sampling</b>: split the pool into strata (cells), and sample from each one separately with a minimum per cell, instead of sampling the whole pool at random. To report a headline number that still reflects real traffic, weight each cell's score by its share of production: overall = Σ (share of cell × pass rate of cell).</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: spending 300 labels</span>
+    <p>You can afford 300 labelled cases. Traffic shares: refunds 40%, shipping 30%, account 20%, billing 8%, non-English cancellations 2%.</p>
+    <ul>
+      <li><b>Proportional</b> (random from logs): 120, 90, 60, 24 and <b>6</b> cases. Six cases at a 40% pass rate gives an error bar of ±39 points: useless.</li>
+      <li><b>Floor + proportional</b>: 30 cases per slice first (150), then the other 150 split by share: 90, 75, 60, 42, <b>33</b>. The smallest slice now has an error bar near ±17 points, enough to see it's broken.</li>
+      <li>Headline score, weighted back to traffic: 0.40 × 97% + 0.30 × 96% + 0.20 × 92% + 0.08 × 65% + 0.02 × 40% = <b>92%</b>, the same number the random sample estimates, now with every slice visible.</li>
+    </ul>
+    <p>Rule of thumb: every slice you want to make decisions about needs its own 30 to 100 cases. A slice with fewer is a smoke test, not a measurement.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Coverage-matrix builder</span>
+    <p class="hint">Six intents × three difficulty levels. Each cell has a hidden true pass rate and a share of real traffic (the overall truth is 92%). Pick how the eval set is sampled and how big it is; each cell shows passes / cases. Dashed red = fewer than 5 cases: a blind spot. Start with Random from logs at 300 cases and look for the 40% cell. Then try Stratified, then Synthetic only.</p>
+    <div class="controls">
+      <span class="seg" id="cmode"><button id="mRandom" data-v="random" class="on">Random from logs</button><button id="mStrat" data-v="strat">Stratified (floor per cell)</button><button id="mSynth" data-v="synth">Synthetic only</button></span>
+    </div>
+    <div class="controls">
+      <label>eval set size <input type="range" id="cn" min="60" max="1200" step="30" value="300"> <b class="mono" id="cnv"></b></label>
+      <button class="btn small" id="resample">🎲 Resample</button>
+      <label><input type="checkbox" id="truth"> show true pass rates</label>
+    </div>
+    <div style="overflow-x:auto"><table class="cov" id="grid"></table></div>
+    <div class="verdict" id="cverdict"></div>
+    <div class="stat-row">
+      <div class="stat">raw score <b id="cRaw">–</b></div>
+      <div class="stat">traffic-weighted <b id="cW">–</b></div>
+      <div class="stat">blind cells (&lt; 5 cases) <b id="cGaps">–</b></div>
+      <div class="stat">worst cell with ≥ 10 cases <b id="cWorst">–</b></div>
+    </div>
+    <p class="hint">Real numbers vary, but the pattern is general: random sampling mirrors traffic and starves rare cells; a floor per cell makes them measurable; synthetic-only sets skip the messy edge column and look easier than reality.</p>
+  </div>
+  <p>What you should see: with random sampling the overall score lands near 92% and the “Cancellations × Edge” cell gets only a handful of cases (resample a few times: sometimes none, sometimes six, with wildly different pass rates). Stratified sampling gives every cell a floor, so the 40% cell shows up with a usable sample, and the traffic-weighted score still lands near the truth. Synthetic only scores higher than reality and leaves the whole edge column blind, because generated questions tend to be clean and well-formed.</p>
+
+  <h2>Synthetic data: cheap coverage, with known traps</h2>
+  <p>When you have no traffic yet, or a cell is too rare in logs, ask an LLM to write cases. Three patterns:</p>
+  <ul>
+    <li><b>From documents</b> (for RAG): pick a passage, ask the model for a question it answers, and keep the passage as the label. Tools like Ragas build a graph of your documents and generate single-hop questions (one passage) and multi-hop ones (needs two), as Lesson 5.4 introduced.</li>
+    <li><b>From dimensions</b>: Hamel Husain and Shreya Shankar's recipe. Write about 20 tuples by hand, one value per dimension, like (Plus member, refund, frustrated, multi-part). Have an LLM generate more tuples, then turn each tuple into a natural message <i>in a separate prompt</i>. Splitting the steps avoids the same phrasing over and over.</li>
+    <li><b>Evolving difficulty</b>: take a simple case and ask the model to rewrite it harder, step by step: add a constraint, require two facts, add a distractor, make it ambiguous. WizardLM's Evol-Instruct did this to build training data; it works for eval cases too.</li>
+  </ul>
+  <p>The traps are predictable:</p>
+  <table>
+    <tr><th>Trap</th><th>What happens</th><th>Fix</th></tr>
+    <tr><td><b>Too easy</b></td><td>The question copies the passage's words (“Within how many days of delivery are refunds available?”), so even keyword search finds it.</td><td>Filter out questions with high word overlap with their source; generate from personas who don't know your vocabulary.</td></tr>
+    <tr><td><b>Duplicates</b></td><td>Models repeat favourite questions, and favour the start of documents.</td><td>Embedding dedup (drop pairs above a similarity threshold); generate from a fixed list of tuples instead of “give me 50 questions”.</td></tr>
+    <tr><td><b>Same style as the model</b></td><td>Generated messages are polite, complete and grammatical. Real users write “refund??” If the same model family writes the questions and answers them, it's testing itself on its own phrasing.</td><td>Mix in real logs as soon as you have them; add typos and fragments; use a different model family to generate.</td></tr>
+    <tr><td><b>Wrong labels</b></td><td>The generator's “expected answer” can be wrong or not actually supported by the passage.</td><td>Human review of every synthetic case that enters the golden set (Lesson 5.8).</td></tr>
+    <tr><td><b>Leakage</b></td><td>Synthetic cases end up in few-shot examples or fine-tuning data, and the eval measures memory.</td><td>Keep generated eval data in its own versioned file that training pipelines never read.</td></tr>
+  </table>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Synthetic question generator</span>
+    <p class="hint">Twelve facts from a four-section handbook. The “generator” is a scripted stand-in for an LLM (in practice you'd call a real model), with the habits real ones show: it likes the first documents and first sentences, and copies wording. “Naive” is the one-line prompt <i>“write 40 questions about these documents”</i>. “Dimensions” cycles through (fact × style) tuples and adds multi-hop and unanswerable cases. Then switch on the filters and watch what survives.</p>
+    <div class="controls">
+      <button class="btn primary" id="genNaive">▶ Naive prompt</button>
+      <button class="btn primary" id="genDims">▶ Dimensions + personas</button>
+      <label>questions <input type="range" id="gn" min="12" max="43" step="1" value="40"> <b class="mono" id="gnv"></b></label>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="fDedup"> drop near-duplicates (embedding similarity &gt; 0.9)</label>
+      <label><input type="checkbox" id="fEasy"> drop “too easy” (≥ 50% of the question's words copied from the source)</label>
+    </div>
+    <div class="qlist" id="qlist"></div>
+    <div class="stat-row">
+      <div class="stat">kept <b id="sKept">–</b></div>
+      <div class="stat">facts covered <b id="sCov">–</b></div>
+      <div class="stat">avg words copied <b id="sOv">–</b></div>
+      <div class="stat">keyword search finds the source (top 1) <b id="sHit">–</b></div>
+    </div>
+    <div class="verdict" id="gverdict"></div>
+    <p class="hint">“Keyword search finds the source” uses BM25 (keyword ranking, Lesson 2.4) over the 12 facts. A test set on which keyword search looks perfect is usually telling you about the test set, not the retriever.</p>
+  </div>
+  <p>What you should see: the naive set has many near-duplicates, misses some facts entirely, and copies most of its words from the source, so keyword search scores around 90%. The dimensions set covers every fact, includes multi-part and unanswerable questions, and is much harder for keyword search, which is closer to what real users will do to your system.</p>
+
+  <h2>Adversarial and edge cases</h2>
+  <p>Take real cases and perturb them on purpose. This is the CheckList idea from software testing: for each capability, write tests that the output should <i>not change</i> under (invariance) or <i>should change</i> in a known direction.</p>
+  <table>
+    <tr><th>Perturbation</th><th>Example</th><th>Expected behaviour</th></tr>
+    <tr><td>Typos, slang, no punctuation</td><td>“cant login reset link dont work”</td><td>Same answer as the clean version</td></tr>
+    <tr><td>Ambiguity</td><td>“Can I return it?” (no item, no date)</td><td>Asks a clarifying question</td></tr>
+    <tr><td>Out of scope</td><td>“Write my cover letter”</td><td>Polite refusal or redirect</td></tr>
+    <tr><td>Unanswerable from the docs</td><td>“Do you ship to Antarctica?”</td><td>Says it doesn't know; doesn't invent</td></tr>
+    <tr><td>Other languages, code-switching</td><td>“Quiero cancelar mi plan Plus”</td><td>Answers correctly, in the user's language</td></tr>
+    <tr><td>Long or noisy input</td><td>A 3-page email thread with the question at the bottom</td><td>Finds the question; stays within latency</td></tr>
+    <tr><td>False premise</td><td>“Since refunds are 90 days…”</td><td>Corrects the premise (30, or 60 for Plus)</td></tr>
+    <tr><td>Negation and swaps</td><td>“I do <b>not</b> want a refund, just an exchange”</td><td>Answer changes accordingly</td></tr>
+  </table>
+  <p>Attacks (prompt injection, jailbreaks, data extraction) are their own must-pass suite: Lesson 5.10.</p>
+
+  <h2>Labels: reference answers and acceptance criteria</h2>
+  <p>Each case needs a way to decide pass or fail. Write the <b>cheapest label that's still correct</b>:</p>
+  <ul>
+    <li><b>Exact reference</b> for closed answers: a label, a number, a JSON object (Lesson 5.9 shows field-by-field scoring).</li>
+    <li><b>Key facts</b> for open answers: <code>must_include: ["60 days"]</code>, <code>must_not_include: ["30 days"]</code>.</li>
+    <li><b>Acceptance criteria</b> when many answers are fine: “asks which item; does not promise a refund; under 80 words”. A judge (Lesson 5.3) or a human (5.8) checks them.</li>
+    <li><b>Expected behaviour</b>, not text, for edge cases: “clarifies”, “refuses”, “escalates to a human”.</li>
+  </ul>
+  <p>Also store <b>metadata</b>: the cell (intent, difficulty, language), the source (log ID, ticket, synthetic), who labelled it, and when. Without tags you can't slice; without a source you can't re-check the label.</p>
+
+  <h2>Splits, overfitting the eval, and contamination</h2>
+  <p>If you tune your prompt for three weeks against the same 200 cases, the prompt gradually fits those cases, quirks included, and the score stops predicting production. Same fix as in machine learning:</p>
+  <ul>
+    <li><b>Dev set</b>: the cases you look at, debug and iterate on every day.</li>
+    <li><b>Held-out test set</b>: same distribution, never inspected while tuning, run only at milestones (“is this release really better?”). If the dev score climbs and the test score doesn't, you've overfit the eval.</li>
+    <li><b>Contamination</b> is the model having seen the test cases during training. For public benchmarks it's a real risk (Lesson 5.11); for your own data the risk is leakage you cause: eval cases pasted into few-shot examples, or into fine-tuning sets. Keep a list of case IDs and check training data against it.</li>
+  </ul>
+
+  <h2>Versioning and keeping it fresh</h2>
+  <p>Treat the dataset like code. Store it as JSONL in git (or a dataset tool with versions), add cases through reviewed pull requests, and record the dataset version next to every score; “87% on v12” and “84% on v13” aren't comparable. Retire cases that have passed for months (they cost money and tell you nothing), and keep feeding it from production: every week, sample new traces, run error analysis, and turn new failure types into new cases and new cells. A dataset that never changes slowly stops describing your users.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>pandas for stratified sampling from exported traces; your tracing or eval platform (Langfuse, LangSmith, Braintrust, Arize Phoenix) to turn traces into dataset items with versions; <b>Ragas</b> for document-based test set generation (<code>TestsetGenerator(llm=..., embedding_model=...).generate_with_langchain_docs(docs, testset_size=10)</code>); <b>sentence-transformers</b> for dedup; any LLM SDK for dimension-based generation.</p>
+<pre><code><span class="k">import</span> json, pandas <span class="k">as</span> pd, anthropic
+<span class="k">from</span> sentence_transformers <span class="k">import</span> SentenceTransformer
+
+<span class="c"># 1) Stratified sample from logs: up to 30 per (intent, difficulty) cell</span>
+logs = pd.read_json(<span class="s">"traces_scrubbed.jsonl"</span>, lines=<span class="k">True</span>)
+evalset = (logs.sample(frac=<span class="n">1</span>, random_state=<span class="n">0</span>)            <span class="c"># shuffle, then take the first 30 per cell</span>
+               .groupby([<span class="s">"intent"</span>, <span class="s">"difficulty"</span>]).head(<span class="n">30</span>))
+print(evalset.groupby([<span class="s">"intent"</span>, <span class="s">"difficulty"</span>]).size())  <span class="c"># spot the cells that are still thin</span>
+
+<span class="c"># 2) Fill thin cells synthetically: tuples first, then messages (two separate prompts)</span>
+client = anthropic.Anthropic()
+tuples = [(<span class="s">"Plus member"</span>, <span class="s">"cancellation"</span>, <span class="s">"Spanish"</span>, <span class="s">"frustrated"</span>)]   <span class="c"># write ~20 by hand first</span>
+<span class="k">for</span> who, intent, lang, mood <span class="k">in</span> tuples:
+    msg = client.messages.create(
+        model=<span class="s">"claude-haiku-5-5"</span>, max_tokens=<span class="n">200</span>,
+        messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>:
+            <span class="s">f"Write one message a {mood} {who} would send to an outdoor-gear shop's support chat "</span>
+            <span class="s">f"about a {intent}, in {lang}. Write like a real customer on a phone: short, "</span>
+            <span class="s">"informal, maybe a typo. Don't use the shop's policy wording. Output only the message."</span>}])
+    print(json.dumps({<span class="s">"input"</span>: msg.content[<span class="n">0</span>].text, <span class="s">"tags"</span>: [intent, lang, <span class="s">"synthetic"</span>]}))
+
+<span class="c"># 3) Drop near-duplicates before a human reviews them</span>
+qs = [<span class="s">"How long do refunds take?"</span>, <span class="s">"How long does a refund take?"</span>, <span class="s">"Do you ship to Canada?"</span>]
+emb = SentenceTransformer(<span class="s">"all-MiniLM-L6-v2"</span>).encode(qs, normalize_embeddings=<span class="k">True</span>)
+sim = emb @ emb.T                                   <span class="c"># cosine similarity (vectors are normalized)</span>
+keep = [i <span class="k">for</span> i <span class="k">in</span> range(len(qs)) <span class="k">if</span> <span class="k">not</span> any(sim[i, j] &gt; <span class="n">0.9</span> <span class="k">for</span> j <span class="k">in</span> range(i))]</code></pre>
+    <p class="hint">The similarity threshold depends on the embedding model: look at pairs just above and below it before trusting it. Model names change; check your provider's current list.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Random sample of logs</td><td>Unbiased headline number; real wording</td><td>Rare slices starved; privacy scrubbing</td></tr>
+      <tr><td>Stratified with a floor</td><td>Every slice measurable</td><td>Needs a taxonomy; must reweight for the headline</td></tr>
+      <tr><td>Synthetic cases</td><td>Fast, cheap, fills rare cells before launch</td><td>Too clean, duplicated, sometimes mislabelled</td></tr>
+      <tr><td>Adversarial perturbations</td><td>Finds brittleness early</td><td>Can over-weight weird inputs real users rarely send</td></tr>
+      <tr><td>Big held-out test set</td><td>Honest milestone numbers</td><td>Labels you can't use for debugging</td></tr>
+      <tr><td>Frequent refresh</td><td>Tracks today's users and failures</td><td>Scores across versions aren't directly comparable</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Read 100 traces (or, pre-launch, 50 synthetic ones from dimension tuples) and name the intents. One JSONL file with tags for intent and difficulty, 5–10 cases per cell, every bug report added the day it arrives. A dev/test split from day one costs nothing.</p></div>
+      <div><h4>At scale</h4><p>Dataset owners per product area, a written taxonomy, stratified sampling jobs from production traces every week, PII scrubbing pipelines, synthetic generation for new launches and languages, versioned datasets with changelogs, slice dashboards that alert when one cell drops, and held-out sets guarded from training pipelines.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you build the eval set for this assistant?” A senior answer:</p>
+    <ul>
+      <li>Starts from <b>error analysis of real traces</b> to get a taxonomy of intents and failure types, then a coverage matrix.</li>
+      <li>Combines sources: <b>stratified log samples</b>, tickets and failure reports as regressions, expert cases, <b>synthetic for thin cells</b>, perturbations for robustness.</li>
+      <li>Says how labels are written (references, key facts, acceptance criteria) and reviewed by people.</li>
+      <li>Reports <b>per-slice scores with error bars</b>, keeps a <b>held-out test set</b>, guards against leakage, versions the data, and refreshes it from production failures.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>A capability × test-type matrix for NLP</b> <span class="tag res">🧪 Research · 2020</span> <a href="https://arxiv.org/abs/2005.04118" target="_blank" rel="noopener">Beyond Accuracy: Behavioral Testing of NLP Models with CheckList</a></div>
+      <p><b>How:</b> a grid of capabilities (vocabulary, negation, robustness to typos…) by test types (minimum functionality, invariance, directional expectation), with templates to generate many cases per cell.</p>
+      <p><b>Why this method:</b> held-out accuracy overestimated real performance; in a user study, practitioners using the matrix wrote twice as many tests and found almost three times as many bugs, and a team behind a commercial model found new bugs in an extensively tested system.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Test sets generated from your documents</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.ragas.io/en/stable/getstarted/rag_testset_generation/" target="_blank" rel="noopener">Ragas: testset generation</a></div>
+      <p><b>How:</b> builds a knowledge graph from your documents, then generates queries with a set mix of single-hop and multi-hop synthesizers (the default is half single-hop specific, a quarter each of two multi-hop kinds).</p>
+      <p><b>Why this method:</b> question-per-chunk generation gives easy, single-passage questions; a planned mix of query types covers the harder cases RAG systems fail on.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Making questions harder, step by step</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2304.12244" target="_blank" rel="noopener">WizardLM: Evol-Instruct</a></div>
+      <p><b>How:</b> starting from simple instructions, an LLM rewrites each one into progressively more complex versions; the authors also built a complexity-balanced test bed for evaluation.</p>
+      <p><b>Why this method:</b> people struggle to write many high-complexity cases by hand; evolving seeds gives a controllable difficulty ladder.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A fresh copy of a famous benchmark</b> <span class="tag co">🏢 Scale AI · 2024</span> <a href="https://arxiv.org/abs/2405.00332" target="_blank" rel="noopener">A Careful Examination of LLM Performance on Grade School Arithmetic (GSM1k)</a></div>
+      <p><b>How:</b> commissioned 1,250 new problems matched to GSM8k's style and difficulty, then compared each model's score on old vs new.</p>
+      <p><b>Why this method:</b> some model families dropped up to 8 points on the unseen copy, and the drop correlated with how likely a model was to reproduce GSM8k examples: evidence of contamination. Frontier models showed little overfitting.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Refreshing questions every month</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2406.19314" target="_blank" rel="noopener">LiveBench</a></div>
+      <p><b>How:</b> questions drawn from recent math competitions, arXiv papers, news and datasets, scored against objective answers, with new questions added monthly.</p>
+      <p><b>Why this method:</b> a static test set leaks into training data over time; regular refresh keeps the eval measuring skill instead of memory, the same reason your own set needs new production cases.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the canary string</span>
+    <p>Every task file in Google's BIG-bench benchmark contains a “canary” string, and contributors are told never to edit it. The point: if a model can reproduce that unique string, its training data probably included the benchmark. It's a tripwire for contamination, and you can plant the same kind of marker in your private eval files.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Lesson 5.1 set up the golden dataset and its error bars; this lesson designs what goes in it. Synthetic retrieval questions and their bias toward keyword search came up in 5.4. Labelling those cases well is Lesson 5.8; scoring them per task is 5.9; attack suites are 5.10; public-benchmark contamination and comparing models fairly are 5.11; turning production failures into new cases runs through the CI and online loop in 5.6. The split logic is the same as in ML: Math for AI <a href="../../math-course/phase5/6-overfitting.html">overfitting &amp; train/test splits</a>, and slice error bars come from <a href="../../math-course/phase5/5-ab-tests.html">confidence intervals</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Guide</span> <a href="https://hamel.dev/blog/posts/evals-faq/" target="_blank" rel="noopener">Hamel Husain &amp; Shreya Shankar: AI Evals FAQ</a>. Dimension-based synthetic data, when synthetic data fails, and stale datasets.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.ragas.io/en/stable/getstarted/rag_testset_generation/" target="_blank" rel="noopener">Ragas: generate a RAG test set</a>. Knowledge graph, query synthesizers and code.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2005.04118" target="_blank" rel="noopener">CheckList (Ribeiro et al., 2020)</a>. The capability × test-type matrix and perturbation tests.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. One slice of your eval set has 25 cases and passes 80% of them. Roughly what's the 95% error bar on that slice?</div>
+    <div class="opts"><button class="opt">±3 points</button><button class="opt" data-ok>±16 points</button><button class="opt">±40 points</button></div>
+    <div class="explain">1.96 × √(0.8 × 0.2 ÷ 25) = 1.96 × 0.08 ≈ <b>±15.7 points</b>. The slice is somewhere between about 64% and 96%: fine for spotting a disaster, not for comparing two prompts. For decisions about a slice, give it more cases.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Pre-launch, your fully synthetic eval set passes 97%. In the first week, users writing in Spanish and users with typos complain a lot. What's the best fix to the eval?</div>
+    <div class="opts"><button class="opt">Generate 1,000 more synthetic questions with the same prompt</button><button class="opt" data-ok>Add language and input-form dimensions to the coverage matrix, fill those cells from real logs (plus perturbed and persona-based cases), and report per-slice scores</button><button class="opt">Switch to a bigger model and re-run the same set</button></div>
+    <div class="explain">The synthetic set was too clean: it never covered messy or non-English inputs, so it couldn't fail on them. More of the same prompt gives more of the same. Add the missing dimensions, fill them with real and perturbed cases, and watch those slices separately.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. After three weeks of prompt tuning against the same 200 cases, the score went from 78% to 94%. Before you announce it, what should you do?</div>
+    <div class="opts"><button class="opt" data-ok>Run the final prompt on a held-out test set you never looked at while tuning, and compare with the starting prompt there</button><button class="opt">Nothing: 200 cases is plenty</button><button class="opt">Remove the cases that still fail, since they're probably mislabelled</button></div>
+    <div class="explain">Weeks of tuning against one set fits the prompt to that set. A held-out set from the same distribution tells you how much of the gain is real. (Do re-check failing labels, but deleting failures to raise the score is the opposite of evaluation.)</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Design the dataset: name the dimensions (intent, difficulty, language, risk), build a coverage matrix, and give every slice you care about its own 30–100 cases.</li>
+      <li>Mix sources: stratified logs, tickets and failures, expert cases, synthetic for thin cells, perturbations for robustness. Report slice scores, and weight back to traffic for the headline.</li>
+      <li>Synthetic data is cheap but too easy, duplicated and too clean: generate from dimension tuples, dedup, filter copied wording, review labels.</li>
+      <li>Keep a held-out test set, prevent leakage into prompts and training, version the data, and refresh it from production failures.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const pct = v => Math.round(100 * v) + "%";
+
+  /* ---------- Playground 1: coverage matrix ---------- */
+  const INT = ["Refunds", "Shipping", "Account & login", "Billing disputes", "Cancellations", "Out of scope"];
+  const DIF = ["Simple", "Multi-part", "Edge (typos, ambiguous, non-English)"];
+  const SH = [[24, 8, 3], [18, 5, 2], [12, 3, 2], [6, 3, 1], [5, 2, 1], [3, 1, 1]]; // % of traffic
+  const TP = [[.98, .93, .85], [.98, .94, .85], [.97, .90, .80], [.90, .75, .55], [.95, .85, .40], [.85, .70, .45]];
+  const cells = []; SH.forEach((r, i) => r.forEach((s, j) => cells.push({ i, j, s: s / 100, p: TP[i][j] })));
+  const TRUE = cells.reduce((a, c) => a + c.s * c.p, 0);
+  let cmode = "random", seed = 1;
+  const segC = [...$("cmode").querySelectorAll("button")];
+  segC.forEach(b => (b.onclick = () => { segC.forEach(x => x.classList.toggle("on", x === b)); cmode = b.dataset.v; drawGrid(); }));
+
+  function pickCell(r, weights) { let x = r() * weights.reduce((a, b) => a + b, 0); for (let k = 0; k < weights.length; k++) { x -= weights[k]; if (x < 0) return k; } return weights.length - 1; }
+  function sampleSet(n) {
+    const r = MX.seeded(seed * 7919 + n), cnt = cells.map(() => 0), pass = cells.map(() => 0);
+    const synthPass = c => c.p + (1 - c.p) * 0.7; // generated cases are cleaner, so the bot passes more of them
+    const add = (k, p) => { cnt[k]++; if (r() < p) pass[k]++; };
+    if (cmode === "random") for (let t = 0; t < n; t++) { const k = pickCell(r, cells.map(c => c.s)); add(k, cells[k].p); }
+    if (cmode === "strat") {
+      const floor = Math.floor(n * 0.7 / cells.length);
+      cells.forEach((c, k) => { for (let t = 0; t < floor; t++) add(k, c.p); });
+      for (let t = floor * cells.length; t < n; t++) { const k = pickCell(r, cells.map(c => c.s)); add(k, cells[k].p); }
+    }
+    if (cmode === "synth") for (let t = 0; t < n; t++) { const k = pickCell(r, cells.map(c => (c.j < 2 ? 1 : 0))); add(k, synthPass(cells[k])); }
+    return { cnt, pass };
+  }
+  const heat = p => `background: color-mix(in srgb, var(--good) ${Math.round(p * 100)}%, var(--bad))`;
+  function drawGrid() {
+    const n = +$("cn").value; $("cnv").textContent = n + " cases";
+    const { cnt, pass } = sampleSet(n), showT = $("truth").checked;
+    let h = `<tr><th></th>${DIF.map(d => `<th>${d}</th>`).join("")}<th>row</th></tr>`;
+    INT.forEach((name, i) => {
+      h += `<tr><th class="rowh">${name}</th>`;
+      let rn = 0, rp = 0;
+      DIF.forEach((_, j) => {
+        const k = i * 3 + j, c = cnt[k], p = pass[k]; rn += c; rp += p;
+        const tline = showT ? `<small>true ${pct(cells[k].p)} · ${Math.round(cells[k].s * 100)}% of traffic</small>` : `<small>${Math.round(cells[k].s * 100)}% of traffic</small>`;
+        if (c < 5) h += `<td class="gap">${c ? p + "/" + c : "—"}<small>blind${c ? "" : ": 0 cases"}</small>${tline}</td>`;
+        else h += `<td style="${heat(Math.pow(p / c, 3))}; color:#fff">${p}/${c} = ${pct(p / c)}${tline}</td>`;
+      });
+      h += `<td class="tot">${rn ? pct(rp / rn) : "—"}<small>${rn} cases</small></td></tr>`;
+    });
+    $("grid").innerHTML = h;
+    const N = cnt.reduce((a, b) => a + b, 0), P = pass.reduce((a, b) => a + b, 0);
+    let wSum = 0, wCov = 0; cells.forEach((c, k) => { if (cnt[k]) { wSum += c.s * pass[k] / cnt[k]; wCov += c.s; } });
+    const gaps = cnt.filter(c => c < 5).length;
+    let worst = null; cells.forEach((c, k) => { if (cnt[k] >= 10) { const p = pass[k] / cnt[k]; if (!worst || p < worst.p) worst = { k, p, n: cnt[k] }; } });
+    $("cRaw").textContent = pct(P / N);
+    $("cW").textContent = pct(wSum / wCov) + (wCov < 0.999 ? ` (${Math.round(wCov * 100)}% of traffic covered)` : "");
+    $("cGaps").textContent = gaps + " / 18";
+    if (worst) { const eb = 1.96 * Math.sqrt(worst.p * (1 - worst.p) / worst.n); $("cWorst").textContent = `${INT[cells[worst.k].i]} × ${DIF[cells[worst.k].j].split(" ")[0]}: ${pct(worst.p)} ± ${Math.round(100 * eb)}`; }
+    else $("cWorst").textContent = "–";
+    const hidden = cnt[14] < 5; // Cancellations × Edge, true 40%
+    $("cverdict").innerHTML = cmode === "synth"
+      ? `<span class="rk">Synthetic only: ${pct(P / N)} raw, against a true ${pct(TRUE)} on real traffic. The whole edge column is blind, and the cases it does have are cleaner than real ones.</span>`
+      : hidden
+      ? `<span class="rk">Overall ${pct(P / N)} looks healthy (truth: ${pct(TRUE)}), but ${gaps} cells are blind, including Cancellations × Edge, the one that truly passes only 40%.</span>`
+      : gaps
+      ? `<span class="rk">Lucky draw: Cancellations × Edge got ${cnt[14]} cases (${pass[14]} passed), but ${gaps} other cells are still blind and small cells have huge error bars. Resample and watch them jump around.</span>`
+      : `<span class="ev">Every slice that matters is visible. The headline, weighted back to traffic, is ${pct(wSum / wCov)} (truth ${pct(TRUE)}), and the worst cell stands out instead of hiding in the average.</span>`;
+  }
+  $("cn").oninput = drawGrid; $("truth").onchange = drawGrid;
+  $("resample").onclick = () => { seed++; drawGrid(); };
+  drawGrid();
+
+  /* ---------- Playground 2: synthetic question generator ---------- */
+  // [section, source fact, copied-wording question, paraphrase, persona-style message]
+  const F = [
+    ["Refunds", "Refunds are available within 30 days of delivery.", "Within how many days of delivery are refunds available?", "How long do I have to send something back?", "bought boots 3 weeks ago, am i too late to get my money back??"],
+    ["Refunds", "Plus members get 60 days to request a refund instead of 30.", "How many days do Plus members get to request a refund instead of 30?", "Does paying for Plus give me a longer return window?", "im on plus, does that change my return deadline"],
+    ["Refunds", "Refunds go back to the original payment method within 5 business days.", "Do refunds go back to the original payment method within 5 business days?", "When will the money show up on my card after a return?", "sent my return last monday and still no money, whats going on"],
+    ["Shipping", "Standard shipping takes 3 to 5 business days.", "How many business days does standard shipping take?", "If I pick the normal delivery option, when will my order arrive?", "ordered on friday w/ normal delivery, will it be here by wed?"],
+    ["Shipping", "Express orders placed before 2 pm arrive the next business day.", "Do express orders placed before 2 pm arrive the next business day?", "What's the cut-off time to get express delivery tomorrow?", "need my jacket tmrw for a trip, its 1pm, can i still make it"],
+    ["Shipping", "Orders over 75 dollars ship for free.", "Do orders over 75 dollars ship for free?", "Is there a minimum spend for free delivery?", "my cart is 70 bucks, do i still pay for shipping"],
+    ["Warranty", "Every jacket has a two-year warranty against defects.", "Does every jacket have a two-year warranty against defects?", "How long are jackets covered if something is faulty?", "zip broke on my 18 month old jacket, covered?"],
+    ["Warranty", "The warranty does not cover damage from normal wear.", "Does the warranty cover damage from normal wear?", "Is wear and tear included in the guarantee?", "elbows wore thin after a year of daily use, can u replace it"],
+    ["Warranty", "To make a claim, send a photo of the defect to support.", "What do I send to support to make a claim?", "How do I start a warranty request?", "how do i claim, do i have to mail the whole jacket back"],
+    ["Account", "Password reset links expire after 30 minutes.", "When do password reset links expire?", "How long is the link in the reset email valid?", "clicked the reset link this morning and it says invalid??"],
+    ["Account", "Two-factor authentication can be turned on in Settings.", "Where can two-factor authentication be turned on?", "How do I add an extra security step to my login?", "how to make my account more secure, like with codes on my phone"],
+    ["Account", "Support will never ask for your password by email.", "Will support ever ask for your password by email?", "Is it normal to get an email asking for my login details?", "got an email from ‘support’ asking for my password, legit?"],
+  ];
+  const MULTI = [[[1, 2], "I'm a Plus member returning boots on day 45. When does the money come back?"], [[6, 7], "My 1-year-old jacket's zip broke, but the cuffs are just worn. What's covered?"], [[4, 5], "I ordered 80 dollars of gear by express at noon. When does it arrive, and do I pay shipping?"], [[9, 11], "An email says my reset link expired and asks me to reply with my password. Real?"]];
+  const UNANS = ["Do you ship to Antarctica?", "Can I return a jacket I bought from another store?", "What's your CEO's phone number?"];
+  const FACTS = F.map(f => f[1]);
+  const cw = t => new Set(AI.words(t));
+  const overlap = (q, src) => { const a = cw(q), b = cw(src); let k = 0; a.forEach(w => b.has(w) && k++); return a.size ? k / a.size : 0; };
+  const STYLE_COLOR = { copied: "var(--c-rk)", paraphrase: "var(--c-in)", persona: "var(--c-md)", "multi-hop": "var(--c-tl)", unanswerable: "var(--c-tk)" };
+  let gen = null;
+
+  function naive(n) {
+    const r = MX.seeded(3), out = [], dw = [4, 3, 2, 1], pw = [3, 2, 1]; // favours early sections and early sentences
+    for (let t = 0; t < n; t++) {
+      const fi = pickCell(r, dw) * 3 + pickCell(r, pw), f = F[fi], copy = r() < 0.8;
+      let q = copy ? f[2] : f[3];
+      if (copy) { const pre = ["", "According to the handbook, ", "Quick question: "][Math.floor(r() * 3)]; if (pre) q = pre + q[0].toLowerCase() + q.slice(1); }
+      out.push({ q, src: [fi], style: copy ? "copied" : "paraphrase" });
+    }
+    return out;
+  }
+  function dims(n) {
+    const r = MX.seeded(5), tup = [];
+    F.forEach((f, fi) => ["paraphrase", "persona", "copied"].forEach((st, si) => tup.push({ q: f[si === 2 ? 2 : si === 0 ? 3 : 4], src: [fi], style: st })));
+    for (let i = tup.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); [tup[i], tup[j]] = [tup[j], tup[i]]; }
+    MULTI.forEach((m, k) => tup.splice(3 + k * 7, 0, { q: m[1], src: m[0], style: "multi-hop" }));
+    UNANS.forEach((u, k) => tup.splice(5 + k * 11, 0, { q: u, src: [], style: "unanswerable" }));
+    return tup.slice(0, n);
+  }
+  function runGen(kind) { gen = { kind, qs: (kind === "naive" ? naive : dims)(+$("gn").value) }; drawGen(); }
+  function drawGen() {
+    $("gnv").textContent = $("gn").value;
+    if (!gen) return;
+    const seen = [];
+    gen.qs.forEach(x => {
+      const v = AI.embed(x.q);
+      x.dup = seen.some(s => AI.cosine(s, v) > 0.9); if (!x.dup) seen.push(v);
+      x.ov = x.src.length ? Math.max(...x.src.map(i => overlap(x.q, FACTS[i]))) : 0;
+      x.drop = ($("fDedup").checked && x.dup) ? "near-duplicate" : ($("fEasy").checked && x.ov >= 0.5) ? "too easy" : "";
+    });
+    const kept = gen.qs.filter(x => !x.drop), ans = kept.filter(x => x.src.length);
+    $("qlist").innerHTML = gen.qs.map(x => `<div class="qrow${x.drop ? " drop" : ""}"><span class="st" style="color:${STYLE_COLOR[x.style]}">${x.style}</span><span>${esc(x.q)}</span><span class="why">${x.drop ? x.drop : x.src.length ? Math.round(100 * x.ov) + "% copied" + (x.dup ? " · dup" : "") : "no answer in docs"}</span></div>`).join("");
+    const cov = new Set(kept.flatMap(x => x.src)).size;
+    const hit = ans.filter(x => x.src.includes(AI.search(FACTS, x.q, { mode: "bm25", k: 1 })[0].i)).length;
+    $("sKept").textContent = kept.length + " / " + gen.qs.length;
+    $("sCov").textContent = cov + " / 12";
+    $("sOv").textContent = ans.length ? pct(ans.reduce((s, x) => s + x.ov, 0) / ans.length) : "–";
+    $("sHit").textContent = ans.length ? pct(hit / ans.length) : "–";
+    const dups = gen.qs.filter(x => x.dup).length;
+    $("gverdict").innerHTML = gen.kind === "naive"
+      ? `<span class="rk">Naive prompt: ${dups} near-duplicates, ${(m => m + (m === 1 ? " fact" : " facts"))(12 - new Set(gen.qs.flatMap(x => x.src)).size)} never asked about, and most questions reuse the source's words, so keyword search looks great on this set.</span>`
+      : `<span class="ev">Dimensions: every fact gets several styles, plus multi-part and unanswerable cases. Fewer copied words means retrieval has to work for it, like with real users.</span>`;
+  }
+  $("genNaive").onclick = () => runGen("naive");
+  $("genDims").onclick = () => runGen("dims");
+  $("gn").oninput = () => (gen ? runGen(gen.kind) : drawGen());
+  $("fDedup").onchange = drawGen; $("fEasy").onchange = drawGen;
+  runGen("naive");
+})();
+</script>
+</body>
+</html>

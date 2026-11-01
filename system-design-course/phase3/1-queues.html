@@ -1,0 +1,509 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.1 Message queues & pub/sub · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .btn.tog.on { background: var(--c-er); border-color: var(--c-er); color: #fff; }
+  .btn.tog.good.on { background: var(--c-db); border-color: var(--c-db); }
+</style>
+</head>
+<body data-lesson="s3-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 1</div>
+  <h1>Message queues & pub/sub</h1>
+  <p class="subtitle">Put slow or spiky work in a line and let workers take it at their own pace. Queues decouple services, soak up traffic spikes and survive crashes, which is why almost every large system has one in the middle.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Latency</b> = how long one request takes; users notice anything over a few hundred milliseconds (Lesson 0.3).</li>
+      <li><b>Stateless workers</b> can be added or removed freely behind something that hands them work (Lesson 1.1).</li>
+      <li><b>Rate limiting</b> = saying “not now” when load is too high, instead of falling over (Lesson 1.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Every Slack message post, push notification, link preview, calendar reminder and billing calculation goes through one job queue. On its busiest days, Slack reported, that queue processes <b>over 1.4 billion jobs</b>, peaking at <b>33,000 per second</b>.</p>
+    <p>None of that work happens while you wait for your message to send. It's put in a line and done a moment later. That one design choice is what this lesson is about, along with the day the line itself broke.</p>
+  </div>
+
+  <h2>Numbers first: why not just do it now?</h2>
+  <p>A user signs up. Your code saves the account (about <b>5 ms</b>) and sends a welcome email through an email provider's API (typically <b>300 ms</b>, sometimes seconds, sometimes an error).</p>
+  <table>
+    <tr><th></th><th>Send the email inside the request</th><th>Put a “send email” job on a queue</th></tr>
+    <tr><td>Sign-up latency</td><td class="lt">5 + 300 = 305 ms (or a timeout)</td><td class="ca">5 + ~2 ms to enqueue = <b>7 ms</b></td></tr>
+    <tr><td>Email provider down</td><td class="er">Sign-up fails. You lose the user.</td><td class="db">Sign-up works. Jobs wait and go out when it's back.</td></tr>
+    <tr><td>Ad on TV: 5× traffic for a minute</td><td class="er">Every web server is stuck waiting on email calls</td><td class="db">The queue grows; workers catch up after</td></tr>
+  </table>
+  <p>The queue turns “do it now, in the user's request” into “do it soon, somewhere else”. That's called making the work <b>asynchronous</b> (async).</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A <b class="nw">message queue</b> sits between a <b class="sv">producer</b> (who creates work) and <b class="sv">consumers</b> (who do it). It <b>decouples</b> them in time and speed: the producer never waits, the consumer works at its own pace, and if either side is down for a while, messages simply wait in line.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the ticket rail in a restaurant kitchen</span>
+    <p>Waiters (producers) clip orders on a rail and go back to their tables. Cooks (consumers) pull the next ticket when they're free. A rush of orders makes the rail longer, not the waiters slower. If a cook burns a dish and walks off, the ticket goes back on the rail for another cook. And a ticket nobody can cook (“a dish we don't make”) gets pinned to a separate board for the manager. That separate board is a <b>dead-letter queue</b>.</p>
+  </div>
+
+  <h2>The words you need</h2>
+  <table>
+    <tr><th>Term</th><th>Plain meaning</th></tr>
+    <tr><td><b>Message</b></td><td>A small piece of data describing work or an event: <code>{"type":"welcome_email","user":42}</code>. Typically a few KB; SQS allows up to 1 MiB.</td></tr>
+    <tr><td><b>Ack</b> (acknowledgement)</td><td>The consumer telling the queue “done, delete it”. No ack = the queue assumes the consumer failed.</td></tr>
+    <tr><td><b>Visibility timeout</b></td><td>While a consumer works on a message, it's hidden from others. If no ack arrives in time (SQS default: 30 s), it reappears for someone else.</td></tr>
+    <tr><td><b>Redelivery</b></td><td>The same message delivered again after a crash or timeout. This is why queues are <b>at-least-once</b>: you may see a message twice (Lesson 3.3 fixes that).</td></tr>
+    <tr><td><b>Dead-letter queue</b> (DLQ)</td><td>Where a message goes after failing too many times (SQS calls the limit <code>maxReceiveCount</code>), so one bad message can't loop forever.</td></tr>
+    <tr><td><b>Backpressure</b></td><td>Pushing back on producers when consumers can't keep up: a full queue rejects new work, or producers slow down.</td></tr>
+  </table>
+
+  <h2>Spikes: the queue as a shock absorber</h2>
+  <p>A queue can't create capacity. It only moves work from a busy moment to a quieter one. The math is simple subtraction:</p>
+  <div class="eq">
+    backlog growth = <span class="cl">arrival rate</span> − <span class="sv">processing rate</span>
+    <span class="say">“Each second, the line grows by what came in minus what the workers finished.” If arrivals stay above processing for good, the line grows forever.</span>
+  </div>
+  <div class="legend"><span class="cl">arrivals: messages per second in</span><span class="sv">processing: workers × jobs per worker per second</span></div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the TV ad</span>
+    <p>Sign-ups normally arrive at <b>100 per second</b>. Each worker sends <b>10 emails per second</b> (100 ms each), and you run <b>15 workers</b>: capacity = 15 × 10 = <b>150 per second</b>. A TV ad brings <b>500 per second</b> for 60 seconds.</p>
+    <ul>
+      <li>During the ad the backlog grows by 500 − 150 = 350 per second. After 60 s: 350 × 60 = <b>21,000 messages</b> waiting.</li>
+      <li>After the ad, spare capacity is 150 − 100 = 50 per second, so draining takes 21,000 ÷ 50 = <b>420 s = 7 minutes</b>.</li>
+      <li>The unlucky last sign-up waits about 21,000 ÷ 150 = <b>140 s</b> for its email. Nobody's sign-up failed.</li>
+    </ul>
+    <p>Two knobs to reduce the wait: more workers (scale on queue depth, Lesson 5.3) or accepting the delay. The playground starts with exactly these numbers.</p>
+  </div>
+
+  <div class="playground" id="pg1">
+    <span class="label">🎮 Playground · Run a work queue</span>
+    <p class="hint">A 10-minute simulation. Each worker handles 10 messages per second and holds up to 10 at a time. Turn on the spike, crash a worker, add a poison message (one that always fails), and see what the queue does. Then press <b>Send 8 messages</b> to watch individual deliveries.</p>
+    <svg id="qf"></svg>
+    <div class="controls">
+      <label>arrivals <input type="range" id="ar" min="20" max="300" step="10" value="100"> <b class="mono" id="arv"></b></label>
+      <label>workers <input type="range" id="wk" min="1" max="40" step="1" value="15"> <b class="mono" id="wkv"></b></label>
+      <label>visibility timeout <input type="range" id="vt" min="5" max="120" step="5" value="30"> <b class="mono" id="vtv"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn tog on" id="spike">📺 TV ad spike (5× for 60 s)</button>
+      <button class="btn tog" id="crash">💥 Crash a worker at t = 200 s</button>
+      <button class="btn tog" id="poison">☠️ Poison message</button>
+      <button class="btn tog good" id="dlq">🪦 Dead-letter queue</button>
+      <button class="btn tog good" id="bound">🧱 Cap queue at 5,000</button>
+      <button class="btn primary" id="send">Send 8 messages</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">capacity <b id="cap">–</b></div>
+      <div class="stat">peak backlog <b id="pk">–</b></div>
+      <div class="stat">longest wait <b id="mw">–</b></div>
+      <div class="stat">redelivered <b id="rd">–</b></div>
+      <div class="stat">poison deliveries <b id="pr">–</b></div>
+      <div class="stat">rejected (backpressure) <b id="rj">–</b></div>
+    </div>
+    <canvas class="chart" id="qc" style="height:210px"></canvas>
+    <p class="hint" id="qmsg"></p>
+  </div>
+  <p>Things to try: raise arrivals to 160 with the spike off. Capacity is 150, so the line grows forever; a queue hides an undersized system only for a while. Then crash a worker with a 120 s visibility timeout and see the redelivery arrive two minutes later. Finally add a poison message: without a DLQ it's delivered again every timeout until the end of time.</p>
+
+  <h2>One message, one worker, or one message, everyone?</h2>
+  <p>There are two shapes of messaging, and mixing them up is a classic design mistake:</p>
+  <table>
+    <tr><th></th><th>Work queue (point-to-point)</th><th>Pub/sub (publish/subscribe, fan-out)</th></tr>
+    <tr><td>Who gets a message</td><td><b>Exactly one</b> of the competing workers</td><td><b>Every</b> subscriber gets its own copy</td></tr>
+    <tr><td>Use it for</td><td>Spreading work: resize images, send emails, charge cards</td><td>Announcing events: “order placed” → email, inventory, analytics</td></tr>
+    <tr><td>Scale by</td><td>Adding workers to the same queue</td><td>Adding subscribers, each with its own queue and workers</td></tr>
+    <tr><td>Examples</td><td>SQS queue, RabbitMQ queue, NATS queue group</td><td>SNS topic → SQS queues, RabbitMQ fanout exchange, Kafka topic (Lesson 3.2)</td></tr>
+  </table>
+  <p>The detail that bites: is a subscriber's copy <b>stored</b> while it's offline? Redis Pub/Sub and core NATS are <b>at-most-once</b>: a subscriber that isn't connected at that moment never gets the message. SNS → SQS, RabbitMQ queues and Kafka store it.</p>
+
+  <div class="playground" id="pg2">
+    <span class="label">🎮 Playground · Point-to-point vs fan-out</span>
+    <p class="hint">Checkout publishes “order placed”. Compare a work queue (each order handled once, by any worker) with fan-out (each order delivered to Email, Inventory and Analytics). Then take Analytics down, send orders, and bring it back.</p>
+    <svg id="ff"></svg>
+    <div class="controls">
+      <span class="seg" id="fmode"><button id="fmq" data-v="queue" class="on">Work queue</button><button id="fmf" data-v="fan">Fan-out</button></span>
+      <span class="seg" id="fdur"><button id="fdd" data-v="durable" class="on">Durable subscriber queues</button><button id="fde" data-v="ephem">Fire-and-forget</button></span>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="fsend">Send 6 orders</button>
+      <button class="btn tog" id="fdown">💥 Analytics down</button>
+      <button class="btn" id="freset">Reset counts</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">orders sent <b id="fs">0</b></div>
+      <div class="stat">deliveries <b id="fd">0</b></div>
+      <div class="stat">waiting for Analytics <b id="fw">0</b></div>
+      <div class="stat">lost <b id="fl">0</b></div>
+    </div>
+    <p class="hint" id="fmsg"></p>
+  </div>
+
+  <div class="box incident">
+    <span class="label">🔥 Real outage: when the queue itself fills up</span>
+    <p>Slack's original job queue kept jobs in Redis, an in-memory store. In the outage that triggered its redesign, database contention slowed the workers, jobs piled up, and <b>Redis ran out of memory</b>. With no memory, the web app couldn't enqueue new jobs, so everything that depended on the queue failed. Worse, Redis needed a little free memory even to <i>dequeue</i>, so the queue stayed stuck after the database recovered and needed lots of manual work.</p>
+    <p><b>The fix:</b> Slack put <b>Kafka</b> (a durable, disk-based log, Lesson 3.2) in front of Redis as a buffer and rate-limited the relay into Redis. A backlog now sits on disk instead of exhausting memory. Lesson: a queue's own capacity is a limit too. Monitor depth and age, and decide what happens when it's full.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Managed:</b> AWS <b>SQS</b> (queues) + <b>SNS</b> (fan-out topics), Google <b>Cloud Pub/Sub</b>, Azure <b>Service Bus</b>. <b>Self-hosted:</b> <b>RabbitMQ</b> (flexible routing, per-message acks), <b>Redis Streams</b> (when you already run Redis), <b>NATS</b> (very lightweight; add JetStream for persistence), and <b>Kafka</b> for high-volume event streams (next lesson). A Python SQS worker with <code>boto3</code>:</p>
+<pre><code><span class="k">import</span> json, boto3
+sqs = boto3.client(<span class="s">"sqs"</span>)
+url = sqs.get_queue_url(QueueName=<span class="s">"welcome-emails"</span>)[<span class="s">"QueueUrl"</span>]
+
+<span class="k">while</span> <span class="k">True</span>:
+    resp = sqs.receive_message(QueueUrl=url, MaxNumberOfMessages=<span class="n">10</span>,
+                               WaitTimeSeconds=<span class="n">20</span>,      <span class="c"># long polling (max 20 s): fewer empty calls</span>
+                               VisibilityTimeout=<span class="n">60</span>)    <span class="c"># hidden from others while we work</span>
+    <span class="k">for</span> m <span class="k">in</span> resp.get(<span class="s">"Messages"</span>, []):
+        send_email(json.loads(m[<span class="s">"Body"</span>]))           <span class="c"># if this crashes, no delete ...</span>
+        sqs.delete_message(QueueUrl=url,                <span class="c"># ... so the message comes back: at-least-once</span>
+                           ReceiptHandle=m[<span class="s">"ReceiptHandle"</span>])</code></pre>
+    <p>The same idea in Redis Streams, from <code>redis-cli</code>:</p>
+<pre><code>XGROUP CREATE jobs workers $ MKSTREAM                 <span class="c"># a consumer group: workers share the stream</span>
+XADD jobs * type welcome_email user 42                <span class="c"># producer appends a message</span>
+XREADGROUP GROUP workers w1 COUNT 10 BLOCK 5000 STREAMS jobs &gt;   <span class="c"># worker w1 takes new ones</span>
+XACK jobs workers 1718000000000-0                      <span class="c"># done: remove from the pending list</span>
+XPENDING jobs workers                                  <span class="c"># what's been taken but never acked?</span></code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 6379:6379 redis</code> and paste the commands above into <code>redis-cli</code>, or <code>docker run -p 5672:5672 -p 15672:15672 rabbitmq:management</code> for RabbitMQ with a web UI on port 15672. A DLQ in SQS is one setting on the source queue: a redrive policy with a <code>maxReceiveCount</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs: when a queue helps and when it hurts</span>
+    <table>
+      <tr><th>✅ Use a queue when…</th><th>❌ Think twice when…</th></tr>
+      <tr><td>The user doesn't need the result right now (emails, thumbnails, reports)</td><td>The user is waiting for the answer (a search result, a login)</td></tr>
+      <tr><td>Traffic is spiky and the work can wait a little</td><td>Arrivals are above capacity all the time: the queue only delays the failure</td></tr>
+      <tr><td>The downstream is slow or flaky (third-party APIs)</td><td>Strict global ordering matters (most queues don't promise it; see FIFO queues and Kafka partitions)</td></tr>
+      <tr><td>Several teams need to react to the same event (fan-out)</td><td>You can't make consumers handle duplicates. At-least-once means duplicates will happen.</td></tr>
+    </table>
+    <p class="hint">Costs you take on: one more system to run and monitor, harder debugging (the work happens “somewhere, later”), and eventual consistency: the email arrives a moment after the sign-up, not with it.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Use a managed queue (SQS, Cloud Pub/Sub) or a job library on the database or Redis you already run (Sidekiq, Celery, BullMQ). Make every job safe to run twice. Set a DLQ and an alert on its size from day one. Don't run Kafka for a few hundred jobs a second.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Queues per workload with separate worker pools so one noisy job type can't starve the rest, autoscaling on queue depth and age, priority lanes, rate-limited relays to fragile dependencies, DLQ triage tooling and replay, and durable buffers (often Kafka) in front of anything in memory, as Slack did.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Put it on a queue” is a start, not an answer. A senior answer covers:</p>
+    <ul>
+      <li><b>Why async here</b>: which work leaves the request path and what latency the user now sees.</li>
+      <li><b>Delivery guarantee</b>: at-least-once, so consumers are <b>idempotent</b> (safe to repeat, Lesson 3.3).</li>
+      <li><b>Capacity math</b>: arrival vs processing rate, how big the backlog gets in a spike, how long it drains.</li>
+      <li><b>Failure handling</b>: visibility timeout vs job duration, retries with backoff, a DLQ and who looks at it.</li>
+      <li><b>Shape</b>: work queue or fan-out, and whether subscribers need their own durable queue.</li>
+    </ul>
+    <p class="hint">Common follow-ups: “What if the consumer crashes halfway?” “How do you keep order for one user?” “What happens when the queue is full?” “How do you know you're falling behind?” (Answer: alert on the age of the oldest message, not just depth.)</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>A durable buffer in front of an in-memory queue</b> <span class="tag co">🏢 Slack · 2017</span> <a href="https://slack.engineering/scaling-slacks-job-queue/" target="_blank" rel="noopener">Scaling Slack's Job Queue</a></div>
+      <p><b>How:</b> web apps write jobs to Kafka; a relay (JQRelay) moves them into the existing Redis-based queue at a controlled rate, and workers run them. Over 1.4 billion jobs on the busiest days.</p>
+      <p><b>Why this method:</b> Kafka stores the backlog on disk, so a slow-down no longer exhausts Redis memory and blocks new jobs. They kept the existing workers and rolled it out one job type at a time.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A queue at retail scale</b> <span class="tag co">🏢 Amazon · 2021</span> <a href="https://aws.amazon.com/blogs/aws/amazon-sqs-15-years-and-still-queueing/" target="_blank" rel="noopener">Amazon SQS: 15 Years and Still Queueing</a></div>
+      <p><b>How:</b> during Prime Day 2021, traffic to SQS peaked at <b>47.7 million messages per second</b>, according to AWS. Producers and consumers never talk to each other directly; they each talk to the queue.</p>
+      <p><b>Why this method:</b> a managed queue absorbs a once-a-year spike without each team sizing its own brokers for the peak.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Visibility timeouts and dead-letter queues</b> <span class="tag prod">🏭 In production</span> <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-visibility-timeout.html" target="_blank" rel="noopener">SQS visibility timeout (AWS docs)</a></div>
+      <p><b>How:</b> a received message is hidden for the visibility timeout (default 30 s, extendable up to 12 hours). If it isn't deleted in time it becomes visible again. A redrive policy moves it to a DLQ after <code>maxReceiveCount</code> receives.</p>
+      <p><b>Why this method:</b> the queue never needs to know whether a consumer crashed; a missing delete is enough. The DLQ keeps one bad message from looping forever.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Fire-and-forget vs stored messages</b> <span class="tag oss">🧰 Open source</span> <a href="https://redis.io/docs/latest/develop/pubsub/" target="_blank" rel="noopener">Redis Pub/Sub delivery semantics</a></div>
+      <p><b>How:</b> Redis documents Pub/Sub as at-most-once: once sent, a message is never sent again, so an offline subscriber misses it. Redis Streams persist messages and support at-least-once with consumer groups and acks.</p>
+      <p><b>Why this method:</b> fire-and-forget is cheap and fast for things like live presence; anything you can't lose needs storage and acks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Queue groups for load balancing</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.nats.io/nats-concepts/core-nats/queue" target="_blank" rel="noopener">NATS queue groups</a></div>
+      <p><b>How:</b> subscribers that join the same queue group share a subject; each message goes to exactly one member, so adding members spreads the work.</p>
+      <p><b>Why this method:</b> the same subject can serve both shapes: plain subscribers get every message (fan-out), a queue group splits the work.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a very old cloud service</span>
+    <p>According to AWS, the first beta of SQS was announced “with little fanfare” in late 2004, and the original one-line description of a reliable, highly scalable hosted queue still applies today. Queues are one of the oldest building blocks of the cloud.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Backpressure is rate limiting applied to producers (Lesson 1.5). Next, <b>Kafka</b> turns the queue into a replayable log (Lesson 3.2). At-least-once delivery means duplicates, which <b>idempotency</b> fixes (Lesson 3.3). Publishing a message reliably after a database write needs the <b>outbox</b> (Lesson 3.5). Workers autoscale on queue depth (Lesson 5.3), and the notification system design is mostly queues (Lesson 7.8). In AI systems, batch inference and document-embedding jobs usually run from a queue so GPU workers stay busy without being flooded.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://slack.engineering/scaling-slacks-job-queue/" target="_blank" rel="noopener">Scaling Slack's Job Queue</a>. A real queue redesign after an outage, with the architecture diagrams.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.rabbitmq.com/docs/confirms" target="_blank" rel="noopener">RabbitMQ: consumer acknowledgements and publisher confirms</a>. Acks, requeueing, prefetch and what happens on connection loss.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.aws.amazon.com/AWSSimpleQueueService/latest/SQSDeveloperGuide/sqs-dead-letter-queues.html" target="_blank" rel="noopener">SQS dead-letter queues</a>. How to pick <code>maxReceiveCount</code> and redrive messages back.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Jobs arrive at 200 per second at peak. Each worker finishes 25 jobs per second. What's the minimum number of workers so the backlog doesn't grow at peak?</div>
+    <div class="opts"><button class="opt">4</button><button class="opt" data-ok>8</button><button class="opt">200</button></div>
+    <div class="explain">Capacity must at least match arrivals: 200 ÷ 25 = <b>8</b> workers. In practice you'd run a few more (say 10) for headroom, crashes and deploys. With fewer than 8, the backlog grows by (200 − 25 × workers) per second for as long as the peak lasts.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A video-transcoding worker takes about 90 seconds per job. The SQS queue uses the default 30-second visibility timeout. What goes wrong?</div>
+    <div class="opts"><button class="opt">Nothing: SQS waits until the worker finishes</button><button class="opt" data-ok>After 30 s the job becomes visible again, so a second (and third) worker starts the same video</button><button class="opt">The job goes straight to the dead-letter queue</button></div>
+    <div class="explain">The queue can't tell a slow worker from a dead one. Without a delete in 30 s, the message reappears and gets processed again. Set the timeout above the job's real duration, or have the worker extend it while it runs (<code>ChangeMessageVisibility</code>). And make the job idempotent anyway.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. When an order is placed, three teams need to react: send an email, reserve stock, update analytics. Analytics is sometimes down for maintenance. Which design fits?</div>
+    <div class="opts"><button class="opt">One work queue that all three services read from</button><button class="opt">Redis Pub/Sub, so every service hears about the order instantly</button><button class="opt" data-ok>A topic that fans out to one durable queue per service (e.g. SNS → three SQS queues)</button></div>
+    <div class="explain">A single work queue gives each order to only <i>one</i> service. Redis Pub/Sub fans out but is at-most-once, so Analytics misses everything while it's down. Fan-out to durable per-subscriber queues gives every service its own copy and lets Analytics catch up later.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>A queue decouples producers from consumers: fast requests, survivable outages, spikes turned into backlog.</li>
+      <li>backlog growth = arrivals − processing. A queue absorbs spikes; it can't fix permanently missing capacity.</li>
+      <li>Acks + visibility timeout give at-least-once delivery: crashes cause redelivery, so consumers must handle duplicates.</li>
+      <li>Work queue = one consumer per message; pub/sub = every subscriber gets a copy (store it if they can be offline).</li>
+      <li>Always have a DLQ, a cap or backpressure plan, and alerts on depth and oldest-message age.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const fmt = n => Math.round(n).toLocaleString("en-US");
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const tog = (id, cb) => { $(id).onclick = () => { $(id).classList.toggle("on"); cb(); }; };
+  const isOn = id => $(id).classList.contains("on");
+
+  // ---------- work queue diagram ----------
+  const F = new Flow($("qf"), { width: 720, height: 230 });
+  F.node("web", { x: 75, y: 115, label: "🌐 Web app", sub: "producer", kind: "sv" })
+   .node("q", { x: 280, y: 115, w: 130, label: "📨 Queue", sub: "0 waiting", kind: "nw" })
+   .node("w1", { x: 500, y: 35, label: "Worker 1", sub: "idle", kind: "sv" })
+   .node("w2", { x: 500, y: 95, label: "Worker 2", sub: "idle", kind: "sv" })
+   .node("w3", { x: 500, y: 155, label: "Worker 3", sub: "idle", kind: "sv" })
+   .node("dlq", { x: 280, y: 205, w: 130, h: 40, label: "🪦 DLQ", sub: "0", kind: "er" })
+   .node("more", { x: 650, y: 95, w: 100, h: 40, label: "+12 more", kind: "sv" })
+   .edge("web", "q").edge("q", "w1").edge("q", "w2").edge("q", "w3").edge("q", "dlq", { dashed: true }).render();
+
+  // ---------- work queue simulation (0.5 s steps over 10 minutes) ----------
+  const DT = 0.5, END = 600, PER = 10, PREFETCH = 10, CAP = 5000;   // PREFETCH: messages a worker holds at once
+  function simulate() {
+    const base = +$("ar").value, k = +$("wk").value, vt = +$("vt").value;
+    $("arv").textContent = base + "/s"; $("wkv").textContent = k; $("vtv").textContent = vt + " s";
+    const o = { spike: isOn("spike"), crash: isOn("crash"), poison: isOn("poison"), dlq: isOn("dlq"), bound: isOn("bound") };
+    let depth = 0, hidden = [], peak = 0, redel = 0, rejected = 0, maxAge = 0, drainAt = null;
+    const poison = o.poison ? { at: 100, recv: 0, done: false } : null;
+    const series = [];
+    for (let t = 0; t <= END + 1e-9; t += DT) {
+      const lam = base * (o.spike && t >= 30 && t < 90 ? 5 : 1);
+      const down = o.crash && t >= 200 && t < 220 ? 1 : 0;      // the crashed worker restarts after 20 s
+      const alive = Math.max(0, k - down);
+      if (o.crash && Math.abs(t - 200) < 1e-9) hidden.push({ n: PREFETCH, at: t + vt });
+      hidden = hidden.filter(h => { if (t >= h.at) { depth += h.n; redel += h.n; return false; } return true; });
+      let arr = lam * DT;
+      if (o.bound && depth + arr > CAP) { rejected += depth + arr - CAP; arr = Math.max(0, CAP - depth); }
+      depth += arr;
+      let cap = alive * PER * DT;
+      if (poison && !poison.done && t >= poison.at) {
+        poison.recv++; cap -= 1;
+        if (o.dlq && poison.recv >= 3) poison.done = true; else poison.at = t + vt;
+      }
+      depth = Math.max(0, depth - Math.max(0, cap));
+      peak = Math.max(peak, depth);
+      if (alive) maxAge = Math.max(maxAge, depth / (alive * PER));
+      if (o.spike && t > 90 && drainAt === null && depth < 1) drainAt = t;
+      series.push([t, depth]);
+    }
+    const capRate = k * PER;
+    $("cap").textContent = fmt(capRate) + "/s";
+    $("pk").textContent = fmt(peak);
+    $("mw").textContent = fmt(maxAge) + " s";
+    $("rd").textContent = fmt(redel);
+    $("pr").textContent = poison ? poison.recv + (poison.done ? " → DLQ" : " (still looping)") : "–";
+    $("rj").textContent = fmt(rejected);
+    Plot.line($("qc"), {
+      series: [{ label: "messages waiting", color: MX.css("--c-nw"), data: series, fill: true }],
+      xLabel: "seconds", yMin: 0, yMax: Math.max(100, peak * 1.1),
+      hlines: o.bound ? [{ y: CAP, label: "cap 5,000", color: MX.css("--c-er") }] : [],
+    });
+    const over = base > capRate;
+    F.set("q", { sub: fmt(peak) + " peak", load: Math.min(1, peak / 25000) })
+     .set("dlq", { sub: poison && poison.done ? "1 message" : "0" })
+     .set("more", { label: k > 3 ? `+${k - 3} more` : "no more", sub: "" });
+    $("qmsg").textContent = over
+      ? `Arrivals (${base}/s) are above capacity (${capRate}/s) all the time, so the backlog grows by ${base - capRate}/s forever. A queue can't fix missing capacity: add workers.`
+      : poison && !poison.done
+      ? `The poison message was delivered ${poison.recv} times and is still looping, wasting a worker every ${vt} s. Turn on the dead-letter queue.`
+      : o.spike && drainAt
+      ? `The spike built a backlog of ${fmt(peak)} messages. It drained by t = ${Math.round(drainAt)} s. Nobody's request failed; some emails were just late.`
+      : o.spike ? `The backlog of ${fmt(peak)} hadn't drained within 10 minutes. More workers would help.`
+      : `Capacity ${capRate}/s comfortably covers ${base}/s: the queue stays nearly empty.`;
+    if (o.crash) $("qmsg").textContent += ` The crashed worker's ${PREFETCH} in-flight messages came back after the ${vt} s visibility timeout.`;
+  }
+  ["ar", "wk", "vt"].forEach(id => ($(id).oninput = simulate));
+  ["spike", "crash", "poison", "dlq", "bound"].forEach(id => tog(id, simulate));
+  simulate();
+
+  // individual deliveries: worker 2 crashes mid-job if the crash toggle is on
+  let sending = false;
+  $("send").onclick = async () => {
+    if (sending) return; sending = true;
+    const crash = isOn("crash"), poisonOn = isOn("poison"), dlqOn = isOn("dlq");
+    let waiting = 8, done = 0;
+    F.set("q", { sub: waiting + " waiting" });
+    for (let i = 0; i < 8; i++) {
+      await F.packet(["web", "q"], { color: "--c-nw", dur: 250 });
+    }
+    for (let i = 0; i < 8; i++) {
+      const w = "w" + (1 + (i % 3));
+      waiting--; F.set("q", { sub: waiting + " waiting" });
+      if (poisonOn && i === 5) {
+        for (let r = 1; r <= 3; r++) {
+          F.set(w, { sub: `poison: fail #${r}`, hot: true });
+          await F.packet(["q", w], { color: "--c-er", dur: 350, back: true });
+        }
+        F.set(w, { sub: "idle", hot: false });
+        if (dlqOn) { await F.packet(["q", "dlq"], { color: "--c-er", dur: 400 }); F.set("dlq", { sub: "1 message" }); }
+        else F.set("q", { sub: "poison loops forever" });
+        continue;
+      }
+      if (crash && w === "w2" && i === 1) {
+        await F.packet(["q", w], { color: "--c-nw", dur: 350 });
+        F.set(w, { down: true, sub: "💥 crashed mid-job" });
+        F.set("q", { sub: "no ack: wait for timeout…" });
+        await wait(900);
+        await F.packet([w, "q"], { color: "--c-er", dur: 350 });
+        F.set("q", { sub: "redelivered" });
+        await F.packet(["q", "w3"], { color: "--c-nw", dur: 350, back: true });
+        done++;
+        continue;
+      }
+      F.set(w, { sub: "working…" });
+      await F.packet(["q", w], { color: "--c-nw", dur: 350, back: true });
+      F.set(w, { sub: "acked ✓" });
+      done++;
+    }
+    F.set("q", { sub: `${done} done` });
+    await wait(1200);
+    ["w1", "w2", "w3"].forEach(w => F.set(w, { down: false, sub: "idle" }));
+    sending = false;
+    simulate();
+  };
+
+  // ---------- fan-out playground ----------
+  let mode = "queue", durable = true, down = false;
+  let sent = 0, deliveries = 0, backlog = 0, lost = 0, rr = 0, busy = false;
+  const counts = {};
+  let G;
+  function drawFan() {
+    G = new Flow($("ff"), { width: 720, height: 220 });
+    G.node("pr", { x: 80, y: 110, label: "🛒 Checkout", sub: "publisher", kind: "sv" });
+    if (mode === "queue") {
+      G.node("q", { x: 300, y: 110, w: 130, label: "📨 orders queue", sub: "work queue", kind: "nw" });
+      ["w1", "w2", "w3"].forEach((w, i) => G.node(w, { x: 560, y: 40 + i * 70, w: 150, label: `Order worker ${i + 1}`, sub: (counts[w] || 0) + " handled", kind: "sv" }).edge("q", w));
+      G.edge("pr", "q");
+    } else {
+      G.node("tp", { x: 250, y: 110, w: 120, label: "📣 Topic", sub: "order-placed", kind: "nw" });
+      const names = { s1: "✉️ Email", s2: "📦 Inventory", s3: "📊 Analytics" };
+      ["s1", "s2", "s3"].forEach((s, i) => {
+        G.node("q" + s, { x: 430, y: 40 + i * 70, w: 110, h: 40, label: "queue", sub: durable ? "stored" : "none", kind: "nw" });
+        G.node(s, { x: 620, y: 40 + i * 70, w: 130, label: names[s], sub: (counts[s] || 0) + " received", kind: "sv", down: s === "s3" && down });
+        G.edge("tp", "q" + s).edge("q" + s, s);
+      });
+      G.edge("pr", "tp");
+      G.set("qs3", { sub: durable ? backlog + " waiting" : "none" });
+    }
+    G.render();
+    paintFan();
+  }
+  function paintFan() {
+    $("fs").textContent = sent; $("fd").textContent = deliveries; $("fw").textContent = backlog; $("fl").textContent = lost;
+    $("fmsg").textContent = mode === "queue"
+      ? "Each order went to exactly one worker. Good for splitting work, but Email, Inventory and Analytics can't all see the same order this way."
+      : down && !durable ? "Fire-and-forget: Analytics was offline, so those orders are gone for it. This is at-most-once delivery (Redis Pub/Sub, core NATS)."
+      : down ? "Analytics is down, but its own queue keeps the orders. Email and Inventory weren't slowed down at all."
+      : lost ? `${lost} deliveries were lost while Analytics was offline with no stored queue.`
+      : "Every subscriber got its own copy of every order.";
+  }
+  $("fsend").onclick = async () => {
+    if (busy) return; busy = true;
+    for (let i = 0; i < 6; i++) {
+      sent++;
+      if (mode === "queue") {
+        const w = "w" + (1 + (rr++ % 3));
+        await G.packet(["pr", "q", w], { color: "--c-nw", dur: 420 });
+        counts[w] = (counts[w] || 0) + 1; deliveries++;
+        G.set(w, { sub: counts[w] + " handled" });
+      } else {
+        await G.packet(["pr", "tp"], { color: "--c-nw", dur: 260 });
+        await Promise.all(["s1", "s2", "s3"].map(async s => {
+          if (s === "s3" && down) {
+            if (durable) { await G.packet(["tp", "q" + s], { color: "--c-nw", dur: 300 }); backlog++; G.set("qs3", { sub: backlog + " waiting", load: Math.min(1, backlog / 12) }); }
+            else { await G.packet(["tp", "q" + s], { color: "--c-er", dur: 300 }); lost++; }
+            return;
+          }
+          await G.packet(["tp", "q" + s, s], { color: "--c-nw", dur: 300 });
+          counts[s] = (counts[s] || 0) + 1; deliveries++;
+          G.set(s, { sub: counts[s] + " received" });
+        }));
+      }
+      paintFan();
+    }
+    busy = false; paintFan();
+  };
+  $("fdown").onclick = async () => {
+    if (busy) return;
+    down = !down; $("fdown").classList.toggle("on", down);
+    $("fdown").textContent = down ? "✅ Bring Analytics back" : "💥 Analytics down";
+    if (mode === "fan") G.set("s3", { down });
+    if (!down && mode === "fan" && backlog) {           // catch up from its own queue
+      busy = true;
+      while (backlog > 0) {
+        await G.packet(["qs3", "s3"], { color: "--c-db", dur: 160 });
+        backlog--; counts.s3 = (counts.s3 || 0) + 1; deliveries++;
+        G.set("s3", { sub: counts.s3 + " received" }).set("qs3", { sub: backlog + " waiting", load: Math.min(1, backlog / 12) });
+        paintFan();
+      }
+      busy = false;
+      $("fmsg").textContent = "Analytics came back and caught up from its own queue. Nothing was lost.";
+      return;
+    }
+    paintFan();
+  };
+  $("freset").onclick = () => { if (busy) return; sent = deliveries = backlog = lost = rr = 0; Object.keys(counts).forEach(k => delete counts[k]); drawFan(); };
+  seg("fmode", v => { if (busy) return; mode = v; drawFan(); });
+  seg("fdur", v => { if (busy) return; durable = v === "durable"; drawFan(); });
+  drawFan();
+})();
+</script>
+</body>
+</html>

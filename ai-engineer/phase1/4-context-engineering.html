@@ -1,0 +1,449 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.4 Context engineering: long context, ordering, caching, memory · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .stack { display: flex; height: 30px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); margin: 8px 0; background: var(--panel); }
+  .stack > i { display: block; height: 100%; font-style: normal; font-size: .7rem; color: #fff; overflow: hidden; white-space: nowrap; padding-left: 3px; line-height: 30px; border-right: 1px solid var(--bg); }
+  .items { display: grid; gap: 5px; margin: 8px 0; }
+  .item { display: grid; grid-template-columns: auto 1fr auto auto; gap: 8px; align-items: center; border: 1px solid var(--line); border-left: 5px solid var(--sw); border-radius: 8px; padding: 4px 8px; background: var(--bg2); font-size: .88rem; }
+  .item.off { opacity: .45; }
+  .item .mv { font: inherit; border: 1px solid var(--line); background: var(--bg); color: var(--text); border-radius: 6px; padding: 0 7px; cursor: pointer; }
+  .item .tk { font-family: var(--mono); }
+</style>
+</head>
+<body data-lesson="a1-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 1 · Lesson 4</div>
+  <h1>Context engineering: long context, ordering, caching, memory</h1>
+  <p class="subtitle">Prompt engineering is the words; context engineering is everything else in the window: which documents, which tool results, how much history, in what order, and which part you pay full price for. It decides quality, cost and latency at once.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>The <b>context window</b> is the maximum number of tokens a model can read in one call, prompt plus output (Lesson 0.3).</li>
+      <li>Time to first token (<b>TTFT</b>) grows with input length, because the model must process every input token before writing (Lesson 0.3).</li>
+      <li><b>RAG</b> (retrieval-augmented generation) means fetching relevant documents and putting them in the prompt; Phase 3 covers it in depth.</li>
+      <li>Prompt elements and XML tags (Lesson 1.1); tool results (Lesson 1.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2023, a Stanford-led team gave GPT-3.5-Turbo a question plus 20 retrieved documents, exactly one of which held the answer. When that document was first or last, the model did well. When it sat in the <b>middle</b>, accuracy fell so far that it was <b>lower than answering with no documents at all</b> (56.1%, the model's closed-book score).</p>
+    <p>Same model, same documents, same question; only the order changed. The paper, “Lost in the Middle”, made something obvious that every RAG and agent builder has to design around: a model with a big context window does not read all of it equally well.</p>
+  </div>
+
+  <h2>Numbers first: what fills the window</h2>
+  <p>One turn of a customer-support agent, counted in tokens:</p>
+  <table>
+    <tr><th>Source</th><th>Tokens</th><th>Changes</th></tr>
+    <tr><td class="in">System instructions</td><td class="tk">800</td><td>Rarely (each deploy)</td></tr>
+    <tr><td class="tl">Tool definitions (12 tools)</td><td class="tk">2,400</td><td>Rarely</td></tr>
+    <tr><td class="in">Few-shot examples</td><td class="tk">900</td><td>Rarely</td></tr>
+    <tr><td class="md">Conversation history (30 turns)</td><td class="tk">9,000</td><td>Grows every turn</td></tr>
+    <tr><td class="cx">Retrieved documents (10 × 1,500)</td><td class="tk">15,000</td><td>Every request</td></tr>
+    <tr><td class="tl">Tool results (raw search JSON)</td><td class="tk">6,000</td><td>Every step</td></tr>
+    <tr><td class="in">The user's question</td><td class="tk">60</td><td>Every request</td></tr>
+    <tr><th>Total</th><th class="tk">34,160</th><th>≈ $0.10 per call at $3/M input; ≈ 4 s just to read it (illustrative)</th></tr>
+  </table>
+  <p>The question is 0.2% of the window. Three levers move the other 99.8%: <b>what</b> you include (and trim), <b>where</b> you put it, and <b>caching</b> the part that doesn't change.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Context is a finite <b>attention budget</b>, not free storage. Anthropic's engineering team puts it as: find the <b>smallest set of high-signal tokens</b> that maximizes the chance of the outcome you want. Every extra token costs money and latency, and can make the model worse at using the tokens that matter.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the desk and the filing cabinet</span>
+    <p>The context window is your desk; retrieval is the filing cabinet. A bigger desk lets you spread out more papers, but if you pile 200 pages on it, the one page you need gets buried in the middle of the stack. Good engineers keep the instructions pinned at the top, put the most relevant page right next to the question, summarize old notes into one sheet, and leave the rest in the cabinet until it's needed. Caching is leaving the pinned pages on the desk between meetings instead of re-reading them.</p>
+  </div>
+
+  <h2>Long context vs retrieval</h2>
+  <table>
+    <tr><th></th><th>Put everything in the window</th><th>Retrieve the relevant parts (RAG)</th></tr>
+    <tr><td>Good when</td><td>Corpus is small and stable (Anthropic suggests under about 200,000 tokens), questions span the whole thing</td><td>Corpus is large, changing, permissioned, or answers live in a few passages</td></tr>
+    <tr><td>Cost per call</td><td class="rk">Pays for every token, every call (unless cached)</td><td>Pays for a few thousand tokens</td></tr>
+    <tr><td>Latency</td><td>Seconds of prefill for long inputs (caching helps)</td><td>Retrieval adds tens of milliseconds</td></tr>
+    <tr><td>Quality risk</td><td>Lost in the middle, distractors, context rot</td><td>The right passage may not be retrieved (Phase 3)</td></tr>
+  </table>
+  <p>In practice you combine them: retrieve generously, then pack carefully. And whatever you include, order matters.</p>
+
+  <h2>Lost in the middle, context rot, and why needle tests mislead</h2>
+  <ul>
+    <li><b>Position:</b> recall is usually best near the <b>start</b> (primacy) and <b>end</b> (recency) of the context, and worst in the middle (Liu et al. 2023: drops of more than 20 points).</li>
+    <li><b>Length:</b> “context rot”: as input grows, accuracy falls even on simple tasks. Chroma tested 18 models in 2025 and found performance grows “increasingly unreliable” with input length, in non-uniform ways.</li>
+    <li><b>Needle-in-a-haystack</b> (NIAH) tests hide one sentence in a long text and ask for it back. Most models now ace it, but that's a lookup. The RULER benchmark (NVIDIA, 2024) added multi-hop and aggregation tasks: of 17 models all claiming 32K+ windows, only <b>half</b> held up at 32K.</li>
+  </ul>
+  <p><b>Ordering rules that follow:</b> instructions first; long documents near the top with the <b>question at the end</b> (Anthropic reports queries at the end can improve quality by up to 30% on complex multi-document inputs); the most relevant document next to the question; and if the context is very long, repeat the key constraint just before the question.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Pack the context window</span>
+    <p class="hint">Include or exclude sources, reorder them with ↑ ↓, choose how many documents to retrieve and where the one that holds the answer sits. The bar shows your window; the curve shows how well the model recalls a fact depending on where it sits, for the current length. Start by hiding the key document in the middle of 40 documents, then fix it.</p>
+    <div class="controls">
+      <label>window <span class="seg" id="pk-win"><button id="pk-win-32000" data-v="32000">32K</button><button id="pk-win-128000" data-v="128000" class="on">128K</button><button id="pk-win-200000" data-v="200000">200K</button><button id="pk-win-1000000" data-v="1000000">1M</button></span></label>
+      <label>retrieved docs <input type="range" id="pk-docs" min="1" max="60" step="1" value="10"> <b class="mono" id="pk-docsv"></b></label>
+      <label>answer doc is <span class="seg" id="pk-key"><button id="pk-key-first" data-v="first">first</button><button id="pk-key-middle" data-v="middle" class="on">in the middle</button><button id="pk-key-last" data-v="last">last</button></span></label>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="pk-compact"> compact history (summarize 30 turns)</label>
+      <label><input type="checkbox" id="pk-trim"> trim tool results to the fields you need</label>
+    </div>
+    <div class="controls">
+      <button class="btn small" id="pk-mid">Bury it: 40 docs, answer in the middle</button>
+      <button class="btn small primary" id="pk-best">Apply best practice</button>
+      <button class="btn small" id="pk-reset">Reset</button>
+    </div>
+    <div class="items" id="pk-items"></div>
+    <div class="stack" id="pk-stack"></div>
+    <div class="verdict" id="pk-verdict"></div>
+    <div class="stat-row">
+      <div class="stat">tokens <b id="pk-tok">–</b></div>
+      <div class="stat">window used <b id="pk-used">–</b></div>
+      <div class="stat">cost / call <b id="pk-cost">–</b></div>
+      <div class="stat">TTFT <b id="pk-ttft">–</b></div>
+      <div class="stat">recall of the answer <b id="pk-recall">–</b></div>
+    </div>
+    <canvas class="chart" id="pk-chart" style="height:210px"></canvas>
+    <p class="hint">The recall curve is an illustrative stand-in shaped like the findings above (a U-shape whose floor drops as length grows, and a penalty when the question isn't last); real curves vary by model and task, so measure yours. Costs assume $3 per million input tokens; TTFT assumes about 9,000 tokens/s of prefill (illustrative).</p>
+  </div>
+  <p>What you should see: 40 documents with the answer in the middle gives roughly a coin flip, at about $0.24 a call. “Best practice” moves the answer next to the question, compacts history, trims tool results and keeps the question last: recall jumps from about 52% to 85%, tokens fall by more than three-quarters and TTFT drops with them. Drag the doc slider to 60 with a 32K window and the context no longer fits at all.</p>
+
+  <h2>Prompt caching: pay full price only for what changed</h2>
+  <p>Before writing anything, the model computes internal state (the <b>KV cache</b>, keys and values for every token) for the whole input. If the first 20,000 tokens are identical to a recent request's, the provider can reuse that work. That's <b>prompt caching</b>, and it only works on an exact <b>prefix</b>: change one token and everything after it is recomputed.</p>
+  <table>
+    <tr><th>Provider (late 2026)</th><th>How</th><th>Price</th></tr>
+    <tr><td>Anthropic</td><td>Mark breakpoints with <code>cache_control</code> (up to 4) or turn on automatic caching; 5-minute TTL by default, 1-hour option</td><td>Write 1.25× (5 min) or 2× (1 h) base input; read 0.1× on most models</td></tr>
+    <tr><td>OpenAI</td><td>Automatic for supported models; minimum 1,024 tokens on recent models; <code>prompt_cache_key</code> to improve routing</td><td>Cached input discounted up to 95%, depending on model</td></tr>
+    <tr><td>Google Gemini</td><td>Implicit caching on by default for 2.5 and newer models (minimums 2,048–4,096 tokens)</td><td>Savings passed on automatically on a hit</td></tr>
+  </table>
+  <p class="muted">TTL (time to live): how long an unused entry survives. Each read refreshes it. Check the pricing pages; these numbers change.</p>
+  <p><b>Design rule:</b> stable things first, volatile things last. Tools → system prompt → examples → long static documents → conversation history → the new question. The classic silent bug is a timestamp or request id at the top of the system prompt: a 0% hit rate and nobody notices until the bill.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: caching a 20,000-token prefix</span>
+    <p>Static prefix 20,000 tokens, dynamic suffix 500, output 300. Illustrative prices: $3/M input, $15/M output; Anthropic-style multipliers.</p>
+    <ul>
+      <li>No cache: 20,500 × $3/M + 300 × $15/M = $0.0615 + $0.0045 = <b>$0.066</b> per request.</li>
+      <li>Cache write (first request): 20,000 × 1.25 × $3/M + 500 × $3/M + $0.0045 = $0.075 + $0.0015 + $0.0045 = <b>$0.081</b>.</li>
+      <li>Cache hit: 20,000 × 0.1 × $3/M + $0.0015 + $0.0045 = $0.006 + $0.006 = <b>$0.012</b>: <b>82% cheaper</b>.</li>
+      <li>Break-even: one write plus one read (0.081 + 0.012 = $0.093) already beats two uncached requests ($0.132).</li>
+    </ul>
+    <p>Latency improves too: Anthropic's launch example cut time to first token on a 100,000-token cached book from 11.5 s to 2.4 s.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Caching calculator</span>
+    <p class="hint">Set your prefix, suffix, traffic and prices. Requests that arrive within the TTL of the previous one hit the cache (and refresh it). Then tick the timestamp bug and watch the savings disappear, or slow the traffic down until the cache keeps expiring.</p>
+    <div class="controls">
+      <label>static prefix <input type="range" id="cc-s" min="0" max="5.3" step="0.05" value="4.3"> <b class="mono" id="cc-sv"></b></label>
+      <label>dynamic suffix <input type="range" id="cc-d" min="50" max="5000" step="50" value="500"> <b class="mono" id="cc-dv"></b></label>
+      <label>output <input type="range" id="cc-o" min="50" max="2000" step="50" value="300"> <b class="mono" id="cc-ov"></b></label>
+    </div>
+    <div class="controls">
+      <label>traffic <input type="range" id="cc-r" min="-2" max="2" step="0.1" value="0"> <b class="mono" id="cc-rv"></b></label>
+      <label>TTL <span class="seg" id="cc-ttl"><button id="cc-ttl-5" data-v="5" class="on">5 min</button><button id="cc-ttl-60" data-v="60">1 hour</button></span></label>
+      <label>input $/M <input type="number" id="cc-pin" value="3" min="0.05" max="50" step="0.05" style="width:70px"></label>
+      <label>output $/M <input type="number" id="cc-pout" value="15" min="0.1" max="200" step="0.5" style="width:70px"></label>
+      <label><input type="checkbox" id="cc-bug"> put a timestamp at the top of the system prompt</label>
+    </div>
+    <div class="verdict" id="cc-verdict"></div>
+    <div class="stat-row">
+      <div class="stat">cache hit rate <b id="cc-hit">–</b></div>
+      <div class="stat">cost / request <b id="cc-cost">–</b></div>
+      <div class="stat">savings <b id="cc-save">–</b></div>
+      <div class="stat">per day <b id="cc-day">–</b></div>
+      <div class="stat">TTFT <b id="cc-ttft">–</b></div>
+    </div>
+    <canvas class="chart" id="cc-chart" style="height:200px"></canvas>
+    <p class="hint">Model: Poisson arrivals, so a request hits if the previous one started within the TTL (probability 1 − e<sup>−rate × TTL</sup>). Write 1.25× (5 min) or 2× (1 hour), read 0.1×, as on Anthropic's pricing page; other providers differ. Prefixes under 1,024 tokens are treated as too short to cache (real minimums are 512–4,096 depending on model). TTFT is the illustrative 9,000 tokens/s prefill, with cached tokens about 5× faster, calibrated to Anthropic's published example.</p>
+  </div>
+  <p>What you should see: at one request a minute with a 5-minute TTL, almost every request hits, and a 20K prefix saves about 80%. At one request every 20 minutes, most requests miss and caching barely pays; switch to the 1-hour TTL. The timestamp bug turns caching into a <b>cost increase</b>: every request pays the 1.25× write and never reads it back.</p>
+
+  <h2>Memory: when the conversation outgrows the window</h2>
+  <p>Long chats and agents accumulate history and tool output until they hit the window, get slow and start to rot. The standard toolkit, from Anthropic's 2025 context-engineering guide:</p>
+  <table>
+    <tr><th>Technique</th><th>How</th><th>Trade-off</th></tr>
+    <tr><td><b>Compaction</b> (summarization)</td><td>Near the limit, summarize the conversation so far and start a fresh window with the summary. Some APIs now do this server-side.</td><td>Details can be lost; summaries must keep decisions, open tasks and facts</td></tr>
+    <tr><td><b>Context editing</b> / tool-result clearing</td><td>Drop old, already-used tool outputs (keep a short note that they happened)</td><td>Cheap and safe; the model can re-fetch if needed</td></tr>
+    <tr><td><b>Structured notes</b></td><td>The agent writes a notes or to-do file outside the window and reads it back when needed</td><td>Needs a tool and discipline in the prompt</td></tr>
+    <tr><td><b>Sub-agents</b></td><td>Hand a focused task to a fresh context; get back only a short result</td><td>More calls; coordination overhead (Phase 6)</td></tr>
+    <tr><td><b>Sliding window</b></td><td>Keep only the last N turns</td><td>Simple; forgets early facts unless they're pinned</td></tr>
+  </table>
+  <p>Compaction rewrites the prefix, so it also resets your prompt cache; do it rarely and deliberately, not every turn.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Provider token counters and caching controls; LangChain/LangGraph message trimming and summarization; LlamaIndex and Haystack for packing retrieved context; your own logging of cached vs uncached tokens per request.</p>
+<pre><code><span class="k">import</span> anthropic
+client = anthropic.Anthropic()
+
+<span class="c"># Stable first: tools → system → static docs. Volatile last: history, then the question.</span>
+SYSTEM = [
+    {<span class="s">"type"</span>: <span class="s">"text"</span>, <span class="s">"text"</span>: INSTRUCTIONS},                      <span class="c"># no timestamps, no request ids!</span>
+    {<span class="s">"type"</span>: <span class="s">"text"</span>, <span class="s">"text"</span>: <span class="s">f"&lt;handbook&gt;{HANDBOOK}&lt;/handbook&gt;"</span>,
+     <span class="s">"cache_control"</span>: {<span class="s">"type"</span>: <span class="s">"ephemeral"</span>}},                  <span class="c"># breakpoint: cache everything up to here (5-min TTL)</span>
+]
+msgs = history + [{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">f"&lt;question&gt;{q}&lt;/question&gt;"</span>}]   <span class="c"># question last</span>
+
+n = client.messages.count_tokens(model=<span class="s">"claude-opus-5-5"</span>, system=SYSTEM, messages=msgs)
+<span class="k">if</span> n.input_tokens &gt; <span class="n">150_000</span>:
+    msgs = compact(msgs)                     <span class="c"># your summarizer, or the API's server-side compaction</span>
+
+r = client.messages.create(model=<span class="s">"claude-opus-5-5"</span>, max_tokens=<span class="n">1024</span>, system=SYSTEM, messages=msgs)
+u = r.usage
+log(cache_read=u.cache_read_input_tokens, cache_write=u.cache_creation_input_tokens,
+    uncached=u.input_tokens)                 <span class="c"># if cache_read stays 0, something in the prefix is changing</span>
+
+<span class="c"># OpenAI: caching is automatic; keep the prefix identical and pass prompt_cache_key="support-v3"</span></code></pre>
+    <p class="hint">Watch the <code>cache_read_input_tokens</code> number on your dashboard. Manus, which builds agents, calls the KV-cache hit rate the single most important metric for a production agent.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>More context</td><td>The answer is more likely to be present</td><td>Cost, latency, lost-in-the-middle, distractors</td></tr>
+      <tr><td>Aggressive trimming</td><td>Cheap, fast, focused</td><td>The one fact you dropped was the one you needed</td></tr>
+      <tr><td>Prompt caching</td><td>Up to ~90% cheaper input and much faster TTFT on long prefixes</td><td>Write premium; needs a frozen prefix and steady traffic; TTLs expire</td></tr>
+      <tr><td>Compaction</td><td>Conversations that never hit the limit</td><td>Lossy; resets the cache; summary quality must be tested</td></tr>
+      <tr><td>Long context instead of RAG</td><td>No retrieval pipeline to build</td><td>Pays per token every call; quality drops with length</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>A fixed order (instructions, docs, history, question), one cache breakpoint after the static part, a token count logged on every request, and a hard cap that trims the oldest turns. Check the cache-read numbers after your first deploy.</p></div>
+      <div><h4>At scale</h4><p>A context assembler service with per-source token budgets, relevance-ordered packing, compaction policies tested against evals, cache hit rate and cost per request as SLOs (service-level objectives), and prompt-prefix changes reviewed because they invalidate every cache at once.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Our agent gets slower, pricier and dumber the longer a session runs. Why, and what do you do?” A senior answer:</p>
+    <ul>
+      <li>Explains the mechanics: history and tool results grow every turn, input cost and TTFT grow with them, and quality falls with length and middle positions.</li>
+      <li>Fixes the window: trim tool outputs, clear old results, compact with a tested summary, move long-term facts to notes or memory (Lesson 6.4).</li>
+      <li>Fixes cost: a frozen prefix, cache breakpoints, append-only history, cache hit rate monitored.</li>
+      <li>Measures it: quality versus session length on an eval set, before and after.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The U-shaped curve</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2307.03172" target="_blank" rel="noopener">Liu et al.: Lost in the Middle</a></div>
+      <p><b>How:</b> moved the answer-bearing document through 10, 20 and 30-document contexts in multi-document QA and key-value retrieval.</p>
+      <p><b>Why this method:</b> isolating position showed accuracy highest at the start and end and down by more than 20 points in the middle, even for extended-context models.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Context rot across 18 models</b> <span class="tag co">🏢 Chroma · 2025</span> <a href="https://research.trychroma.com/context-rot" target="_blank" rel="noopener">Context Rot</a></div>
+      <p><b>How:</b> held task difficulty fixed and varied only input length, including needle-question similarity and distractor tests.</p>
+      <p><b>Why this method:</b> even on simple tasks, performance degraded with length in non-uniform, model-specific ways. Long windows are capacity, not a guarantee.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Prompt caching: up to 90% cheaper, 85% faster</b> <span class="tag co">🏢 Anthropic · 2024</span> <a href="https://www.anthropic.com/news/prompt-caching" target="_blank" rel="noopener">Prompt caching with Claude</a></div>
+      <p><b>How:</b> cache a long, reused prefix (a book, many-shot examples, a long system prompt) and read it back on later calls.</p>
+      <p><b>Why this method:</b> their “chat with a book” example (100K cached tokens) went from 11.5 s to 2.4 s to first token at 90% lower cost.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Design the agent around the KV cache</b> <span class="tag co">🏢 Manus · 2025</span> <a href="https://manus.im/blog/Context-Engineering-for-AI-Agents-Lessons-from-Building-Manus" target="_blank" rel="noopener">Context Engineering for AI Agents</a></div>
+      <p><b>How:</b> a stable prompt prefix, append-only context, deterministic serialization, and no tool-list changes mid-task.</p>
+      <p><b>Why this method:</b> their agents average about 100 input tokens per output token, so prefill dominates; cached input was 10× cheaper than uncached ($0.30 vs $3 per million at the time).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Compaction, notes and sub-agents</b> <span class="tag co">🏢 Anthropic · 2025</span> <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" target="_blank" rel="noopener">Effective context engineering for AI agents</a></div>
+      <p><b>How:</b> treat context as a finite attention budget; compact near the limit, keep structured notes outside the window, give focused tasks to sub-agents with clean contexts.</p>
+      <p><b>Why this method:</b> lets agents work over long horizons without drowning in their own history.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · one sentence, 27% → 98%</span>
+    <p>In 2023, Anthropic tested Claude 2.1 on a needle-in-a-haystack task across its 200K window and got 27%. The model was reluctant to answer from a single out-of-place sentence. Starting its reply with “Here is the most relevant sentence in the context:” raised the score to <b>98%</b>. Context engineering and prompt engineering are the same job seen from two sides.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Token, cost and latency math is Lesson 0.3; XML-tagged sections are 1.1; tool results come from 1.3, and 1.5 versions the whole assembled prompt. Phase 3 decides <i>which</i> documents to retrieve (3.4) and how to pack them with citations (3.5); Lesson 4.7 and 8.2 cover caching at the system level; agent memory is 6.4. Why the middle gets less attention is about how attention spreads its weight: <a href="../../math-course/phase8/4-attention.html">attention in the Math for AI course</a>. Classic cache design (TTLs, hit rates, invalidation) is in <a href="../../system-design-course/phase1/3-caching.html">System Design: caching</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://www.anthropic.com/engineering/effective-context-engineering-for-ai-agents" target="_blank" rel="noopener">Anthropic: Effective context engineering for AI agents</a>. The attention-budget view, compaction and notes.</li>
+      <li><span class="kind">Docs</span> <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching" target="_blank" rel="noopener">Anthropic: Prompt caching</a>. Breakpoints, TTLs, pricing, what invalidates a cache.</li>
+      <li><span class="kind">Docs</span> <a href="https://developers.openai.com/api/docs/guides/prompt-caching" target="_blank" rel="noopener">OpenAI: Prompt caching</a>. Automatic caching, minimums, cache keys.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A 50,000-token cached prefix, input $3/M, read 0.1×. You serve 100,000 requests a day, all cache hits. How much do you save per day on the prefix versus no caching?</div>
+    <div class="opts"><button class="opt">$1,350</button><button class="opt" data-ok>$13,500</button><button class="opt">$15,000</button></div>
+    <div class="explain">Uncached: 50,000 × 100,000 = 5 billion tokens × $3/M = $15,000. Cached reads: 10% of that = $1,500. Savings: <b>$13,500/day</b> (ignoring the small cost of occasional writes).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After a deploy, cache reads drop to zero and your input bill rises 15%. The diff added “Current time: {now}” as the first line of the system prompt. What's the fix?</div>
+    <div class="opts"><button class="opt">Switch to the 1-hour TTL</button><button class="opt" data-ok>Move the time (and anything else per-request) after the cached prefix, e.g. into the user message</button><button class="opt">Add more cache breakpoints</button></div>
+    <div class="explain">Caching matches exact prefixes. A value that changes every request at the very top invalidates everything after it, and you now pay the write premium every time. Volatile content goes last.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your RAG prompt has 30 retrieved chunks, sorted most relevant first, then the question. Answers miss facts that appear in chunks 10–20. What's the cheapest thing to try first?</div>
+    <div class="opts"><button class="opt">Switch to a model with a bigger context window</button><button class="opt" data-ok>Retrieve fewer, better chunks (rerank to the top 5–8) and place the best ones next to the question</button><button class="opt">Duplicate every chunk so it appears twice</button></div>
+    <div class="explain">The window isn't full; the middle is under-read and the noise is high. Fewer, better-ordered chunks fix both and cut cost. Reranking is Lesson 3.4.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Everything in the window costs money and latency and competes for attention: include the smallest high-signal set.</li>
+      <li>Models read the start and end best and lose the middle; quality falls with length even on simple tasks. Put the question last and the best evidence next to it.</li>
+      <li>Prompt caching reuses an exact prefix: stable content first, volatile last, watch the hit rate. Anthropic-style: write 1.25×, read 0.1×.</li>
+      <li>For long sessions: trim tool output, clear old results, compact with a tested summary, keep notes outside the window.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); })); return v => bs.forEach(x => x.classList.toggle("on", x.dataset.v === String(v))); };
+  const K = n => n >= 1e6 ? (n / 1e6).toFixed(n % 1e6 ? 2 : 0) + "M" : n >= 1000 ? (n / 1000).toFixed(n >= 1e5 ? 0 : 1) + "K" : String(Math.round(n));
+
+  /* ---------- Playground 1: context packer ---------- */
+  const SRC = {
+    sys: { label: "System instructions", t: 800, c: "--c-in" },
+    tools: { label: "Tool definitions", t: 2400, c: "--c-tl" },
+    ex: { label: "Few-shot examples", t: 900, c: "--c-in" },
+    hist: { label: "Conversation history", t: 9000, c: "--c-md" },
+    docs: { label: "Retrieved documents", t: 1500, c: "--c-cx" },
+    res: { label: "Tool results", t: 6000, c: "--c-tl" },
+    q: { label: "User question", t: 60, c: "--c-in" },
+  };
+  const DEF = ["sys", "tools", "ex", "hist", "docs", "res", "q"];
+  let order, inc, win = 128000, key = "middle";
+  const setWin = seg("pk-win", v => { win = +v; renderPK(); });
+  const setKey = seg("pk-key", v => { key = v; renderPK(); });
+  function resetPK() { order = DEF.slice(); inc = Object.fromEntries(DEF.map(k => [k, true])); $("pk-docs").value = 10; $("pk-compact").checked = false; $("pk-trim").checked = false; win = 128000; setWin(win); key = "middle"; setKey(key); renderPK(); }
+  const tok = k => k === "docs" ? SRC.docs.t * +$("pk-docs").value : k === "hist" && $("pk-compact").checked ? 600 : k === "res" && $("pk-trim").checked ? 800 : SRC[k].t;
+  const rot = L => Math.max(0.35, 1 - 0.065 * Math.log2(Math.max(1, L / 8000)));
+  const ushape = x => 1 - 0.32 * 4 * x * (1 - x);
+  function layout() {
+    let pos = 0, keyPos = null; const segs = [];
+    order.forEach(k => {
+      if (!inc[k]) return;
+      const t = tok(k);
+      if (k === "docs") {
+        const n = +$("pk-docs").value, idx = key === "first" ? 0 : key === "last" ? n - 1 : Math.floor((n - 1) / 2);
+        keyPos = pos + (idx + 0.5) * SRC.docs.t;
+      }
+      segs.push({ k, t, start: pos }); pos += t;
+    });
+    return { segs, total: pos, keyPos };
+  }
+  function recallAt(x, L, qLast) { return 0.97 * rot(L) * ushape(x) * (qLast ? 1 : 0.85); }
+  function renderPK() {
+    $("pk-docsv").textContent = $("pk-docs").value;
+    $("pk-items").innerHTML = order.map((k, i) => `<div class="item${inc[k] ? "" : " off"}" style="--sw:${MX.css(SRC[k].c)}"><input type="checkbox" data-k="${k}" ${inc[k] ? "checked" : ""} aria-label="include ${SRC[k].label}"><span>${SRC[k].label}${k === "docs" ? ` (${$("pk-docs").value} × 1,500, answer ${key === "middle" ? "in the middle" : key})` : k === "hist" && $("pk-compact").checked ? " (compacted)" : k === "res" && $("pk-trim").checked ? " (trimmed)" : ""}</span><span class="tk">${tok(k).toLocaleString()}</span><span><button class="mv" data-up="${i}" aria-label="move up">↑</button> <button class="mv" data-dn="${i}" aria-label="move down">↓</button></span></div>`).join("");
+    $("pk-items").querySelectorAll("input").forEach(c => (c.onchange = () => { inc[c.dataset.k] = c.checked; renderPK(); }));
+    $("pk-items").querySelectorAll("[data-up]").forEach(b => (b.onclick = () => { const i = +b.dataset.up; if (i > 0) [order[i - 1], order[i]] = [order[i], order[i - 1]]; renderPK(); }));
+    $("pk-items").querySelectorAll("[data-dn]").forEach(b => (b.onclick = () => { const i = +b.dataset.dn; if (i < order.length - 1) [order[i + 1], order[i]] = [order[i], order[i + 1]]; renderPK(); }));
+    const L = layout(), total = L.total, fits = total <= win;
+    $("pk-stack").innerHTML = L.segs.map(s => `<i style="width:${100 * s.t / Math.max(win, total)}%;background:${MX.css(SRC[s.k].c)}" title="${SRC[s.k].label}: ${s.t.toLocaleString()} tokens">${s.t / Math.max(win, total) > 0.06 ? SRC[s.k].label : ""}</i>`).join("");
+    const lastInc = order.filter(k => inc[k]).pop(), qLast = lastInc === "q";
+    const x = L.keyPos == null ? null : L.keyPos / total;
+    const rec = x == null ? 0 : recallAt(x, total, qLast);
+    $("pk-tok").textContent = total.toLocaleString();
+    $("pk-used").textContent = (100 * total / win).toFixed(0) + "%";
+    $("pk-cost").textContent = "$" + (total * 3e-6).toFixed(3);
+    $("pk-ttft").textContent = (0.3 + total / 9000).toFixed(1) + " s";
+    $("pk-recall").textContent = x == null ? "n/a" : (100 * rec).toFixed(0) + "%";
+    const issues = [];
+    if (!inc.q) issues.push("there's no question");
+    if (inc.q && !qLast) issues.push("the question isn't last");
+    if (!inc.sys) issues.push("no instructions");
+    if (inc.sys && order.filter(k => inc[k])[0] !== "sys" && order.filter(k => inc[k])[0] !== "tools") issues.push("instructions aren't at the top");
+    $("pk-verdict").innerHTML = !fits ? `<span class="rk">❌ ${total.toLocaleString()} tokens don't fit in a ${K(win)} window. The API rejects the request (or your framework silently drops the oldest content).</span>`
+      : !inc.docs ? `<span class="rk">❌ The document with the answer isn't in the context: the model can only guess.</span>`
+      : rec < 0.6 ? `<span class="rk">❌ Recall ≈ ${(100 * rec).toFixed(0)}%: the answer is ${x > 0.15 && x < 0.85 ? "buried mid-context" : "present but the context is long and noisy"}${issues.length ? "; also " + issues.join(", ") : ""}.</span>`
+      : rec < 0.8 ? `<span class="tk">⚠️ Recall ≈ ${(100 * rec).toFixed(0)}%. ${issues.length ? "Fix: " + issues.join(", ") + "." : "Shorter context or the answer next to the question would help."}</span>`
+      : `<span class="ev">✅ Recall ≈ ${(100 * rec).toFixed(0)}% at ${total.toLocaleString()} tokens.${issues.length ? " But " + issues.join(", ") + "." : ""}</span>`;
+    const curve = []; for (let i = 0; i <= 50; i++) curve.push([i / 50 * 100, 100 * recallAt(i / 50, total, qLast)]);
+    Plot.line($("pk-chart"), {
+      series: [
+        { label: `recall vs position at ${K(total)} tokens`, color: MX.css("--c-ev"), data: curve, width: 3 },
+        ...(x == null ? [] : [{ label: "the answer doc", color: MX.css("--c-cx"), data: [[100 * x, 100 * rec]], dots: true }]),
+      ], xMin: 0, xMax: 100, yMin: 0, yMax: 100, xLabel: "position in context (% from start)",
+    });
+  }
+  ["pk-docs"].forEach(id => ($(id).oninput = renderPK));
+  ["pk-compact", "pk-trim"].forEach(id => ($(id).onchange = renderPK));
+  $("pk-mid").onclick = () => { $("pk-docs").value = 40; key = "middle"; setKey(key); renderPK(); };
+  $("pk-best").onclick = () => {
+    order = ["sys", "tools", "ex", "hist", "res", "docs", "q"];
+    inc = Object.fromEntries(DEF.map(k => [k, true]));
+    if (+$("pk-docs").value > 8) $("pk-docs").value = 8;
+    $("pk-compact").checked = true; $("pk-trim").checked = true; key = "last"; setKey(key); renderPK();
+  };
+  $("pk-reset").onclick = resetPK;
+  resetPK();
+
+  /* ---------- Playground 2: caching calculator ---------- */
+  let ttl = 5;
+  seg("cc-ttl", v => { ttl = +v; renderCC(); });
+  function costs(S, D, O, r, o) {
+    const pin = o.pin / 1e6, pout = o.pout / 1e6, w = o.ttl === 60 ? 2 : 1.25;
+    const cacheable = S >= 1024 && !o.bug;
+    const hit = cacheable ? 1 - Math.exp(-r * o.ttl) : 0;
+    const none = (S + D) * pin + O * pout;
+    const missC = cacheable ? (S * w + D) * pin + O * pout : (o.bug && S >= 1024 ? (S * w + D) * pin + O * pout : none);
+    const hitC = (S * 0.1 + D) * pin + O * pout;
+    const withC = hit * hitC + (1 - hit) * missC;
+    const ttftNo = 0.3 + (S + D) / 9000, ttftHit = 0.3 + D / 9000 + S / 50000;
+    return { hit, none, withC, ttft: hit * ttftHit + (1 - hit) * ttftNo, ttftNo, cacheable };
+  }
+  function renderCC() {
+    const S = Math.round(10 ** +$("cc-s").value / 100) * 100 * (+$("cc-s").value > 0 ? 1 : 0), D = +$("cc-d").value, O = +$("cc-o").value;
+    const r = 10 ** +$("cc-r").value; // requests per minute
+    const o = { pin: +$("cc-pin").value || 3, pout: +$("cc-pout").value || 15, ttl, bug: $("cc-bug").checked };
+    $("cc-sv").textContent = S.toLocaleString() + " tok"; $("cc-dv").textContent = D.toLocaleString() + " tok"; $("cc-ov").textContent = O.toLocaleString() + " tok";
+    $("cc-rv").textContent = r >= 1 ? r.toFixed(r < 10 ? 1 : 0) + " req/min" : "1 every " + (1 / r).toFixed(0) + " min";
+    const c = costs(S, D, O, r, o), save = 1 - c.withC / c.none, perDay = r * 60 * 24;
+    $("cc-hit").textContent = (100 * c.hit).toFixed(0) + "%";
+    $("cc-cost").textContent = `$${c.none.toFixed(4)} → $${c.withC.toFixed(4)}`;
+    $("cc-save").textContent = (save >= 0 ? "" : "+") + (100 * Math.abs(save)).toFixed(0) + "%" + (save >= 0 ? " saved" : " more");
+    $("cc-save").style.color = MX.css(save > 0.005 ? "--good" : save < -0.005 ? "--bad" : "--text");
+    const fm = v => v >= 1000 ? "$" + Math.round(v).toLocaleString() : "$" + v.toFixed(2);
+    $("cc-day").textContent = `${fm(c.none * perDay)} → ${fm(c.withC * perDay)}`;
+    $("cc-ttft").textContent = `${c.ttftNo.toFixed(1)} s → ${c.ttft.toFixed(1)} s`;
+    $("cc-verdict").innerHTML = o.bug && S >= 1024 ? `<span class="rk">❌ The timestamp changes every request, so the prefix never matches: 0% hits, and every request pays the ${ttl === 60 ? "2" : "1.25"}× write premium. Caching now costs you money.</span>`
+      : S < 1024 ? `<span class="tk">⚠️ The prefix is too short to cache. Nothing to gain until the static part is at least ~1,024 tokens.</span>`
+      : c.hit < 0.5 ? `<span class="tk">⚠️ Only ${(100 * c.hit).toFixed(0)}% of requests arrive within the ${ttl === 60 ? "1-hour" : "5-minute"} TTL. ${ttl === 5 ? "Try the 1-hour TTL." : "Traffic is too sparse for caching to matter."}</span>`
+      : `<span class="ev">✅ ${(100 * c.hit).toFixed(0)}% hit rate: ${(100 * save).toFixed(0)}% cheaper per request and faster first tokens.</span>`;
+    const pts = [], ptsNo = [];
+    for (let lr = -2; lr <= 2.001; lr += 0.1) { const rr = 10 ** lr, cc = costs(S, D, O, rr, o); pts.push([lr, 100 * (1 - cc.withC / cc.none)]); }
+    Plot.line($("cc-chart"), {
+      series: [
+        { label: "savings % vs traffic (log scale: 1 per 100 min … 100 per min)", color: MX.css("--c-tk"), data: pts, width: 3 },
+        { label: "you are here", color: MX.css("--c-ev"), data: [[+$("cc-r").value, 100 * save]], dots: true },
+      ], xMin: -2, xMax: 2, yMin: -30, yMax: 100, xLabel: "log10(requests per minute)", hlines: [{ y: 0, label: "break-even", color: MX.css("--muted") }],
+    });
+  }
+  ["cc-s", "cc-d", "cc-o", "cc-r", "cc-pin", "cc-pout"].forEach(id => ($(id).oninput = renderCC));
+  $("cc-bug").onchange = renderCC;
+  renderCC();
+})();
+</script>
+</body>
+</html>

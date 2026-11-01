@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.2 Tool design & the Model Context Protocol (MCP) · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .tooled { display: grid; grid-template-columns: minmax(150px, 220px) 1fr; gap: 6px 10px; margin: 8px 0; }
+  .tooled input, .tooled textarea { font: inherit; font-family: var(--mono); font-size: .82rem; padding: 5px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg); color: var(--text); width: 100%; box-sizing: border-box; }
+  .tooled textarea { min-height: 62px; resize: vertical; }
+  @media (max-width: 640px) { .tooled { grid-template-columns: 1fr; } }
+  .req { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: baseline; padding: 5px 0; border-bottom: 1px dashed var(--line); font-size: .9rem; }
+  .req .pick { font-family: var(--mono); font-size: .82rem; }
+  .json { font-family: var(--mono); font-size: .78rem; white-space: pre; overflow: auto; max-height: 300px; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bg2); margin: 6px 0; }
+  .twojson { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .twojson > div { min-width: 0; }
+  @media (max-width: 760px) { .twojson { grid-template-columns: 1fr; } }
+  .verdict { font-weight: 700; margin: 8px 0; }
+</style>
+</head>
+<body data-lesson="a6-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 2</div>
+  <h1>Tool design & the Model Context Protocol (MCP)</h1>
+  <p class="subtitle">The model only knows a tool by its name, its description and its input schema. Write those badly and a brilliant model calls the wrong one. MCP is the standard way to plug tools into any AI app.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The agent loop</b>: model asks for a tool call, your code runs it, the result goes back into the context (Lesson 6.1).</li>
+      <li><b>Function calling and JSON Schema</b>: a tool is declared as a name, a description and a JSON Schema for its arguments (Lesson 1.3).</li>
+      <li><b>Tokens</b>: tool definitions are sent with every call and cost tokens like any other prompt text (Lesson 0.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>When Anthropic built its agent for SWE-bench (a benchmark of real GitHub issues to fix), the team wrote that they <b>spent more time optimizing the tools than the overall prompt</b>. One example: the model kept making mistakes with relative file paths after it had moved out of the root directory. The fix wasn't a smarter model or a longer prompt. They changed the tool to <b>always require absolute file paths</b>, and the model then used it flawlessly.</p>
+    <p>They gave the idea a name: the <b>agent–computer interface</b> (ACI). You design it with the same care as a human UI, because the model is its user.</p>
+  </div>
+
+  <h2>Numbers first: tools cost tokens and attention</h2>
+  <table>
+    <tr><th>Fact</th><th>Number</th><th>Source</th></tr>
+    <tr><td>Tool definitions from 5 popular MCP servers (58 tools) before the conversation starts</td><td class="tk">≈55,000 tokens (≈950 per tool)</td><td>Anthropic, Nov 2025</td></tr>
+    <tr><td>Token saving from loading tool definitions on demand (a “tool search” tool) instead of all up front</td><td class="ev">85%</td><td>Anthropic, Nov 2025</td></tr>
+    <tr><td>Tool-selection accuracy on their MCP eval with tool search (Claude Opus 4)</td><td class="ev">49% → 74%</td><td>Anthropic, Nov 2025</td></tr>
+    <tr><td>OpenAI's soft suggestion for functions available at once</td><td>fewer than 20</td><td>OpenAI function-calling guide</td></tr>
+    <tr><td>Claude Code's default cap on a single tool response</td><td class="tk">25,000 tokens</td><td>Anthropic, Sep 2025</td></tr>
+  </table>
+  <p>Two lessons hide in that table. <b>Every tool you add is paid for on every call</b> (in a 10-step agent, ten times). And <b>more tools means more chances to pick the wrong one</b>, especially when names and descriptions overlap.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A tool definition is a <b>prompt</b>. The model chooses tools by reading names and descriptions, fills arguments by reading the schema, and decides its next move by reading your tool's output and errors. Design all four for a reader who is smart, literal, and has never seen your codebase.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: labels on a breaker panel</span>
+    <p>A fuse box labelled “circuit 1, circuit 2, misc” makes even an expert electrician guess. “Kitchen sockets (not the oven)” doesn't. The electrician didn't get smarter; the labels did. Tool names and descriptions are those labels, and “not the oven” (when <i>not</i> to use it) is often the most useful part.</p>
+  </div>
+
+  <h2>Anatomy of a good tool</h2>
+  <table>
+    <tr><th>Part</th><th>❌ Vague</th><th>✅ Clear</th></tr>
+    <tr><td><b>Name</b></td><td><code>process</code></td><td><code>payments_issue_refund</code>: a namespace prefix (<code>payments_</code>) plus verb + object</td></tr>
+    <tr><td><b>Description</b></td><td>“Processes the request.”</td><td>What it does, <b>when to use it</b>, <b>when not to</b>, what it returns, side effects: “Sends money back for one order. Use only when the user explicitly asks for a refund. Not for questions about the refund policy.”</td></tr>
+    <tr><td><b>Input schema</b></td><td><code>{"data": "string"}</code></td><td>Typed fields, enums for fixed choices, formats and examples: <code>order_id</code> “like ORD-1042”, <code>reason</code> ∈ {damaged, late, other}</td></tr>
+    <tr><td><b>Output</b></td><td>A raw 4,000-token API dump with UUIDs</td><td>Only high-signal fields, human-readable names, paginated or truncated with a note on how to get more</td></tr>
+    <tr><td><b>Errors</b></td><td>“Error 400”</td><td>“order_id must look like ORD-1042 (got 1042)”: an error the model can act on</td></tr>
+    <tr><td><b>Safety</b></td><td>One <code>run_sql</code> tool that can do anything</td><td>Read and write tools separated; writes idempotent (an idempotency key makes a retry safe) and gated by approval when risky (Lesson 6.6)</td></tr>
+  </table>
+  <p><b>Few vs many tools.</b> Prefer a few tools that match <b>tasks</b> (<code>schedule_event</code> that finds a free slot and books it) over many thin wrappers around every API endpoint (<code>list_users</code>, <code>list_events</code>, <code>create_event</code>), which make the model do the plumbing and burn tokens. When you really need hundreds, load them on demand (tool search) or split them across specialised agents (Lesson 6.5).</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Tune the tool descriptions</span>
+    <p class="hint">Four support tools, eight customer messages. The “model” is a <b>rule-based stand-in</b>: it picks the tool whose name + description is most similar to the message (this course's toy embedding), and it honours a <code>Do not use for: …</code> clause by penalising matches to it. Real LLMs read descriptions far more cleverly, but they fail the same way when descriptions are vague or overlap. Start with <b>Vague</b>, then <b>Short</b>, then <b>Clear</b>; or edit the text yourself. Then add tools from “other MCP servers”.</p>
+    <div class="controls"><span class="seg" id="tPreset"><button data-v="vague" class="on">Vague</button><button data-v="short">Short</button><button data-v="clear">Clear</button></span>
+      <label>extra tools from other servers <input type="range" id="tDis" min="0" max="10" step="1" value="0"> <b class="mono" id="tDisV"></b></label></div>
+    <div class="tooled" id="tEd"></div>
+    <div class="verdict" id="tVerdict"></div>
+    <div id="tReqs"></div>
+    <div class="stat-row">
+      <div class="stat">right tool <b id="tScore">–</b></div>
+      <div class="stat">dangerous wrong picks <b id="tDanger">–</b></div>
+      <div class="stat">tools offered <b id="tN">–</b></div>
+      <div class="stat">definition tokens per call (at ≈950/tool, real-world avg) <b id="tTok">–</b></div>
+    </div>
+  </div>
+  <p>What you should see: with vague names, almost everything goes to <code>get_data</code> (2 of 8 right). “Short” descriptions look fine but send <b>policy questions to the refund tool</b>: a destructive action nobody asked for. “Clear” gets 8 of 8 because the descriptions say what each tool is for and the refund tool says when <i>not</i> to use it. Now slide in 10 extra tools: <code>returns_create_label</code> starts stealing “I want my money back”. Overlapping tools from different servers are a real source of wrong picks, which is why namespacing and fewer, sharper tools matter.</p>
+
+  <h2>The Model Context Protocol (MCP)</h2>
+  <p>Before MCP, every AI app wrote its own connector for every system: your IDE assistant, your chat app and your support bot each needed their own GitHub, Jira and database integration. MCP, the <b>Model Context Protocol</b>, is an open standard (introduced by Anthropic in November 2024, donated to the Linux Foundation's Agentic AI Foundation in December 2025) so that <b>a tool server written once works in any app that speaks MCP</b>.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: why a protocol pays off</span>
+    <p>Your company has 4 AI apps (IDE assistant, chat, support bot, an internal agent) and 6 systems (GitHub, Jira, Postgres, Slack, Drive, billing).</p>
+    <ul>
+      <li>Without a standard: every app × every system = 4 × 6 = <b>24 integrations</b> to build, secure and maintain.</li>
+      <li>With MCP: 6 servers (one per system) + 4 clients (one per app, usually built into the framework) = <b>10</b>. A 7th system adds 1 server, not 4 integrations.</li>
+      <li>Token check: if all 6 servers expose 10 tools each at ≈950 tokens, that's ≈57,000 tokens of definitions per call. Connect only the servers a task needs, or use tool search.</li>
+    </ul>
+    <p>It's the same N × M → N + M argument that made USB and the Language Server Protocol (used by code editors) win.</p>
+  </div>
+
+  <table>
+    <tr><th>Piece</th><th>What it is</th><th>Example</th></tr>
+    <tr><td><b>Host</b></td><td>The AI application the user runs; it owns the model and the UI</td><td>A desktop chat app, an IDE, your agent service</td></tr>
+    <tr><td><b>Client</b></td><td>A connector inside the host, one per server</td><td>Built into the host or your framework</td></tr>
+    <tr><td><b>Server</b></td><td>A program exposing capabilities over MCP</td><td>A GitHub server, your <code>orders</code> server</td></tr>
+    <tr><td>Server feature: <b>tools</b></td><td>Actions the <i>model</i> can call</td><td><code>get_order</code>, <code>create_issue</code></td></tr>
+    <tr><td>Server feature: <b>resources</b></td><td>Data the <i>app</i> can read and put in context</td><td>A file, a DB schema, a ticket</td></tr>
+    <tr><td>Server feature: <b>prompts</b></td><td>Reusable templates the <i>user</i> picks</td><td>“Summarise this PR”</td></tr>
+    <tr><td>Client feature: <b>elicitation</b></td><td>The server asks the user for missing input via the host</td><td>“Which repository?”</td></tr>
+    <tr><td><b>Transports</b></td><td><b>stdio</b>: the host launches the server as a local subprocess and they exchange newline-delimited JSON. <b>Streamable HTTP</b>: each message is an HTTP POST to one endpoint; the reply is JSON or a stream (SSE, server-sent events)</td><td>Local tools vs remote, shared servers (with OAuth 2.1 authorization)</td></tr>
+  </table>
+  <p>Messages are <b>JSON-RPC 2.0</b>: a small standard where each request has an <code>id</code>, a <code>method</code> and <code>params</code>, and each response has the same <code>id</code> and either a <code>result</code> or an <code>error</code>. The field moves fast: the current spec version (<b>2026-07-28</b>) made MCP stateless, replacing the old <code>initialize</code> handshake with a <code>server/discover</code> call and per-request metadata, and deprecated the Roots, Sampling and Logging features. Toggle both versions below. This lesson is the map; building, deploying and securing your own servers (local vs remote, OAuth, multi-tenant) is Lesson 6.9.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · MCP message explorer</span>
+    <p class="hint">Step through one tool call between a host and an <code>orders</code> MCP server. The JSON is modelled on the official spec examples (trimmed: in the current version every request also carries <code>_meta</code> fields, shown once in step 1). Try the two error steps: one the model can learn from, one it can't.</p>
+    <div class="controls">
+      <span class="seg" id="mVer"><button data-v="new" class="on">spec 2026-07-28 (current)</button><button data-v="old">2025-11-25 (legacy handshake)</button></span>
+      <span class="seg" id="mTr"><button data-v="stdio" class="on">stdio</button><button data-v="http">Streamable HTTP</button></span>
+    </div>
+    <div class="controls">
+      <button class="btn" id="mPrev">◀ Back</button>
+      <button class="btn primary" id="mNext">Next step ▶</button>
+      <button class="btn" id="mReset">↺ Start over</button>
+      <b class="mono" id="mPos"></b>
+    </div>
+    <svg id="mFlow" aria-label="MCP message flow"></svg>
+    <h4 id="mTitle" style="margin:10px 0 4px"></h4>
+    <p id="mWhy" class="hint"></p>
+    <div class="muted mono" id="mWire" style="font-size:.8rem"></div>
+    <div class="twojson"><div><div class="muted">→ sent</div><div class="json" id="mReq"></div></div><div><div class="muted">← received</div><div class="json" id="mRes"></div></div></div>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>The official MCP SDKs (Python, TypeScript and others), the <b>MCP Inspector</b> for testing servers, and the provider SDKs and frameworks that act as MCP clients (Claude Agent SDK, OpenAI Agents SDK, LangGraph via adapters). In v2 of the Python SDK (as of 2026) the high-level class is <code>MCPServer</code> (it was called <code>FastMCP</code> before); type hints and docstrings become the tool's schema and description.</p>
+<pre><code><span class="k">from</span> mcp.server <span class="k">import</span> MCPServer
+<span class="k">from</span> mcp.server.mcpserver.exceptions <span class="k">import</span> ToolError
+
+mcp = MCPServer(<span class="s">"orders"</span>)
+
+<span class="k">@mcp.tool</span>()
+<span class="k">def</span> orders_get_status(order_id: str) -> str:
+    <span class="s">"""Look up where an order is: shipped or not, tracking link, delivery date.
+    Use when the user asks where their parcel is. order_id looks like ORD-1042."""</span>
+    <span class="k">if not</span> order_id.startswith(<span class="s">"ORD-"</span>):
+        <span class="c"># ToolError → a result with isError: true and this message, so the model can fix its call</span>
+        <span class="k">raise</span> ToolError(<span class="s">f'order_id must look like "ORD-1042" (got "{order_id}")'</span>)
+    o = db.get_order(order_id)
+    <span class="k">return</span> <span class="s">f"{o.id}: {o.status}, delivered {o.delivered_on}, tracking {o.tracking_url}"</span>  <span class="c"># high-signal only</span>
+
+<span class="k">if</span> __name__ == <span class="s">"__main__"</span>:
+    mcp.run(transport=<span class="s">"stdio"</span>)        <span class="c"># or "streamable-http" for a remote server</span></code></pre>
+    <p class="hint">Test it with <code>uv run mcp dev server.py</code> (opens the Inspector). Lesson 6.9 goes further: remote deployment, authorization and securing a server. Raise <code>ToolError</code> for errors the model should see; any other exception is treated as a crash and the model learns only that the call failed. The spec also defines <b>tool annotations</b> (<code>readOnlyHint</code>, <code>destructiveHint</code>, <code>idempotentHint</code>, <code>openWorldHint</code>) so hosts can decide what needs confirmation; clients must treat them as untrusted unless the server is trusted.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Many fine-grained tools</td><td>Flexible; mirrors the API</td><td>Tokens on every call; more wrong picks; the model does the plumbing</td></tr>
+      <tr><td>Few task-level tools</td><td>Fewer steps, fewer mistakes</td><td>Less flexible; more server-side code</td></tr>
+      <tr><td>MCP server instead of in-process functions</td><td>Reusable across apps and teams; standard auth and discovery</td><td>A process or service to run, version and secure; another hop of latency</td></tr>
+      <tr><td>Verbose tool output</td><td>The model has everything</td><td>Context fills up fast (Lesson 6.4); signal buried in noise</td></tr>
+      <tr><td>Third-party MCP servers</td><td>Instant integrations</td><td>Their descriptions and outputs enter your prompt: a prompt-injection and data-leak surface (Lessons 6.6, 8.3)</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>3–8 task-level tools as plain functions in your agent, with careful descriptions and actionable errors. Write 20 test prompts with the expected tool and check tool-selection accuracy on every description change. Wrap in an MCP server only when a second app needs the same tools.</p></div>
+      <div><h4>At scale</h4><p>An internal MCP registry of vetted servers, OAuth-scoped per user, tool-search or per-task tool subsets to keep definitions small, tool-selection evals in CI, audit logs of every call, and a review process for third-party servers like any other dependency.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Our agent keeps calling the wrong tool. What do you do?” A senior answer:</p>
+    <ul>
+      <li>Reads <b>traces</b> to see which tools get confused, then fixes <b>names and descriptions</b> first (namespaces, when-to-use and when-not-to-use, examples).</li>
+      <li><b>Reduces overlap</b>: merges thin tools into task-level ones, removes tools a task doesn't need, or loads them on demand.</li>
+      <li>Makes <b>errors actionable</b> and outputs concise, and separates read from write tools.</li>
+      <li>Measures <b>tool-selection accuracy</b> on a labelled prompt set before and after (Lesson 5.5), and explains where MCP fits (standard plumbing, not a fix for bad descriptions).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The agent–computer interface</b> <span class="tag co">🏢 Anthropic · 2024</span> <a href="https://www.anthropic.com/research/building-effective-agents" target="_blank" rel="noopener">Building effective agents (appendix on tools)</a></div>
+      <p><b>How:</b> for the SWE-bench agent, tools were iterated like a UI: test how the model uses them, then change formats and parameters (absolute paths only) so mistakes become hard to make.</p>
+      <p><b>Why this method:</b> the team found tool design mattered more than the overall prompt; “poka-yoke” (mistake-proofing) the arguments removed a whole class of errors.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Tools written and tested with agents</b> <span class="tag co">🏢 Anthropic · 2025</span> <a href="https://www.anthropic.com/research/writing-tools-for-agents" target="_blank" rel="noopener">Writing effective tools for agents</a></div>
+      <p><b>How:</b> namespacing related tools under common prefixes, returning only high-signal information, pagination/filtering/truncation with sensible defaults, and prompt-engineered error messages; evaluated with realistic tasks.</p>
+      <p><b>Why this method:</b> agents have limited context and read everything literally; Claude Code caps tool responses at 25,000 tokens by default for the same reason.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Loading tools on demand</b> <span class="tag co">🏢 Anthropic · 2025</span> <a href="https://www.anthropic.com/research/advanced-tool-use" target="_blank" rel="noopener">Introducing advanced tool use</a></div>
+      <p><b>How:</b> instead of sending all tool definitions, the model gets a search tool and loads only the definitions it needs.</p>
+      <p><b>Why this method:</b> 58 tools from 5 servers cost ≈55K tokens up front; on-demand loading cut that by 85% and raised tool-selection accuracy on their MCP eval (Opus 4: 49% → 74%).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A neutral home for the protocol</b> <span class="tag hist">📜 History · 2024–2025</span> <a href="https://www.anthropic.com/news/donating-the-model-context-protocol-and-establishing-of-the-agentic-ai-foundation" target="_blank" rel="noopener">MCP donated to the Agentic AI Foundation</a></div>
+      <p><b>How:</b> open-sourced by Anthropic on 25 Nov 2024; on 9 Dec 2025 donated to the Agentic AI Foundation, a fund under the Linux Foundation, alongside Block's goose and OpenAI's AGENTS.md.</p>
+      <p><b>Why this method:</b> a standard only wins if competitors can trust it; vendor-neutral governance makes it safe for every provider and tool vendor to build on.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Strict schemas, few functions</b> <span class="tag co">🏢 OpenAI · 2025</span> <a href="https://developers.openai.com/api/docs/guides/function-calling" target="_blank" rel="noopener">Function calling guide</a></div>
+      <p><b>How:</b> recommends always enabling <code>strict</code> mode so calls follow the schema, and (softly) fewer than 20 functions available at the start of a turn.</p>
+      <p><b>Why this method:</b> schema-valid arguments remove a whole class of parse errors, and a short tool list keeps selection accurate.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a year from launch to foundation</span>
+    <p>MCP went from an Anthropic open-source release (25 November 2024) to a Linux Foundation project co-founded with OpenAI's AGENTS.md and Block's goose (9 December 2025) in just over a year, and then changed its own core handshake in the 2026-07-28 spec. Check the spec version before you copy any MCP tutorial.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Tool calls are structured output (Lesson 1.3) inside the agent loop (6.1). Lesson 6.3 composes tools into workflows; 6.8 unit-tests tools and integration-tests the flows that use them; 6.9 builds and deploys MCP servers; 6.5 shows frameworks consuming MCP servers and A2A for agent-to-agent calls; 6.6 covers permissions and approvals for risky tools; 8.3 covers prompt injection through tool outputs. Tool-selection and argument accuracy are agent eval metrics in Lesson 5.5. Idempotency keys for safe retries are explained in the System Design course: <a href="../../system-design-course/phase3/3-idempotency.html">retries & idempotency</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Spec</span> <a href="https://modelcontextprotocol.io/specification/2026-07-28" target="_blank" rel="noopener">MCP specification 2026-07-28</a>. Architecture, tools, transports, authorization, changelog.</li>
+      <li><span class="kind">Blog</span> <a href="https://www.anthropic.com/research/writing-tools-for-agents" target="_blank" rel="noopener">Anthropic: Writing effective tools for agents</a>. Principles plus an eval-driven workflow.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/modelcontextprotocol/python-sdk" target="_blank" rel="noopener">MCP Python SDK</a>. Servers, clients and the Inspector.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Your agent has 40 tools at about 500 tokens each and runs 10 model calls per task. How many tokens go on tool definitions per task?</div>
+    <div class="opts"><button class="opt">20,000</button><button class="opt" data-ok>200,000</button><button class="opt">4,000</button></div>
+    <div class="explain">40 × 500 = 20,000 tokens per call, resent on each of 10 calls = <b>200,000</b> tokens, before any actual work. Caching helps the price, but trimming tools or loading them on demand helps price, latency and accuracy.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Users ask “what's your refund policy?” and your agent sometimes calls <code>refund</code> and actually refunds an order. What's the best fix?</div>
+    <div class="opts"><button class="opt">Lower the temperature</button><button class="opt" data-ok>Rename and redescribe: <code>payments_issue_refund</code> “only when the user explicitly asks for a refund on a specific order; not for policy questions”, add a <code>kb_search</code> tool for policies, and require approval for refunds</button><button class="opt">Add “be careful” to the system prompt</button></div>
+    <div class="explain">The model picked the tool whose label matched the words. Clear names, when-not-to-use guidance and a proper tool for the other intent fix the selection; an approval gate (Lesson 6.6) limits the damage when it still goes wrong.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. An MCP tool is called with a date in the past. How should the server report it?</div>
+    <div class="opts"><button class="opt">A JSON-RPC error, code -32602</button><button class="opt" data-ok>A normal result with <code>isError: true</code> and a message like “date must be in the future; today is …”</button><button class="opt">Return an empty result</button></div>
+    <div class="explain">The spec separates <b>protocol errors</b> (unknown tool, malformed request → JSON-RPC errors) from <b>tool execution errors</b> (bad input, API failure, business rules → <code>isError: true</code> in the result). The latter should go to the model so it can correct itself.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>The model sees only name, description, schema, output and errors: design them like a UI for a literal reader.</li>
+      <li>Say when to use a tool and when not to; namespace names; prefer few task-level tools; keep outputs short; make errors actionable.</li>
+      <li>Tool definitions cost tokens on every call (≈55K for 58 tools in one real example): load only what the task needs.</li>
+      <li>MCP: hosts contain clients that talk JSON-RPC to servers exposing tools, resources and prompts, over stdio or Streamable HTTP. Current spec: 2026-07-28.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  document.querySelectorAll(".seg button").forEach(b => { if (!b.id) b.id = b.parentElement.id + "-" + b.dataset.v; });
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  // ---------- Playground 1: tool description tuner ----------
+  AI.addConcept(["order", "orders", "parcel", "package", "shipped", "where is", "status", "tracking"]);
+  AI.addConcept(["policy", "policies", "rules", "rule", "allowed", "how many days", "how long do i have", "cover", "covers", "covered"]);
+  AI.addConcept(["account", "email", "locked out", "sign in", "login", "password"]);
+  const PRE = {
+    vague: [["get_data", "Gets data."], ["process", "Processes the request for the customer."], ["search", "Searches for information."], ["account_tool", "Handles account stuff."]],
+    short: [["get_order", "Get an order."], ["refund", "Handles refunds and refund questions."], ["search_help", "Search the help center."], ["reset_password", "Reset a password."]],
+    clear: [["orders_get_status", "Look up where an order is: shipped or not, tracking link, delivery date. Use when the user asks where their parcel or package is."],
+      ["payments_issue_refund", "Send money back to the original payment method for one order. Use only when the user explicitly asks for a refund on a specific order. Do not use for: questions about the refund policy, how many days, rules."],
+      ["kb_search_articles", "Search help-center articles about policies and rules: refund window, how many days, warranty coverage, returns. Use for questions about rules, not actions on an order."],
+      ["account_send_password_reset", "Email a password reset link. Use when the user is locked out or can't sign in."]],
+  };
+  const ROLE = ["order status", "refund (moves money!)", "help articles", "password reset"];
+  const REQ = [["Where is my parcel for order 1042?", 0], ["I want my money back for order 1042.", 1], ["How many days do I have to return a jacket?", 2], ["Does the warranty cover a torn zip?", 2],
+    ["I'm locked out and can't sign in.", 3], ["Has my package shipped yet?", 0], ["Please refund the duplicate charge on order 2210.", 1], ["What is your refund policy for Plus members?", 2]];
+  const DIS = [["drive_search_files", "Search files in the shared drive."], ["tickets_search", "Search support tickets and their status."], ["billing_get_invoice", "Get an invoice and payment details for an order."],
+    ["shipping_quote_rates", "Quote shipping price for a package."], ["crm_get_customer", "Get customer data: name, email, account."], ["calendar_list_events", "List calendar events."],
+    ["slack_send_message", "Send a message to a Slack channel."], ["analytics_run_query", "Run a query over sales data."], ["returns_create_label", "Create a return shipping label for an order."], ["warranty_register_product", "Register a product for warranty."]];
+  $("tEd").innerHTML = ROLE.map((r, i) => `<div><input id="tn${i}" aria-label="tool ${i + 1} name"><div class="muted" style="font-size:.78rem">real job: ${r}</div></div><textarea id="td${i}" aria-label="tool ${i + 1} description"></textarea>`).join("");
+  function score(req, name, desc) {
+    const parts = desc.split(/Do not use for:/i), v = AI.embed(req);
+    let s = AI.cosine(v, AI.embed(name.replace(/_/g, " ") + ". " + parts[0]));
+    if (parts[1]) s -= 0.7 * AI.cosine(v, AI.embed(parts[1]));
+    return s;
+  }
+  function loadPreset(k) { PRE[k].forEach(([n, d], i) => { $("tn" + i).value = n; $("td" + i).value = d; }); tune(); }
+  function tune() {
+    const nd = +$("tDis").value; $("tDisV").textContent = nd;
+    const mine = [0, 1, 2, 3].map(i => [$("tn" + i).value || "tool" + i, $("td" + i).value]);
+    const tools = mine.concat(DIS.slice(0, nd));
+    let ok = 0, danger = 0;
+    $("tReqs").innerHTML = REQ.map(([r, g]) => {
+      const sc = tools.map(([n, d]) => score(r, n, d)), b = sc.indexOf(Math.max(...sc)), right = b === g;
+      const bad = !right && b === 1;
+      ok += right; danger += bad;
+      return `<div class="req"><span>${right ? "✅" : bad ? "💸" : "❌"}</span><span class="in" style="flex:1 1 260px">${esc(r)}</span><span class="pick ${right ? "ev" : "rk"}">→ ${esc(tools[b][0])}()</span>${right ? "" : `<span class="muted" style="font-size:.8rem">wanted ${esc(mine[g][0])}${bad ? " · refunded money nobody asked for" : ""}</span>`}</div>`;
+    }).join("");
+    $("tScore").textContent = ok + " / " + REQ.length;
+    $("tDanger").textContent = danger;
+    $("tN").textContent = tools.length;
+    $("tTok").textContent = (tools.length * 950).toLocaleString();
+    $("tVerdict").innerHTML = ok === REQ.length ? `<span class="ev">✅ Every message reaches the right tool.</span>`
+      : danger ? `<span class="rk">💸 ${danger} message(s) triggered a refund by mistake: the refund tool's description overlaps with policy questions.</span>`
+      : `<span class="rk">❌ ${REQ.length - ok} wrong pick(s). Look at which tool is stealing them and sharpen both descriptions.</span>`;
+  }
+  const pBtns = [...$("tPreset").querySelectorAll("button")];
+  pBtns.forEach(b => (b.onclick = () => { pBtns.forEach(x => x.classList.toggle("on", x === b)); loadPreset(b.dataset.v); }));
+  [0, 1, 2, 3].forEach(i => { $("tn" + i).oninput = tune; $("td" + i).oninput = tune; });
+  $("tDis").oninput = tune;
+  loadPreset("vague");
+
+  // ---------- Playground 2: MCP message explorer ----------
+  const F = new Flow($("mFlow"), { width: 680, height: 160 });
+  F.node("llm", { x: 80, y: 80, w: 120, label: "LLM", sub: "via provider API", kind: "nw" })
+   .node("host", { x: 255, y: 80, w: 150, label: "Host app", sub: "contains MCP client", kind: "cl" })
+   .node("srv", { x: 455, y: 80, w: 150, label: "MCP server", sub: "orders", kind: "sv" })
+   .node("db", { x: 615, y: 80, w: 100, label: "Orders DB", kind: "db" })
+   .edge("llm", "host", { noArrow: true }).edge("host", "srv", { noArrow: true }).edge("srv", "db", { noArrow: true }).render();
+  const J = o => JSON.stringify(o, null, 2);
+  const META = { "io.modelcontextprotocol/protocolVersion": "2026-07-28", "io.modelcontextprotocol/clientInfo": { name: "SupportHost", version: "1.0.0" }, "io.modelcontextprotocol/clientCapabilities": {} };
+  const TOOL = { name: "orders_get_status", title: "Order status", description: "Look up where an order is… order_id looks like ORD-1042.", inputSchema: { type: "object", properties: { order_id: { type: "string" } }, required: ["order_id"] }, annotations: { readOnlyHint: true } };
+  const rt = (o, v) => (v === "new" ? Object.assign({ resultType: "complete" }, o) : o);
+  function steps(v) {
+    const first = v === "new"
+      ? [{ t: "1 · Discover the server", why: "The client asks what the server supports. In the current spec there's no session handshake: every request carries its protocol version and client capabilities in _meta, and server/discover is optional up-front discovery.", path: ["host", "srv"],
+          req: { jsonrpc: "2.0", id: "discover-1", method: "server/discover", params: { _meta: META } },
+          res: { jsonrpc: "2.0", id: "discover-1", result: { resultType: "complete", supportedVersions: ["2026-07-28"], capabilities: { tools: {} }, _meta: { "io.modelcontextprotocol/serverInfo": { name: "orders", version: "1.0.0" } }, instructions: "Order lookups for Acme support." } } }]
+      : [{ t: "1 · Initialize (legacy handshake)", why: "In spec versions up to 2025-11-25, the client opened a session with initialize, agreeing a protocol version and capabilities, then sent notifications/initialized (a notification: no id, no reply).", path: ["host", "srv"],
+          req: { jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2025-11-25", capabilities: {}, clientInfo: { name: "SupportHost", version: "1.0.0" } } },
+          res: { jsonrpc: "2.0", id: 1, result: { protocolVersion: "2025-11-25", capabilities: { tools: { listChanged: true } }, serverInfo: { name: "orders", version: "1.0.0" } } }, after: "then → {\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}" }];
+    return first.concat([
+      { t: "2 · List the tools", why: "The client fetches tool definitions (name, title, description, inputSchema, optional outputSchema and annotations). Results can be paginated with a cursor.", path: ["host", "srv"],
+        req: { jsonrpc: "2.0", id: 2, method: "tools/list", params: {} }, res: { jsonrpc: "2.0", id: 2, result: rt({ tools: [TOOL] }, v) } },
+      { t: "3 · The model chooses (not MCP!)", why: "The host converts MCP tool definitions into the model provider's tool format and calls the LLM. The model replies with a tool call. MCP never talks to the model; the host is in the middle and can refuse or ask the user.", path: ["host", "llm"],
+        req: { tools: [{ name: "orders_get_status", description: "…", input_schema: "{…}" }], messages: [{ role: "user", content: "Where is order ORD-1042?" }] }, res: { stop_reason: "tool_use", content: [{ type: "tool_use", id: "toolu_01…", name: "orders_get_status", input: { order_id: "ORD-1042" } }] } },
+      { t: "4 · Call the tool", why: "The client sends tools/call with the name and arguments the model chose. The server runs it (here: a DB lookup) and returns content blocks.", path: ["host", "srv", "db"],
+        req: { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "orders_get_status", arguments: { order_id: "ORD-1042" } } },
+        res: { jsonrpc: "2.0", id: 3, result: rt({ content: [{ type: "text", text: "ORD-1042: delivered 2026-10-20, tracking https://…" }], isError: false }, v) } },
+      { t: "5 · Tool execution error (model can fix it)", why: "Bad input, API failures and business-rule errors come back as a normal result with isError: true and an actionable message. The host should pass it to the model, which can correct the argument and retry.", path: ["host", "srv"], err: true,
+        req: { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "orders_get_status", arguments: { order_id: "1042" } } },
+        res: { jsonrpc: "2.0", id: 4, result: rt({ content: [{ type: "text", text: "order_id must look like “ORD-1042” (got “1042”)" }], isError: true }, v) } },
+      { t: "6 · Protocol error (model can't do much)", why: "Unknown tools and malformed requests are JSON-RPC errors. They signal a bug in the client or a stale tool list, and are much less useful to show the model.", path: ["host", "srv"], err: true,
+        req: { jsonrpc: "2.0", id: 5, method: "tools/call", params: { name: "orders_cancel", arguments: {} } },
+        res: { jsonrpc: "2.0", id: 5, error: { code: -32602, message: "Unknown tool: orders_cancel" } } },
+      { t: "7 · Back to the model", why: "The host wraps the tool result as a tool_result for the provider API and the loop continues (Lesson 6.1). The model writes: “Your order was delivered on 20 October.”", path: ["host", "llm"],
+        req: { role: "user", content: [{ type: "tool_result", tool_use_id: "toolu_01…", content: "ORD-1042: delivered 2026-10-20…" }] }, res: { stop_reason: "end_turn", content: [{ type: "text", text: "Your order was delivered on 20 October." }] } },
+    ]);
+  }
+  let ver = "new", tr = "stdio", pos = 0;
+  function show(anim) {
+    const S = steps(ver), s = S[pos];
+    $("mPos").textContent = `${pos + 1} / ${S.length}`;
+    $("mTitle").textContent = s.t;
+    $("mWhy").textContent = s.why;
+    $("mReq").textContent = J(s.req) + (s.after ? "\n\n" + s.after : "");
+    $("mRes").textContent = J(s.res);
+    const mcp = s.path.includes("srv");
+    $("mWire").textContent = !mcp ? "Provider API call (HTTPS to the model vendor), not MCP."
+      : tr === "stdio" ? "stdio: the host launched the server as a subprocess; each JSON-RPC message is one line on its stdin (requests) or stdout (responses)."
+      : `Streamable HTTP: POST /mcp · Accept: application/json, text/event-stream${ver === "new" ? " · MCP-Protocol-Version: 2026-07-28" : ""} → reply as JSON or an SSE stream.`;
+    F.set("srv", { down: !!s.err && pos === S.length - 2, hot: !!s.err });
+    if (anim) F.packet(s.path, { color: s.err ? "--c-er" : mcp ? "--c-cl" : "--c-nw", dur: 600, back: true });
+  }
+  const seg = (id, fn) => { const bs = [...$(id).querySelectorAll("button")]; bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); fn(b.dataset.v); })); };
+  seg("mVer", v => { ver = v; show(true); });
+  seg("mTr", v => { tr = v; show(false); });
+  $("mNext").onclick = () => { pos = Math.min(steps(ver).length - 1, pos + 1); show(true); };
+  $("mPrev").onclick = () => { pos = Math.max(0, pos - 1); show(true); };
+  $("mReset").onclick = () => { pos = 0; show(true); };
+  show(false);
+})();
+</script>
+</body>
+</html>

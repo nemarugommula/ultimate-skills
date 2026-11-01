@@ -1,0 +1,438 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.1 Query transformation · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .chat { font-size: .9rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 8px 0; }
+  .chat div { margin: 2px 0; }
+  .gen { border-left: 4px solid var(--c-md); }
+  .gen .tagline { font-size: .78rem; color: var(--c-md); font-weight: 700; text-transform: uppercase; letter-spacing: .04em; }
+  .lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; margin: 10px 0; }
+  .lists .col { border: 1px solid var(--line); border-radius: 10px; padding: 6px 8px; background: var(--bg2); font-size: .84rem; }
+  .lists .col h5 { margin: 2px 0 6px; font-size: .82rem; }
+  .lists .col.off { opacity: .4; }
+  .lists ol { margin: 0; padding-left: 18px; }
+  .gold { color: var(--good); font-weight: 700; }
+  table.mx td, table.mx th { text-align: center; font-size: .86rem; }
+  table.mx td:first-child { text-align: left; }
+</style>
+</head>
+<body data-lesson="a4-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 1</div>
+  <h1>Query transformation: rewriting, multi-query, HyDE, decomposition</h1>
+  <p class="subtitle">Users type questions the way people talk. Documents are written the way experts write. Before you search, it often pays to turn the question into a better search.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>RAG</b> (retrieval-augmented generation): retrieve the most relevant chunks of your documents, put them in the prompt, then generate (Lesson 3.1).</li>
+      <li><b>Dense search</b> compares embedding vectors; <b>BM25</b> scores keyword overlap; <b>hybrid</b> search merges both rankings (Lessons 2.1 and 2.4).</li>
+      <li><b>Top-k</b>: how many chunks you hand to the model; <b>recall@k</b>: how often the right chunk is among them (Lesson 3.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2022, researchers at Carnegie Mellon and Waterloo tried something that sounds wrong. Instead of searching with the user's question, they asked a language model to <b>write a fake answer</b> first (details made up and all) and searched with that. They called it HyDE.</p>
+    <p>On the TREC DL19 web-search benchmark, a search model with no task-specific training scored <b>44.5</b> nDCG@10 (a ranking-quality score out of 100). Searching with the fake answer instead: <b>61.3</b>. A model fine-tuned on hundreds of thousands of labelled examples scored 62.1. No training at all, just a better query.</p>
+  </div>
+
+  <h2>Numbers first: what a transformation costs</h2>
+  <p>Every technique in this lesson adds work <b>before</b> retrieval, usually one call to a small, fast LLM. Here's the typical bill on top of a plain RAG query (illustrative; measure yours).</p>
+  <table>
+    <tr><th>Technique</th><th>Extra LLM calls</th><th>Extra searches</th><th>Typical added latency</th><th>Fixes</th></tr>
+    <tr><td><b>Rewrite</b> (make it standalone)</td><td>1</td><td>0</td><td class="tk">≈ 0.3–1 s</td><td>Follow-ups, typos, chatty phrasing</td></tr>
+    <tr><td><b>Multi-query</b> + fusion</td><td>1</td><td class="tk">3–5</td><td class="tk">≈ 0.5–1.5 s</td><td>One phrasing missing the right words</td></tr>
+    <tr><td><b>HyDE</b></td><td>1 (longer output)</td><td>0</td><td class="tk">≈ 1–2 s</td><td>Question and answer use different vocabulary</td></tr>
+    <tr><td><b>Step-back</b></td><td>1</td><td>1</td><td class="tk">≈ 0.5–1 s</td><td>Over-specific questions; need the general rule</td></tr>
+    <tr><td><b>Decomposition</b></td><td>1</td><td class="tk">one per sub-question</td><td class="tk">≈ 0.5–2 s</td><td>Compound questions (“compare A and B”)</td></tr>
+  </table>
+  <p class="muted">Latency mostly comes from output tokens: a 20-token rewrite is fast; a 150-token hypothetical document is slower. Searches can run in parallel.</p>
+  <p>The win can be large because retrieval is the bottleneck: if the right chunk isn't retrieved, nothing downstream can save the answer.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    The user's message is a <b>first draft of a search query</b>, not the query itself. Query transformation uses a cheap LLM call to turn it into one or more queries that look like the documents you're searching: standalone, specific, in the documents' own vocabulary, and one question at a time.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the reference librarian</span>
+    <p>You walk up to a librarian and say “and how long do I have to send it back?” A good librarian doesn't search the catalogue for those words. They remember you mentioned your Plus membership (<b>rewrite</b>), think of a few ways the policy might be titled (<b>multi-query</b>), picture what the answer page would look like (<b>HyDE</b>), check the general returns policy first (<b>step-back</b>), and if you asked two things at once, look them up separately (<b>decomposition</b>).</p>
+  </div>
+
+  <h2>The five transformations</h2>
+  <h3>1. Rewriting: make the question standalone</h3>
+  <p>In a chat, the latest message leans on earlier ones: “and what about Plus?”, “how long for that?”. Searching for those words alone finds nothing useful. A rewrite prompt sees the conversation and outputs one self-contained query. This is the single most useful transformation in chat products, and it's cheap.</p>
+  <div class="prompt"><span class="in">Conversation so far:</span>
+user: I'm a Plus member and bought a jacket six weeks ago.
+assistant: Thanks! How can I help with your jacket?
+user: and how long do I have to send it back?
+
+<span class="md">Rewrite the last user message as one standalone search query.
+Keep names, numbers and constraints. Output only the query.</span>
+
+→ <span class="cx">How many days do Plus members have to return a jacket for a refund?</span></div>
+  <p>The research version, Rewrite-Retrieve-Read (Ma et al., 2023), even trained a small rewriter with reinforcement learning from the reader's feedback. Most products just prompt a small model.</p>
+
+  <h3>2. Multi-query + fusion (RAG-Fusion)</h3>
+  <p>One phrasing can miss; several phrasings rarely all miss. Ask the LLM for 3–5 different versions of the query, search with each, then merge the ranked lists with <b>reciprocal rank fusion</b> (RRF): every list gives each document a score of 1 ÷ (k + rank), and you add them up. Documents that rank well in many lists float to the top. (k is usually 60; it softens the gap between rank 1 and rank 2.)</p>
+  <div class="calc">RRF(d) = Σ<sub>lists</sub> 1 / (k + rank<sub>list</sub>(d))</div>
+  <p>This pattern was popularised as <b>RAG-Fusion</b> in 2023. An evaluation at Infineon found its answers more comprehensive, but also that some drifted off topic when the generated queries strayed from the original. Keep the original query in the mix.</p>
+
+  <h3>3. HyDE: search with a hypothetical answer</h3>
+  <p>Questions and answers look different. “my zip came apart, am I covered?” shares almost no words with “Every jacket has a two-year warranty against defects.” <b>HyDE</b> (Hypothetical Document Embeddings, Gao et al., 2022) asks the LLM to write a short passage that <i>would</i> answer the question, embeds that passage, and searches with its vector. The fake passage may contain wrong details, but it is written in answer vocabulary, so its vector lands near the real answer. Query2doc (Microsoft, 2023) does the same for keyword search by appending the generated passage to the query, improving BM25 by 3–15% on MS MARCO and TREC DL.</p>
+  <div class="prompt"><span class="md">Write a short passage from a store help page that answers:</span> my zip came apart after a month of hiking, am I covered?
+
+→ <span class="cx">A broken zipper is a defect covered by the jacket warranty. To make a claim, send a photo of the defect to support.</span>   <span class="muted">(embed this, not the question)</span></div>
+  <p class="rk">The danger: if the question is ambiguous or needs facts the model can't know (like your conversation), the hypothetical answer invents a specific number and drags retrieval toward the wrong chunk. You'll cause exactly that below.</p>
+
+  <h3>4. Step-back prompting: ask the general question first</h3>
+  <p>Over-specific questions (“I clicked the fastest option at 1:30 on Tuesday, when do I get my parcel?”) are full of details no document mentions. <b>Step-back prompting</b> (Google DeepMind, 2023) first asks a more general question (“What are the delivery speeds and order cutoff times?”), retrieves or reasons about the principle, then answers the specific case. In the paper it improved PaLM-2L by 7% and 11% on MMLU Physics and Chemistry, 27% on TimeQA and 7% on the multi-hop MuSiQue benchmark.</p>
+
+  <h3>5. Decomposition: one question at a time</h3>
+  <p>“Compare the refund window and the warranty length for Plus members” needs two unrelated chunks. One embedding of the whole sentence lands between them and often finds only one. <b>Decomposition</b> splits it into sub-questions, retrieves for each, and answers from the union. When later sub-questions depend on earlier answers (“who manages the team that owns X?”), you answer them in order; that's least-to-most prompting (Zhou et al., 2022), and it becomes iterative, agentic retrieval in Lesson 4.4.</p>
+
+  <h3>And one decision before all of them: routing</h3>
+  <p>Some questions shouldn't hit your vector store at all: “thanks!” needs no retrieval, “how much revenue did EMEA make in March?” belongs in SQL (Lesson 4.6), “what happened in the news today?” needs web search. A <b>router</b> (a classifier or a cheap LLM call) picks the source and strategy first. Lesson 4.4 builds one.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The query lab</span>
+    <p class="hint">Twelve help-centre chunks, five real-looking user questions. Each one fails with plain search. Pick a transformation and see the queries it produces (scripted, <b>simulated LLM output</b>: in production a small model writes these) and what retrieval returns. Then press “score every combination”.</p>
+    <div class="controls">
+      <label>question <select id="sc" class="btn small"></select></label>
+      <label>top-k <input type="range" id="qk" min="1" max="4" value="2"> <b class="mono" id="qkv"></b></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="tech"><button data-v="raw" class="on">No transformation</button><button data-v="rewrite">Rewrite</button><button data-v="multi">Multi-query + RRF</button><button data-v="hyde">HyDE</button><button data-v="step">Step-back</button><button data-v="decomp">Decompose</button></span>
+    </div>
+    <div class="chat" id="chat"></div>
+    <div id="gen"></div>
+    <div class="verdict" id="qverdict"></div>
+    <div id="qhits"></div>
+    <div class="stat-row">
+      <div class="stat">LLM calls <b id="qcalls">–</b></div>
+      <div class="stat">searches <b id="qsearch">–</b></div>
+      <div class="stat">added latency (illustrative) <b id="qlat">–</b></div>
+      <div class="stat">chunks sent <b id="qtok">–</b></div>
+    </div>
+    <div class="controls"><button class="btn primary" id="matrix">▶ Score every combination</button></div>
+    <div id="mxout"></div>
+    <p class="hint">Search is the course's offline toy hybrid search (embedding + BM25, fused with RRF). Real embedding models are much better at synonyms, but they fail the same way on follow-ups, compound questions and over-specific phrasing.</p>
+  </div>
+  <p>What you should see: <b>rewrite</b> fixes four of five on its own, which is why it's the default in chat. <b>HyDE</b> is brilliant for the zipper question but, without the conversation, it invents “30 days” for the follow-up and retrieves the wrong policy. Only <b>decomposition</b> gets both halves of the compare question, at the price of sending more chunks. No single transformation wins everywhere, so production systems pick per question (that's routing) or chain two: rewrite, then decompose.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: RRF by hand</span>
+    <p>Three query variants return these top-3 lists (k = 60):</p>
+    <ul>
+      <li>Variant A: <b>D7</b>, D8, D2 &nbsp; · &nbsp; Variant B: <b>D7</b>, D8, D0 &nbsp; · &nbsp; Variant C: D0, D1, <b>D7</b></li>
+      <li>D7 = 1/61 + 1/61 + 1/63 = 0.01639 + 0.01639 + 0.01587 = <b>0.04866</b></li>
+      <li>D8 = 1/62 + 1/62 = <b>0.03226</b>; &nbsp; D0 = 1/63 + 1/61 = <b>0.03227</b>; &nbsp; D1 = 1/62 = 0.01613; &nbsp; D2 = 1/63 = 0.01587</li>
+    </ul>
+    <p>D7 wins: it was near the top everywhere. D8 and D0 tie almost exactly: being #2 twice is worth the same as #1 once plus #3 once. Notice RRF never looks at raw similarity scores, only ranks, which is why it can fuse dense, keyword and multi-query lists whose scores aren't comparable.</p>
+    <p><b>Cost:</b> 4 variants (original + 3) means 1 LLM call (≈ 60 output tokens) + 4 embeddings + 4 searches. At $0.02 per million embedding tokens, embedding four 15-token queries costs about $0.0000012: the LLM call and the latency matter, the extra searches barely do.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Multi-query fusion, by the numbers</span>
+    <p class="hint">The original question alone misses the warranty chunks. Turn generated variants on and off (simulated LLM output), and slide RRF's k. Watch the fused list: the gold chunks (✓) need several lists to agree. Variant 4 has <b>drifted</b> off topic: see what it does to the fused ranking.</p>
+    <div class="controls" id="mqbox"></div>
+    <div class="controls"><label>RRF k <input type="range" id="rk" min="1" max="100" value="60"> <b class="mono" id="rkv"></b></label></div>
+    <div class="lists" id="mqlists"></div>
+    <div class="verdict" id="mqverdict"></div>
+  </div>
+  <p>With k = 1, being ranked first is worth twice as much as being second, so one confident list can dominate. With k = 60, ranks 1 and 2 are worth almost the same and <b>agreement across lists</b> decides. That's why 60 is the usual default.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Most teams write these as a few lines of prompt + code, often with a small fast model. Frameworks have them built in: LangChain's <code>MultiQueryRetriever</code> (in <code>langchain_classic</code> since LangChain 1.0), LlamaIndex's <code>QueryFusionRetriever</code> (RRF via <code>mode="reciprocal_rerank"</code>) and <code>HyDEQueryTransform</code>. Managed search has it too: Azure AI Search's generative query rewriting (preview) creates up to 10 rewrites with a fine-tuned small model.</p>
+<pre><code><span class="k">from</span> anthropic <span class="k">import</span> Anthropic
+client = Anthropic()
+FAST = <span class="s">"claude-haiku-5-5"</span>   <span class="c"># a small, fast model (as of 2026)</span>
+
+<span class="k">def</span> <span class="f">llm</span>(prompt, max_tokens=<span class="n">200</span>):
+    r = client.messages.create(model=FAST, max_tokens=max_tokens,
+                               messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: prompt}])
+    <span class="k">return</span> r.content[<span class="n">0</span>].text.strip()
+
+<span class="k">def</span> <span class="f">rewrite</span>(history, message):
+    <span class="k">return</span> llm(<span class="s">f"Conversation:\n{history}\nUser: {message}\n\n"</span>
+               <span class="s">"Rewrite the last user message as ONE standalone search query. Output only the query."</span>)
+
+<span class="k">def</span> <span class="f">variants</span>(q, n=<span class="n">3</span>):
+    out = llm(<span class="s">f"Write {n} different search queries for: {q}\nOne per line, no numbering."</span>)
+    <span class="k">return</span> [q] + [line <span class="k">for</span> line <span class="k">in</span> out.splitlines() <span class="k">if</span> line.strip()][:n]  <span class="c"># keep the original</span>
+
+<span class="k">def</span> <span class="f">rrf</span>(ranked_lists, k=<span class="n">60</span>):
+    scores = {}
+    <span class="k">for</span> ranking <span class="k">in</span> ranked_lists:
+        <span class="k">for</span> rank, doc_id <span class="k">in</span> enumerate(ranking, start=<span class="n">1</span>):
+            scores[doc_id] = scores.get(doc_id, <span class="n">0</span>) + <span class="n">1</span> / (k + rank)
+    <span class="k">return</span> sorted(scores, key=scores.get, reverse=<span class="k">True</span>)
+
+q = rewrite(history, user_message)
+fused = rrf([search(v, k=<span class="n">20</span>) <span class="k">for</span> v <span class="k">in</span> variants(q)])[:<span class="n">5</span>]   <span class="c"># run searches in parallel in production</span></code></pre>
+<pre><code><span class="c"># The same with LlamaIndex: several queries, fused with RRF</span>
+<span class="k">from</span> llama_index.core.retrievers <span class="k">import</span> QueryFusionRetriever
+retriever = QueryFusionRetriever([vector_retriever, bm25_retriever], similarity_top_k=<span class="n">5</span>,
+                                 num_queries=<span class="n">4</span>, mode=<span class="s">"reciprocal_rerank"</span>)
+nodes = retriever.retrieve(<span class="s">"my zip came apart, am I covered?"</span>)</code></pre>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Technique</th><th>✅ Gains</th><th>❌ Costs and risks</th></tr>
+      <tr><td>Rewrite</td><td>Fixes follow-ups; cheap; easy to log and debug</td><td>Can drop a constraint (“for Plus members”) or add one the user never said</td></tr>
+      <tr><td>Multi-query + RRF</td><td>Robust recall; fuses any retrievers</td><td>N× searches; drifted variants add noise; more chunks to rerank</td></tr>
+      <tr><td>HyDE</td><td>Bridges question vs answer vocabulary; zero training</td><td>Slowest; hallucinated specifics pull toward wrong chunks; weak on private jargon the model has never seen</td></tr>
+      <tr><td>Step-back</td><td>Finds the general rule behind a specific case</td><td>The model must still apply the rule correctly; extra retrieval</td></tr>
+      <tr><td>Decomposition</td><td>The only fix for compound questions</td><td>More searches and chunks; dependent sub-questions need sequential, slower loops</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Add a rewrite step for anything conversational, keep the original query alongside it, and log both. Use hybrid search so keywords still work. Add multi-query only after your eval shows recall misses that phrasing explains.</p></div>
+      <div><h4>At scale</h4><p>A router picks the transformation per query class, a small fine-tuned model does rewrites in tens of milliseconds, variants run in parallel, results are cached, and each transformation is an A/B-tested stage with its own retrieval eval and latency budget.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Users complain the chatbot ignores context in follow-up questions. What do you do?” A senior answer:</p>
+    <ul>
+      <li>Diagnoses first: log the <b>actual search query</b> and retrieved chunks for failing turns; confirm it's a retrieval miss, not generation.</li>
+      <li>Adds <b>query rewriting</b> with conversation history (small model, short output), keeping the original query too.</li>
+      <li>Knows the menu: multi-query + RRF for recall, HyDE for vocabulary gaps, decomposition for compound questions, and their latency/cost.</li>
+      <li>Measures recall@k on a set of multi-turn conversations before and after, plus p95 latency (Lessons 5.4 and 8.2).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Search with a fake answer</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2212.10496" target="_blank" rel="noopener">HyDE (Gao et al.)</a></div>
+      <p><b>How:</b> an instruction-following model writes a hypothetical document; an unsupervised encoder (Contriever) embeds it; the vector retrieves real documents.</p>
+      <p><b>Why this method:</b> no relevance labels needed. On TREC DL19, nDCG@10 rose from 44.5 (Contriever) to 61.3, close to a fine-tuned retriever's 62.1.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Rewrites inside a managed search engine</b> <span class="tag co">🏢 Microsoft · 2024</span> <a href="https://techcommunity.microsoft.com/blog/azure-ai-services-blog/-/4302729" target="_blank" rel="noopener">Azure AI Search query rewriting</a></div>
+      <p><b>How:</b> a fine-tuned small language model generates up to 10 query rewrites before first-stage retrieval, then a cross-encoder reranks the top 50.</p>
+      <p><b>Why this method:</b> Microsoft reports +4 points NDCG@3, especially for keyword indexes and low-recall queries, with a small model chosen for low latency.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>RAG-Fusion for product questions</b> <span class="tag co">🏢 Infineon · 2024</span> <a href="https://arxiv.org/abs/2402.03367" target="_blank" rel="noopener">RAG-Fusion: a New Take on RAG</a></div>
+      <p><b>How:</b> generate several queries from the user's question, retrieve for each, fuse with reciprocal rank fusion, answer from the fused set.</p>
+      <p><b>Why this method:</b> manual evaluation found more accurate and comprehensive answers, with the caveat that answers strayed when generated queries drifted from the original.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Abstraction before reasoning</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2310.06117" target="_blank" rel="noopener">Step-Back Prompting (Google DeepMind)</a></div>
+      <p><b>How:</b> ask a higher-level question about concepts or principles, retrieve or reason about it, then answer the original.</p>
+      <p><b>Why this method:</b> gains of 7–27% across STEM, knowledge QA and multi-hop tasks with PaLM-2L, with the same idea working for GPT-4 and Llama 2.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the oldest trick in search</span>
+    <p>Reciprocal rank fusion predates LLMs by more than a decade: Cormack, Clarke and Büttcher published it at SIGIR 2009, where the simple formula beat more elaborate fusion methods. The k = 60 you'll see in almost every library comes from that paper.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Transformations sit in front of the retrieval you built in Phase 3 (Lessons 3.4 and 3.6) and the hybrid search of Lesson 2.4, which already used RRF. Lesson 4.2 attacks the same gap from the index side (index hypothetical questions per chunk instead of rewriting the query). Lesson 4.4 turns decomposition and routing into an agent loop, and Lesson 5.4 measures whether any of it helped. Caching the rewrites is Lesson 8.2; the general latency math is in the System Design course: <a href="../../system-design-course/phase1/3-caching.html">caching</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2212.10496" target="_blank" rel="noopener">Precise Zero-Shot Dense Retrieval without Relevance Labels (HyDE)</a>. Short and readable; the prompts are in the appendix.</li>
+      <li><span class="kind">Paper</span> <a href="https://plg.uwaterloo.ca/~gvcormac/cormacksigir09-rrf.pdf" target="_blank" rel="noopener">Reciprocal Rank Fusion (Cormack et al., 2009)</a>. Two pages that every hybrid search engine still uses.</li>
+      <li><span class="kind">Docs</span> <a href="https://learn.microsoft.com/en-us/azure/search/semantic-how-to-query-rewrite" target="_blank" rel="noopener">Azure AI Search: rewrite queries</a>. A production take on generative query rewriting.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Multi-query with 4 variants, each searched for its top 20. Using RRF with k = 60, a chunk ranked #1 in one list and absent from the others scores 1/61 ≈ 0.0164. A chunk ranked #5 in all four lists scores about…</div>
+    <div class="opts"><button class="opt">0.0154: less than the #1 chunk</button><button class="opt" data-ok>0.0615: almost four times the #1 chunk</button><button class="opt">0.25: because 4 ÷ 16</button></div>
+    <div class="explain">4 × 1/(60 + 5) = 4/65 ≈ <b>0.0615</b>. Consistent agreement across lists beats a single top rank; that's the whole point of fusion (and why a single drifted variant can't dominate).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your support bot gets “and for international orders?” as the third message of a chat about shipping times. Retrieval returns random chunks. What's the best first fix?</div>
+    <div class="opts"><button class="opt">HyDE: write a hypothetical answer and embed it</button><button class="opt" data-ok>Rewrite the message into a standalone query using the conversation (“How long does shipping take for international orders?”)</button><button class="opt">Raise top-k from 5 to 50</button></div>
+    <div class="explain">The query lacks its subject, which lives in the conversation. A rewrite with history restores it cheaply. HyDE without history would guess; a bigger k just adds noise and tokens.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. “Which is cheaper per seat, the Team plan or the Business plan, and does either include SSO?” What transformation fits best?</div>
+    <div class="opts"><button class="opt">Step-back to “What is pricing?”</button><button class="opt">None: one embedding captures it</button><button class="opt" data-ok>Decomposition into sub-questions (Team price, Business price, SSO availability), retrieve for each, answer from the union</button></div>
+    <div class="explain">It's a compound question needing several separate facts that probably live in different chunks. One vector for the whole sentence tends to land between them and retrieve only one.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>The user's message is a draft; a cheap LLM call can turn it into queries that look like your documents.</li>
+      <li>Rewrite for follow-ups (the default in chat), multi-query + RRF for recall, HyDE for vocabulary gaps, step-back for over-specific questions, decomposition for compound ones.</li>
+      <li>Each costs an LLM call and some latency; keep the original query in the mix and measure recall@k before and after.</li>
+      <li>No transformation wins everywhere: route per question type (Lesson 4.4).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const C = [
+    "Refunds: items can be returned for a refund within 30 days of delivery.",
+    "Plus members get an extended return window of 60 days for refunds.",
+    "Refunds go back to the original payment method within 5 business days.",
+    "Gift returns: items received as a gift can be returned for store credit, no receipt needed.",
+    "Standard shipping takes 3 to 5 business days.",
+    "Express shipping arrives the next business day if you order before 2 pm.",
+    "Plus costs 49 dollars per year and includes free express shipping on every order.",
+    "Every jacket has a two-year warranty against defects such as broken zippers or seams.",
+    "To make a warranty claim, send a photo of the defect to support.",
+    "If you are locked out, use the Forgot password link on the sign in page.",
+    "The password reset link expires after 30 minutes.",
+    "We ship to Canada and Mexico; international orders may pay import duties.",
+  ];
+  // scenarios: the user's message, conversation, gold chunks, whether all gold chunks are needed, a tempting wrong chunk,
+  // and the scripted (simulated) LLM output of each transformation
+  const S = [
+    { name: "Follow-up in a chat", chat: ["user: I'm a Plus member and bought a jacket six weeks ago.", "assistant: Thanks! How can I help with your jacket?"],
+      q: "and how long do I have to send it back?", gold: [1], all: false, trap: 0,
+      T: { rewrite: ["How many days do Plus members have to return a jacket for a refund?"],
+           multi: ["How long do I have to send it back?", "What is the deadline to send something back?", "How many days until I must send it back?"],
+           hyde: ["You can send it back within 30 days of delivery using the prepaid label."],
+           step: ["What is the return policy?"],
+           decomp: ["How long do I have to send it back?"] } },
+    { name: "Vocabulary gap", chat: [], q: "my zip came apart after a month of hiking, am I covered?", gold: [7], all: false, trap: 0,
+      T: { rewrite: ["Is a broken zip covered after one month of hiking?"],
+           multi: ["Is a zip that came apart covered?", "Am I covered if my zip breaks while hiking?", "What happens if my zip comes apart?"],
+           hyde: ["A broken zipper is a defect covered by the jacket warranty. To make a claim, send a photo of the defect to support."],
+           step: ["What does the jacket warranty cover?"],
+           decomp: ["Is a broken zip covered?", "Does hiking count as normal use?"] } },
+    { name: "Over-specific", chat: [], q: "I clicked the fastest option at 1:30 on Tuesday, when do I get my parcel?", gold: [5], all: false, trap: 4,
+      T: { rewrite: ["When does an order placed at 1:30 pm on Tuesday with the fastest option arrive?"],
+           multi: ["When will my parcel arrive?", "How long does the fastest option take?", "When do I get my parcel if I ordered at 1:30?"],
+           hyde: ["Your parcel ordered at 1:30 on Tuesday should arrive on Thursday."],
+           step: ["What are the delivery speeds and order cutoff times?"],
+           decomp: ["What is the fastest delivery option?", "What time is the order cutoff?"] } },
+    { name: "Compound question", chat: [], q: "Compare the refund window and the warranty length for Plus members", gold: [1, 7], all: true, trap: null,
+      T: { rewrite: ["Refund window and warranty length for Plus members"],
+           multi: ["What are the refund window and warranty for Plus members?", "How long are refunds and warranty for Plus?", "Plus member refund and warranty periods"],
+           hyde: ["Plus members can get a refund within 60 days, and jackets carry a warranty."],
+           step: ["What benefits do Plus members get?"],
+           decomp: ["What is the refund window for Plus members?", "How long is the jacket warranty?"] } },
+    { name: "Jargon", chat: [], q: "RMA timeline for a parka?", gold: [0, 1], all: false, trap: null,
+      T: { rewrite: ["What is the return merchandise authorization (RMA) timeline?"],
+           multi: ["How long do I have to return an item?", "What is the deadline for returns?", "How many days is the return window?"],
+           hyde: ["An RMA must be requested within the return window, typically 30 days."],
+           step: ["What is the return policy?"],
+           decomp: ["What is an RMA?", "What is the RMA timeline?"] } },
+  ];
+  const TECH = { raw: "No transformation", rewrite: "Rewrite", multi: "Multi-query + RRF", hyde: "HyDE", step: "Step-back", decomp: "Decompose" };
+  const COST = { raw: [0, 1, 0], rewrite: [1, 1, 0.5], multi: [1, 4, 0.8], hyde: [1, 1, 1.4], step: [1, 1, 0.6], decomp: [1, 0, 0.7] };
+  const ranked = q => AI.search(C, q, { mode: "hybrid", k: C.length }).map(r => r.i);
+  function retrieve(s, tech, k) {
+    if (tech === "raw") return { queries: [s.q], ids: ranked(s.q).slice(0, k), per: null };
+    const qs = tech === "multi" ? [s.q, ...s.T.multi] : s.T[tech];
+    if (tech === "decomp") { // retrieve separately per sub-question, answer from the union
+      const per = qs.map(q => ranked(q).slice(0, k)), ids = [];
+      per.forEach(l => l.forEach(i => { if (!ids.includes(i)) ids.push(i); }));
+      return { queries: qs, ids, per };
+    }
+    if (qs.length === 1) return { queries: qs, ids: ranked(qs[0]).slice(0, k), per: null };
+    return { queries: qs, ids: AI.rrf(qs.map(ranked)).slice(0, k).map(r => r.i), per: null };
+  }
+  const judge = (s, ids) => {
+    const ok = s.all ? s.gold.every(g => ids.includes(g)) : s.gold.some(g => ids.includes(g));
+    const trapFirst = s.trap != null && ids.includes(s.trap) && (!ok || ids.indexOf(s.trap) < Math.min(...s.gold.filter(g => ids.includes(g)).map(g => ids.indexOf(g))));
+    return { ok, trapFirst };
+  };
+
+  $("sc").innerHTML = S.map((s, i) => `<option value="${i}">${i + 1}. ${s.name}</option>`).join("");
+  let tech = "raw";
+  const segBtns = [...$("tech").querySelectorAll("button")];
+  segBtns.forEach(b => (b.onclick = () => { segBtns.forEach(x => x.classList.toggle("on", x === b)); tech = b.dataset.v; render(); }));
+  segBtns.forEach(b => (b.id = "t-" + b.dataset.v));
+
+  function render() {
+    const s = S[+$("sc").value], k = +$("qk").value;
+    $("qkv").textContent = k;
+    $("chat").innerHTML = s.chat.map(l => `<div class="muted">${esc(l)}</div>`).join("") + `<div><b class="in">user: ${esc(s.q)}</b></div>`;
+    const r = retrieve(s, tech, k);
+    $("gen").innerHTML = tech === "raw" ? `<div class="prompt">search query = the user's message, as typed</div>`
+      : `<div class="prompt gen"><div class="tagline">simulated LLM output · ${TECH[tech]}</div>${r.queries.map((q, i) => `${tech === "multi" && i === 0 ? "(original) " : ""}→ ${esc(q)}`).join("\n")}</div>`;
+    const j = judge(s, r.ids);
+    $("qverdict").innerHTML = j.ok && !j.trapFirst ? `<span class="ev">✅ The chunk${s.gold.length > 1 && s.all ? "s" : ""} holding the answer ${s.all ? "were all" : "was"} retrieved.</span>`
+      : j.ok ? `<span class="tk">⚠️ The answer was retrieved, but the tempting wrong chunk ranks above it. A careless model might use it.</span>`
+      : j.trapFirst ? `<span class="rk">❌ Missed, and the wrong chunk (“${esc(C[s.trap].slice(0, 48))}…”) was retrieved instead: a confident wrong answer.</span>`
+      : `<span class="rk">❌ The answer isn't in what was retrieved${s.all ? " (this question needs every gold chunk)" : ""}.</span>`;
+    let hits = "";
+    if (r.per) hits = r.per.map((l, n) => `<div class="muted">sub-question ${n + 1}: ${esc(r.queries[n])}</div>` + l.map(i => hitRow(s, i)).join("")).join("");
+    else hits = r.ids.map(i => hitRow(s, i)).join("");
+    $("qhits").innerHTML = hits;
+    const c = COST[tech];
+    $("qcalls").textContent = c[0];
+    $("qsearch").textContent = tech === "decomp" ? r.queries.length : c[1];
+    $("qlat").textContent = c[2] ? "+" + c[2].toFixed(1) + " s" : "0 s";
+    $("qtok").textContent = r.ids.length + " (≈" + r.ids.reduce((t, i) => t + AI.countTokens(C[i]), 0) + " tokens)";
+  }
+  const hitRow = (s, i) => `<div class="hit${s.gold.includes(i) ? "" : " miss"}"><span class="sc">chunk ${i}${s.gold.includes(i) ? " · ✓ answer" : i === s.trap ? " · trap" : ""}</span>${esc(C[i])}</div>`;
+  ["sc", "qk"].forEach(id => ($(id).oninput = render));
+  render();
+
+  $("matrix").onclick = () => {
+    const k = +$("qk").value, techs = Object.keys(TECH);
+    const wins = techs.map(() => 0);
+    const rows = S.map((s, si) => `<tr><td>${si + 1}. ${s.name}</td>${techs.map((t, ti) => {
+      const j = judge(s, retrieve(s, t, k).ids); if (j.ok) wins[ti]++;
+      return `<td>${j.ok ? (j.trapFirst ? "⚠️" : "✅") : (j.trapFirst ? "❌ trap" : "❌")}</td>`;
+    }).join("")}</tr>`).join("");
+    $("mxout").innerHTML = `<table class="mx"><tr><th>question \\ technique (top-${k})</th>${techs.map(t => `<th>${TECH[t]}</th>`).join("")}</tr>${rows}
+      <tr><td><b>answer retrieved</b></td>${wins.map(w => `<td><b>${w} / ${S.length}</b></td>`).join("")}</tr></table>
+      <p class="hint">✅ answer retrieved · ⚠️ retrieved but a wrong chunk outranks it · ❌ trap = missed and a wrong chunk retrieved instead. Try top-k 3: some misses turn into ✅ by luck, at more tokens per question.</p>`;
+  };
+
+  // ---------- playground 2: multi-query fusion ----------
+  const MQ = { q: "my zip came apart after a month of hiking, am I covered?", gold: [7, 8],
+    vars: ["Does the warranty cover a broken zipper?", "Is a jacket zipper that came apart a defect?", "How do I make a warranty claim for a broken jacket?", "Can I return a jacket after a month of hiking?"] };
+  const on = [true, true, true, true, true];
+  $("mqbox").innerHTML = [MQ.q, ...MQ.vars].map((v, i) => `<label><input type="checkbox" id="mq${i}" checked> ${i === 0 ? "original" : "variant " + i}${i === 4 ? " (drifted)" : ""}</label>`).join(" ");
+  [0, 1, 2, 3, 4].forEach(i => ($("mq" + i).onchange = () => { on[i] = $("mq" + i).checked; renderMQ(); }));
+  $("rk").oninput = renderMQ;
+  function renderMQ() {
+    const k = +$("rk").value; $("rkv").textContent = k;
+    const qs = [MQ.q, ...MQ.vars];
+    const lists = qs.map(q => ranked(q).slice(0, 5));
+    const li = (i, extra) => `<li class="${MQ.gold.includes(i) ? "gold" : ""}">chunk ${i}${MQ.gold.includes(i) ? " ✓" : ""}${extra || ""}</li>`;
+    let html = qs.map((q, n) => `<div class="col${on[n] ? "" : " off"}"><h5>${n === 0 ? "original" : "variant " + n}: <span class="muted">${esc(q)}</span></h5><ol>${lists[n].map(i => li(i)).join("")}</ol></div>`).join("");
+    const used = lists.filter((_, n) => on[n]);
+    const fused = used.length ? AI.rrf(used, k).slice(0, 5) : [];
+    html += `<div class="col" style="border-color:var(--c-ev)"><h5 class="ev">fused with RRF (k = ${k})</h5><ol>${fused.map(f => li(f.i, ` <span class="muted mono">${f.score.toFixed(4)}</span>`)).join("")}</ol></div>`;
+    $("mqlists").innerHTML = html;
+    const top2 = fused.slice(0, 2).map(f => f.i);
+    $("mqverdict").innerHTML = !used.length ? `<span class="muted">Turn at least one query on.</span>`
+      : MQ.gold.every(g => top2.includes(g)) ? `<span class="ev">✅ Both warranty chunks are the fused top 2: the variants agree, so fusion lifts them.</span>`
+      : MQ.gold.some(g => top2.includes(g)) ? `<span class="tk">⚠️ Only one warranty chunk made the fused top 2. A drifted or missing variant is pulling other chunks up.</span>`
+      : `<span class="rk">❌ Neither warranty chunk is in the fused top 2.</span>`;
+  }
+  renderMQ();
+})();
+</script>
+</body>
+</html>

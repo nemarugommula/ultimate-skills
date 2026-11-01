@@ -1,0 +1,491 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P.2 Iterators & generators · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .meter-wrap { margin: 8px 0; }
+  .meter-wrap .meterbar { height: 14px; }
+  .meter-wrap .meterbar > i.hot { background: var(--c-rk); }
+  .c0 { background: color-mix(in srgb, var(--c-in) 22%, transparent); }
+  .c1 { background: color-mix(in srgb, var(--c-tl) 24%, transparent); }
+  .c2 { background: color-mix(in srgb, var(--c-cx) 22%, transparent); }
+  .c3 { background: color-mix(in srgb, var(--c-md) 22%, transparent); }
+  .tokline { font-family: var(--mono); font-size: .85rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-height: 2.4em; }
+</style>
+</head>
+<body data-lesson="ap-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase P · Lesson 2</div>
+  <h1>Iterators & generators: lazy pipelines and streaming</h1>
+  <p class="subtitle">How to push a million documents through chunking and embedding without running out of memory, and why every token stream you'll ever read is just a Python iterator.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><code>for x in obj</code> calls special methods on <code>obj</code> (Lesson P.1's data model).</li>
+      <li><b>Chunking</b> cuts documents into pieces; an <b>embedding</b> is a list of numbers (often 1,000 to 3,000 of them) describing a chunk's meaning, returned by an embeddings API (Lessons 3.3 and 2.1).</li>
+      <li><b>Streaming</b>: an LLM API can send its answer token by token as it's generated, instead of all at once (Lesson 0.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>The English split of Hugging Face's <b>FineWeb</b> dataset is <b>45 terabytes</b>. Hugging Face's docs say you can “use it instantly” anyway: pass <code>streaming=True</code> to <code>load_dataset()</code> and you get an <code>IterableDataset</code> that downloads and yields one example at a time as you loop over it.</p>
+    <p>No laptop holds 45 TB. The trick isn't a bigger machine; it's a Python protocol: <b>iteration</b>. Process one item, let it go, ask for the next. That's this lesson.</p>
+  </div>
+
+  <h2>Numbers first: a million chunks</h2>
+  <p>You're indexing 1,000,000 chunks of about 1,000 characters each, with 1,536-dimension embeddings (a common size). Sizes measured on CPython 3.13:</p>
+  <table>
+    <tr><th>Held in memory at once</th><th>Size</th></tr>
+    <tr><td>All 1M chunk texts as Python strings (1,041 bytes each)</td><td class="tk">≈ 1.0 GB</td></tr>
+    <tr><td>All 1M embeddings as Python lists of floats (≈ 49.6 KB each)</td><td class="rk">≈ 50 GB</td></tr>
+    <tr><td>All 1M embeddings as a float32 array (6 KB each)</td><td class="tk">≈ 6.1 GB</td></tr>
+    <tr><td><b>One batch of 64</b> chunks + their embeddings as lists</td><td class="ev">≈ 3.2 MB</td></tr>
+  </table>
+  <p>Plain sentence: <b>a pipeline that only ever holds one batch uses megabytes, whatever the size of the corpus.</b> A pipeline that builds a list at every step needs the whole corpus in RAM, several times over, and its first vector isn't stored until everything has been processed.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    An <b>iterator</b> hands out one item per request. A <b>generator</b> is the easy way to write one: a function with <code>yield</code> that <b>pauses</b> after each item and resumes, locals intact, when the next one is requested. Chain generators and you get a <b>lazy pipeline</b>: work happens only when the last stage asks for an item, so memory is bounded by what's in flight (one batch), and results start flowing immediately. Token streams from LLM APIs are the same shape: an iterator of small pieces you consume as they arrive.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the sushi conveyor</span>
+    <p>A banquet kitchen cooks every dish, plates every dish, then serves every dish: the kitchen needs a table for all of it, and the first guest eats last. A sushi conveyor makes one plate, puts it on the belt, and makes the next only when there's room. The kitchen never holds more than a few plates, and the first guest eats in a minute. List comprehensions at every stage are the banquet; generators are the belt. Batching is putting four plates on one tray because the walk to the table (an API call) is the slow part.</p>
+  </div>
+
+  <h2>The iterator protocol in one screen</h2>
+  <p>An <b>iterable</b> is anything you can loop over (a list, a file, a dict, a generator): it has <code>__iter__</code>, which returns an <b>iterator</b>. An iterator has <code>__next__</code>, which returns the next item or raises <code>StopIteration</code> when it's done. A <code>for</code> loop is just:</p>
+<pre><code>it = iter(chunks)                <span class="c"># calls chunks.__iter__()</span>
+<span class="k">while</span> <span class="k">True</span>:
+    <span class="k">try</span>:
+        chunk = next(it)         <span class="c"># calls it.__next__()</span>
+    <span class="k">except</span> StopIteration:
+        <span class="k">break</span>
+    process(chunk)</code></pre>
+  <ul>
+    <li><b>Iterators are one-shot.</b> A list can be looped over again; a generator or a file handle can't. <code>gen = (c for c in docs); list(gen); list(gen)</code> gives <code>[...]</code> then <code>[]</code>. The classic bug: you count the items with <code>sum(1 for _ in gen)</code>, then the “real” loop sees nothing.</li>
+    <li><b>Generator functions:</b> a <code>def</code> with <code>yield</code>. Calling it runs <b>none</b> of the body; it returns a generator object. Each <code>next()</code> runs to the next <code>yield</code>, hands out the value, and freezes.</li>
+    <li><b>Generator expressions:</b> <code>(x.text for x in chunks)</code>, with round brackets. A list comprehension of a million squares is ≈ 8.4 MB; the equivalent generator expression is ≈ 200 bytes, whatever the length.</li>
+    <li><b><code>yield from sub()</code></b> hands out every item of another iterator: the clean way for a per-document generator to emit all of its chunks.</li>
+  </ul>
+
+  <div class="playground" id="pg-lazy">
+    <span class="label">🎮 Playground · Banquet or conveyor?</span>
+    <p class="hint">Six documents go through read → clean → chunk → embed (in batches of 3) → store. Pick how each stage is written and press run. Watch what each stage holds, and when the first vector reaches the store. Then drag the corpus size to see what the same design needs at scale. (An animation of Python's evaluation order; no real files or APIs.)</p>
+    <div class="controls">
+      <span class="seg" id="lzMode"><button data-v="list" class="on">lists at every stage: [f(x) for x in …]</button><button data-v="gen">generators: (f(x) for x in …)</button></span>
+      <button class="btn primary" id="lz-run">▶ Run 6 documents</button>
+    </div>
+    <svg id="lzFlow"></svg>
+    <div class="meter-wrap"><div class="muted">items held in memory right now: <b class="mono" id="lzHeld">0</b> (peak <b class="mono" id="lzPeak">0</b>)</div><div class="meterbar"><i id="lzBar" style="width:0%"></i></div></div>
+    <div class="verdict" id="lzMsg"></div>
+    <div class="controls">
+      <label>corpus size <input type="range" id="lzN" min="3" max="7" step="0.25" value="6"> <b class="mono" id="lzNv"></b></label>
+      <span class="muted">machine RAM: 16 GB · 4 chunks per document · embeddings kept as Python lists</span>
+    </div>
+    <div class="stat-row">
+      <div class="stat">peak memory, lists <b id="lzMemL">–</b></div>
+      <div class="stat">peak memory, generators <b id="lzMemG">–</b></div>
+      <div class="stat">first vector stored, lists <b id="lzFirstL">–</b></div>
+      <div class="stat">first vector stored, generators <b id="lzFirstG">–</b></div>
+    </div>
+    <p class="hint">Scale model: 1,041 bytes per chunk text, ≈ 49.6 KB per embedding as a Python list (both measured), illustrative 2 ms per document to read and clean, and 0.5 s per embedding call of 64 chunks with 4 calls in flight.</p>
+  </div>
+  <p>What you should see: with lists, every stage holds every item before the next stage starts, the memory meter goes red, and the first vector is stored only at the very end. With generators, one document travels the whole pipeline, waits at the embed step until a batch of 3 is full, and is stored while later documents haven't been read yet. Total work is the same; peak memory and time to first result are not.</p>
+
+  <h2>Pipelines of generators</h2>
+  <p>Each stage takes an iterator and returns an iterator, so stages compose like Unix pipes: <code>store(embed(chunk(clean(read(paths)))))</code>. Nothing runs until the outermost loop pulls. Useful tools from <code>itertools</code>, all lazy:</p>
+  <table>
+    <tr><th>Tool</th><th>What it does</th><th>AI use</th><th>Watch out</th></tr>
+    <tr><td><code>islice(it, n)</code></td><td>The first <i>n</i> items (or a slice) of any iterator</td><td>Dry-run a pipeline on 100 docs</td><td>Consumes them from the iterator</td></tr>
+    <tr><td><code>batched(it, n)</code> (3.12+)</td><td>Tuples of up to <i>n</i> items; last one may be shorter</td><td>Batches for embedding calls and DB upserts</td><td><code>strict=True</code> (3.13+) raises on a short last batch</td></tr>
+    <tr><td><code>chain(a, b)</code></td><td>One iterator after another</td><td>System prompt + history + new turn</td><td>Use <code>chain.from_iterable</code> for an iterator of iterators</td></tr>
+    <tr><td><code>groupby(it, key)</code></td><td>Runs of consecutive items with the same key</td><td>Group chunks back by document</td><td>Only groups <b>adjacent</b> items: sort first</td></tr>
+    <tr><td><code>pairwise(it)</code> (3.10+)</td><td>Overlapping pairs (a, b), (b, c)…</td><td>Compare neighbouring sentences (semantic chunking, 3.3)</td><td>n − 1 pairs for n items</td></tr>
+  </table>
+  <p>Before 3.12, the standard batching recipe was <code>while batch := tuple(islice(it, n)): yield batch</code>, which is what the docs give as <code>batched</code>'s rough equivalent.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: sizing embedding batches against real limits</span>
+    <p>OpenAI's embeddings endpoint (per its Python SDK documentation, 2026) accepts at most <b>2,048 inputs</b> per request, at most <b>8,192 tokens</b> per input, and at most <b>300,000 tokens summed</b> across a request. Your chunks average 250 tokens.</p>
+    <ul>
+      <li>2,048 × 250 = 512,000 tokens: <b>over</b> the 300,000 cap, so a batch of 2,048 is rejected.</li>
+      <li>Largest safe batch: 300,000 ÷ 250 = <b>1,200</b> chunks. Leave headroom for longer chunks: use ~1,000, or batch by token count rather than item count.</li>
+      <li>1,000,000 chunks ÷ 1,000 per batch = <b>1,000 requests</b>, versus 15,625 requests at 64 per batch and a million at 1. Fewer requests means far less per-request overhead and fewer rate-limit hits.</li>
+      <li>Memory per in-flight batch of 1,000 (text + vectors as float32): ≈ 1,000 × (1 KB + 6 KB) ≈ <b>7 MB</b>.</li>
+    </ul>
+    <p class="muted">Limits differ by provider and change; read the current API reference. For big offline jobs, providers also offer batch APIs at a discount (Lesson 4.8).</p>
+  </div>
+
+  <div class="playground" id="pg-batch">
+    <span class="label">🎮 Playground · Batch it, stream it</span>
+    <p class="hint">Embed a corpus with an embeddings API (<b>simulated</b>: latency, rate limit and RAM are illustrative; the 2,048-input and 300,000-token caps are OpenAI's documented ones). Choose a batch size, a chunk length, and whether to load everything first or stream batches through generators. Try batch size 1, then 4,096, then find the sweet spot.</p>
+    <div class="controls">
+      <label>chunks <input type="range" id="btN" min="3" max="6.3" step="0.1" value="5"> <b class="mono" id="btNv"></b></label>
+      <label>tokens per chunk <input type="range" id="btT" min="100" max="1000" step="50" value="250"> <b class="mono" id="btTv"></b></label>
+      <label>batch size <input type="range" id="btK" min="0" max="12" step="1" value="6"> <b class="mono" id="btKv"></b></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="btMode"><button data-v="all" class="on">load all → embed all → store all</button><button data-v="stream">stream: batched(generator) → embed → store</button></span>
+      <button class="btn primary" id="bt-run">▶ Run the job</button>
+      <button class="btn" id="bt-sweep">Sweep batch sizes</button>
+    </div>
+    <canvas class="chart" id="btChart" style="height:230px"></canvas>
+    <div class="verdict" id="btMsg"></div>
+    <div class="stat-row">
+      <div class="stat">API requests <b id="btReq">–</b></div>
+      <div class="stat">total time <b id="btTime">–</b></div>
+      <div class="stat">first vector stored <b id="btFirst">–</b></div>
+      <div class="stat">peak memory <b id="btMem">–</b></div>
+    </div>
+    <p class="hint">Model: each request costs 0.25 s of overhead plus 2 µs per token, 4 requests in flight, a rate limit of 3,000 requests per minute, a 4 GB worker, float32 vectors of 1,536 dimensions, and 20 µs per chunk to load and split.</p>
+  </div>
+  <p>What you should see: batch size 1 makes a million chunks take hours, mostly per-request overhead and the rate limit. Very large batches are rejected outright by the token cap. In between there's a broad sweet spot. “Load all” doesn't change the total much, but it makes you wait until the end for the first stored vector, and past roughly half a million chunks it runs out of memory on a 4 GB worker.</p>
+
+  <h2>Streaming tokens: the same idea, from the network</h2>
+  <p>When you stream a model's answer, the SDK gives you an iterator of events or text pieces as they arrive over the connection (server-sent events). Python lets you treat it like any other iterator: wrap it in your own generators to accumulate the full text, filter events, or re-chunk tokens into sentences for text-to-speech. Two rules:</p>
+  <ul>
+    <li><b>Use the SDK's context manager</b> (<code>with client.messages.stream(...) as stream:</code>) so the HTTP connection is closed even if you <code>break</code> early or an exception is raised.</li>
+    <li><b>Keep the full text</b> as you go if you need it afterwards (logging, evals); the iterator won't replay. The SDK helpers also give you the final assembled message.</li>
+  </ul>
+<pre><code><span class="c"># Shape from the Anthropic SDK docs; needs an API key. MODEL is whatever model you use.</span>
+<span class="k">with</span> client.messages.stream(model=MODEL, max_tokens=<span class="n">1024</span>,
+                            messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: question}]) <span class="k">as</span> stream:
+    <span class="k">for</span> sentence <span class="k">in</span> sentences(stream.text_stream):   <span class="c"># your generator over theirs</span>
+        speak(sentence)                               <span class="c"># start talking before the answer is done</span>
+    final = stream.get_final_message()               <span class="c"># full message + token usage</span></code></pre>
+
+  <div class="playground" id="pg-tok">
+    <span class="label">🎮 Mini-demo · a sentence generator over a token stream</span>
+    <p class="hint">Scripted tokens stand in for a real stream. The <code>sentences()</code> generator from the tools box buffers tokens and yields each sentence the moment it ends.</p>
+    <div class="controls"><button class="btn" id="tk-run">▶ Stream a reply</button></div>
+    <div class="muted">tokens arriving:</div><div class="tokline" id="tkIn"></div>
+    <div class="muted">sentences yielded:</div><div class="tokline" id="tkOut"></div>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Standard library:</b> <code>itertools</code> (<code>islice</code>, <code>batched</code>, <code>chain</code>, <code>groupby</code>, <code>pairwise</code>), <code>collections.abc.Iterator</code> for type hints. <b>Libraries:</b> Hugging Face <code>datasets</code> with <code>streaming=True</code>, the OpenAI and Anthropic SDK stream iterators, and FastAPI's <code>StreamingResponse</code>, which accepts a normal or async generator as the response body (Lesson P.6). This runs on Python 3.12+ (for <code>batched</code>; checked on 3.13):</p>
+<pre><code><span class="k">import</span> re
+<span class="k">from</span> itertools <span class="k">import</span> batched, islice        <span class="c"># batched: Python 3.12+</span>
+<span class="k">from</span> collections.abc <span class="k">import</span> Iterator, Iterable
+
+<span class="k">def</span> read_docs(paths: Iterable[str]) -&gt; Iterator[dict]:
+    <span class="k">for</span> p <span class="k">in</span> paths:                              <span class="c"># real code: open(p) and yield one record at a time</span>
+        <span class="k">yield</span> {<span class="s">"id"</span>: p, <span class="s">"text"</span>: <span class="s">f"  Refunds take 5 days.   Plus members get 60 days. ({p})  "</span>}
+
+<span class="k">def</span> clean(docs: Iterator[dict]) -&gt; Iterator[dict]:
+    <span class="k">for</span> d <span class="k">in</span> docs:
+        <span class="k">yield</span> {**d, <span class="s">"text"</span>: <span class="s">" "</span>.join(d[<span class="s">"text"</span>].split())}
+
+<span class="k">def</span> chunk(docs: Iterator[dict], size: int = <span class="n">40</span>) -&gt; Iterator[dict]:
+    <span class="k">for</span> d <span class="k">in</span> docs:
+        t = d[<span class="s">"text"</span>]
+        <span class="k">for</span> i <span class="k">in</span> range(<span class="n">0</span>, len(t), size):
+            <span class="k">yield</span> {<span class="s">"doc_id"</span>: d[<span class="s">"id"</span>], <span class="s">"text"</span>: t[i:i + size]}
+
+<span class="k">def</span> embed_batch(texts: list[str]) -&gt; list[list[float]]:   <span class="c"># stand-in for one embeddings API call</span>
+    <span class="k">return</span> [[len(t) / <span class="n">100.0</span>] <span class="k">for</span> t <span class="k">in</span> texts]
+
+<span class="k">def</span> embed_all(chunks: Iterator[dict], batch_size: int = <span class="n">64</span>) -&gt; Iterator[tuple[dict, list[float]]]:
+    <span class="k">for</span> batch <span class="k">in</span> batched(chunks, batch_size):              <span class="c"># tuples of up to 64, built lazily</span>
+        vectors = embed_batch([c[<span class="s">"text"</span>] <span class="k">for</span> c <span class="k">in</span> batch])
+        <span class="k">yield from</span> zip(batch, vectors)                     <span class="c"># hand results on one by one</span>
+
+paths = (<span class="s">f"doc{i}.md"</span> <span class="k">for</span> i <span class="k">in</span> range(<span class="n">1_000_000</span>))           <span class="c"># a million docs, nothing read yet</span>
+pipeline = embed_all(chunk(clean(read_docs(paths))))       <span class="c"># still nothing has run</span>
+<span class="k">for</span> c, v <span class="k">in</span> islice(pipeline, <span class="n">3</span>):                           <span class="c"># runs only enough work for the first batch</span>
+    print(c[<span class="s">"doc_id"</span>], repr(c[<span class="s">"text"</span>]), v)
+
+<span class="k">def</span> sentences(tokens: Iterable[str]) -&gt; Iterator[str]:     <span class="c"># re-chunk a token stream (e.g. for text-to-speech)</span>
+    buf = <span class="s">""</span>
+    <span class="k">for</span> tok <span class="k">in</span> tokens:
+        buf += tok
+        <span class="k">while</span> (m := re.search(<span class="s">r"[.!?]\s"</span>, buf)):
+            <span class="k">yield</span> buf[:m.end()].strip()
+            buf = buf[m.end():]
+    <span class="k">if</span> buf.strip():
+        <span class="k">yield</span> buf.strip()
+
+print(list(sentences([<span class="s">"Hel"</span>, <span class="s">"lo there"</span>, <span class="s">". How "</span>, <span class="s">"are you"</span>, <span class="s">"? Fine"</span>, <span class="s">"."</span>])))
+<span class="c"># ['Hello there.', 'How are you?', 'Fine.']</span></code></pre>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Generators / lazy pipelines</td><td>Constant memory, results start at once, works on unbounded streams</td><td>One pass only; harder to debug (nothing runs until pulled); no <code>len()</code> or random access</td></tr>
+      <tr><td>Lists</td><td>Reusable, indexable, easy to inspect</td><td>Memory grows with the data; first result waits for the last</td></tr>
+      <tr><td>Bigger batches</td><td>Fewer requests, less overhead, fewer 429s</td><td>Hit per-request caps; one failure retries more work; more memory in flight</td></tr>
+      <tr><td>Streaming responses to users</td><td>Lower perceived latency (first token fast)</td><td>Harder error handling mid-stream; must validate output after it's complete</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>One script: a generator pipeline from files to vectors, <code>batched</code> at a few hundred chunks, upserts per batch, and a checkpoint (last processed ID) written every batch so a crash resumes instead of restarting. Stream every user-facing answer.</p></div>
+      <div><h4>At scale</h4><p>The same stages become distributed jobs: a queue or workflow engine feeds workers, each running a lazy pipeline over its shard; provider batch APIs for offline re-embeds; backpressure so a slow vector DB doesn't fill memory upstream (Lessons 4.8 and P.4). Streaming goes through a gateway that meters tokens as they flow (8.1).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <ul>
+      <li>“How would you embed 50 million documents on one machine?” Lazy generator pipeline, batches sized to the provider's caps (count <b>and</b> tokens), bounded concurrency (P.3), idempotent upserts keyed by chunk ID, checkpoints, retries per batch.</li>
+      <li>“What's the difference between an iterable and an iterator?” Iterable has <code>__iter__</code> and can be looped many times; an iterator has <code>__next__</code>, holds position, and is exhausted once.</li>
+      <li>“What does this print?” <code>g = (x for x in range(3)); print(sum(g), sum(g))</code> → <code>3 0</code>.</li>
+      <li>“How do you stream an LLM answer to the browser?” A generator (or async generator) over the SDK stream, returned via a streaming HTTP response with server-sent events.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Streaming a 45 TB dataset</b> <span class="tag oss">🧰 Open source</span> <a href="https://huggingface.co/docs/datasets/stream" target="_blank" rel="noopener">Hugging Face Datasets: Stream</a></div>
+      <p><b>How:</b> <code>load_dataset(..., streaming=True)</code> returns an <code>IterableDataset</code>; you <code>next(iter(ds))</code> or loop, and data is fetched as you go. <code>to_iterable_dataset()</code> streams from local files.</p>
+      <p><b>Why this method:</b> you can explore or train on datasets far bigger than your disk without downloading them first.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Batch caps on embeddings</b> <span class="tag co">🏢 OpenAI · 2026</span> <a href="https://github.com/openai/openai-python/blob/main/src/openai/resources/embeddings.py" target="_blank" rel="noopener">openai-python: embeddings.create</a></div>
+      <p><b>How:</b> one request takes a list of up to 2,048 inputs, each under 8,192 tokens, with at most 300,000 tokens across the request.</p>
+      <p><b>Why this method:</b> batching amortizes per-request overhead; the caps keep any one request bounded. Your batcher must respect both the count and the token total.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Streams as iterators</b> <span class="tag oss">🧰 Open source</span> <a href="https://platform.claude.com/docs/en/api/sdks/python" target="_blank" rel="noopener">Anthropic Python SDK</a></div>
+      <p><b>How:</b> <code>client.messages.stream(...)</code> is a context manager whose <code>text_stream</code> is an iterator (an async iterator on the async client) of text pieces, plus <code>get_final_message()</code> for the assembled reply.</p>
+      <p><b>Why this method:</b> the most familiar interface in Python (a <code>for</code> loop) for incremental output, with cleanup guaranteed by <code>with</code>.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Generators get their keyword</b> <span class="tag hist">📜 History</span> <a href="https://peps.python.org/pep-0255/" target="_blank" rel="noopener">PEP 255: Simple Generators</a></div>
+      <p><b>How:</b> written in May 2001 by Neil Schemenauer, Tim Peters and Magnus Lie Hetland, and shipped in Python 2.2, it added <code>yield</code>.</p>
+      <p><b>Why this method:</b> producers that are naturally written as loops (tokenizers, parsers, tree walks) no longer had to be turned inside-out into callback or state-machine classes.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a sequence of a quintillion numbers, in 48 bytes</span>
+    <p>In Python 3, <code>range</code> is lazy: <code>sys.getsizeof(range(10**18))</code> is <b>48 bytes</b>, the same as <code>range(10)</code>. It stores only start, stop and step, and computes each number when asked. Generators take the same idea from numbers to anything you can compute.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>P.1 gave you the protocols; here the iteration protocol becomes pipelines and streams. P.3 adds <code>async for</code> and async generators so many streams and batches run concurrently; P.4 adds bounded queues and backpressure between worker threads or processes. In the RAG phases, this is how ingestion (3.2), chunking (3.3) and batch embedding at scale (4.8) are written. The same pipeline thinking, across machines, is in the System Design course: <a href="../../system-design-course/phase3/6-pipelines.html">data pipelines</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/howto/functional.html" target="_blank" rel="noopener">Functional Programming HOWTO</a>. Iterators, generators and generator expressions from the official docs.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/library/itertools.html" target="_blank" rel="noopener">itertools</a>. Every tool with a pure-Python “roughly equivalent” implementation.</li>
+      <li><span class="kind">Docs</span> <a href="https://huggingface.co/docs/datasets/stream" target="_blank" rel="noopener">Hugging Face: streaming datasets</a>. Shuffling, batching and splitting an <code>IterableDataset</code>.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Chunks average 400 tokens. An embeddings API allows 2,048 inputs and 300,000 tokens per request. What's the largest batch you can send safely, on average?</div>
+    <div class="opts"><button class="opt">2,048</button><button class="opt" data-ok>750</button><button class="opt">5,120</button></div>
+    <div class="explain">The token cap binds first: 300,000 ÷ 400 = <b>750</b> chunks. 2,048 × 400 = 819,200 tokens would be rejected. In practice batch by running token count with some headroom, since chunk lengths vary.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your indexing script logs “processed 0 chunks” but no error, right after you added a progress count: <code>total = sum(1 for _ in chunks)</code>, followed by <code>for c in chunks: ...</code>. <code>chunks</code> comes from a generator. Why?</div>
+    <div class="opts"><button class="opt" data-ok>Counting consumed the generator, so the loop gets nothing; generators are one-shot</button><button class="opt">Generators can't be used in <code>sum()</code></button><button class="opt">The loop needs <code>list(chunks)</code> to run at all</button></div>
+    <div class="explain">An iterator can be traversed once. Either count as you go inside the main loop, or (if you really need the total first and it fits) materialize a list. <code>itertools.tee</code> exists but buffers everything not yet consumed by both copies.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A nightly job reads 3 million chunks into a list, embeds them all, then upserts them all. It sometimes dies of out-of-memory, and when it does, nothing is saved. What's the best fix?</div>
+    <div class="opts"><button class="opt">Run it on a machine with 4× the RAM</button><button class="opt">Use a smaller embedding model</button><button class="opt" data-ok>Stream: a generator over the source, <code>batched(…, n)</code>, embed and upsert each batch, and checkpoint progress</button></div>
+    <div class="explain">Memory becomes bounded by one batch instead of the corpus, the first vectors are saved within seconds, and a crash resumes from the checkpoint. More RAM just moves the cliff; a smaller model shrinks vectors but keeps the all-or-nothing design.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Iterable → <code>__iter__</code> → iterator → <code>__next__</code> until <code>StopIteration</code>. Iterators are one-shot.</li>
+      <li>Generators (<code>yield</code>, <code>(x for …)</code>) pause between items: chain them into lazy pipelines whose memory is one batch, not the corpus.</li>
+      <li><code>itertools.batched</code> (3.12+) sizes API calls; respect both the item and the token caps.</li>
+      <li>LLM token streams are iterators: wrap them in generators, use the SDK's <code>with</code>, keep the text if you need it later.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const fmtB = b => (b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? (b / 1e6).toFixed(1) + " MB" : (b / 1e3).toFixed(0) + " KB");
+  const fmtS = s => (s >= 3600 ? (s / 3600).toFixed(1) + " h" : s >= 60 ? (s / 60).toFixed(1) + " min" : s.toFixed(1) + " s");
+  const fmtN = n => Math.round(n).toLocaleString("en-US");
+
+  /* ---------- Playground 1: banquet (lists) vs conveyor (generators) ---------- */
+  const F = new Flow($("lzFlow"), { width: 760, height: 150 });
+  const ST = [["read", "read", "cl"], ["clean", "clean", "sv"], ["chunk", "chunk", "sv"], ["embed", "embed ×3", "nw"], ["store", "vector DB", "db"]];
+  ST.forEach(([id, label, kind], i) => F.node(id, { x: 80 + i * 150, y: 75, w: 112, h: 52, label, sub: "holds 0", kind }));
+  for (let i = 0; i < ST.length - 1; i++) F.edge(ST[i][0], ST[i + 1][0]);
+  F.render();
+  let lzMode = "list", running = false;
+  const segs = [...$("lzMode").querySelectorAll("button")];
+  segs.forEach(b => (b.id = "lzMode-" + b.dataset.v));
+  segs.forEach(b => (b.onclick = () => { if (running) return; segs.forEach(x => x.classList.toggle("on", x === b)); lzMode = b.dataset.v; resetLz(); }));
+  const held = {}; let peak = 0;
+  function setHeld() {
+    let tot = 0;
+    ST.forEach(([id]) => { tot += held[id] || 0; F.set(id, { sub: (id === "store" ? "stored " : "holds ") + (held[id] || 0), hot: id !== "store" && (held[id] || 0) >= 6 }); });
+    const inMem = tot - (held.store || 0);
+    peak = Math.max(peak, inMem);
+    $("lzHeld").textContent = inMem; $("lzPeak").textContent = peak;
+    $("lzBar").style.width = Math.min(100, inMem / 18 * 100) + "%";
+    $("lzBar").classList.toggle("hot", inMem >= 6);
+  }
+  function resetLz() { ST.forEach(([id]) => (held[id] = 0)); peak = 0; setHeld(); $("lzMsg").innerHTML = ""; }
+  resetLz();
+  const D = 170;
+  $("lz-run").onclick = async () => {
+    if (running) return; running = true; resetLz();
+    let firstAt = null, step = 0;
+    if (lzMode === "list") {
+      held.read = 6; setHeld(); await sleep(250);
+      for (let s = 0; s < ST.length - 1; s++) {
+        const a = ST[s][0], b = ST[s + 1][0];
+        await Promise.all([0, 1, 2, 3, 4, 5].map(k => sleep(k * 40).then(() => F.packet([a, b], { color: "--c-cx", dur: D }))));
+        step++;
+        if (b === "store") { held.store = 6; firstAt = step; held[a] = 0; }
+        else held[b] = 6; // the previous list is still referenced until the next comprehension finishes
+        setHeld(); await sleep(150);
+        if (s > 0) held[ST[s][0]] = 0; // older list freed
+        setHeld();
+      }
+      held.read = 0; setHeld();
+      $("lzMsg").innerHTML = `<span class="rk">Every stage built a full list. Peak: ${peak} items in memory, and nothing was stored until the last stage finished.</span>`;
+    } else {
+      let waiting = 0, seen = 0;
+      for (let d = 0; d < 6; d++) {
+        held.read = 1; setHeld();
+        await F.packet(["read", "clean"], { color: "--c-in", dur: D }); held.read = 0; held.clean = 1; setHeld();
+        await F.packet(["clean", "chunk"], { color: "--c-in", dur: D }); held.clean = 0; held.chunk = 1; setHeld();
+        await F.packet(["chunk", "embed"], { color: "--c-in", dur: D }); held.chunk = 0; waiting++; held.embed = waiting; setHeld();
+        if (waiting === 3) {
+          await Promise.all([0, 1, 2].map(k => sleep(k * 40).then(() => F.packet(["embed", "store"], { color: "--c-cx", dur: D }))));
+          seen += 3; waiting = 0; held.embed = 0; held.store = seen; setHeld();
+          if (firstAt === null) firstAt = d + 1;
+        }
+      }
+      $("lzMsg").innerHTML = `<span class="ev">Items flowed one at a time. Peak: ${peak} items in memory (one batch), and the first vectors were stored after reading only ${firstAt} of 6 documents.</span>`;
+    }
+    running = false;
+  };
+  function scaleStats() {
+    const docs = Math.round(10 ** +$("lzN").value), ch = docs * 4;
+    const perChunk = 1041 + 49592, perDoc = 4 * 1041;
+    $("lzNv").textContent = fmtN(docs) + " docs";
+    const memL = ch * perChunk + docs * perDoc * 2 + ch * 1041; // vectors + texts, plus the read/clean lists alive at the same time
+    const memG = 64 * 4 * perChunk + 4 * perDoc;
+    const readT = docs * 0.002, embT = Math.ceil(ch / 64) * 0.5 / 4;
+    $("lzMemL").textContent = fmtB(memL) + (memL > 16e9 ? " 💥 out of memory" : "");
+    $("lzMemG").textContent = fmtB(memG);
+    $("lzFirstL").textContent = memL > 16e9 ? "never (crashed)" : fmtS(readT + embT);
+    $("lzFirstG").textContent = fmtS(16 * 0.002 + 0.5);
+    $("lzMemL").parentElement.style.borderColor = memL > 16e9 ? "var(--bad)" : "";
+  }
+  $("lzN").oninput = scaleStats; scaleStats();
+
+  /* ---------- Playground 2: batching and streaming an embedding job ---------- */
+  const KS = [1, 8, 16, 32, 64, 128, 256, 512, 768, 1024, 1536, 2048, 4096];
+  let btMode = "all";
+  const bsegs = [...$("btMode").querySelectorAll("button")];
+  bsegs.forEach(b => (b.id = "btMode-" + b.dataset.v));
+  bsegs.forEach(b => (b.onclick = () => { bsegs.forEach(x => x.classList.toggle("on", x === b)); btMode = b.dataset.v; btRun(); }));
+  const RAM = 4e9, DIM = 1536, OVER = 0.25, PER_TOK = 2e-6, INFLIGHT = 4, RPM = 3000, LOAD = 20e-6;
+  function job(N, T, k, mode) {
+    if (k > 2048) return { err: `400 Bad Request: ${fmtN(k)} inputs > 2,048 per request` };
+    if (k * T > 300000) return { err: `400 Bad Request: ${fmtN(k * T)} tokens > 300,000 per request` };
+    const reqs = Math.ceil(N / k), lat = OVER + k * T * PER_TOK;
+    const embT = Math.max(reqs * lat / INFLIGHT, reqs / RPM * 60);
+    const perChunk = T * 4 + 41 + DIM * 4;
+    if (mode === "all") {
+      const mem = N * perChunk, loadT = N * LOAD, total = loadT + embT;
+      return { reqs, total, first: total, mem, oom: mem > RAM, loadT, embT };
+    }
+    const mem = INFLIGHT * k * perChunk + 5e6, total = Math.max(N * LOAD, embT) + lat;
+    return { reqs, total, first: k * LOAD + lat, mem, oom: mem > RAM, embT };
+  }
+  function btOpts() { return { N: Math.round(10 ** +$("btN").value), T: +$("btT").value, k: KS[+$("btK").value] }; }
+  function btLabels() { const o = btOpts(); $("btNv").textContent = fmtN(o.N); $("btTv").textContent = o.T; $("btKv").textContent = fmtN(o.k); return o; }
+  function btRun() {
+    const o = btLabels(), r = job(o.N, o.T, o.k, btMode);
+    if (r.err) {
+      ["btReq", "btTime", "btFirst", "btMem"].forEach(id => ($(id).textContent = "–"));
+      $("btMsg").innerHTML = `<span class="rk">❌ ${r.err}. Every request is rejected; shrink the batch (max ≈ ${fmtN(Math.min(2048, Math.floor(300000 / o.T)))} at ${o.T} tokens per chunk).</span>`;
+      Plot.line($("btChart"), { series: [{ label: "vectors stored", color: MX.css("--c-rk"), data: [[0, 0], [1, 0]] }], xLabel: "time (s)", yLabel: "vectors stored", yMin: 0, yMax: o.N });
+      return;
+    }
+    $("btReq").textContent = fmtN(r.reqs);
+    $("btTime").textContent = r.oom ? "crashed" : fmtS(r.total);
+    $("btFirst").textContent = r.oom ? "never" : fmtS(r.first);
+    $("btMem").textContent = fmtB(r.mem) + (r.oom ? " 💥" : "");
+    const other = job(o.N, o.T, o.k, btMode === "all" ? "stream" : "all");
+    const tMax = Math.max(r.oom ? 0 : r.total, other.oom ? 0 : other.total, 1);
+    const curve = (x, m) => {
+      if (x.oom) return [[0, 0], [tMax, 0]];
+      if (m === "all") return [[0, 0], [x.total * 0.999, 0], [x.total, o.N], [tMax, o.N]];
+      return [[0, 0], [x.first, Math.min(o.N, o.k)], [x.total, o.N], [tMax, o.N]];
+    };
+    Plot.line($("btChart"), {
+      series: [
+        { label: "load all, then store", color: MX.css("--c-rk"), data: curve(btMode === "all" ? r : other, "all"), width: btMode === "all" ? 3 : 1.5, dash: btMode === "all" ? null : [5, 4] },
+        { label: "streamed batches", color: MX.css("--c-cx"), data: curve(btMode === "all" ? other : r, "stream"), width: btMode === "stream" ? 3 : 1.5, dash: btMode === "stream" ? null : [5, 4] },
+      ], xLabel: "time (s)", yLabel: "vectors stored", yMin: 0, yMax: o.N, xMin: 0, xMax: tMax,
+    });
+    const rateBound = r.reqs / RPM * 60 >= r.reqs * (OVER + o.k * o.T * PER_TOK) / INFLIGHT;
+    $("btMsg").innerHTML = r.oom ? `<span class="rk">💥 Out of memory at ${fmtB(r.mem)} on a 4 GB worker, and nothing was stored. Stream it.</span>`
+      : o.k === 1 ? `<span class="rk">${fmtN(r.reqs)} requests: one per chunk. ${rateBound ? "The rate limit" : "Per-request overhead"} dominates.</span>`
+      : `<span class="ev">${fmtN(r.reqs)} requests, ${fmtS(r.total)} in total (${rateBound ? "limited by requests per minute" : "limited by request time"}). First vector stored after ${fmtS(r.first)}.</span>`;
+  }
+  ["btN", "btT", "btK"].forEach(id => ($(id).oninput = btRun));
+  $("bt-run").onclick = btRun;
+  $("bt-sweep").onclick = () => {
+    const o = btLabels(), pts = [];
+    KS.forEach(k => { const r = job(o.N, o.T, k, "stream"); if (!r.err) pts.push([Math.log2(k), r.total / 60]); });
+    Plot.line($("btChart"), { series: [{ label: "total minutes (streamed)", color: MX.css("--c-tk"), data: pts, dots: true, width: 3 }], xLabel: "log₂(batch size)", yLabel: "minutes", yMin: 0 });
+    const best = pts.reduce((b, p) => (p[1] < b[1] ? p : b), [0, Infinity]);
+    $("btMsg").innerHTML = `<span class="ev">Fastest valid batch here: ${fmtN(2 ** best[0])} (${fmtS(best[1] * 60)}). Missing points on the right were rejected by the 2,048-input or 300,000-token cap.</span>`;
+  };
+  btRun();
+
+  /* ---------- Mini-demo: sentence generator over scripted tokens ---------- */
+  const TOKS = ["Refunds", " are", " available", " within", " 30", " days", ".", " Plus", " members", " get", " 60", " days", ".", " Need", " help", "?", " Just", " ask", "."];
+  let tkBusy = false;
+  $("tk-run").onclick = async () => {
+    if (tkBusy) return; tkBusy = true;
+    $("tkIn").textContent = ""; $("tkOut").innerHTML = "";
+    let buf = "";
+    for (let i = 0; i < TOKS.length; i++) {
+      await sleep(90);
+      $("tkIn").textContent += TOKS[i];
+      buf += TOKS[i];
+      const nextStartsSpace = i + 1 < TOKS.length && TOKS[i + 1].startsWith(" ");
+      if (/[.!?]$/.test(buf) && (nextStartsSpace || i + 1 === TOKS.length)) {
+        $("tkOut").innerHTML += `<span class="chunk c${$("tkOut").children.length % 4}">${buf.trim()}</span> `;
+        buf = "";
+      }
+    }
+    tkBusy = false;
+  };
+})();
+</script>
+</body>
+</html>

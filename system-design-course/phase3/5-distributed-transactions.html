@@ -1,0 +1,490 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.5 Distributed transactions: 2PC, sagas & the outbox · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .btn.tog.on { background: var(--c-er); border-color: var(--c-er); color: #fff; }
+  .sagalog { font-family: var(--mono); font-size: .8rem; color: var(--muted); min-height: 6em; margin: 6px 0; }
+  .sagalog div:last-child { color: var(--text); }
+</style>
+</head>
+<body data-lesson="s3-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 5</div>
+  <h1>Distributed transactions: 2PC, sagas & the outbox</h1>
+  <p class="subtitle">One database gives you transactions for free. Once an operation spans two databases, or a database and a message broker, “all or nothing” becomes a design problem. Here are the three answers the industry actually uses.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>ACID transactions</b>: inside one database, a group of writes commits together or not at all (Lesson 2.5).</li>
+      <li><b>Kafka and CDC</b>: change data capture reads a database's own log and publishes each change (Lesson 3.2).</li>
+      <li><b>Idempotency</b>: a step that's safe to run twice (Lesson 3.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Netflix keeps its movie data in a primary database and copies it into others: Elasticsearch for search, caches for speed. In 2019 its engineers described what goes wrong when an application simply writes to two stores in a row, a <b>dual write</b>: if the second write fails, the stores drift apart, and someone has to build a repair job to find and fix the differences.</p>
+    <p>The obvious fix, a distributed transaction across both, wasn't available either: Elasticsearch doesn't support that kind of transaction. So they built Delta, a platform that reads the database's change log and feeds every other store from it. That's the pattern you'll learn here.</p>
+  </div>
+
+  <h2>Numbers first: rare failures, every day</h2>
+  <p>An order service saves the order to Postgres, then publishes <code>OrderPlaced</code> to Kafka so the warehouse ships it. Suppose the publish fails (broker blip, process killed by a deploy) only <b>0.01%</b> of the time.</p>
+  <table>
+    <tr><th>Orders per day</th><th>Saved but never announced (at 0.01%)</th><th>What the customer sees</th></tr>
+    <tr><td>10,000</td><td>1</td><td>One order paid for and never shipped</td></tr>
+    <tr><td>1,000,000</td><td class="er">100</td><td>100 support tickets a day, every day</td></tr>
+  </table>
+  <p>At scale, “almost never” is “every day”. And you can't fix it by reordering the two writes: publish first and a failed database write creates a <b>ghost event</b> for an order that doesn't exist.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    You can't atomically write to two independent systems without a coordinator. So either <b>coordinate</b> them (two-phase commit, which blocks when the coordinator fails), <b>split the work into local transactions with undo steps</b> (a saga), or <b>write once, to one place</b>, and derive everything else from it (the transactional outbox + CDC).
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: booking a trip</span>
+    <p>You need a flight, a hotel and a car. <b>Two-phase commit</b> is a travel agent who phones all three, asks each to hold a booking, and confirms only when all three say yes. If the agent faints mid-call, all three hold your booking, unsure, blocking other customers. A <b>saga</b> is booking each one yourself in turn, and if the car is sold out, cancelling the hotel and then the flight. Each cancellation is a <b>compensating action</b>. The <b>outbox</b> is writing your plan in one notebook, and having an assistant read the notebook and make every call, retrying until each one's done.</p>
+  </div>
+
+  <h2>Option 1: two-phase commit (2PC)</h2>
+  <p>A <b>coordinator</b> runs two rounds. <b>Phase 1, prepare:</b> “can you commit?” Each participant writes everything to disk, locks the rows and votes yes or no. <b>Phase 2, commit:</b> if all voted yes, “commit”; otherwise “abort”.</p>
+  <p>The catch: a participant that voted yes has promised to obey, so it <b>cannot decide alone</b>. If the coordinator crashes after the prepare, participants hold their locks until it comes back. That's why 2PC is called a <b>blocking</b> protocol. Postgres supports it (<code>PREPARE TRANSACTION</code>), but its docs say the feature is meant for external transaction managers, not applications, and warn against leaving transactions prepared for long.</p>
+
+  <div class="playground" id="pg1">
+    <span class="label">🎮 Playground · 2PC and the stuck coordinator</span>
+    <p class="hint">A coordinator moves money between two databases. Run it normally, then turn on the crash: the coordinator dies right after both participants vote yes. Other requests that need the locked rows (200 per second here) pile up until you recover the coordinator.</p>
+    <svg id="tf"></svg>
+    <div class="controls">
+      <button class="btn primary" id="t2run">▶ Run 2PC</button>
+      <button class="btn tog" id="t2crash">💥 Coordinator crashes after PREPARE</button>
+      <button class="btn" id="t2rec">♻️ Recover coordinator</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">outcome <b id="t2o">–</b></div>
+      <div class="stat">rows locked for <b id="t2l">0 s</b></div>
+      <div class="stat">requests blocked <b id="t2b">0</b></div>
+    </div>
+    <p class="hint" id="t2msg"></p>
+  </div>
+
+  <h2>Option 2: sagas</h2>
+  <p>A <b>saga</b> (the name comes from a 1987 paper on long-lived transactions) breaks one big transaction into a sequence of <b>local transactions</b>, one per service, each committed on its own. If step k fails, the saga runs <b>compensating transactions</b> for steps k−1 … 1 in reverse: refund the card, release the stock, cancel the order.</p>
+  <table>
+    <tr><th></th><th>Choreography</th><th>Orchestration</th></tr>
+    <tr><td>How</td><td>Each service listens for events and emits the next: <code>OrderCreated</code> → inventory reserves → <code>StockReserved</code> → payments charges…</td><td>A central orchestrator tells each service what to do and tracks the saga's state</td></tr>
+    <tr><td>Good</td><td>No central component; loosely coupled</td><td>The whole flow is in one place; easy to see, test and change</td></tr>
+    <tr><td>Bad</td><td>The flow is spread over many services; hard to follow past 3–4 steps; cycles</td><td>The orchestrator must be durable (survive crashes mid-saga)</td></tr>
+    <tr><td>Tools</td><td>Kafka/SNS events</td><td>Temporal, Cadence (Uber), AWS Step Functions</td></tr>
+  </table>
+  <p>Sagas give up <b>isolation</b> (the I in ACID): other requests can see the order in “pending” while the saga runs, and a refund happens <i>after</i> the charge. Design for it: show “pending” states, and use “semantic locks” like a <code>status = PENDING</code> flag.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: a food order saga</span>
+    <p>Steps: create order (PENDING) → reserve the dish at the restaurant → charge $30 → assign a courier → mark APPROVED. No courier is available.</p>
+    <ul>
+      <li>Steps 1–3 committed: an order exists, the dish is reserved, <b>$30 was charged</b>.</li>
+      <li>Step 4 fails, so compensate in reverse: <b>refund $30</b> → release the dish → set the order to CANCELLED.</li>
+      <li>Net effect: $30 − $30 = <b>$0</b>, nothing held. But for a few seconds the customer's card showed a $30 charge: sagas are “eventually all-or-nothing”, not instantly.</li>
+      <li>If the refund call times out, retry it (with backoff, Lesson 3.3). Compensations must be <b>idempotent and retried until they succeed</b>; there's no undo for an undo.</li>
+    </ul>
+  </div>
+
+  <div class="playground" id="pg2">
+    <span class="label">🎮 Playground · An order saga with failure injection</span>
+    <p class="hint">Pick which step fails, then run. Watch the compensations run backwards. In orchestration mode you can also crash the orchestrator mid-saga: a durable orchestrator (like Temporal) records each step, so a restarted one continues where it left off.</p>
+    <svg id="sf"></svg>
+    <div class="controls">
+      <span class="seg" id="sfail"><button id="sf-none" data-v="none" class="on">Nothing fails</button><button id="sf-inv" data-v="inv">Out of stock</button><button id="sf-pay" data-v="pay">Card declined</button><button id="sf-ship" data-v="ship">No courier</button></span>
+    </div>
+    <div class="controls">
+      <span class="seg" id="smode"><button id="sm-orch" data-v="orch" class="on">Orchestration</button><button id="sm-chor" data-v="chor">Choreography</button></span>
+      <button class="btn tog" id="scrash">💥 Crash orchestrator after step 2</button>
+      <button class="btn tog" id="sflaky">📶 First refund attempt times out</button>
+      <button class="btn primary" id="srun">▶ Run saga</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">order <b id="so">–</b></div>
+      <div class="stat">stock held <b id="si">–</b></div>
+      <div class="stat">money taken <b id="sp">–</b></div>
+      <div class="stat">courier <b id="ss">–</b></div>
+      <div class="stat">compensations <b id="sc">0</b></div>
+    </div>
+    <div class="sagalog" id="slog"></div>
+  </div>
+
+  <h2>Option 3: the transactional outbox</h2>
+  <p>The cleanest fix for the dual write: don't write to the broker from your request at all. In the <b>same local transaction</b> as the order, insert a row into an <b>outbox</b> table describing the event. The database guarantees both rows commit together or not at all. Then a separate <b>relay</b> reads the outbox (by polling, or with CDC reading the database log, e.g. Debezium's outbox event router) and publishes to Kafka, retrying until it succeeds.</p>
+  <p>The relay can crash after publishing but before marking the row as sent, so it may publish twice. That's fine: the event has a unique ID, and consumers dedupe on it (Lesson 3.3). <b>At-least-once + idempotent consumers = effectively once.</b></p>
+
+  <div class="playground" id="pg3">
+    <span class="label">🎮 Playground · Dual write vs outbox</span>
+    <p class="hint">Run 1,000 orders. “failure rate” is the chance that something breaks between the two writes (a broker blip, a deploy killing the process). Compare the three designs and count orders with no event, events with no order, and duplicates.</p>
+    <svg id="of"></svg>
+    <div class="controls">
+      <span class="seg" id="omode"><button id="om-db" data-v="db" class="on">Dual write: DB, then publish</button><button id="om-pub" data-v="pub">Dual write: publish, then DB</button><button id="om-out" data-v="out">Outbox + relay</button></span>
+    </div>
+    <div class="controls">
+      <label>failure rate <input type="range" id="ofr" min="0" max="10" step="0.5" value="2"> <b class="mono" id="ofrv"></b></label>
+      <button class="btn primary" id="orun">▶ Run 1,000 orders</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">orders in DB <b id="oo">–</b></div>
+      <div class="stat">events published <b id="oe">–</b></div>
+      <div class="stat">orders never announced <b id="om">–</b></div>
+      <div class="stat">ghost events <b id="og">–</b></div>
+      <div class="stat">duplicates (deduped) <b id="od">–</b></div>
+    </div>
+    <p class="hint" id="omsg"></p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Sagas / workflows:</b> <b>Temporal</b> (open source + Temporal Cloud), <b>Cadence</b> (open-sourced by Uber), <b>AWS Step Functions</b>, <b>Azure Durable Functions</b>, <b>Camunda</b>. <b>Outbox:</b> a table + <b>Debezium</b>'s outbox event router, or a polling relay. <b>2PC:</b> XA transactions, Postgres <code>PREPARE TRANSACTION</code>. The outbox write, in one transaction:</p>
+<pre><code><span class="k">BEGIN</span>;
+<span class="k">INSERT INTO</span> orders (id, customer_id, total_cents, status) <span class="k">VALUES</span> (<span class="n">42</span>, <span class="n">7</span>, <span class="n">3000</span>, <span class="s">'PENDING'</span>);
+<span class="k">INSERT INTO</span> outbox (id, aggregatetype, aggregateid, type, payload)   <span class="c">-- Debezium's default columns</span>
+  <span class="k">VALUES</span> (gen_random_uuid(), <span class="s">'order'</span>, <span class="s">'42'</span>, <span class="s">'OrderPlaced'</span>, <span class="s">'{"total_cents":3000}'</span>);
+<span class="k">COMMIT</span>;   <span class="c">-- both rows or neither; Debezium then publishes to topic outbox.event.order</span></code></pre>
+    <p>An orchestrated saga with compensations in Temporal's Python SDK. If the worker crashes, Temporal replays the recorded history and the workflow carries on from the last completed step:</p>
+<pre><code><span class="k">from</span> datetime <span class="k">import</span> timedelta
+<span class="k">from</span> temporalio <span class="k">import</span> workflow
+
+T = timedelta(seconds=<span class="n">30</span>)
+
+<span class="n">@workflow.defn</span>
+<span class="k">class</span> OrderSaga:
+    <span class="n">@workflow.run</span>
+    <span class="k">async def</span> run(self, order: dict) -&gt; str:
+        undo = []
+        <span class="k">try</span>:
+            <span class="k">await</span> workflow.execute_activity(reserve_stock, order, start_to_close_timeout=T)
+            undo.append(release_stock)
+            <span class="k">await</span> workflow.execute_activity(charge_card, order, start_to_close_timeout=T)
+            undo.append(refund_card)
+            <span class="k">await</span> workflow.execute_activity(assign_courier, order, start_to_close_timeout=T)
+            <span class="k">return</span> <span class="s">"APPROVED"</span>
+        <span class="k">except</span> Exception:
+            <span class="k">for</span> step <span class="k">in</span> reversed(undo):                 <span class="c"># compensate in reverse order</span>
+                <span class="k">await</span> workflow.execute_activity(step, order, start_to_close_timeout=T)   <span class="c"># retried by Temporal</span>
+            <span class="k">return</span> <span class="s">"CANCELLED"</span></code></pre>
+    <p class="hint">Try it locally: <code>temporal server start-dev</code> (the Temporal CLI) runs a dev server with a web UI on port 8233, where you can watch each workflow's event history.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th></th><th>2PC</th><th>Saga</th><th>Outbox + CDC</th></tr>
+      <tr><td>Consistency</td><td>Atomic: all or nothing</td><td>Eventually all-or-nothing, with visible in-between states</td><td>DB is the truth; others catch up in seconds</td></tr>
+      <tr><td>Failure mode</td><td class="er">Blocks with locks held if the coordinator dies</td><td>A compensation can fail; must retry forever</td><td>Relay lag; duplicates (dedupe them)</td></tr>
+      <tr><td>Latency</td><td>2 round trips + locks held throughout</td><td>Each step commits right away</td><td>The request is one local transaction</td></tr>
+      <tr><td>Works across</td><td>Systems that support it (XA)</td><td>Any service with an undo action</td><td>One database → anything downstream</td></tr>
+      <tr><td>Use it for</td><td>Inside one vendor's system (e.g. a distributed SQL database)</td><td>Business flows across services: orders, bookings, payouts</td><td>“Update my DB and tell the world”</td></tr>
+    </table>
+    <p class="hint">Before any of these, ask: can the data live in one database? A single Postgres transaction is simpler than every pattern on this page. Split databases only when you must (Lesson 4.1).</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Keep related data in one Postgres and use real transactions. When you must notify other systems, use an outbox table with a simple polling worker. Avoid microservice sagas until the team and the domain demand them; a modular monolith with one database covers a long way.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>CDC from every database (Debezium, Netflix's DBLog/Delta), outbox as the standard way to publish events, workflow engines (Temporal, Cadence) for long business processes with compensations, and distributed SQL databases that handle cross-shard transactions internally so applications don't have to.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How do you keep the order service and the payment service consistent?” is a classic. A senior answer covers:</p>
+    <ul>
+      <li>Spotting the <b>dual write</b> and saying why reordering doesn't fix it.</li>
+      <li>Choosing a <b>saga</b> (orchestrated, for clarity) with explicit <b>compensations</b>, each idempotent and retried.</li>
+      <li>Publishing events via a <b>transactional outbox</b> + CDC, with consumers deduping on event ID.</li>
+      <li>Explaining why <b>2PC</b> is avoided across services: blocking, coupling, and many systems don't support it.</li>
+      <li>The user-visible <b>in-between states</b> (“payment pending”) and how the UI shows them.</li>
+    </ul>
+    <p class="hint">Common follow-ups: “What if the refund fails?” “What if the orchestrator crashes halfway?” “How does the consumer avoid processing an event twice?” “Choreography or orchestration, and why?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Replacing dual writes with a change log</b> <span class="tag co">🏢 Netflix · 2019</span> <a href="https://netflixtechblog.com/delta-a-data-synchronization-and-enrichment-platform-e82c36a79aee" target="_blank" rel="noopener">Delta: a data synchronization and enrichment platform</a></div>
+      <p><b>How:</b> Delta captures changes from the source database (CDC) and syncs derived stores like Elasticsearch, with optional enrichment by calling other services. The post walks through one real use case: movie search.</p>
+      <p><b>Why this method:</b> dual writes drift and need custom repair jobs, and distributed (XA) transactions don't work with stores like Elasticsearch.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The saga and outbox patterns</b> <span class="tag oss">🧰 Pattern</span> <a href="https://microservices.io/patterns/data/saga.html" target="_blank" rel="noopener">microservices.io: Saga</a> · <a href="https://microservices.io/patterns/data/transactional-outbox.html" target="_blank" rel="noopener">Transactional outbox</a></div>
+      <p><b>How:</b> a saga is a sequence of local transactions, coordinated by choreography (events) or orchestration (a central coordinator), with compensating transactions to undo. The outbox stores messages in the service's database as part of its local transaction.</p>
+      <p><b>Why this method:</b> 2PC across the database and the broker isn't viable, but sending a message after (or during) a transaction isn't reliable without it.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Outbox events straight from the database log</b> <span class="tag oss">🧰 Open source</span> <a href="https://debezium.io/documentation/reference/stable/transformations/outbox-event-router.html" target="_blank" rel="noopener">Debezium outbox event router</a></div>
+      <p><b>How:</b> a Debezium connector captures inserts to the outbox table and routes each to a topic based on its <code>aggregatetype</code> (e.g. <code>outbox.event.order</code>), with the event's <code>id</code> as a header for deduplication.</p>
+      <p><b>Why this method:</b> no polling, no extra load on the database, and events go out in commit order.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Durable orchestration</b> <span class="tag co">🏢 Uber · 2017</span> <a href="https://www.uber.com/blog/open-source-orchestration-tool-cadence-overview/" target="_blank" rel="noopener">Uber's open source orchestration tool, Cadence</a></div>
+      <p><b>How:</b> Cadence gives engineers persistence, queues and timers so that a long multi-service flow can be written as ordinary code; Uber open-sourced it in 2017. Temporal, a similar open-source engine, replays a workflow's event history to rebuild its state after a crash.</p>
+      <p><b>Why this method:</b> hand-written sagas end up as a tangle of callbacks, state tables and retry cron jobs; a workflow engine makes the saga's state durable for you.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Where the word comes from</b> <span class="tag hist">📜 History · 1987</span> <a href="https://www.cs.cornell.edu/andru/cs711/2002fa/reading/sagas.pdf" target="_blank" rel="noopener">Garcia-Molina & Salem: Sagas (SIGMOD)</a></div>
+      <p><b>How:</b> long-lived transactions (monthly statements, insurance claims) held database resources for too long, so the paper split them into a sequence of transactions, each with a compensating transaction.</p>
+      <p><b>Why this method:</b> holding locks for a long time blocks everyone else; short transactions plus undo steps keep the system moving.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · an idea 30 years ahead</span>
+    <p>The Sagas paper was written in 1987, at Princeton, for long transactions inside a single database. Decades later it became the standard answer for keeping microservices consistent, without the paper's authors having microservices in mind at all.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>ACID inside one database (Lesson 2.5) is what we're trying to stretch here. The outbox relies on CDC and Kafka (Lesson 3.2), and every saga step and consumer must be idempotent (Lesson 3.3). 2PC's coordinator problem is why consensus exists (Lesson 3.4). Service boundaries decide how many sagas you'll need (Lesson 4.2), and the payment system design is a saga with real money (Lesson 7.7).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://debezium.io/blog/2019/02/19/reliable-microservices-data-exchange-with-the-outbox-pattern/" target="_blank" rel="noopener">Reliable microservices data exchange with the outbox pattern</a>. The outbox end to end with Debezium.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.temporal.io/workflows" target="_blank" rel="noopener">Temporal: workflows</a>. How durable execution and event-history replay work.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.postgresql.org/docs/current/sql-prepare-transaction.html" target="_blank" rel="noopener">Postgres PREPARE TRANSACTION</a>. Two-phase commit in a real database, and its warnings.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A service saves 2,000,000 orders a day and then publishes an event for each. The publish step fails 0.005% of the time. Roughly how many orders a day are saved but never announced?</div>
+    <div class="opts"><button class="opt">1</button><button class="opt" data-ok>100</button><button class="opt">10,000</button></div>
+    <div class="explain">2,000,000 × 0.00005 = <b>100</b> a day. Tiny failure rates become daily incidents at scale, which is why “just publish after commit” isn't good enough.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. An order saga charges the card, then fails to reserve stock. What should happen?</div>
+    <div class="opts"><button class="opt">Roll back the whole saga with a database ROLLBACK</button><button class="opt" data-ok>Run the compensating action (refund the charge), retrying it until it succeeds, then cancel the order</button><button class="opt">Leave it; the customer can contact support</button></div>
+    <div class="explain">Each saga step already committed in its own service, so there's no single ROLLBACK. You undo with compensating transactions in reverse order, and since there's no undo for an undo, compensations must be idempotent and retried until they work.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A user-signup service must create the account and reliably publish <code>UserSignedUp</code> to Kafka. Which design is best?</div>
+    <div class="opts"><button class="opt">Insert the user, commit, then publish to Kafka</button><button class="opt">Two-phase commit across Postgres and Kafka</button><button class="opt" data-ok>Insert the user and an outbox row in one transaction; a relay (e.g. Debezium) publishes the outbox row</button></div>
+    <div class="explain">Commit-then-publish loses events when the publish fails. 2PC across Postgres and Kafka isn't practical. The outbox makes the event part of the same local transaction, and the relay delivers it at least once; consumers dedupe on the event ID.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Writing to two systems in a row (a dual write) loses or invents events at scale; reordering doesn't help.</li>
+      <li>2PC is atomic but blocking: prepared participants hold locks until the coordinator decides. Avoid it across services.</li>
+      <li>Sagas = local transactions + compensations in reverse. Orchestrate for clarity; make every step and undo idempotent.</li>
+      <li>Outbox = write the event in the same local transaction, publish it with a relay or CDC, dedupe downstream.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const wait = ms => new Promise(r => setTimeout(r, ms));
+  const fmt = n => Math.round(n).toLocaleString("en-US");
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- 2PC ----------
+  const T = new Flow($("tf"), { width: 720, height: 200 });
+  T.node("co", { x: 140, y: 100, w: 150, label: "🧭 Coordinator", sub: "idle", kind: "sv" })
+   .node("pa", { x: 520, y: 45, w: 170, label: "🗄️ Accounts DB (EU)", sub: "−$100", kind: "db" })
+   .node("pb", { x: 520, y: 155, w: 170, label: "🗄️ Accounts DB (US)", sub: "+$100", kind: "db" })
+   .edge("co", "pa").edge("co", "pb").render();
+  let blockedTimer = null, lockedFor = 0, blocked = 0, t2busy = false, t2pending = false;
+  const t2 = (o, msg) => { $("t2o").textContent = o; $("t2msg").textContent = msg; };
+  function startBlock() {
+    lockedFor = 0; blocked = 0;
+    blockedTimer = setInterval(() => {
+      lockedFor += 0.2; blocked += 40;                      // 200 requests/s wait on the locked rows
+      $("t2l").textContent = lockedFor.toFixed(1) + " s"; $("t2b").textContent = fmt(blocked);
+      T.set("pa", { load: Math.min(1, lockedFor / 10) }).set("pb", { load: Math.min(1, lockedFor / 10) });
+    }, 200);
+  }
+  async function phase2(decision) {
+    const c = decision === "commit" ? "--c-db" : "--c-er";
+    T.set("co", { sub: decision.toUpperCase() + "!" });
+    await Promise.all([T.packet(["co", "pa"], { color: c, dur: 400, back: true }), T.packet(["co", "pb"], { color: c, dur: 400, back: true })]);
+    const st = decision === "commit" ? "committed ✓" : "aborted ↩ (unlocked)";
+    T.set("pa", { sub: st, hot: false, load: 0 }).set("pb", { sub: st, hot: false, load: 0 }).set("co", { sub: "done" });
+  }
+  $("t2run").onclick = async () => {
+    if (t2busy || t2pending) return; t2busy = true;
+    $("t2l").textContent = "0 s"; $("t2b").textContent = "0";
+    T.set("co", { sub: "PREPARE?", down: false }).set("pa", { sub: "−$100", load: 0 }).set("pb", { sub: "+$100", load: 0 });
+    t2("phase 1…", "Phase 1: each database writes the change to disk, locks the rows, and votes.");
+    await Promise.all([T.packet(["co", "pa"], { color: "--c-lt", dur: 400, back: true }), T.packet(["co", "pb"], { color: "--c-lt", dur: 400, back: true })]);
+    T.set("pa", { sub: "prepared 🔒 voted YES", hot: true }).set("pb", { sub: "prepared 🔒 voted YES", hot: true });
+    if ($("t2crash").classList.contains("on")) {
+      T.set("co", { down: true, sub: "💥 crashed" });
+      t2("❓ in doubt", "Both databases voted YES, so neither may commit or abort alone. Their rows stay locked, and every request that touches them waits. Press Recover.");
+      t2pending = true; startBlock();
+    } else {
+      await phase2("commit");
+      t2("✅ committed", "Both voted YES, so the coordinator said COMMIT. Two round trips, rows locked the whole time, but all-or-nothing.");
+    }
+    t2busy = false;
+  };
+  $("t2crash").onclick = () => $("t2crash").classList.toggle("on");
+  $("t2rec").onclick = async () => {
+    if (!t2pending || t2busy) return; t2busy = true;
+    T.set("co", { down: false, sub: "recovering: reads its log" });
+    await wait(600);
+    clearInterval(blockedTimer);
+    await phase2("abort");
+    t2("↩️ aborted (late)", `The recovered coordinator found no COMMIT decision in its log (it crashed before writing one), so it told both databases to ABORT. The rows were locked for ${lockedFor.toFixed(1)} s and ${fmt(blocked)} requests waited. In production, coordinators can be down for minutes.`);
+    t2pending = false; t2busy = false;
+  };
+
+  // ---------- saga ----------
+  const S = new Flow($("sf"), { width: 720, height: 210 });
+  const SV = [["order", "🧾 Orders"], ["inv", "📦 Restaurant"], ["pay", "💳 Payments"], ["ship", "🛵 Couriers"]];
+  let sbusy = false;
+  const getFail = seg("sfail", () => {}), getMode = seg("smode", () => drawSaga());
+  function drawSaga() {
+    const orch = getMode() === "orch";
+    S.nodes = {}; S.edges = [];
+    if (orch) {
+      S.node("orc", { x: 360, y: 40, w: 220, label: "🧭 Saga orchestrator", sub: "durable state", kind: "sv" });
+      SV.forEach(([id, l], i) => { S.node(id, { x: 100 + i * 173, y: 160, w: 150, label: l, sub: "", kind: "db" }); S.edge("orc", id); });
+    } else {
+      SV.forEach(([id, l], i) => S.node(id, { x: 100 + i * 173, y: 120, w: 150, label: l, sub: "", kind: "db" }));
+      S.node("bus", { x: 360, y: 30, w: 220, label: "📣 Event bus (Kafka)", sub: "events", kind: "nw" });
+      for (let i = 0; i < 3; i++) S.edge(SV[i][0], SV[i + 1][0], { label: ["OrderCreated", "DishReserved", "Charged"][i] });
+    }
+    S.render();
+    $("scrash").disabled = !orch;
+  }
+  const slog = [];
+  const log = s => { slog.push(s); while (slog.length > 7) slog.shift(); $("slog").innerHTML = slog.map(x => `<div>${x}</div>`).join(""); };
+  const state = {};
+  function paintState() {
+    $("so").textContent = state.order || "–"; $("si").textContent = state.inv ? "1 dish" : "none";
+    $("sp").textContent = "$" + (state.paid || 0); $("ss").textContent = state.ship ? "assigned" : "none"; $("sc").textContent = state.comp || 0;
+    S.set("order", { sub: state.order || "" }).set("inv", { sub: state.inv ? "dish reserved" : state.invRel ? "released" : "" })
+     .set("pay", { sub: state.paid ? "charged $30" : state.refunded ? "refunded" : "" }).set("ship", { sub: state.ship ? "courier assigned" : "" });
+  }
+  async function call(id, ok, color) {
+    const orch = getMode() === "orch";
+    const idx = SV.findIndex(s => s[0] === id);
+    if (orch) await S.packet(["orc", id], { color: color || (ok ? "--c-db" : "--c-er"), dur: 380, back: true });
+    else if (idx > 0) await S.packet([SV[idx - 1][0], id], { color: color || (ok ? "--c-nw" : "--c-er"), dur: 380 });
+    else await wait(200);
+  }
+  $("srun").onclick = async () => {
+    if (sbusy) return; sbusy = true;
+    drawSaga();
+    Object.keys(state).forEach(k => delete state[k]); slog.length = 0; $("slog").innerHTML = "";
+    const fail = getFail(), crash = $("scrash").classList.contains("on") && getMode() === "orch", flaky = $("sflaky").classList.contains("on");
+    const orch = getMode() === "orch";
+    state.comp = 0;
+    const steps = [
+      ["order", "create order (PENDING)", () => (state.order = "PENDING"), null],
+      ["inv", "reserve the dish", () => (state.inv = true), "inv"],
+      ["pay", "charge $30", () => (state.paid = 30), "pay"],
+      ["ship", "assign a courier", () => (state.ship = true), "ship"],
+    ];
+    let done = [], failed = false;
+    for (let i = 0; i < steps.length; i++) {
+      const [id, what, apply, key] = steps[i];
+      const ok = key !== fail;
+      await call(id, ok);
+      if (!ok) { log(`❌ step ${i + 1}: ${what} failed`); failed = true; break; }
+      apply(); done.push(id); paintState(); log(`✅ step ${i + 1}: ${what}`);
+      if (crash && i === 1) {
+        S.set("orc", { down: true, sub: "💥 crashed" }); log("💥 orchestrator crashed after step 2");
+        await wait(1200);
+        S.set("orc", { down: false, sub: "restarted: replaying history" }); log("♻️ new orchestrator replays the saga log: steps 1–2 done → continue at step 3");
+        await wait(800);
+        S.set("orc", { sub: "durable state" });
+      }
+    }
+    if (!failed) { state.order = "APPROVED"; paintState(); await call("order", true); log(orch ? "🎉 all steps done → order APPROVED" : "🎉 Couriers emitted CourierAssigned → Orders marks it APPROVED"); sbusy = false; return; }
+    log(orch ? "↩️ orchestrator runs compensations in reverse" : "↩️ the failing service emits a failure event; each earlier service undoes its own step");
+    const undo = { pay: async () => {
+        if (flaky) { await call("pay", false, "--c-er"); log("⏳ refund timed out; retrying with the same idempotency key"); await wait(500); }
+        await call("pay", true, "--c-lt"); state.paid = 0; state.refunded = true; log("💸 compensation: refund $30");
+      },
+      inv: async () => { await call("inv", true, "--c-lt"); state.inv = false; state.invRel = true; log("📦 compensation: release the dish"); },
+      order: async () => { await call("order", true, "--c-lt"); state.order = "CANCELLED"; log("🧾 compensation: order → CANCELLED"); },
+    };
+    for (const id of done.slice().reverse()) { await undo[id](); state.comp++; paintState(); }
+    log(`Net effect: $${state.paid} taken, nothing held. The customer saw a “pending” order for a moment.`);
+    sbusy = false;
+  };
+  $("scrash").onclick = () => $("scrash").classList.toggle("on");
+  $("sflaky").onclick = () => $("sflaky").classList.toggle("on");
+  drawSaga(); paintState();
+
+  // ---------- dual write vs outbox ----------
+  let O;
+  const getO = seg("omode", () => { drawO(); outbox(); });
+  function drawO() {
+    const out = getO() === "out";
+    O = new Flow($("of"), { width: 720, height: 190 });
+    O.node("svc", { x: 80, y: 95, label: "🧾 Order service", kind: "sv" });
+    if (out) {
+      O.node("db", { x: 270, y: 95, w: 160, label: "🗄️ orders + outbox", sub: "one transaction", kind: "db" })
+       .node("rel", { x: 450, y: 95, w: 120, label: "🔁 Relay / CDC", kind: "sv" })
+       .node("k", { x: 625, y: 50, w: 130, label: "📨 Kafka", kind: "nw" })
+       .node("wh", { x: 625, y: 145, w: 130, label: "🏭 Warehouse", sub: "dedupes on event id", kind: "sv" })
+       .edge("svc", "db").edge("db", "rel").edge("rel", "k").edge("k", "wh");
+    } else {
+      O.node("db", { x: 350, y: 45, w: 150, label: "🗄️ orders", kind: "db" })
+       .node("k", { x: 350, y: 150, w: 150, label: "📨 Kafka", kind: "nw" })
+       .node("wh", { x: 600, y: 150, w: 140, label: "🏭 Warehouse", kind: "sv" })
+       .edge("svc", "db", { label: getO() === "db" ? "1" : "2" }).edge("svc", "k", { label: getO() === "db" ? "2" : "1" }).edge("k", "wh");
+    }
+    O.render();
+  }
+  function outbox(animate) {
+    const p = +$("ofr").value / 100, mode = getO(), rng = MX.seeded(21);
+    $("ofrv").textContent = (+$("ofr").value).toFixed(1) + "%";
+    let orders = 0, events = 0, missing = 0, ghost = 0, dup = 0;
+    for (let i = 0; i < 1000; i++) {
+      const fails = rng() < p;
+      if (mode === "db") { orders++; if (fails) missing++; else events++; }
+      else if (mode === "pub") { events++; if (fails) ghost++; else orders++; }
+      else {
+        if (fails) { i--; continue; }   // the single transaction rolled back; the client retries and it succeeds
+        orders++; events++;
+        if (rng() < p) dup++;           // relay crashed after publishing, before marking sent: published again
+      }
+    }
+    $("oo").textContent = fmt(orders); $("oe").textContent = fmt(events + dup);
+    $("om").textContent = fmt(missing); $("og").textContent = fmt(ghost); $("od").textContent = fmt(dup);
+    $("omsg").textContent = p === 0 ? "With no failures every design looks fine. That's why dual-write bugs reach production: set the failure rate above zero."
+      : mode === "db" ? `${missing} orders were saved and charged but never announced. The warehouse will never ship them, and nothing will alert you.`
+      : mode === "pub" ? `${ghost} ghost events: the warehouse was told to ship orders that were never saved.`
+      : `0 missing, 0 ghosts. The order and its event committed together. The relay published ${dup} events twice, which the warehouse ignored by event ID.`;
+    if (animate) animO(mode, p);
+  }
+  async function animO(mode, p) {
+    const red = "--c-er";
+    if (mode === "out") { await O.packet(["svc", "db"], { color: "--c-db", dur: 300 }); await O.packet(["db", "rel", "k", "wh"], { color: "--c-nw", dur: 700 }); }
+    else if (mode === "db") { await O.packet(["svc", "db"], { color: "--c-db", dur: 300 }); await O.packet(["svc", "k"], { color: p > 0 ? red : "--c-nw", dur: 300 }); }
+    else { await O.packet(["svc", "k", "wh"], { color: "--c-nw", dur: 500 }); await O.packet(["svc", "db"], { color: p > 0 ? red : "--c-db", dur: 300 }); }
+  }
+  $("ofr").oninput = () => outbox(false);
+  $("orun").onclick = () => outbox(true);
+  drawO(); outbox(false);
+})();
+</script>
+</body>
+</html>

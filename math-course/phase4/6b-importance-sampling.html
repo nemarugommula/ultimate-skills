@@ -1,0 +1,364 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.6b Importance sampling: reusing someone else's samples · Math for AI</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>📐</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .tbl { border-collapse: collapse; margin: 10px auto; display: block; width: max-content; max-width: 100%; overflow-x: auto; font-size: .9rem; }
+  .tbl th, .tbl td { border: 1px solid var(--line); padding: 4px 9px; text-align: center; }
+  .tbl th { background: var(--bg2); }
+  .tbl td.clipped { color: var(--bad); font-weight: 700; }
+  .chips { display: flex; flex-wrap: wrap; gap: 5px; margin: 10px 0; }
+  .chip { border: 1px solid var(--line); border-radius: 8px; padding: 2px 6px; font-size: .78rem; text-align: center; line-height: 1.25; background: var(--bg2); min-width: 46px; }
+  .chip b { display: block; font-family: var(--mono); color: var(--c-w); }
+  .chip.big { border-color: var(--bad); box-shadow: 0 0 0 1px var(--bad) inset; }
+  .verdict { font-weight: 700; margin: 8px 0 0; }
+</style>
+</head>
+<body data-lesson="m4-6b" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 6b</div>
+  <h1>Importance sampling: reusing someone else's samples</h1>
+  <p class="subtitle">You want an average under one distribution, but your samples came from another. Reweight each sample and the answer comes out right. It's how PPO and GRPO reuse old rollouts, how ad systems test a new policy without running it, and how movie renderers trace light.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Expected value 𝔼[X] = Σ x · P(x): the probability-weighted, long-run average. Variance measures the swing around it (Lesson 4.4).</li>
+      <li>Monte Carlo: estimate an expected value by averaging random samples (Lesson 4.6).</li>
+      <li>A policy is a probability distribution over actions; an LLM's is a distribution over the next token (Lesson 4.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>RL fine-tuning of an LLM is expensive mostly because of generation: write a batch of answers, score them, update the model. PPO squeezes several updates out of each batch. But after the first update the model has <b>changed</b>, and the answers were written by the old one. Using them as if nothing happened would be wrong.</p>
+    <p>The fix is one fraction per token, <b>new probability ÷ old probability</b>, and then PPO clips that fraction to between 0.8 and 1.2. By the end of this lesson you'll know why the fraction works and why it needs a leash.</p>
+  </div>
+
+  <h2>Numbers first: a die you didn't roll</h2>
+  <p>A friend rolled a <b>fair</b> die 600 times and wrote down the results: about 100 of each face. You want to know the average roll of a <b>loaded</b> die that lands on 6 half the time (and on each of 1–5 with probability 0.1). You can't roll the loaded die. Can you still use your friend's list?</p>
+  <p>Under the loaded die, a 6 is <b>3× as likely</b> (0.5 instead of 1/6) and each other face is <b>0.6× as likely</b> (0.1 instead of 1/6). So count every 6 in the list three times, and every other roll as 0.6 of a roll:</p>
+  <div class="calc">( 100 × 0.6 × (1 + 2 + 3 + 4 + 5) &nbsp;+&nbsp; 100 × 3 × 6 ) / 600 &nbsp;=&nbsp; (900 + 1800) / 600 &nbsp;=&nbsp; <b>4.5</b></div>
+  <p>The true average of the loaded die is 0.1 × (1 + 2 + 3 + 4 + 5) + 0.5 × 6 = 1.5 + 3 = <b>4.5</b>. ✓ The plain average of the list is 3.5, the fair die's answer, which is the wrong question.</p>
+  <div class="eq">
+    𝔼<sub><span class="pr">p</span></sub>[ f(X) ] &nbsp;≈&nbsp; (1/n) Σ<sub>i</sub> <span class="w">w<sub>i</sub></span> · f(x<sub>i</sub>), &nbsp;&nbsp; with <span class="w">w<sub>i</sub></span> = <span class="pr">p(x<sub>i</sub>)</span> / <span class="x">q(x<sub>i</sub>)</span> and x<sub>i</sub> ~ <span class="x">q</span>
+    <span class="say">“The average of f under p is about the average, over samples drawn from q, of f times the weight p over q.” 𝔼<sub>p</sub> means “expected value when X follows p”; x<sub>i</sub> ~ q means “sample i was drawn from q”; Σ<sub>i</sub> adds over the n samples.</span>
+  </div>
+  <div class="legend"><span class="pr">p: the distribution you care about (target, new policy)</span><span class="x">q: the one your samples came from (old policy, logging policy)</span><span class="w">w: the importance weight</span></div>
+
+  <details class="mathbox">
+    <summary><span class="pill">Why it works</span> the q's cancel, in three lines</summary>
+    <div class="inner">
+      <p>Average of w · f under q = Σ<sub>x</sub> <span class="x">q(x)</span> · (<span class="pr">p(x)</span> / <span class="x">q(x)</span>) · f(x) = Σ<sub>x</sub> <span class="pr">p(x)</span> · f(x) = 𝔼<sub>p</sub>[f]. The q on top and the q underneath cancel.</p>
+      <p>Check with the die's 6: q = 1/6, weight 3, and 1/6 × 3 = 0.5 = p(6). ✓ So the estimate is right <b>on average</b> (unbiased). One catch: q must be above 0 wherever p is. You can't reweight a face that never appears in the list.</p>
+    </div>
+  </details>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A sample from <span class="x">q</span> can stand in for <span class="pr">p</span> if you count it <span class="w">p(x)/q(x)</span> times: <b>how much more likely this sample is under the new rule than under the old one</b>. Weight above 1: p wanted more of these than q gave you. Below 1: q over-produced them.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: fixing a lopsided survey</span>
+    <p>You survey a town by standing outside the university. Half the people you ask are students, but only 10% of the town is. So each student's answer counts 0.1 / 0.5 = <b>0.2</b> of a person and everyone else's counts 0.9 / 0.5 = <b>1.8</b>. Pollsters do this every election (“survey weighting”). The danger is the same too: if you met only one retiree, that one person's answer carries a huge weight and can swing the whole poll.</p>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: six rolls by hand</span>
+    <p>Weights: faces 1–5 get 0.6, face 6 gets 3. Estimate = (sum of weight × roll) / 6.</p>
+    <ul>
+      <li>Rolls 4, 6, 2, 5, 1, 3 (one of each face): 0.6 × (4 + 2 + 5 + 1 + 3) + 3 × 6 = 9 + 18 = 27, and 27 / 6 = <b>4.5</b>. Spot on.</li>
+      <li>Rolls 6, 6, 5, 6, 2, 1 (lucky sixes): 3 × 18 + 0.6 × 8 = 54 + 4.8 = 58.8, and 58.8 / 6 = <b>9.8</b>. Way too high: three sixes, each counted 3 times.</li>
+      <li>Rolls 3, 1, 5, 2, 4, 2 (no sixes): 0.6 × 17 = 10.2, and 10.2 / 6 = <b>1.7</b>. Way too low.</li>
+    </ul>
+    <p>Right on average, wobbly in a small batch. One roll of the weighted estimate has a spread (standard deviation) of about <b>6.1</b>. Rolling the loaded die itself would give a spread of only about <b>1.8</b>. Reweighting costs you variance.</p>
+  </div>
+
+  <h2>The catch: a few samples get huge weights</h2>
+  <p>The weight p/q is big exactly where p likes something that q rarely produced. Those rare samples carry most of the answer. Here's a handy way to measure the damage, the <b>effective sample size</b> (ESS):</p>
+  <div class="eq">
+    ESS = ( Σ <span class="w">w<sub>i</sub></span> )² / Σ <span class="w">w<sub>i</sub></span>²
+    <span class="say">“The total weight, squared, divided by the sum of the squared weights.” With equal weights it equals n. If one sample hogs the weight, it drops toward 1: you have n samples, but they're worth about one.</span>
+  </div>
+  <p>Four samples with weights [1, 1, 1, 1]: ESS = 16 / 4 = <b>4</b>. Four samples with weights [0.1, 0.1, 0.1, 3.7]: same total (4), but ESS = 16 / 13.72 ≈ <b>1.2</b>. The further p and q are apart, the faster ESS collapses.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Borrowed samples, reweighted</span>
+    <p class="hint">You want the average of x under the purple bell curve <span class="pr">p</span>, but you only get samples from the blue one, <span class="x">q</span>. Draw samples and compare the naive average, the reweighted estimate and the truth. Then drag <span class="pr">p</span> far from <span class="x">q</span> and watch the weights (and ESS) go wild. Press “Repeat 200 times” to see how much the estimate wobbles.</p>
+    <div class="controls">
+      <label>center of <span class="pr">p</span> = <input type="range" id="mp" min="-3" max="3" step="0.1" value="1"> <b class="mono" id="mpv"></b></label>
+      <label>center of <span class="x">q</span> = <input type="range" id="mq" min="-3" max="3" step="0.1" value="0"> <b class="mono" id="mqv"></b></label>
+      <label>width of <span class="x">q</span> = <input type="range" id="sq" min="0.6" max="3" step="0.1" value="1"> <b class="mono" id="sqv"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn small primary" id="isDraw100">🎲 Draw 100 from q</button>
+      <button class="btn small" id="isDraw1000">Draw 1,000</button>
+      <button class="btn small" id="isRepeat">🔁 Repeat 200 times (n = 100)</button>
+      <span class="spacer"></span>
+      <button class="btn small" id="isClose">p close to q</button>
+      <button class="btn small" id="isFar">p far from q</button>
+      <button class="btn small" id="isWide">wide q covers p</button>
+    </div>
+    <canvas class="chart" id="isDens" style="height:200px"></canvas>
+    <div class="calc" id="iscalc" style="margin-top:10px"></div>
+    <div class="stat-row">
+      <div class="stat">truth 𝔼<sub>p</sub>[x] = <b id="isTrue"></b></div>
+      <div class="stat">naive average = <b id="isNaive"></b></div>
+      <div class="stat">reweighted = <b id="isEst"></b></div>
+      <div class="stat">ESS = <b id="isEss"></b></div>
+      <div class="stat">biggest weight's share = <b id="isTop"></b></div>
+    </div>
+    <canvas class="chart" id="isHist" style="height:170px"></canvas>
+    <p class="hint verdict" id="isverdict"></p>
+  </div>
+  <p>With p close to q, ESS stays near n and the estimate is good. Push p two or three widths away and a handful of samples in p's region get weights in the tens or hundreds: ESS drops to single digits and the estimate jumps around from batch to batch. A <b>wider</b> q that covers p's region keeps the weights tame. That's the whole art: pick (or keep) q close to p.</p>
+
+  <h2>Old samples, new policy</h2>
+  <p>In RL the two distributions are two versions of the same policy. An agent chose “left” and “right” 50/50 (the old policy, <span class="x">π<sub>old</sub></span>, read “pi old”). “Right” gives reward 1, “left” 0. After an update the new policy <span class="pr">π<sub>new</sub></span> picks right 80% of the time. How good is the new policy, judged from the old log: L, R, R, L?</p>
+  <ul>
+    <li>Weights: right 0.8 / 0.5 = <b>1.6</b>, left 0.2 / 0.5 = <b>0.4</b>.</li>
+    <li>Estimate: (0.4 × 0 + 1.6 × 1 + 1.6 × 1 + 0.4 × 0) / 4 = 3.2 / 4 = <b>0.8</b>, exactly the new policy's true average reward. The naive average of the log says 0.5.</li>
+  </ul>
+  <div class="eq">
+    <span class="w">ρ</span> = <span class="pr">π<sub>new</sub>(a | s)</span> / <span class="x">π<sub>old</sub>(a | s)</span>
+    <span class="say">“The ratio rho is the new policy's probability of the action that was taken, divided by the old policy's probability of it.” ρ = 1: nothing changed. ρ = 1.6: the new policy likes this action 60% more. The PPO paper writes it r<sub>t</sub>(θ); the RL course writes ρ so it doesn't clash with the reward r.</span>
+  </div>
+  <p>For an LLM, the action is a token and the probabilities come from the model's softmax. A whole answer's exact weight is the <b>product</b> of its per-token ratios, and products explode: 100 tokens at 1.05 each gives 1.05¹⁰⁰ ≈ <b>131</b>, and at 0.95 each, 0.006. GRPO instead uses one ratio per token, each clipped on its own.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The policy changed: reuse the old batch</span>
+    <p class="hint">“The cat sat on the …”. The old policy wrote 40 next tokens (the chips). A poetry judge scored each token (moon scores best). Move the update size to shift the policy toward high-scoring tokens, and watch each chip's weight <span class="w">ρ = π<sub>new</sub>/π<sub>old</sub></span>. Then turn on PPO-style clipping and compare the estimates. “Repeat 200 batches” shows the trade: clipping wobbles less but drifts away from the truth.</p>
+    <div class="controls">
+      <label>update size = <input type="range" id="pt" min="0" max="30" step="1" value="8"> <b class="mono" id="ptv"></b></label>
+      <label><input type="checkbox" id="clipOn"> clip ρ to [1 − ε, 1 + ε]</label>
+      <label>ε = <input type="range" id="pe" min="0.05" max="0.5" step="0.05" value="0.2"> <b class="mono" id="pev"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn small" id="polSmall">small update</button>
+      <button class="btn small" id="polBig">big update</button>
+      <button class="btn small" id="polHuge">huge update</button>
+      <span class="spacer"></span>
+      <button class="btn small" id="polNew">🎲 New old batch</button>
+      <button class="btn small primary" id="polRepeat">🔁 Repeat 200 batches</button>
+    </div>
+    <div id="ptable"></div>
+    <div class="chips" id="pchips"></div>
+    <div class="calc" id="pcalc"></div>
+    <p class="hint verdict" id="pverdict"></p>
+  </div>
+  <p>Small updates: every ρ stays near 1, the reweighted estimate is accurate, and clipping barely matters. Big updates: “moon” went from 5% to a large share, so its few old samples get weights of 5, 10 or more, and the estimate swings from batch to batch. That's why PPO stops trusting the old batch beyond about ±20% and goes back to collect fresh samples.</p>
+
+  <h2>Why PPO clips the ratio</h2>
+  <p>PPO's training objective multiplies each old sample's advantage (how much better than usual it did) by ρ, and clips ρ to [1 − ε, 1 + ε] with ε = 0.2. Once the update has made an action 20% more likely (when it was good) or 20% less likely (when it was bad), that sample stops pushing. In the playground above the clip is applied to the weights themselves, the way ad-system engineers cap weights (below). Both buy the same thing: <b>less variance, at the price of a small bias</b>, and a policy that's never judged from data it has moved too far away from.</p>
+  <p>This is also why <b>off-policy</b> RL (learning from data some other, older or different policy collected) is hard: the more the policies differ, the more a few samples dominate, and the less your batch is really worth.</p>
+
+  <div class="box code">
+    <span class="label">🐍 In code</span>
+<pre><code><span class="k">import</span> numpy <span class="k">as</span> np, torch
+rolls = np.random.randint(<span class="n">1</span>, <span class="n">7</span>, size=<span class="n">100_000</span>)      <span class="c"># samples from q: a fair die</span>
+w = np.where(rolls == <span class="n">6</span>, <span class="n">0.5</span>, <span class="n">0.1</span>) / (<span class="n">1</span>/<span class="n">6</span>)       <span class="c"># weights p/q: 3 for a six, 0.6 otherwise</span>
+np.mean(w * rolls)                                 <span class="c"># ≈ 4.5 = average of the loaded die</span>
+w.sum()**<span class="n">2</span> / (w**<span class="n">2</span>).sum()                          <span class="c"># effective sample size (≈ 55,600 of 100,000 here)</span>
+
+<span class="c"># PPO / GRPO: one ratio per token, from log-probabilities (safer than dividing tiny numbers)</span>
+ratio = torch.exp(logp_new - logp_old)             <span class="c"># ρ = π_new / π_old</span>
+loss = -torch.min(ratio * adv, ratio.clamp(<span class="n">0.8</span>, <span class="n">1.2</span>) * adv).mean()   <span class="c"># clipped, ε = 0.2</span></code></pre>
+  </div>
+
+  <div class="box watch">
+    <span class="label">📺 Watch</span>
+    <ul>
+      <li><a href="https://www.youtube.com/watch?v=C3p2wI4RAi8" target="_blank" rel="noopener">Mutual Information: Importance Sampling</a> (about 13 min). How reweighting estimates an expectation, and how a well-chosen q can even make the estimate <i>less</i> noisy than sampling p directly (as in the fun fact below).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🌍 Where it's used</span>
+    <div class="use">
+      <div class="use-head"><b>PPO's probability ratio and clip</b> <span class="tag rl">🎮 RL · 2017</span> <a href="https://arxiv.org/abs/1707.06347" target="_blank" rel="noopener">Schulman et al.: Proximal Policy Optimization</a></div>
+      <p><b>How:</b> the old policy collects a batch; PPO then runs several epochs of minibatch updates on it. Each sample enters the objective as r<sub>t</sub>(θ) × advantage, where r<sub>t</sub>(θ) = π<sub>θ</sub>(a<sub>t</sub>|s<sub>t</sub>) / π<sub>θ old</sub>(a<sub>t</sub>|s<sub>t</sub>) is exactly this lesson's weight, clipped to [1 − ε, 1 + ε] with ε = 0.2 in the paper.</p>
+      <p><b>Why this method:</b> throwing the batch away after one step wastes expensive experience; reusing it unweighted is biased; reusing it with unlimited weights lets a few samples run wild. The clip “removes the incentive for moving r<sub>t</sub> outside” the safe range (the paper's words).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>GRPO's per-token ratio</b> <span class="tag llm">🧠 LLMs · 2024</span> <a href="https://arxiv.org/abs/2402.03300" target="_blank" rel="noopener">DeepSeekMath (Shao et al.)</a></div>
+      <p><b>How:</b> for each question, the old model writes a group of G answers. Every token of every answer gets its own ratio π<sub>θ</sub>(token | question, earlier tokens) / π<sub>θ old</sub>(same), clipped like PPO's and multiplied by that answer's group-relative advantage, then averaged over tokens and answers.</p>
+      <p><b>Why this method:</b> one ratio per token keeps the weights near 1, where a product over hundreds of tokens would explode or vanish. The paper notes that with a single update on fresh samples π<sub>θ old</sub> = π<sub>θ</sub>: every ratio is 1 and the clip does nothing.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Off-policy evaluation of an ad system</b> <span class="tag prod">🏭 In production · 2013</span> <a href="https://jmlr.org/papers/v14/bottou13a.html" target="_blank" rel="noopener">Bottou et al.: Counterfactual Reasoning and Learning Systems (JMLR)</a></div>
+      <p><b>How:</b> Bing's ad placement system logged what it did, with a little randomness, plus the outcomes. To ask “what if we had used a different setting?”, each logged event is reweighted by (its probability under the new setting) ÷ (its probability under the logged one). Because rare events get huge weights, the authors clip the weights, using the fifth-largest observed weight as the cap.</p>
+      <p><b>Why this method:</b> a live A/B test for every idea is slow and risky for revenue. Reweighting old logs answers many “what ifs” at once, as long as the old system sometimes did what the new one would do (q &gt; 0 wherever p &gt; 0).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Path tracing in film rendering</b> <span class="tag prod">🏭 In production · 1997</span> <a href="https://pbr-book.org/3ed-2018/Monte_Carlo_Integration/Importance_Sampling" target="_blank" rel="noopener">Physically Based Rendering: Importance Sampling</a></div>
+      <p><b>How:</b> a pixel's brightness is an average of the light arriving from every direction, estimated with random rays (Monte Carlo, Lesson 4.6). Renderers shoot more rays toward lamps and along shiny reflections, and divide each ray's light by the probability of having chosen it. Eric Veach's 1997 thesis showed how to combine several such strategies (multiple importance sampling) and won a 2014 Academy Sci-Tech award.</p>
+      <p><b>Why this method:</b> uniformly random rays mostly hit dark walls and give noisy, speckled images. Sampling where the light is gives the same right answer with far less noise per ray.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a one-in-3.5-million event, measured with 10,000 samples</span>
+    <p>How likely is a standard bell-curve draw (Lesson 4.3) to land above 5? About 2.87 × 10⁻⁷, roughly 1 in 3.5 million. Sample the bell curve itself a million times and you expect 0.29 hits: usually zero, so the estimate is “0”. Instead, sample from a bell curve <b>centered at 5</b> and reweight each draw by p/q. We tried it: 10,000 samples gave the answer to within 1%, and the typical error at that size is about 2.4%. That trick is how engineers estimate rare failures, from network outages to financial crashes.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 AI bridge · the ratio behind modern RL</span>
+    <p><b>RL:</b> the ratio and its clip are the core of <a href="../../rl-course/phase5/6-ppo.html">RL Lesson 5.6: Trust regions, TRPO → PPO</a>. Learning purely from someone else's logs (patients' records, old robot runs) is <a href="../../rl-course/phase6/4-offline-rl.html">RL Lesson 6.4: Offline RL</a>, which uses the same weights.</p>
+    <p><b>LLMs:</b> GRPO's per-token ratio is in <a href="../../rl-course/phase8/3-grpo-rloo.html">RL Lesson 8.3: GRPO &amp; RLOO</a>; when rollouts are generated by a slightly stale model, big training systems reweight them the same way (<a href="../../rl-course/phase8/11-rl-infrastructure.html">RL Lesson 8.11: RL infrastructure</a>). Next here: why averages of many samples settle down, and how fast (Lesson 4.7). Later, KL divergence (Lesson 6.4) measures how far apart p and q are, which is what makes the weights explode.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Book</span> <a href="https://artowen.su.domains/mc/" target="_blank" rel="noopener">Art Owen: Monte Carlo theory, methods and examples</a>. Free chapters; the importance-sampling chapter covers effective sample size and choosing q.</li>
+      <li><span class="kind">Docs</span> <a href="https://spinningup.openai.com/en/latest/algorithms/ppo.html" target="_blank" rel="noopener">OpenAI Spinning Up: PPO</a>. The clipped objective written out, with a plain-English reading of what the clip does.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. The old policy sampled a token with probability 0.2. After an update, the new policy gives it 0.5. What importance weight does that old sample get?</div>
+    <div class="opts"><button class="opt">0.4</button><button class="opt" data-ok>2.5</button><button class="opt">0.3</button></div>
+    <div class="explain">ρ = new ÷ old = 0.5 / 0.2 = <b>2.5</b>: the new policy produces this token 2.5× as often, so this old sample counts 2.5 times. 0.4 is the ratio upside down; 0.3 is the difference, not the ratio. (PPO with ε = 0.2 would clip it to 1.2.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You reweight 100 old samples and find that one of them carries 90% of the total weight. What does that tell you?</div>
+    <div class="opts"><button class="opt">The estimate is extra accurate because that sample is important</button><button class="opt" data-ok>The effective sample size is close to 1: p and q are far apart, and the estimate will swing wildly from batch to batch</button><button class="opt">The weights must be wrong, since they should all be equal</button></div>
+    <div class="explain">The estimate is still right <i>on average</i>, but this batch's answer rests almost entirely on one sample. Fixes: collect fresh samples from a policy closer to p, or clip the weights (accepting a little bias), as PPO and the Bing ad paper do.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. An ad system has logs from its current policy. Engineers want to know how a new policy would have performed, without deploying it. What makes importance sampling possible here?</div>
+    <div class="opts"><button class="opt">The new policy must be identical to the old one</button><button class="opt">Nothing: you always need a live A/B test</button><button class="opt" data-ok>The old policy was a bit random, so it sometimes took the actions the new one would take; each logged event is reweighted by p_new / p_old</button></div>
+    <div class="explain">Reweighting needs q &gt; 0 wherever p &gt; 0. If the old system never showed a certain ad, no weight can tell you how it would have done. That's why Bottou et al.'s system logged with deliberate randomness.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>To average under <span class="pr">p</span> with samples from <span class="x">q</span>: weight each sample by <span class="w">w = p(x)/q(x)</span>, then average w · f. Right on average (needs q &gt; 0 where p &gt; 0).</li>
+      <li>The weight says how much more likely the sample is under the new rule than the old one.</li>
+      <li>When p and q differ a lot, a few samples get huge weights: variance explodes and ESS = (Σw)²/Σw² collapses.</li>
+      <li>PPO and GRPO reweight old rollouts by ρ = π<sub>new</sub>/π<sub>old</sub> per token and clip it to [0.8, 1.2]; ad systems, offline RL and film renderers use the same trick.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const f = (v, d) => MX.fmt(v, d);
+  const gauss = (x, m, s) => Math.exp(-0.5 * ((x - m) / s) ** 2) / (s * Math.sqrt(2 * Math.PI));
+  const randnFrom = rng => { let u = 0; while (u === 0) u = rng(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rng()); };
+
+  // ---------- Playground 1: borrowed samples ----------
+  let xs = [], seed = 7, spread = null;
+  const SP = 1; // width of p
+  const par = () => ({ mp: +$("mp").value, mq: +$("mq").value, sq: +$("sq").value });
+  const weight = (x, P) => gauss(x, P.mp, SP) / gauss(x, P.mq, P.sq);
+  function draw(n) { const rng = MX.seeded(seed++), P = par(); xs = Array.from({ length: n }, () => P.mq + P.sq * randnFrom(rng)); spread = null; renderIS(); }
+  function stats(sample, P) {
+    const w = sample.map(x => weight(x, P)), sw = MX.sum(w), sw2 = MX.sum(w.map(v => v * v));
+    return { w, est: MX.sum(sample.map((x, i) => w[i] * x)) / sample.length, naive: MX.mean(sample), ess: sw * sw / sw2, top: Math.max(...w) / sw };
+  }
+  function renderIS() {
+    const P = par();
+    $("mpv").textContent = f(P.mp, 1); $("mqv").textContent = f(P.mq, 1); $("sqv").textContent = f(P.sq, 1);
+    const S = stats(xs, P), grid = MX.linspace(-6, 6, 241);
+    const shownX = xs.slice(0, 300);
+    Plot.line($("isDens"), {
+      series: [
+        { label: "p (target)", color: MX.css("--c-pr"), data: grid.map(x => [x, gauss(x, P.mp, SP)]), width: 2.5 },
+        { label: "q (samples come from here)", color: MX.css("--c-x"), data: grid.map(x => [x, gauss(x, P.mq, P.sq)]), width: 2.5 },
+        { label: "samples", color: MX.css("--c-w"), data: shownX.map(x => [x, 0.004 + 0.02 * Math.min(1, weight(x, P) / 5)]), dotsOnly: true },
+      ],
+      yMin: 0, xLabel: "x",
+    });
+    const ex = xs.slice(0, 3).map(x => `x = ${f(x)}: <span class="w">w</span> = <span class="pr">${f(gauss(x, P.mp, SP), 3)}</span> / <span class="x">${f(gauss(x, P.mq, P.sq), 3)}</span> = <b>${f(weight(x, P), 2)}</b>`).join("<br>");
+    $("iscalc").innerHTML = `${xs.length} samples from <span class="x">q</span>. First three:<br>${ex}` +
+      `<br>reweighted = (1/${xs.length}) Σ <span class="w">w</span>·x = <b>${f(S.est, 3)}</b> · average weight = ${f(MX.mean(S.w), 2)} (should be near 1)` +
+      (spread ? `<br>200 repeats of n = 100: reweighted estimates spread (std) <b>${f(spread.sd, 3)}</b>, from ${f(spread.lo, 2)} to ${f(spread.hi, 2)}. Sampling p directly would give a spread of 0.10.` : "");
+    $("isTrue").textContent = f(P.mp, 2); $("isNaive").textContent = f(S.naive, 2); $("isEst").textContent = f(S.est, 2);
+    $("isEss").textContent = f(S.ess, 1) + " / " + xs.length; $("isTop").textContent = f(100 * S.top, 1) + "%";
+    const edges = [0, 0.5, 1, 2, 4, 8, 16, 32, Infinity], labels = ["<0.5", "0.5–1", "1–2", "2–4", "4–8", "8–16", "16–32", "32+"];
+    const counts = labels.map((_, i) => S.w.filter(v => v >= edges[i] && v < edges[i + 1]).length);
+    Plot.bars($("isHist"), { bars: counts.map((c, i) => ({ label: "w " + labels[i], value: c, color: MX.css(i >= 4 ? "--bad" : "--c-w") })), yMin: 0, yLabel: "samples" });
+    const essFrac = S.ess / xs.length;
+    $("isverdict").textContent = essFrac > 0.6 ? "✅ p and q overlap well: the weights are tame and the reweighted estimate is close to the truth." :
+      essFrac > 0.15 ? "⚠️ Some samples carry big weights. The estimate is still usable but noticeably noisier." :
+      "💥 A handful of samples carry almost all the weight (tiny ESS). Draw again and the estimate jumps around.";
+  }
+  function repeat() {
+    const P = par(), ests = [];
+    for (let r = 0; r < 200; r++) { const rng = MX.seeded(1000 + r + seed * 7); const s = Array.from({ length: 100 }, () => P.mq + P.sq * randnFrom(rng)); ests.push(stats(s, P).est); }
+    spread = { sd: MX.std(ests), lo: Math.min(...ests), hi: Math.max(...ests) };
+    renderIS();
+  }
+  const setP = (mp, mq, sq) => () => { $("mp").value = mp; $("mq").value = mq; $("sq").value = sq; draw(xs.length || 100); };
+  ["mp", "mq", "sq"].forEach(id => ($(id).oninput = () => draw(xs.length || 100)));
+  $("isDraw100").onclick = () => draw(100);
+  $("isDraw1000").onclick = () => draw(1000);
+  $("isRepeat").onclick = repeat;
+  $("isClose").onclick = setP(0.5, 0, 1);
+  $("isFar").onclick = setP(3, 0, 1);
+  $("isWide").onclick = setP(3, 0, 2.5);
+  draw(100);
+
+  // ---------- Playground 2: the policy changed ----------
+  const TOK = ["mat", "sofa", "floor", "roof", "moon"], OLD = [0.40, 0.25, 0.20, 0.10, 0.05], R = [0.5, 0.3, 0.2, 0.1, 1.0];
+  const rOld = MX.dot(OLD, R);
+  let batch = [], bseed = 11, rep = null;
+  const sampleOld = rng => { let u = rng(), i = 0; for (; i < OLD.length - 1; i++) { u -= OLD[i]; if (u < 0) return i; } return i; };
+  const newBatch = () => { const rng = MX.seeded(bseed++); batch = Array.from({ length: 40 }, () => sampleOld(rng)); rep = null; };
+  const newPol = t => MX.softmax(OLD.map((p, i) => Math.log(p) + t * (R[i] - rOld) * 3));
+  function estimates(b, NEW, clip, eps) {
+    const rho = NEW.map((p, i) => p / OLD[i]), use = rho.map(v => (clip ? MX.clamp(v, 1 - eps, 1 + eps) : v));
+    const w = b.map(i => use[i]), sw = MX.sum(w), sw2 = MX.sum(w.map(v => v * v));
+    return { rho, use, naive: MX.mean(b.map(i => R[i])), est: MX.sum(b.map(i => use[i] * R[i])) / b.length, ess: sw * sw / sw2 };
+  }
+  function renderPol() {
+    const t = +$("pt").value / 10, eps = +$("pe").value, clip = $("clipOn").checked, NEW = newPol(t);
+    $("ptv").textContent = f(t, 1); $("pev").textContent = f(eps, 2);
+    const E = estimates(batch, NEW, clip, eps), truth = MX.dot(NEW, R);
+    const cnt = TOK.map((_, i) => batch.filter(b => b === i).length);
+    $("ptable").innerHTML = `<table class="tbl"><tr><th>token</th><th>judge's score</th><th><span class="x">π<sub>old</sub></span></th><th><span class="pr">π<sub>new</sub></span></th><th><span class="w">ρ</span> = new/old</th>${clip ? "<th>clipped ρ</th>" : ""}<th>in batch</th></tr>` +
+      TOK.map((k, i) => `<tr><td>${k}</td><td>${f(R[i], 1)}</td><td>${f(OLD[i], 2)}</td><td>${f(NEW[i], 3)}</td><td>${f(E.rho[i], 2)}</td>` +
+        (clip ? `<td class="${Math.abs(E.use[i] - E.rho[i]) > 1e-9 ? "clipped" : ""}">${f(E.use[i], 2)}</td>` : "") + `<td>${cnt[i]}</td></tr>`).join("") + "</table>";
+    $("pchips").innerHTML = batch.map(i => `<span class="chip${E.use[i] > 3 ? " big" : ""}">${TOK[i]}<b>×${f(E.use[i], 2)}</b></span>`).join("");
+    $("pcalc").innerHTML =
+      `truth (new policy's average score) = Σ <span class="pr">π<sub>new</sub></span> · score = <b>${f(truth, 3)}</b>` +
+      `<br>naive average of the old batch = <b>${f(E.naive, 3)}</b> (that's the OLD policy's score, ≈ ${f(rOld, 3)})` +
+      `<br>${clip ? "clipped" : "reweighted"}: (1/40) Σ <span class="w">${clip ? "clip(ρ)" : "ρ"}</span> × score = <b>${f(E.est, 3)}</b> · ESS = ${f(E.ess, 1)} / 40` +
+      (rep ? `<br>200 fresh old batches → reweighted: mean ${f(rep.m1, 3)}, spread ${f(rep.s1, 3)} · clipped (ε = ${f(eps, 2)}): mean ${f(rep.m2, 3)}, spread ${f(rep.s2, 3)} · truth ${f(truth, 3)}` : "");
+    const maxRho = Math.max(...E.rho);
+    $("pverdict").textContent = maxRho < 1.25 && Math.min(...E.rho) > 0.8 ? "✅ Small update: every ratio is within ±25% of 1, so the old batch still describes the new policy well." :
+      clip ? `✂️ Clipping caps every weight at ${f(1 + eps, 2)}: the estimate is steadier, but it can't see the full change (biased toward the old policy).` :
+      maxRho > 4 ? `💥 “moon” is now ${f(maxRho, 1)}× more likely than before: its few old samples dominate. Re-draw the batch and watch the estimate swing.` :
+      "⚠️ The ratios are drifting from 1: the estimate is still unbiased but getting noisier.";
+  }
+  function repeatPol() {
+    const t = +$("pt").value / 10, eps = +$("pe").value, NEW = newPol(t), a = [], b = [];
+    for (let r = 0; r < 200; r++) {
+      const rng = MX.seeded(5000 + r), bb = Array.from({ length: 40 }, () => sampleOld(rng));
+      a.push(estimates(bb, NEW, false, eps).est); b.push(estimates(bb, NEW, true, eps).est);
+    }
+    rep = { m1: MX.mean(a), s1: MX.std(a), m2: MX.mean(b), s2: MX.std(b) };
+    renderPol();
+  }
+  const setT = v => () => { $("pt").value = v; rep = null; renderPol(); };
+  $("polSmall").onclick = setT(1); $("polBig").onclick = setT(10); $("polHuge").onclick = setT(25);
+  $("polNew").onclick = () => { newBatch(); renderPol(); };
+  $("polRepeat").onclick = repeatPol;
+  $("pt").oninput = () => { rep = null; renderPol(); };
+  $("pe").oninput = () => { rep = null; renderPol(); };
+  $("clipOn").onchange = renderPol;
+  newBatch(); renderPol();
+})();
+</script>
+</body>
+</html>

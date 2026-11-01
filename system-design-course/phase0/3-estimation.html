@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0.3 Latency numbers & back-of-the-envelope estimation · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .est { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 8px 18px; margin: 10px 0; }
+  .est label { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: .9rem; }
+  .est input[type=number] { width: 110px; font: inherit; font-family: var(--mono); font-size: .88rem; padding: 3px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .calc { text-align: left; line-height: 1.7; }
+  .calc b { color: var(--accent); }
+  .ladder .row { display: grid; grid-template-columns: 190px 1fr 96px; gap: 8px; align-items: center; margin: 3px 0; font-size: .84rem; }
+  .ladder .bar { height: 14px; border-radius: 4px; background: var(--c-lt); min-width: 3px; transition: width .3s; }
+  .ladder .v { font-family: var(--mono); text-align: right; }
+  .budget { display: flex; height: 26px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); background: var(--panel); margin: 8px 0; }
+  .budget i { display: block; height: 100%; }
+  .blist { font-size: .85rem; font-family: var(--mono); color: var(--muted); }
+</style>
+</head>
+<body data-lesson="s0-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 0 · Lesson 3</div>
+  <h1>Latency numbers &amp; back-of-the-envelope estimation</h1>
+  <p class="subtitle">A handful of memorised numbers and five minutes of arithmetic tell you how many servers, how much storage and how much bandwidth a design needs. It's how seniors know which part of a system will break first, before anyone writes code.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>QPS</b> = requests per second; peak QPS ≈ daily users × requests each ÷ 86,400 × peak factor (Lesson 0.1).</li>
+      <li><b>RTT</b> = round-trip time over the network; distance sets a floor (Lesson 0.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On August 3rd, 2013, people in Japan watched an airing of the film <i>Castle in the Sky</i>. At one moment, fans tweeted so hard that Twitter hit <b>143,199 tweets in a single second</b>.</p>
+    <p>Twitter's average at the time: about <b>500 million tweets a day</b>, which is <b>5,700 a second</b>. The spike was about <b>25×</b> the steady state, and Twitter says users didn't notice a blip. If you'd sized the system for the average, it would have fallen over twenty-five times. This lesson is the arithmetic that tells you that in advance.</p>
+  </div>
+
+  <h2>Numbers first: the latency ladder</h2>
+  <p>Jeff Dean of Google made this list famous in a 2009 talk as “numbers everyone should know”. The hardware is older now and some steps got faster, but the <b>ratios</b> are what you design with. (1 ns = a billionth of a second; 1 µs = a millionth; 1 ms = a thousandth.)</p>
+  <table>
+    <tr><th>Operation</th><th>Time</th><th>If an L1 cache hit took 1 second…</th></tr>
+    <tr><td>L1 cache reference (memory inside the CPU)</td><td>0.5 ns</td><td>1 second</td></tr>
+    <tr><td>Main memory (RAM) reference</td><td>100 ns</td><td>3.3 minutes</td></tr>
+    <tr><td>Send 2 KB over a 1 Gbps network</td><td>20 µs</td><td>11 hours</td></tr>
+    <tr><td><span class="db">SSD</span> random 4 KB read <span class="muted">(from a later, widely shared version of the list)</span></td><td>150 µs</td><td>3.5 days</td></tr>
+    <tr><td>Read 1 MB sequentially from memory</td><td>250 µs</td><td>5.8 days</td></tr>
+    <tr><td><span class="nw">Round trip within the same data center</span></td><td>500 µs</td><td>11.6 days</td></tr>
+    <tr><td><span class="db">Disk</span> seek (spinning disk)</td><td>10 ms</td><td>7.6 months</td></tr>
+    <tr><td>Read 1 MB sequentially from disk</td><td>20 ms</td><td>1.3 years</td></tr>
+    <tr><td><span class="er">Packet California → Netherlands → California</span></td><td>150 ms</td><td>9.5 years</td></tr>
+  </table>
+  <p>Four rules fall out of that table: <b>memory is fast</b> (a cache hit costs microseconds), <b>a network hop inside the data center is about half a millisecond</b>, <b>disk is slow</b>, and <b>a trip across the world is forever</b>. A request that makes 100 database calls in a loop pays 100 round trips; a request that calls another continent pays 150 ms before doing anything.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    You don't need exact numbers to design well; you need the right <b>order of magnitude</b> (the power of ten). Is it 10 QPS or 10,000? 10 GB or 10 TB? Being right within a factor of a few is enough to know whether you need one server or a hundred.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the chef and the ingredients</span>
+    <p>A chef needs salt. On the counter (CPU cache): reach out, 1 second. In the fridge (RAM): a few minutes. In the shop down the street (SSD): a few days' trip at this scale. A different city (the data center network): a couple of weeks. Another country (a cross-ocean request): nine and a half years. Good chefs, like good systems, keep what they use most within arm's reach.</p>
+  </div>
+
+  <h2>The toolkit: powers of two, seconds and sizes</h2>
+  <div class="two-col">
+    <table>
+      <tr><th>Power</th><th>Roughly</th><th>Unit</th></tr>
+      <tr><td>2<sup>10</sup></td><td>a thousand</td><td>KB (kilobyte)</td></tr>
+      <tr><td>2<sup>20</sup></td><td>a million</td><td>MB</td></tr>
+      <tr><td>2<sup>30</sup></td><td>a billion</td><td>GB</td></tr>
+      <tr><td>2<sup>40</sup></td><td>a trillion</td><td>TB</td></tr>
+      <tr><td>2<sup>50</sup></td><td>a quadrillion</td><td>PB</td></tr>
+    </table>
+    <table>
+      <tr><th>Handy fact</th><th>Value</th></tr>
+      <tr><td>Seconds in a day</td><td>86,400 ≈ 10<sup>5</sup></td></tr>
+      <tr><td>1 million requests/day</td><td>≈ 12 per second</td></tr>
+      <tr><td>1 billion requests/day</td><td>≈ 12,000 per second</td></tr>
+      <tr><td>Seconds in a year</td><td>≈ 3.15 × 10<sup>7</sup></td></tr>
+      <tr><td>1 Gbps (gigabit per second)</td><td>= 125 MB per second (8 bits per byte)</td></tr>
+    </table>
+  </div>
+  <p>Typical sizes to assume, then say out loud as assumptions: a numeric ID is 8 bytes; a short text post with its metadata is a few hundred bytes; a JSON API response is a few KB (Stack Overflow's 2016 numbers work out to about 5.9 KB per HTTP request on average); a phone photo is a few MB; a minute of compressed video is a few tens of MB.</p>
+
+  <h2>The recipe</h2>
+  <ol>
+    <li><b>Traffic:</b> daily users × requests each ÷ 86,400 = average QPS. Multiply by a <b>peak factor</b> (2–3× for normal daily swings is a common assumption; events can spike far higher, as Twitter saw).</li>
+    <li><b>Split reads and writes.</b> They scale differently (Lesson 0.1).</li>
+    <li><b>Storage:</b> writes per day × size per write × days kept × <b>3</b> (data is usually kept in about three copies for safety).</li>
+    <li><b>Bandwidth:</b> QPS × response size. Convert bytes to bits (× 8) for network links.</li>
+    <li><b>Servers:</b> peak QPS ÷ what one server handles, plus headroom. That per-server number must come from a load test of <i>your</i> code (Lesson 6.5), never from a blog.</li>
+  </ol>
+  <div class="eq">
+    storage per year = <span class="db">writes/day</span> × <span class="db">bytes per write</span> × 365 × <span class="db">copies</span>
+    <span class="say">“Writes per day times how big each one is, times the days in a year, times how many copies you keep.”</span>
+  </div>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: a photo-sharing app with 10 million daily users</span>
+    <p>Assumptions (say them out loud): each user views 50 photos a day and uploads one every 10 days (0.1/day). An original photo is 2 MB; the feed shows a 200 KB version. Peak = 3× average.</p>
+    <ul>
+      <li><b>Views:</b> 10,000,000 × 50 ÷ 86,400 ≈ <b>5,800/s</b> average, ≈ <b>17,400/s</b> at peak.</li>
+      <li><b>Uploads:</b> 10,000,000 × 0.1 ÷ 86,400 ≈ <b>12/s</b>. Writes are tiny; reads are the problem (again).</li>
+      <li><b>Storage:</b> 1,000,000 uploads/day × 2 MB = <b>2 TB per day</b> → 730 TB per year → about <b>2.2 PB</b> with 3 copies. That's object storage (Lesson 2.7), not a database.</li>
+      <li><b>Bandwidth:</b> 5,800 views/s × 200 KB ≈ 1.16 GB/s ≈ <b>9.3 Gbps</b> average, ~28 Gbps at peak. That's a CDN's job (Lesson 1.4).</li>
+      <li><b>App servers:</b> if one handles ~1,000 requests/s (measure it!), peak needs 18, so run about <b>23</b> with 30% headroom (17,400 × 1.3 ÷ 1,000).</li>
+    </ul>
+    <p>In five lines you've learned the design's real shape: object storage for petabytes, a CDN for tens of gigabits, and a modest fleet of app servers.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The estimator</span>
+    <p class="hint">Change any input and the arithmetic updates line by line. The chart shows one day of traffic shaped by your peak factor; the gold line is what your servers can handle. Press <b>Size for the average</b> to see how much traffic fails at peak, then <b>Size for the peak</b> to fix it.</p>
+    <div class="controls">
+      <span class="hint">Preset</span>
+      <span class="seg" id="pre"><button id="pre-photo" data-v="photo" class="on">Photo app (worked example)</button><button id="pre-tw" data-v="tw">Twitter 2013 tweets</button><button id="pre-so" data-v="so">Stack Overflow 2016</button></span>
+    </div>
+    <div class="est">
+      <label>daily active users <input type="number" id="dau" min="1" step="any"></label>
+      <label>requests / user / day <input type="number" id="rpu" min="0" step="any"></label>
+      <label>% that are writes <input type="number" id="wp" min="0" max="100" step="any"></label>
+      <label>peak factor (×) <input type="number" id="pf" min="1" max="50" step="any"></label>
+      <label>response size (KB) <input type="number" id="rkb" min="0" step="any"></label>
+      <label>stored per write (KB) <input type="number" id="wkb" min="0" step="any"></label>
+      <label>copies kept <input type="number" id="rep" min="1" max="5" step="1"></label>
+      <label>req/s one server handles <input type="number" id="cap" min="1" step="any"></label>
+    </div>
+    <div class="calc" id="calc"></div>
+    <div class="controls">
+      <button class="btn" id="avg">📉 Size for the average</button>
+      <button class="btn primary" id="peak">📈 Size for the peak (+30%)</button>
+      <label>servers you run <input type="range" id="srv" min="1" max="200" step="1" value="24"> <b class="mono" id="srvv"></b></label>
+    </div>
+    <canvas class="chart" id="day" style="height:210px"></canvas>
+    <div class="stat-row">
+      <div class="stat">peak QPS <b id="spk">–</b></div>
+      <div class="stat">capacity <b id="scap">–</b></div>
+      <div class="stat">requests failing per day <b id="sfail">–</b></div>
+      <div class="stat">hours overloaded <b id="shrs">–</b></div>
+    </div>
+    <p class="hint" id="emsg"></p>
+  </div>
+  <p>Sanity checks against reality: the Twitter preset's 500 M/day gives 5,787/s, matching the 5,700 Twitter reported. Stack Overflow's 209 M requests a day is about 2,400/s on average, spread over 9 web servers: under 300 requests/s each, which is why so few servers were enough. The <i>per-user</i> splits in those two presets are just a convenient way to type in the daily totals the companies published.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Latency ladder and the request budget</span>
+    <p class="hint">Top: the ladder on a log scale (each step right is 10× slower). Flip to human scale to feel the gaps. Bottom: build one request by adding operations, against a 200 ms budget for the whole request. Try <b>+100 calls in a loop</b> (the “N+1 queries” bug) and <b>+ call across an ocean</b>.</p>
+    <div class="controls">
+      <span class="seg" id="scale"><button id="scale-real" data-v="real" class="on">Real time</button><button id="scale-human" data-v="human">If L1 = 1 second</button></span>
+    </div>
+    <div class="ladder" id="ladder"></div>
+    <h3 style="margin-top:1.2em">Build a request (budget 200 ms)</h3>
+    <div class="controls">
+      <button class="btn small" id="b-mem">+ read 1 MB from memory</button>
+      <button class="btn small" id="b-dc">+ 1 call in the data center</button>
+      <button class="btn small" id="b-n1">+ 100 calls in a loop</button>
+      <button class="btn small" id="b-ssd">+ read 1 MB from SSD</button>
+      <button class="btn small" id="b-disk">+ disk seek</button>
+      <button class="btn small" id="b-far">+ call across an ocean</button>
+      <button class="btn small" id="b-reset">Reset</button>
+    </div>
+    <div class="budget" id="bud"></div>
+    <div class="stat-row">
+      <div class="stat">request time <b id="btot">0 ms</b></div>
+      <div class="stat">budget left <b id="bleft">200 ms</b></div>
+      <div class="stat">biggest cost <b id="bbig">–</b></div>
+    </div>
+    <div class="blist" id="blist"></div>
+    <p class="hint" id="bmsg">Add some operations.</p>
+  </div>
+  <p>The lesson of the budget: dozens of memory reads cost nothing; a loop of database calls quietly costs tens of milliseconds; one cross-ocean call eats most of the budget by itself. That's why the fixes are “batch the calls”, “cache it in memory” and “keep the data in the same region as the code”.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Estimates are done in a notebook, a spreadsheet or a Python prompt. The per-server number comes from a load test: <b>k6</b> (Grafana), <b>wrk</b>, <b>Locust</b> or <b>JMeter</b> locally, or managed versions like Grafana Cloud k6 and Azure Load Testing.</p>
+<pre><code><span class="c"># estimate.py: the worked example, so you can change one assumption and rerun</span>
+dau, views, uploads = <span class="n">10e6</span>, <span class="n">50</span>, <span class="n">0.1</span>
+photo, thumb, peak, copies = <span class="n">2e6</span>, <span class="n">200e3</span>, <span class="n">3</span>, <span class="n">3</span>          <span class="c"># bytes, bytes, ×, copies</span>
+read_qps = dau * views / <span class="n">86400</span>
+print(<span class="s">f"reads: {read_qps:,.0f}/s avg, {read_qps*peak:,.0f}/s peak"</span>)
+print(<span class="s">f"storage: {dau*uploads*photo*365*copies/1e15:.2f} PB/year"</span>)
+print(<span class="s">f"egress: {read_qps*thumb*8/1e9:.1f} Gbps avg"</span>)</code></pre>
+<pre><code><span class="c">// load.js: how many requests/s can ONE server really take? (k6)</span>
+<span class="k">import</span> http <span class="k">from</span> <span class="s">'k6/http'</span>;
+<span class="k">export const</span> options = { vus: <span class="n">50</span>, duration: <span class="s">'30s'</span> };   <span class="c">// 50 virtual users for 30 s</span>
+<span class="k">export default function</span> () { http.get(<span class="s">'http://localhost:8080/photos/42'</span>); }</code></pre>
+    <p class="hint">Try it locally: <code>python3 estimate.py</code>, then start your app and run <code>docker run --rm -i grafana/k6 run - &lt;load.js</code>. k6 prints requests per second and latency percentiles; raise <code>vus</code> until p99 latency climbs. That knee is your per-server capacity.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs: how precise should an estimate be?</span>
+    <table>
+      <tr><th>✅ Rough (order of magnitude) is right when…</th><th>❌ Get real numbers when…</th></tr>
+      <tr><td>Choosing between designs (one database or sharded? CDN or not?)</td><td>Buying hardware, signing a cloud contract or setting autoscaling limits</td></tr>
+      <tr><td>In an interview or an early design doc</td><td>You're within 2–3× of a known limit: measure with a load test</td></tr>
+      <tr><td>The answer is 100× away from any limit</td><td>Cost is a big part of the business (video, storage-heavy products)</td></tr>
+    </table>
+    <p>Overestimating wastes money; underestimating causes outages. Most teams size for the expected peak plus headroom (often 30–50%), then let autoscaling (Lesson 5.3) handle the rest.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Do the estimate once on a napkin to know when your single database will run out (“at 20× today's users”), then stop worrying. Spend the time on the product. Re-run the numbers when growth or a launch event (a TV spot, a big customer) changes the inputs.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Capacity planning is a job: teams forecast peak QPS and storage per quarter, load-test before big events, and budget hardware in advance (Lesson 6.5). Estimates are reviewed in design docs and checked against dashboards afterwards.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Interviewers don't check your arithmetic to the digit; they watch your process. A senior estimate:</p>
+    <ul>
+      <li><b>States assumptions</b> first (“say 100 M daily users, 10 reads each”) and rounds hard (86,400 ≈ 100,000).</li>
+      <li>Computes <b>reads and writes separately</b>, average and peak, then storage and bandwidth, keeping units.</li>
+      <li><b>Draws a conclusion</b> from each number: “12 writes/s: one database is fine. 28 Gbps out: we need a CDN.”</li>
+      <li>Sanity-checks the result against something known.</li>
+    </ul>
+    <p>Common follow-ups: “What if each user uploads 10× more?” “How much does a year of storage cost?” “Which number worries you most?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Numbers everyone should know</b> <span class="tag hist">📜 Google · 2009</span> <a href="https://www.cs.cornell.edu/projects/ladis2009/talks/dean-keynote-ladis2009.pdf" target="_blank" rel="noopener">Jeff Dean, LADIS 2009 keynote (slides)</a></div>
+      <p><b>How:</b> the slide lists L1 0.5 ns, main memory 100 ns, a data center round trip 500 µs, a disk seek 10 ms and a California–Netherlands–California packet 150 ms, followed directly by worked back-of-the-envelope calculations.</p>
+      <p><b>Why this method:</b> at Google's scale, being able to estimate a design's cost in your head lets you discard bad designs before building them.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The original “approximate timings”</b> <span class="tag hist">📜 Peter Norvig</span> <a href="https://norvig.com/21-days.html" target="_blank" rel="noopener">Teach Yourself Programming in Ten Years</a></div>
+      <p><b>How:</b> the essay's answers section lists approximate timings for a typical PC: fetch from main memory 100 ns, read 1 MB sequentially from disk 20 ms, a packet US → Europe and back 150 ms.</p>
+      <p><b>Why this method:</b> Norvig's advice is that a programmer should know these ratios, because they decide which code is fast more than clever algorithms do.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Peak is not average</b> <span class="tag co">🏢 Twitter · 2013</span> <a href="https://blog.x.com/engineering/en_us/a/2013/new-tweets-per-second-record-and-how" target="_blank" rel="noopener">New Tweets per second record, and how!</a></div>
+      <p><b>How:</b> 500 M tweets a day ≈ 5,700/s on average, and a one-second peak of 143,199/s, about 25× the steady state. The post explains the re-architecture that let Twitter absorb it.</p>
+      <p><b>Why this method:</b> real traffic follows events (TV, sports, news), so systems must be sized and tested for spikes, not means.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Publishing your own numbers</b> <span class="tag co">🏢 Stack Overflow · 2016</span> <a href="https://nickcraver.com/blog/2016/02/17/stack-overflow-the-architecture-2016-edition/" target="_blank" rel="noopener">Stack Overflow: The Architecture, 2016 Edition</a></div>
+      <p><b>How:</b> a full day of stats: 209 M HTTP requests, 1.24 TB of HTTP traffic sent, 505 M SQL queries, 5.8 B Redis hits, on a small, listed set of servers.</p>
+      <p><b>Why this method:</b> knowing your real per-day numbers is what lets you say with confidence that 9 web servers are enough, and spot the next limit early.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · nine and a half years</span>
+    <p>On the human scale where an L1 cache hit takes one second, a single packet from California to the Netherlands and back takes about <b>9.5 years</b> (150 ms ÷ 0.5 ns = 300 million). A CPU waiting on a cross-ocean network call is waiting the equivalent of a decade.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>You'll use this recipe in every design lesson: cache sizing (Lesson 1.3), deciding when to shard (Lesson 2.4), Kafka partitions (Lesson 3.2), capacity planning and cost (Lesson 6.5), and each classic problem in Phase 7. In AI systems the same arithmetic applies to tokens: users × requests × tokens per request ÷ 86,400 gives tokens per second, which sets how many GPUs you need.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Talk</span> <a href="https://www.cs.cornell.edu/projects/ladis2009/talks/dean-keynote-ladis2009.pdf" target="_blank" rel="noopener">Jeff Dean: Designs, Lessons and Advice from Building Large Distributed Systems</a>. The source of the numbers, plus worked estimates.</li>
+      <li><span class="kind">Blog</span> <a href="https://gist.github.com/jboner/2841832" target="_blank" rel="noopener">Latency Numbers Every Programmer Should Know (gist)</a>. The widely shared version of the list with SSD rows and handy ratios.</li>
+      <li><span class="kind">Tool</span> <a href="https://colin-scott.github.io/personal_website/research/interactive_latency.html" target="_blank" rel="noopener">Interactive latency numbers by year</a>. Slide the year and see which numbers improved and which physics froze.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A chat app stores 2 billion messages a day, 200 bytes each, kept forever in 3 copies. Roughly how much new storage per year?</div>
+    <div class="opts"><button class="opt">About 400 GB</button><button class="opt" data-ok>About 440 TB</button><button class="opt">About 44 PB</button></div>
+    <div class="explain">2 × 10<sup>9</sup> × 200 B = 400 GB per day. × 365 ≈ 146 TB per year. × 3 copies ≈ <b>438 TB</b>. Order of magnitude: hundreds of terabytes a year, so plan for a database that partitions data across many machines (Lesson 2.4).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Which is slowest?</div>
+    <div class="opts"><button class="opt">Reading 1 MB sequentially from memory</button><button class="opt">100 network round trips inside one data center</button><button class="opt" data-ok>One request from California to the Netherlands and back</button></div>
+    <div class="explain">1 MB from memory ≈ 0.25 ms. 100 round trips in a data center ≈ 100 × 0.5 ms = 50 ms. One California–Netherlands round trip ≈ <b>150 ms</b>. Distance beats almost everything.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your API averages 3,000 QPS. One server handles 1,000 QPS. A big launch is next week and marketing expects a 10× spike for an hour. What do you do?</div>
+    <div class="opts"><button class="opt">Run 3 servers: that covers the average</button><button class="opt" data-ok>Plan for ~30,000 QPS: about 39 servers with headroom (or autoscaling limits that allow it), and load-test it before launch</button><button class="opt">Nothing: autoscaling will figure it out</button></div>
+    <div class="explain">Peak = 10 × 3,000 = 30,000 QPS ÷ 1,000 = 30 servers, + 30% headroom ≈ 39. Autoscaling helps, but it takes minutes to react and needs limits and database capacity that allow it, so you still do the arithmetic and test it.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Memorise the ladder: memory ~100 ns, SSD read ~150 µs, data center round trip ~0.5 ms, disk seek ~10 ms, cross-ocean round trip ~150 ms.</li>
+      <li>1 M requests/day ≈ 12/s. Peak = average × a peak factor (2–3× daily, far more for events).</li>
+      <li>Storage = writes/day × size × days × copies. Bandwidth = QPS × response size × 8 bits.</li>
+      <li>Servers = peak ÷ measured per-server capacity + headroom. Always draw a conclusion from each number.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const n0 = v => Math.round(v).toLocaleString("en-US");
+  const sig = v => Number.isInteger(v) ? v.toLocaleString("en-US") : v >= 100 ? n0(v) : v >= 10 ? v.toFixed(1) : v >= 1 ? v.toFixed(2) : v.toPrecision(2);
+  const bytes = b => { const u = ["B", "KB", "MB", "GB", "TB", "PB", "EB"]; let i = 0; while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; } return sig(b) + " " + u[i]; };
+  const bits = b => { const u = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"]; let i = 0; while (b >= 1000 && i < u.length - 1) { b /= 1000; i++; } return sig(b) + " " + u[i]; };
+
+  // ---------- estimator ----------
+  const PRE = {
+    photo: { dau: 10e6, rpu: 50.1, wp: 0.2, pf: 3, rkb: 200, wkb: 2000, rep: 3, cap: 1000, msg: "The worked example: 50 views + 0.1 uploads per user per day." },
+    tw: { dau: 100e6, rpu: 5, wp: 100, pf: 25, rkb: 1, wkb: 0.3, rep: 3, cap: 1000, msg: "Only tweet writes: 500 M/day (typed in as 100 M × 5), peak factor 25 as measured. Tweet size is an assumption." },
+    so: { dau: 10e6, rpu: 20.94, wp: 1, pf: 2, rkb: 5.9, wkb: 2, rep: 3, cap: 1000, msg: "209 M HTTP requests/day (typed in as 10 M × 20.94), 5.9 KB average response from their published traffic. Write share and peak are assumptions." },
+  };
+  const ids = ["dau", "rpu", "wp", "pf", "rkb", "wkb", "rep", "cap"];
+  const getPre = seg("pre", v => load(v));
+  let model = null, presetMsg = "";
+  function load(k) { const p = PRE[k]; ids.forEach(i => ($(i).value = p[i])); presetMsg = p.msg; est(); setServers(true); $("peak").classList.add("primary"); $("avg").classList.remove("primary"); }
+  function est() {
+    const v = {}; ids.forEach(i => (v[i] = Math.max(0, +$(i).value || 0)));
+    const perDay = v.dau * v.rpu, avg = perDay / 86400, peak = avg * Math.max(1, v.pf);
+    const wDay = perDay * v.wp / 100, rAvg = avg * (1 - v.wp / 100);
+    const stDay = wDay * v.wkb * 1000, stYear = stDay * 365 * Math.max(1, v.rep);
+    const egAvg = rAvg * v.rkb * 1000 * 8, egPeak = egAvg * Math.max(1, v.pf);
+    const need = Math.ceil(peak / Math.max(1, v.cap)), withHead = Math.ceil(peak * 1.3 / Math.max(1, v.cap));
+    model = { avg, peak, pf: Math.max(1, v.pf), cap: Math.max(1, v.cap), need, withHead };
+    $("calc").innerHTML = [
+      `requests/day = ${n0(v.dau)} × ${sig(v.rpu)} = <b>${n0(perDay)}</b>`,
+      `average QPS = ${n0(perDay)} ÷ 86,400 = <b>${sig(avg)}/s</b> &nbsp;·&nbsp; peak = × ${sig(v.pf)} = <b>${sig(peak)}/s</b>`,
+      `writes/day = ${n0(perDay)} × ${sig(v.wp)}% = <b>${n0(wDay)}</b> (${sig(wDay / 86400)}/s)`,
+      `storage/day = ${n0(wDay)} × ${sig(v.wkb)} KB = <b>${bytes(stDay)}</b> &nbsp;·&nbsp; per year × 365 × ${v.rep} copies = <b>${bytes(stYear)}</b>`,
+      `bandwidth out = ${sig(rAvg)} reads/s × ${sig(v.rkb)} KB × 8 = <b>${bits(egAvg)}</b> avg, <b>${bits(egPeak)}</b> peak`,
+      `servers = ${sig(peak)} ÷ ${n0(v.cap)} = ${need} at peak → <b>${withHead}</b> with 30% headroom`,
+    ].join("<br>");
+    day();
+  }
+  // one day of traffic: diurnal swing + an evening spike, normalised so mean = 1 and max = peak factor
+  const H = 24 * 12, ts = MX.linspace(0, 24, H);
+  const diur = t => 1 + 0.6 * Math.sin(2 * Math.PI * (t - 14.5) / 24);
+  const spike = t => Math.exp(-(((t - 20.5) / 0.15) ** 2));
+  function shape(P) {
+    const d = ts.map(diur), s = ts.map(spike), ms = MX.mean(s), md = MX.mean(d), dmax = Math.max(...d);
+    if (P <= dmax) return ts.map(t => 1 + (P - 1) / (dmax - 1) * (diur(t) - 1));
+    const d20 = diur(20.5), b = (P - d20 / md) / (1 - ms * d20 / md), a = (1 - b * ms) / md;
+    return ts.map((t, i) => a * d[i] + b * s[i]);
+  }
+  function day() {
+    if (!model) return;
+    const srv = +$("srv").value, capQ = srv * model.cap, f = shape(model.pf), q = f.map(x => x * model.avg);
+    $("srvv").textContent = srv;
+    let fail = 0, over = 0;
+    q.forEach(x => { if (x > capQ) { fail += (x - capQ) * 300; over++; } });
+    const peakQ = Math.max(...q);
+    Plot.line($("day"), {
+      series: [{ label: "demand (red where it fails)", color: MX.css("--c-er"), data: ts.map((t, i) => [t, q[i]]) },
+               { label: "served", color: MX.css("--c-cl"), data: ts.map((t, i) => [t, Math.min(q[i], capQ)]), fill: true }],
+      hlines: [{ y: capQ, label: srv + " servers", color: MX.css("--c-lt") }],
+      xMin: 0, xMax: 24, yMin: 0, yMax: Math.max(peakQ, capQ) * 1.1, xLabel: "hour of day",
+    });
+    $("spk").textContent = sig(model.peak) + "/s"; $("scap").textContent = sig(capQ) + "/s";
+    $("sfail").textContent = fail ? n0(fail) : "0"; $("sfail").style.color = fail ? "var(--c-er)" : "";
+    $("shrs").textContent = (over * 5 / 60).toFixed(1) + " h";
+    $("emsg").textContent = (presetMsg ? presetMsg + " " : "") + (fail ? `Overloaded: ${n0(fail)} requests a day fail or time out, all at the busiest moments, when the most people are watching.` :
+      capQ > peakQ * 2 ? "No failures, but you're paying for more than twice the peak. Fine for a launch week; wasteful forever." : "Peak fits, with some headroom. This is the target.");
+  }
+  function setServers(peak) { if (!model) return; const n = Math.min(200, Math.max(1, peak ? model.withHead : Math.ceil(model.avg / model.cap))); $("srv").max = Math.max(200, n); $("srv").value = n; day(); }
+  ids.forEach(i => ($(i).oninput = () => { presetMsg = ""; est(); }));
+  $("srv").oninput = day;
+  const mark = pk => { $("peak").classList.toggle("primary", pk); $("avg").classList.toggle("primary", !pk); };
+  $("avg").onclick = () => { mark(false); setServers(false); };
+  $("peak").onclick = () => { mark(true); setServers(true); };
+  load("photo");
+
+  // ---------- latency ladder ----------
+  const OPS = [["L1 cache reference", 0.5], ["Main memory reference", 100], ["Send 2 KB over 1 Gbps", 2e4], ["SSD random 4 KB read", 1.5e5], ["Read 1 MB from memory", 2.5e5], ["Round trip in data center", 5e5], ["Read 1 MB from SSD", 1e6], ["Disk seek", 1e7], ["Read 1 MB from disk", 2e7], ["California → Netherlands → CA", 1.5e8]];
+  const realT = ns => ns < 1e3 ? sig(ns) + " ns" : ns < 1e6 ? sig(ns / 1e3) + " µs" : sig(ns / 1e6) + " ms";
+  const human = ns => { const s = ns / 0.5; return s < 60 ? sig(s) + " s" : s < 3600 ? (s / 60).toFixed(1) + " min" : s < 86400 ? (s / 3600).toFixed(1) + " hours" : s < 86400 * 365 ? (s / 86400).toFixed(1) + " days" : (s / 86400 / 365).toFixed(1) + " years"; };
+  const getScale = seg("scale", () => ladder());
+  function ladder() {
+    const h = getScale() === "human", lo = Math.log10(0.5), hi = Math.log10(1.5e8);
+    $("ladder").innerHTML = OPS.map(([n, ns]) => `<div class="row"><span>${n}</span><div><div class="bar" style="width:${3 + 97 * (Math.log10(ns) - lo) / (hi - lo)}%"></div></div><span class="v">${h ? human(ns) : realT(ns)}</span></div>`).join("");
+  }
+  ladder();
+
+  // ---------- request budget ----------
+  const BOPS = { mem: ["1 MB from memory", 0.25, "--c-ca"], dc: ["call in data center", 0.5, "--c-nw"], n1: ["100 calls in a loop", 50, "--c-sv"], ssd: ["1 MB from SSD", 1, "--c-db"], disk: ["disk seek", 10, "--c-db"], far: ["call across an ocean", 150, "--c-er"] };
+  let items = [];
+  function budget() {
+    const tot = MX.sum(items.map(k => BOPS[k][1])), BUD = 200, width = Math.max(BUD, tot);
+    $("bud").innerHTML = items.map(k => `<i title="${BOPS[k][0]}" style="width:${100 * BOPS[k][1] / width}%;background:var(${BOPS[k][2]});border-right:1px solid var(--bg2)"></i>`).join("");
+    $("btot").textContent = sig(tot) + " ms";
+    $("bleft").textContent = (BUD - tot >= 0 ? sig(BUD - tot) : "−" + sig(tot - BUD)) + " ms";
+    $("bleft").style.color = tot > BUD ? "var(--c-er)" : "";
+    const agg = {}; items.forEach(k => (agg[k] = (agg[k] || 0) + BOPS[k][1]));
+    const big = Object.entries(agg).sort((a, b) => b[1] - a[1])[0];
+    $("bbig").textContent = big ? `${BOPS[big[0]][0]} (${Math.round(100 * big[1] / tot)}%)` : "–";
+    $("blist").textContent = Object.entries(agg).map(([k, v]) => `${items.filter(x => x === k).length}× ${BOPS[k][0]} = ${sig(v)} ms`).join(" · ");
+    $("bmsg").textContent = !items.length ? "Add some operations." : tot > BUD ? "Over budget. Remove the biggest cost: batch the loop into one query, cache the far-away data locally, or move the code next to the data." :
+      items.includes("far") ? "One cross-ocean call already uses most of the budget." : items.includes("n1") ? "The loop costs more than everything else combined. One batched query would be ~0.5 ms." : "Comfortably in budget: memory and local calls are cheap.";
+  }
+  Object.keys(BOPS).forEach(k => ($("b-" + k).onclick = () => { items.push(k); budget(); }));
+  $("b-reset").onclick = () => { items = []; budget(); };
+  budget();
+})();
+</script>
+</body>
+</html>

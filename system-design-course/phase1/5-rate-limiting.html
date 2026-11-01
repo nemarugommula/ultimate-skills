@@ -1,0 +1,409 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.5 Rate limiting: token buckets & friends · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .bucketwrap { display: flex; flex-wrap: wrap; gap: 18px; align-items: center; }
+  .bucketwrap svg { width: 170px; height: auto; flex: none; }
+  .bucketwrap .side { flex: 1; min-width: 220px; }
+  #last { font-weight: 700; }
+</style>
+</head>
+<body data-lesson="s1-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 1 · Lesson 5</div>
+  <h1>Rate limiting: token buckets & friends</h1>
+  <p class="subtitle">A rate limiter caps how many requests each client may send, so one runaway script or abusive user can't eat the capacity everyone else needs. Every public API has one; the algorithm decides how fair and how bursty it feels.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>RPS</b> = requests per second; capacity is finite, and queues explode near it (Lessons 0.3 and 1.2).</li>
+      <li><b>Redis</b>: a fast shared in-memory store with atomic counters and key expiry (TTL) (Lesson 1.3).</li>
+      <li>HTTP <b>status codes</b>: 2xx success, 4xx “client did something wrong”, 5xx “server failed” (Lesson 0.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2017, Stripe wrote that its basic request rate limiter is <b>constantly triggered</b>: it had “rejected millions of requests this month alone”, often from a user's test script that had gotten out of hand.</p>
+    <p>Stripe runs four different limiters, built on <b>token buckets in Redis</b>. Without them, one customer's buggy loop could slow down payments for everybody. By the end of this lesson you'll be able to build one.</p>
+  </div>
+
+  <h2>Numbers first: why “100 per minute” is trickier than it sounds</h2>
+  <p>Your API allows each user <b>100 requests per minute</b>. That's an average of 1.67 per second. The simplest implementation keeps a counter per user per clock minute and resets it at :00.</p>
+  <p>Now a client sends 100 requests at <b>0:59</b> and 100 more at <b>1:01</b>. Each burst lands in a different minute, so both are allowed. That's <b>200 requests in about 2 seconds</b>: 100 per second, 60× the rate you meant to allow, and double the per-minute limit.</p>
+  <p>This is the <b>fixed-window boundary burst</b>, and it's why most production limiters use something smoother.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A rate limit has two numbers, whether you say so or not: a <b>sustained rate</b> (how much on average) and a <b>burst</b> (how much at once). The token bucket makes both explicit: tokens drip in at the rate, the bucket's size is the burst, and each request spends one token.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: an arcade token jar</span>
+    <p>You get one arcade token every 10 seconds, dropped into a jar that holds 20. Play slowly and the jar fills up, so you can later play 20 games in a row (a burst). Play nonstop and you're limited to one game every 10 seconds (the rate). An empty jar means “come back later”: that's an HTTP <b>429</b>.</p>
+  </div>
+
+  <h2>The four classic algorithms</h2>
+  <table>
+    <tr><th>Algorithm</th><th>How it works</th><th>Good</th><th>Bad</th></tr>
+    <tr><td><b>Fixed window</b></td><td>Count per clock window (this minute); reset at the boundary</td><td>Tiny: one counter, one <code>INCR</code></td><td>Up to 2× the limit around boundaries</td></tr>
+    <tr><td><b>Sliding window log</b></td><td>Store every request's timestamp; count those in the last 60 s</td><td>Exact</td><td>Memory grows with the limit (100 timestamps per user)</td></tr>
+    <tr><td><b>Sliding window counter</b></td><td>Two counters: blend the previous window's count by how much of it is still inside the last 60 s</td><td>Nearly exact, two numbers per user</td><td>An approximation</td></tr>
+    <tr><td><b>Token bucket</b></td><td>Tokens refill at rate r up to capacity b; a request spends one</td><td>Explicit burst + rate; the industry default</td><td>Allows a full burst after a quiet period (by design)</td></tr>
+    <tr><td><b>Leaky bucket</b></td><td>Requests join a queue that drains at a fixed rate; a full queue rejects</td><td>Perfectly smooth output for the backend</td><td>Adds waiting time; bursts are delayed, not served</td></tr>
+  </table>
+  <div class="eq">
+    allowed in any T seconds ≤ <span class="ca">b</span> + <span class="lt">r</span> × T
+    <span class="say">“A token bucket lets through at most its capacity, plus whatever drips in during the window.” With r = 10/s and b = 50: at most 60 in one second, and at most 650 in a minute.</span>
+  </div>
+  <div class="legend"><span class="ca">b: bucket capacity (burst)</span><span class="lt">r: refill rate (tokens per second)</span></div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Watch a token bucket</span>
+    <p class="hint">20 seconds of traffic from one client. Tokens drip in at the refill rate, up to the capacity. Every request needs a token; no token means HTTP 429. Pick a traffic pattern, tune the bucket, and press <b>Play</b> to watch it at 2× speed.</p>
+    <div class="bucketwrap">
+      <svg id="bk" viewBox="0 0 170 200" aria-label="token bucket"></svg>
+      <div class="side">
+        <div class="controls">
+          <label>refill rate <input type="range" id="rate" min="1" max="20" step="1" value="5"> <b class="mono" id="ratev"></b></label>
+          <label>capacity (burst) <input type="range" id="capa" min="1" max="60" step="1" value="20"> <b class="mono" id="capav"></b></label>
+        </div>
+        <div class="controls">
+          <span class="seg" id="pat"><button data-v="steady">Steady 4/s</button><button data-v="bursty" class="on">Bursts of 25</button><button data-v="spike">Traffic spike</button><button data-v="abuse">Runaway script 30/s</button></span>
+        </div>
+        <div class="controls"><button class="btn primary" id="play">▶ Play</button><span id="last" class="hint"></span></div>
+      </div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">requests <b id="nr">–</b></div>
+      <div class="stat">allowed <b id="na">–</b></div>
+      <div class="stat">rejected (429) <b id="nx">–</b></div>
+      <div class="stat">most allowed in 1 s <b id="mb">–</b></div>
+    </div>
+    <canvas class="chart" id="tc" style="height:210px"></canvas>
+    <p class="hint" id="tmsg"></p>
+  </div>
+  <p>Things to try: with “Bursts of 25” and capacity 20, the first 20 of each burst pass and the rest bounce. Raise the capacity to 25 and the bursts fit, because the bucket refills between them. With the runaway script, no capacity helps for long: after the bucket drains, the script gets exactly the refill rate and nothing more. That's the point.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the sliding window counter</span>
+    <p>Cloudflare needed a limiter that worked across its whole network using only simple counter operations. Its trick, with a limit of 50 requests per minute:</p>
+    <ul>
+      <li>The current minute started <b>15 s ago</b> and has <b>18</b> requests so far. The whole previous minute had <b>42</b>.</li>
+      <li>The last 60 seconds include the current 15 s plus the last 45 s of the previous minute, so weight the previous count by 45/60 = 0.75.</li>
+      <li>Estimate = 42 × 0.75 + 18 = <b>49.5</b>. One more request and the user is over the limit.</li>
+    </ul>
+    <p>It assumes the previous minute's requests were spread evenly. Cloudflare measured it on 400 million requests from 270,000 sources: only <b>0.003%</b> were wrongly allowed or limited.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Five algorithms, one bursty client</span>
+    <p class="hint">Limit: <b>100 requests per minute</b> per client. The token and leaky buckets refill at 100/60 per second with a burst of 20. Pick what the client does over 3 minutes and compare: how many get through, how many are rejected, and the most that ever got through in any 60-second stretch (red bars break the limit of 100).</p>
+    <div class="controls">
+      <span class="seg" id="scn"><button data-v="edge" class="on">Boundary burst (0:59 + 1:01)</button><button data-v="over">Steady 2/s (over limit)</button><button data-v="rand">Random bursts</button></span>
+    </div>
+    <canvas class="chart" id="ac" style="height:210px"></canvas>
+    <table id="atab">
+      <tr><th>Algorithm</th><th>Allowed</th><th>Rejected</th><th>Most in any 60 s</th><th>Longest wait</th></tr>
+    </table>
+    <p class="hint" id="amsg"></p>
+  </div>
+  <p>Notice the trade-offs. The <b>fixed window</b> lets 200 through in 2 seconds at the boundary. The <b>log</b> and <b>sliding counter</b> hold the line at about 100. The <b>token bucket</b> allows a short burst (its capacity) and then exactly the rate, so in a 60-second stretch it can let through its burst plus a minute of refill. The <b>leaky bucket</b> never exceeds the rate but makes requests wait in line, which is great for protecting a fragile backend and bad for a user staring at a spinner.</p>
+
+  <h2>Where to enforce it, and per what</h2>
+  <ul>
+    <li><b>Key</b>: per API key or user (fair), per IP address (for logged-out traffic; shared offices and phone networks put many users behind one IP), per endpoint (search is costlier than reading a profile).</li>
+    <li><b>Place</b>: at the edge or CDN (cheap rejection of floods, Lesson 1.4), at the API gateway (Lesson 1.6, the usual home), inside a service for expensive operations.</li>
+    <li><b>Kind</b>: Stripe also runs a <b>concurrency limiter</b> (“only 20 requests in progress at a time”) for expensive endpoints, and <b>load shedders</b> that drop low-priority traffic when the whole system is struggling. A rate limiter protects you from one client; a load shedder protects you from everyone at once.</li>
+  </ul>
+
+  <h3>Distributed limits: when you have 20 gateways</h3>
+  <p>Say each of your 20 gateway servers enforces “100 per minute” in its own memory. The load balancer spreads a user's requests across all of them, so the user really gets up to <b>20 × 100 = 2,000 per minute</b>. Two fixes:</p>
+  <ul>
+    <li><b>A shared counter</b> in Redis: every gateway increments the same key. Costs about one Redis round trip (~1 ms) per request, and Redis must be fast and available.</li>
+    <li><b>Split the limit</b>: each gateway allows 100 ÷ 20 = 5. No shared state, but only fair if traffic is spread evenly. Some systems do this locally and sync counters every so often.</li>
+  </ul>
+  <p>Two details bite people. <b>Atomicity</b>: “read the counter, then write it back” from two gateways at once loses updates; use <code>INCR</code> or a Lua script that runs as one step inside Redis. <b>Failure</b>: if Redis is down, should requests be blocked or let through? Stripe's advice is to <b>fail open</b>: a broken limiter shouldn't take the API down with it.</p>
+
+  <h3>Saying no politely: 429 and Retry-After</h3>
+  <p>Return <b>429 Too Many Requests</b> (a 4xx, because the client can fix it by slowing down), with a <code>Retry-After</code> header saying how many seconds to wait. Tell clients where they stand on every response; GitHub sends <code>x-ratelimit-limit</code>, <code>x-ratelimit-remaining</code> and <code>x-ratelimit-reset</code>. Good clients back off with exponential delays plus randomness (Lesson 3.3), so they don't all retry at the same instant.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>nginx</b> <code>limit_req</code> (a leaky bucket), <b>Envoy</b> local and global rate limiting (the global one calls a rate limit service; Envoy provides a reference one in Go backed by Redis), <b>Kong</b>'s rate-limiting plugin (counters local, in the cluster, or in Redis), managed ones in <b>AWS API Gateway</b> (token bucket: a rate plus a burst) and <b>Cloudflare</b>. nginx, per client IP, 10 requests/s with a burst of 20:</p>
+<pre><code><span class="k">limit_req_zone</span> $binary_remote_addr zone=api:10m rate=10r/s;
+<span class="k">server</span> {
+    <span class="k">location</span> /api/ {
+        limit_req zone=api burst=<span class="n">20</span> nodelay;   <span class="c"># nodelay: serve the burst now instead of queueing it</span>
+        limit_req_status <span class="n">429</span>;                <span class="c"># the default is 503!</span>
+        proxy_pass http://api;
+    }
+}</code></pre>
+    <p>A fixed window in Redis, straight from the Redis docs' rate-limiter pattern:</p>
+<pre><code>MULTI
+INCR   rate:user42:2026-10-31T14:05     <span class="c"># one key per user per minute</span>
+EXPIRE rate:user42:2026-10-31T14:05 <span class="n">60</span>  <span class="c"># old windows clean themselves up</span>
+EXEC                                     <span class="c"># if the INCR result is over 100: reject</span></code></pre>
+    <p>And a token bucket as a Redis Lua script, so the read-refill-spend runs as one atomic step:</p>
+<pre><code><span class="c">-- KEYS[1] = bucket key;  ARGV = rate (tokens/s), capacity, now (ms)</span>
+<span class="k">local</span> rate, cap, now = tonumber(ARGV[<span class="n">1</span>]), tonumber(ARGV[<span class="n">2</span>]), tonumber(ARGV[<span class="n">3</span>])
+<span class="k">local</span> b = redis.call(<span class="s">"HMGET"</span>, KEYS[<span class="n">1</span>], <span class="s">"tokens"</span>, <span class="s">"ts"</span>)
+<span class="k">local</span> tokens = tonumber(b[<span class="n">1</span>]) <span class="k">or</span> cap
+<span class="k">local</span> ts = tonumber(b[<span class="n">2</span>]) <span class="k">or</span> now
+tokens = math.min(cap, tokens + (now - ts) / <span class="n">1000</span> * rate)   <span class="c">-- refill for the time that passed</span>
+<span class="k">local</span> ok = tokens >= <span class="n">1</span>
+<span class="k">if</span> ok <span class="k">then</span> tokens = tokens - <span class="n">1</span> <span class="k">end</span>
+redis.call(<span class="s">"HSET"</span>, KEYS[<span class="n">1</span>], <span class="s">"tokens"</span>, tokens, <span class="s">"ts"</span>, now)
+redis.call(<span class="s">"PEXPIRE"</span>, KEYS[<span class="n">1</span>], math.ceil(cap / rate * <span class="n">1000</span>))  <span class="c">-- idle buckets vanish</span>
+<span class="k">return</span> ok <span class="k">and</span> <span class="n">1</span> <span class="k">or</span> <span class="n">0</span></code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 6379:6379 redis</code>, save the script as <code>bucket.lua</code>, and run <code>redis-cli --eval bucket.lua bucket:me , 1 5 $(date +%s000)</code> a few times quickly: five 1s, then 0s.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>Pick it when…</th><th>Cost</th></tr>
+      <tr><td>Fixed window</td><td>Rough limits (daily quotas, login attempts per hour)</td><td>Boundary bursts up to 2×</td></tr>
+      <tr><td>Sliding window counter</td><td>You want a clean “N per minute” cheaply</td><td>Small approximation error</td></tr>
+      <tr><td>Token bucket</td><td>APIs: you want to allow short bursts but cap the average</td><td>Two numbers to tune; bursts after quiet periods</td></tr>
+      <tr><td>Leaky bucket / queue</td><td>Protecting a backend that needs a smooth, steady rate</td><td>Latency; queued requests can time out anyway</td></tr>
+      <tr><td>Shared Redis counter</td><td>Exact limits across many servers</td><td>~1 ms per request; Redis becomes critical (fail open)</td></tr>
+      <tr><td>Local counters only</td><td>Abuse protection where precision doesn't matter</td><td>Real limit ≈ local limit × number of servers</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Turn on your gateway's or CDN's built-in limiter per IP and per API key, generous limits, 429 + <code>Retry-After</code>. Add a stricter limit on login and signup (password guessing) and on anything that costs you money per call (SMS, emails, LLM calls). That's most of the value.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Layered limits: edge floods, per-customer token buckets in a global rate-limit service, per-endpoint concurrency limits, priority-aware load shedding, quotas sold as part of pricing tiers, and dashboards showing who is being limited, because a limiter that fires by mistake is an outage.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Design a rate limiter” is a classic question. A senior answer covers:</p>
+    <ul>
+      <li><b>Requirements</b>: limit per what (user, API key, IP), how strict, how many requests per second overall.</li>
+      <li>The <b>algorithm</b> and why: token bucket for APIs, with the rate and burst stated; the fixed-window boundary problem.</li>
+      <li><b>Distributed</b> state: Redis with atomic <code>INCR</code> or Lua, latency cost, and failing open.</li>
+      <li>The <b>client contract</b>: 429, <code>Retry-After</code>, remaining-quota headers, and clients backing off with jitter.</li>
+    </ul>
+    <p>Common follow-ups: “How would you limit across regions?” (local limits with periodic sync, accept small overshoot) · “Rate limiter vs load shedder?” · “What happens when Redis is down?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Four limiters, token buckets in Redis</b> <span class="tag co">🏢 Stripe · 2017</span> <a href="https://stripe.com/blog/rate-limiters" target="_blank" rel="noopener">Scaling your API with rate limiters</a></div>
+      <p><b>How:</b> a request rate limiter, a concurrent-requests limiter, a fleet usage load shedder (reserving capacity for critical calls like creating charges) and a worker utilization load shedder. Every user has a token bucket, implemented in Redis.</p>
+      <p><b>Why this method:</b> each protects against a different failure; their tips include failing open, dark-launching limiters first, and clear 429 vs 503 errors.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A sliding window counter at network scale</b> <span class="tag co">🏢 Cloudflare · 2017</span> <a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/" target="_blank" rel="noopener">How we built rate limiting capable of scaling to millions of domains</a></div>
+      <p><b>How:</b> only GET, SET and atomic INCR were available, so they blend the previous window's count with the current one. Across 400 million requests, 0.003% were wrongly allowed or limited.</p>
+      <p><b>Why this method:</b> two counters per client is cheap enough for millions of domains, and far more accurate than a fixed window.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Public limits with headers</b> <span class="tag co">🏢 GitHub</span> <a href="https://docs.github.com/en/rest/using-the-rest-api/rate-limits-for-the-rest-api" target="_blank" rel="noopener">Rate limits for the REST API</a></div>
+      <p><b>How:</b> 60 requests per hour for unauthenticated calls (per IP), 5,000 per hour for an authenticated user, reported on every response via <code>x-ratelimit-*</code> headers; secondary limits answer 403 or 429, sometimes with <code>retry-after</code>.</p>
+      <p><b>Why this method:</b> anonymous traffic is cheap to abuse, so it gets a tiny limit; identified users get a generous one and can see exactly where they stand.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The leaky bucket in your web server</b> <span class="tag oss">🧰 Open source · nginx</span> <a href="https://nginx.org/en/docs/http/ngx_http_limit_req_module.html" target="_blank" rel="noopener">ngx_http_limit_req_module</a></div>
+      <p><b>How:</b> limits the processing rate per key (often the client IP) using the “leaky bucket” method; <code>burst</code> sets how many excess requests may wait, <code>nodelay</code> serves them immediately.</p>
+      <p><b>Why this method:</b> it runs in the process that already handles every request, with a shared memory zone and no extra network hop.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Token buckets as a managed setting</b> <span class="tag prod">🏭 AWS API Gateway</span> <a href="https://docs.aws.amazon.com/apigateway/latest/developerguide/api-gateway-request-throttling.html" target="_blank" rel="noopener">Throttle requests to your REST APIs</a></div>
+      <p><b>How:</b> API Gateway throttles with the token bucket algorithm: you set a rate (tokens added per second) and a burst (the bucket size), per account, stage, method or usage plan; clients get 429 when throttled.</p>
+      <p><b>Why this method:</b> the two-number contract (rate + burst) is easy to explain to customers and to sell as pricing tiers.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · a surprisingly young status code</span>
+    <p>HTTP status <b>429 Too Many Requests</b> was only standardized in <b>April 2012</b>, in RFC 6585. Its example response tells the client <code>Retry-After: 3600</code>: please come back in an hour.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Rate limits usually live in the <b>API gateway</b> (Lesson 1.6) or at the <b>edge</b> (1.4), with counters in <b>Redis</b> (1.3). Clients pair them with <b>retries, backoff and idempotency</b> (3.3), and services pair them with <b>circuit breakers and load shedding</b> (4.4). They're also a <b>DDoS</b> layer (6.6). In AI products, limits are often counted in <b>tokens per minute</b>, not requests, because one request can cost a thousand times more than another.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://stripe.com/blog/rate-limiters" target="_blank" rel="noopener">Stripe: Scaling your API with rate limiters</a>. Four limiters and practical rollout advice, with sample code.</li>
+      <li><span class="kind">Blog</span> <a href="https://blog.cloudflare.com/counting-things-a-lot-of-different-things/" target="_blank" rel="noopener">Cloudflare: rate limiting at scale</a>. The sliding window counter, with the accuracy numbers.</li>
+      <li><span class="kind">Docs</span> <a href="https://redis.io/docs/latest/commands/incr/" target="_blank" rel="noopener">Redis INCR: rate limiter patterns</a>. Two implementations and the race condition to avoid.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A token bucket refills 5 tokens/s and holds 20. It's full, and a client sends requests as fast as it can. About how many are allowed in the first 10 seconds?</div>
+    <div class="opts"><button class="opt">50</button><button class="opt" data-ok>70</button><button class="opt">100</button></div>
+    <div class="explain">The full bucket gives a burst of 20, then 5 more per second: 20 + 5 × 10 = <b>70</b>. That's the b + r × T rule.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Each of your 20 API servers enforces “100 requests per minute per user” in its own memory, behind a round-robin load balancer. What can a determined user actually get?</div>
+    <div class="opts"><button class="opt">100 per minute</button><button class="opt">5 per minute</button><button class="opt" data-ok>Up to about 2,000 per minute; use a shared counter (e.g. Redis) or split the limit per server</button></div>
+    <div class="explain">Each server counts only what it sees, and the user's requests are spread over all 20: 20 × 100 = 2,000. A shared atomic counter in Redis enforces one global limit, at the cost of a fast extra hop.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A client is over its limit. What should your API send back?</div>
+    <div class="opts"><button class="opt">500 Internal Server Error</button><button class="opt" data-ok>429 Too Many Requests with a Retry-After header</button><button class="opt">200 OK with an empty body</button></div>
+    <div class="explain">429 says “you, slow down” (a client-side condition), and <code>Retry-After</code> says for how long. A 500 blames your server and invites instant retries; a fake 200 hides the problem and corrupts the client's data.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>A limit has a <b>rate</b> and a <b>burst</b>. Token bucket: allowed in T seconds ≤ b + r × T.</li>
+      <li>Fixed windows allow up to 2× at boundaries; sliding window counters fix that with two numbers; leaky buckets smooth output but add waiting.</li>
+      <li>Many servers need a <b>shared, atomic</b> counter (Redis <code>INCR</code> or Lua) or a split limit; fail open if the limiter breaks.</li>
+      <li>Reply <b>429 + Retry-After</b>, expose remaining quota, and make clients back off with jitter.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- playground 1: token bucket ----------
+  const NS = "http://www.w3.org/2000/svg", bk = $("bk");
+  const mk = (tag, a) => { const e = document.createElementNS(NS, tag); Object.entries(a).forEach(([k, v]) => e.setAttribute(k, v)); bk.appendChild(e); return e; };
+  mk("text", { x: 85, y: 14, "text-anchor": "middle", "font-size": 12, style: "fill: var(--muted)" }).textContent = "💧 refill";
+  const drip = mk("circle", { cx: 85, cy: 26, r: 4, style: "fill: var(--c-ca)" });
+  mk("clipPath", { id: "bkclip" }).appendChild((() => { const p = document.createElementNS(NS, "path"); p.setAttribute("d", "M25 40 L35 180 L135 180 L145 40 Z"); return p; })());
+  const fill = mk("rect", { x: 20, y: 180, width: 130, height: 0, "clip-path": "url(#bkclip)", style: "fill: var(--c-ca); opacity: .55" });
+  mk("path", { d: "M25 40 L35 180 L135 180 L145 40", fill: "none", "stroke-width": 3, style: "stroke: var(--text)" });
+  const tTxt = mk("text", { x: 85, y: 120, "text-anchor": "middle", "font-size": 20, "font-weight": 700, style: "fill: var(--text)" });
+  const cTxt = mk("text", { x: 85, y: 198, "text-anchor": "middle", "font-size": 11, style: "fill: var(--muted)" });
+
+  const T = 20, DT = 0.01;
+  const arrivals = pat => {
+    const a = [];
+    if (pat === "steady") for (let t = 0.1; t < T; t += 0.25) a.push(t);
+    if (pat === "bursty") for (let b = 1; b < T; b += 5) for (let k = 0; k < 25; k++) a.push(b + k * 0.02);
+    if (pat === "spike") { for (let t = 0.1; t < T; t += 0.25) if (t < 8 || t >= 11) a.push(t); for (let t = 8; t < 11; t += 1 / 40) a.push(t); }
+    if (pat === "abuse") for (let t = 0.05; t < T; t += 1 / 30) a.push(t);
+    return a;
+  };
+  const getPat = seg("pat", () => bucket());
+  let sim = null;
+  function bucket() {
+    const r = +$("rate").value, b = +$("capa").value, arr = arrivals(getPat());
+    $("ratev").textContent = r + " tokens/s"; $("capav").textContent = b + " tokens";
+    let tokens = b, last = 0, i = 0, allowed = 0, rejected = 0;
+    const tok = [], okS = [], badS = [], events = [];
+    const perSecOk = new Array(T * 10).fill(0);
+    for (let step = 0; step <= T / DT; step++) {
+      const t = step * DT;
+      tokens = Math.min(b, tokens + r * (t - last)); last = t;
+      while (i < arr.length && arr[i] <= t) {
+        const ok = tokens >= 1;
+        if (ok) { tokens -= 1; allowed++; perSecOk[Math.floor(t * 10)]++; } else rejected++;
+        events.push({ t, ok, tokens }); i++;
+      }
+      if (step % 10 === 0) tok.push([t, tokens]);
+    }
+    // counts in each 1-second bin, plotted as steps
+    for (let s = 0; s < T; s++) {
+      const n = events.filter(e => e.t >= s && e.t < s + 1), ok = n.filter(e => e.ok).length, bad = n.length - ok;
+      okS.push([s, ok], [s + 1, ok]); badS.push([s, bad], [s + 1, bad]);
+    }
+    let maxSec = 0;
+    for (let k = 0; k + 10 <= perSecOk.length; k++) { let s = 0; for (let j = k; j < k + 10; j++) s += perSecOk[j]; maxSec = Math.max(maxSec, s); }
+    sim = { r, b, tok, events };
+    $("nr").textContent = arr.length; $("na").textContent = allowed; $("nx").textContent = rejected; $("mb").textContent = maxSec;
+    drawBucket(b, b, "");
+    Plot.line($("tc"), { series: [
+      { label: "tokens in bucket", color: MX.css("--c-ca"), data: tok, fill: true },
+      { label: "allowed in that second", color: MX.css("--good"), data: okS },
+      { label: "rejected (429) in that second", color: MX.css("--c-er"), data: badS },
+    ], xMin: 0, xMax: T, yMin: 0, yMax: Math.max(b, ...okS.map(p => p[1]), ...badS.map(p => p[1])) * 1.35, xLabel: "seconds" });
+    $("tmsg").textContent = rejected === 0 ? `Everything fits: the traffic never outruns ${r} tokens/s plus a burst of ${b}.` :
+      `${rejected} of ${arr.length} requests got a 429. In any one second at most ${maxSec} got through, never more than b + r = ${b + r}.`;
+  }
+  const drawBucket = (tokens, cap, note) => {
+    const f = Math.max(0, Math.min(1, tokens / cap)), h = 140 * f;
+    fill.setAttribute("y", 180 - h); fill.setAttribute("height", h);
+    tTxt.textContent = tokens.toFixed(tokens < 10 ? 1 : 0); cTxt.textContent = "capacity " + cap;
+    $("last").textContent = note;
+  };
+  let playing = null;
+  $("play").onclick = () => {
+    if (!sim) bucket();
+    if (playing) cancelAnimationFrame(playing);
+    const t0 = performance.now(), S = sim, reduce = window.matchMedia && matchMedia("(prefers-reduced-motion: reduce)").matches;
+    let ei = 0, ok = 0, bad = 0;
+    const frame = now => {
+      const t = reduce ? T : Math.max(0, Math.min(T, (now - t0) / 500)); // 2x speed
+      let tokens = S.tok[Math.min(S.tok.length - 1, Math.floor(t * 10))][1], note = $("last").textContent;
+      while (ei < S.events.length && S.events[ei].t <= t) { const e = S.events[ei++]; e.ok ? ok++ : bad++; tokens = e.tokens; note = e.ok ? `t = ${e.t.toFixed(1)} s  ✅ allowed (${ok})` : `t = ${e.t.toFixed(1)} s  ❌ 429 (${bad})`; }
+      drawBucket(tokens, S.b, note);
+      drip.setAttribute("cy", 22 + ((now / 8) % 18));
+      if (t < T) playing = requestAnimationFrame(frame); else { playing = null; $("last").textContent = `done: ${ok} allowed, ${bad} rejected`; }
+    };
+    playing = requestAnimationFrame(frame);
+  };
+  ["rate", "capa"].forEach(id => ($(id).oninput = bucket));
+  bucket();
+
+  // ---------- playground 2: algorithm comparison ----------
+  const L = 100, WIN = 60, H = 180, RATE = L / WIN, BURST = 20;
+  const scenario = s => {
+    const a = [];
+    if (s === "edge") { for (let k = 0; k < 100; k++) a.push(58 + k / 100); for (let k = 0; k < 100; k++) a.push(60.05 + k / 100); }
+    if (s === "over") for (let t = 0.25; t < H; t += 0.5) a.push(t);
+    if (s === "rand") { const r = MX.seeded(21); let t = 2; while (t < H - 2) { const n = 20 + Math.floor(r() * 50); for (let k = 0; k < n; k++) a.push(t + k * 0.03); t += 8 + r() * 25; } }
+    return a.sort((x, y) => x - y);
+  };
+  const ALGOS = {
+    "Fixed window": arr => { const c = {}, out = []; arr.forEach(t => { const w = Math.floor(t / WIN); c[w] = c[w] || 0; if (c[w] < L) { c[w]++; out.push(t); } }); return { out }; },
+    "Sliding log": arr => { const log = [], out = []; arr.forEach(t => { while (log.length && log[0] <= t - WIN) log.shift(); if (log.length < L) { log.push(t); out.push(t); } }); return { out }; },
+    "Sliding counter": arr => { const c = {}, out = []; arr.forEach(t => { const w = Math.floor(t / WIN), into = t - w * WIN; const est = (c[w - 1] || 0) * (WIN - into) / WIN + (c[w] || 0); if (est < L) { c[w] = (c[w] || 0) + 1; out.push(t); } }); return { out }; },
+    "Token bucket": arr => { let tok = BURST, last = 0; const out = []; arr.forEach(t => { tok = Math.min(BURST, tok + (t - last) * RATE); last = t; if (tok >= 1) { tok--; out.push(t); } }); return { out }; },
+    "Leaky bucket": arr => { let next = 0; const q = [], out = []; let wait = 0; // queue of up to BURST, drains at RATE
+      arr.forEach(t => { while (q.length && q[0] <= t) q.shift(); if (q.length < BURST) { const s = Math.max(t, next); next = s + 1 / RATE; q.push(s); out.push(s); wait = Math.max(wait, s - t); } });
+      return { out, wait }; },
+  };
+  const maxIn = (ts, w) => { let m = 0, j = 0; ts = ts.slice().sort((a, b) => a - b); for (let i = 0; i < ts.length; i++) { while (ts[i] - ts[j] >= w) j++; m = Math.max(m, i - j + 1); } return m; };
+  const getScn = seg("scn", () => compare());
+  function compare() {
+    const arr = scenario(getScn()), rows = [], bars = [];
+    Object.entries(ALGOS).forEach(([name, f]) => {
+      const r = f(arr), m = maxIn(r.out, WIN);
+      rows.push(`<tr><td>${name}</td><td>${r.out.length}</td><td>${arr.length - r.out.length}</td><td class="${m > L * 1.05 ? "er" : ""}">${m}</td><td>${r.wait ? r.wait.toFixed(1) + " s" : "0"}</td></tr>`);
+      bars.push({ label: name, value: m, color: MX.css(m > L * 1.05 ? "--c-er" : name === "Leaky bucket" ? "--c-nw" : "--c-ca") });
+    });
+    $("atab").innerHTML = "<tr><th>Algorithm</th><th>Allowed</th><th>Rejected</th><th>Most in any 60 s</th><th>Longest wait</th></tr>" + rows.join("");
+    Plot.bars($("ac"), { bars, yMin: 0, yMax: 220, yLabel: "most allowed in 60 s" });
+    const fixed = ALGOS["Fixed window"](arr), fm = maxIn(fixed.out, WIN);
+    $("amsg").textContent = getScn() === "edge" ? `${arr.length} requests in two bursts 2 s apart. The fixed window let ${fm} through within one minute, because the bursts straddle the 1:00 reset. The limit was 100.` :
+      getScn() === "over" ? `The client sends 120 per minute, 20% over. Every algorithm trims it to about 100 per minute; they differ in how (rejecting now vs queueing).` :
+      `Random bursts of 20 to 70 requests. Burst-tolerant algorithms let more of each burst through; the leaky bucket smooths them but makes requests wait.`;
+  }
+  compare();
+})();
+</script>
+</body>
+</html>

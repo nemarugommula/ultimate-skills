@@ -1,0 +1,443 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>3.4 Consensus & leader election (Raft, etcd) · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .btn.tog.on { background: var(--c-er); border-color: var(--c-er); color: #fff; }
+  .logs { font-family: var(--mono); font-size: .8rem; margin: 8px 0; }
+  .logs .row { display: flex; gap: 3px; align-items: center; margin: 3px 0; flex-wrap: wrap; }
+  .logs .who { min-width: 34px; font-weight: 700; }
+  .logs .e { border-radius: 4px; padding: 1px 5px; border: 1px solid var(--line); }
+  .logs .e.c { background: color-mix(in srgb, var(--c-db) 25%, transparent); border-color: var(--c-db); }
+  .logs .e.u { background: color-mix(in srgb, var(--c-lt) 20%, transparent); border-color: var(--c-lt); }
+  .events { font-size: .85rem; color: var(--muted); min-height: 7.5em; margin: 6px 0; }
+  .events div:first-child { color: var(--text); }
+</style>
+</head>
+<body data-lesson="s3-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 3 · Lesson 4</div>
+  <h1>Consensus & leader election (Raft, etcd)</h1>
+  <p class="subtitle">How a group of machines agrees on one leader and one history, even when some of them crash or get cut off. It's the quiet core under Kubernetes, Kafka and every “highly available” database.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Leader-follower replication</b>: one node takes writes and copies them to the others (Lesson 2.3).</li>
+      <li><b>Network partition</b>: the network splits so some machines can't reach others, though all are still running (Lesson 2.6).</li>
+      <li><b>Availability in nines</b>: what “tolerating a failure” buys you (Lesson 0.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On October 21, 2018, maintenance on network equipment cut the link between GitHub's US East Coast network hub and its main East Coast data center. Connectivity came back in <b>43 seconds</b>. GitHub was degraded for <b>24 hours and 11 minutes</b>.</p>
+    <p>In those 43 seconds, the nodes of GitHub's database failover tool (which uses Raft to agree) in the West and in the cloud formed a majority without the East and promoted databases in the West. But the East had accepted a brief period of writes the West never got. Now two sites each held writes the other didn't. Untangling that took a day. This lesson is about how agreement between machines works, and why getting it slightly wrong is so expensive.</p>
+  </div>
+
+  <h2>Numbers first: how many can fail?</h2>
+  <p>Consensus systems run on <b>majorities</b>. A decision counts once more than half of the nodes agree. Two different majorities of the same group always share at least one node, so two conflicting decisions can never both win.</p>
+  <table>
+    <tr><th>Nodes</th><th>Majority (quorum)</th><th>Failures tolerated</th><th>Note</th></tr>
+    <tr><td>1</td><td>1</td><td class="er">0</td><td>No fault tolerance</td></tr>
+    <tr><td>3</td><td>2</td><td>1</td><td>The usual minimum</td></tr>
+    <tr><td>4</td><td>3</td><td>1</td><td class="er">Same as 3, but one more machine to fail</td></tr>
+    <tr><td>5</td><td>3</td><td class="db">2</td><td>The recommended production size for etcd and Chubby</td></tr>
+    <tr><td>7</td><td>4</td><td>3</td><td>Writes get slower: more copies per write</td></tr>
+  </table>
+  <div class="eq">
+    quorum = ⌊<span class="sv">n</span> / 2⌋ + 1 &nbsp;&nbsp;·&nbsp;&nbsp; failures tolerated = <span class="sv">n</span> − quorum
+    <span class="say">“A quorum is half the nodes, rounded down, plus one. You can lose everything except a quorum.” That's why clusters have an odd number of nodes.</span>
+  </div>
+  <div class="legend"><span class="sv">n: number of nodes in the cluster</span></div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Consensus</b> lets a group of machines agree on a value, or a sequence of values (a log), so that once something is <b>committed</b> it stays committed, even if machines crash and restart. The trick is that nothing commits without a <b>majority</b>, and a node can only lead with a majority's votes. A minority, however loud, can't make decisions.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a committee with a chair</span>
+    <p>Five people run a club. One is elected chair for a numbered <b>term</b>. The chair proposes decisions and writes them in the minutes only after at least three members have copied them into their own notebooks. If the chair stops showing up, a member who's waited long enough calls a vote for the next term; whoever gets three votes is the new chair. If two members get locked in a side room, they can talk all they like, but with only two they can't decide anything. When they come out, they see a higher term number and copy the official minutes.</p>
+  </div>
+
+  <h2>What consensus is used for</h2>
+  <ul>
+    <li><b>Leader election:</b> exactly one database primary, one Kafka controller, one scheduler. Two leaders at once is called <b>split brain</b>, and it corrupts data.</li>
+    <li><b>Configuration and metadata:</b> which servers exist, which shard lives where. Kubernetes keeps all cluster state in <b>etcd</b>.</li>
+    <li><b>Locks and leases:</b> “only one worker runs the nightly billing job”.</li>
+  </ul>
+  <p>You rarely implement consensus yourself. You use a system that does it (etcd, ZooKeeper, Consul) or a database that has it built in (CockroachDB, Kafka's KRaft). But you need to understand it to size clusters, place nodes and read outages. Leaderless systems coordinate without consensus, using logical clocks and gossip (Lesson 3.4b).</p>
+
+  <h2>Raft in four rules</h2>
+  <p>Raft (2014) was designed to be easier to understand than the older Paxos algorithm, while being equivalent in fault tolerance and performance. Each node is a <b>follower</b>, a <b>candidate</b> or the <b>leader</b>.</p>
+  <ol>
+    <li><b>Terms:</b> time is divided into numbered terms. Each term has at most one leader. Any node that sees a higher term immediately steps down to follower and adopts it.</li>
+    <li><b>Heartbeats and elections:</b> the leader sends regular heartbeats. A follower that hears nothing for its <b>election timeout</b> (randomized, e.g. 150–300 ms in the paper) becomes a candidate, increments the term and asks for votes. Majority of votes → leader. Randomized timeouts make split votes rare.</li>
+    <li><b>Voting:</b> each node votes once per term, and only for a candidate whose log is at least as up to date as its own. So a new leader always has every committed entry.</li>
+    <li><b>Log replication:</b> clients send writes to the leader, which appends them to its log and copies them to followers. An entry is <b>committed</b> once a majority has it; only then is the client told “OK”.</li>
+  </ol>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what a partition does to 5 nodes</span>
+    <p>Nodes A–E; A is leader in term 3. The network splits into {A, B} and {C, D, E}.</p>
+    <ul>
+      <li>A keeps leading {A, B} and accepts a write. It needs 3 copies to commit but can only reach 2. The write <b>never commits</b>, and the client never gets an “OK”.</li>
+      <li>C, D, E stop hearing heartbeats. After a timeout, one (say C) starts term 4, gets 3 votes (C, D, E) and becomes leader. It can commit, because 3 is a majority of 5.</li>
+      <li>The network heals. A sees term 4 &gt; 3, steps down, and its uncommitted entry is replaced by C's log. Nothing that was acknowledged is lost.</li>
+    </ul>
+    <p>This is exactly what the simulator below does. Kill nodes and split the network to see it.</p>
+  </div>
+
+  <div class="playground" id="pg1">
+    <span class="label">🎮 Playground · A 5-node Raft cluster</span>
+    <p class="hint">Slowed down about 10×: election timeouts are 1.5–3 s and heartbeats every 0.5 s. In each node's log, <span class="db">green</span> entries are committed and <span class="lt">gold</span> ones are waiting for a majority. Kill the leader and watch an election. Then split the network with the leader on the small side and send writes.</p>
+    <svg id="rf"></svg>
+    <div class="controls">
+      <button class="btn primary" id="write">✍️ Client write</button>
+      <button class="btn" id="kill">💀 Kill the leader</button>
+      <button class="btn tog" id="part">✂️ Partition: leader + 1 vs 3</button>
+      <button class="btn" id="revive">♻️ Revive all</button>
+      <button class="btn" id="rpause">⏸ Pause</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">leader(s) <b id="rl">–</b></div>
+      <div class="stat">highest term <b id="rt">–</b></div>
+      <div class="stat">committed entries <b id="rc">–</b></div>
+      <div class="stat">elections <b id="re">0</b></div>
+      <div class="stat">acked writes lost <b id="rlost">0</b></div>
+    </div>
+    <div class="logs" id="rlogs"></div>
+    <div class="events" id="rev"></div>
+  </div>
+  <p>Things to try: kill the leader twice. With 3 nodes left the cluster still elects and commits. Kill a third: 2 of 5 can't form a majority, so elections loop forever and writes stall. That's the cluster correctly choosing to be <b>unavailable rather than wrong</b> (Lesson 2.6's CP side). During the partition, two nodes may both show 👑 for a moment, but only one of them can commit. That's why “acked writes lost” stays at zero.</p>
+
+  <h2>Leases, locks and split brain</h2>
+  <p>Leader election is only half the story. An old leader that was paused (a long garbage-collection pause, a frozen VM) may wake up still <i>believing</i> it's the leader. Two safeguards:</p>
+  <ul>
+    <li><b>Leases:</b> leadership is granted for a limited time (seconds) and must be renewed with the majority. Chubby's master holds a “master lease” of a few seconds; etcd attaches keys to leases with a TTL (time to live).</li>
+    <li><b>Fencing tokens:</b> every new lock holder gets a higher number (Chubby calls it a sequencer with a lock generation number). The storage rejects writes carrying an older number, so a zombie leader can't do damage.</li>
+  </ul>
+
+  <h2>Sizing a quorum: failures vs speed</h2>
+  <p>More nodes tolerate more failures, but every write waits for a majority to answer, so the write is as slow as the slowest member of the fastest majority. Where you put the nodes matters more than how many you have.</p>
+
+  <div class="playground" id="pg2">
+    <span class="label">🎮 Playground · Quorum calculator</span>
+    <p class="hint">Pick a cluster size and placement, then fail some nodes. Commit latency is the round trip to enough followers to reach a majority (typical round trips: about 0.5 ms within a zone, 1–2 ms across zones in one region, 60–80 ms across US and EU regions).</p>
+    <div class="controls">
+      <label>nodes <input type="range" id="qn" min="1" max="9" step="1" value="5"> <b class="mono" id="qnv"></b></label>
+      <label>failed <input type="range" id="qf" min="0" max="9" step="1" value="0"> <b class="mono" id="qfv"></b></label>
+      <span class="seg" id="qplace"><button id="qp-zone" data-v="zone" class="on">3 zones, 1 region</button><button id="qp-region" data-v="region">3 regions (US-East, US-West, EU)</button></span>
+    </div>
+    <div class="stat-row">
+      <div class="stat">quorum <b id="qq">–</b></div>
+      <div class="stat">failures tolerated <b id="qt">–</b></div>
+      <div class="stat">status <b id="qs">–</b></div>
+      <div class="stat">commit latency <b id="ql">–</b></div>
+    </div>
+    <canvas class="chart" id="qc" style="height:200px"></canvas>
+    <p class="hint" id="qmsg"></p>
+  </div>
+
+  <div class="box incident">
+    <span class="label">🔥 Real outage: 43 seconds, 24 hours</span>
+    <p>GitHub's October 2018 analysis: when the East Coast link dropped, the Orchestrator nodes in the West and in the public cloud formed a quorum and failed database clusters over to the West, as designed for a regional loss. But the East's databases had “a brief period of writes” not yet replicated West. After the link came back, both sites had writes the other lacked, so GitHub couldn't simply fail back without losing data.</p>
+    <p><b>What it teaches:</b> consensus did its job (one leader per cluster), but promoting a replica that was <b>behind</b> traded a 43-second blip for a data reconciliation problem. GitHub chose data integrity over speed and ran degraded until it was resolved. Senior engineers ask “what does failover do to un-replicated writes?” before trusting automation.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>etcd</b> (Raft; Kubernetes' brain), <b>Apache ZooKeeper</b> (what Kafka used before KRaft), <b>HashiCorp Consul</b> (Raft; service discovery + key-value store), <b>Kafka KRaft</b> (Raft inside Kafka), and databases that run Raft per data range: <b>CockroachDB</b>, <b>TiKV</b>. Managed clouds hide it: <b>Amazon EKS</b> and <b>GKE</b> run etcd for you. Leader election and locks with <code>etcdctl</code>:</p>
+<pre><code>etcdctl member list                          <span class="c"># who's in the cluster</span>
+etcdctl endpoint status --cluster -w table   <span class="c"># which member is leader, Raft term and index</span>
+
+etcdctl lease grant <span class="n">10</span>                       <span class="c"># a lease with a 10 s TTL -&gt; prints a lease ID</span>
+etcdctl put /jobs/billing/owner worker-7 --lease=&lt;lease-id&gt;   <span class="c"># key vanishes if the lease isn't renewed</span>
+etcdctl lease keep-alive &lt;lease-id&gt;        <span class="c"># renew while alive</span>
+
+etcdctl elect billing-leader worker-7       <span class="c"># campaign; returns when worker-7 is elected</span>
+etcdctl lock nightly-report ./run_report.sh  <span class="c"># run a command while holding a distributed lock</span></code></pre>
+    <p class="hint">Try it locally: <code>docker run -p 2379:2379 quay.io/coreos/etcd etcd --advertise-client-urls http://0.0.0.0:2379 --listen-client-urls http://0.0.0.0:2379</code> gives a single-node etcd to play with (one node = no fault tolerance, fine for learning). In Kubernetes code, the client-go <code>leaderelection</code> package does this with a Lease object.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>Good</th><th>Cost</th></tr>
+      <tr><td>3 nodes</td><td>Cheap, fast writes, survives 1 failure</td><td>During maintenance on one node, a second failure stops the cluster</td></tr>
+      <tr><td>5 nodes</td><td>Survives 2 failures (or 1 during maintenance)</td><td>More machines; each write needs 3 copies</td></tr>
+      <tr><td>Spread across regions</td><td>Survives a whole region going down</td><td>Every commit pays a cross-region round trip (tens of ms)</td></tr>
+      <tr><td>Short election timeout</td><td>Faster failover</td><td>False elections on network hiccups or GC pauses</td></tr>
+      <tr><td>Automatic failover</td><td>No human needed at 3 am</td><td>Can promote a lagging replica and lose or fork writes (GitHub 2018)</td></tr>
+    </table>
+    <p class="hint">Consensus is for small, critical data (metadata, leadership, config), not for high-volume user data. etcd's FAQ suggests no more than seven members; Kubernetes recommends five in production.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Don't run consensus yourself. Use a managed database with automatic failover (RDS, Cloud SQL), managed Kubernetes (etcd hidden), and for “only one worker should do this” use a database row lock or a Redis lock with a TTL, accepting that it's best-effort. Know your provider's failover behavior.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Dedicated etcd/ZooKeeper clusters with careful disk and network sizing, 5-node quorums spread over zones, Raft-per-shard databases, fencing tokens on critical writes, and chaos tests that kill leaders and cut networks on purpose (Lesson 8.4).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Consensus questions test whether you understand failure, not whether you can recite Paxos. A senior answer covers:</p>
+    <ul>
+      <li><b>Why majorities</b>: two majorities overlap, so there's never two committed histories. Odd sizes; 3 or 5.</li>
+      <li><b>Split brain</b> and how it's prevented: terms, majority votes, leases and fencing tokens.</li>
+      <li><b>The cost</b>: writes wait for a majority; cross-region quorums add tens of ms per write.</li>
+      <li><b>Where to use it</b>: leader election, metadata, locks. Not the main data path at high volume.</li>
+    </ul>
+    <p class="hint">Common follow-ups: “Your 3-node cluster loses one node during an upgrade. What happens?” “Why not 4 nodes?” “How do you stop a paused old leader from writing?” “How would you make a cron job run exactly once across 10 servers?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>All of Kubernetes' state, in Raft</b> <span class="tag prod">🏭 In production</span> <a href="https://kubernetes.io/docs/tasks/administer-cluster/configure-upgrade-etcd/" target="_blank" rel="noopener">Operating etcd clusters for Kubernetes</a></div>
+      <p><b>How:</b> the docs say to run etcd as a cluster with an odd number of members, recommend a five-member cluster in production, and stress that the leader must send heartbeats on time, so disk and network starvation cause trouble.</p>
+      <p><b>Why this method:</b> every scheduling decision and object lives in etcd; losing quorum freezes the control plane, so it's sized for two failures.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A lock service for a whole company</b> <span class="tag co">🏢 Google · 2006</span> <a href="https://research.google/pubs/the-chubby-lock-service-for-loosely-coupled-distributed-systems/" target="_blank" rel="noopener">The Chubby lock service (OSDI)</a></div>
+      <p><b>How:</b> a Chubby cell usually has five replicas, three of which must be running. Replicas elect a master with a consensus protocol and promise not to elect another for a few seconds: the master lease. Lock holders can get sequencers to fence stale clients.</p>
+      <p><b>Why this method:</b> one well-run, reliable service for coarse-grained locks and leader election, instead of every team implementing Paxos.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Kafka drops ZooKeeper for Raft</b> <span class="tag oss">🧰 Open source · 2025</span> <a href="https://kafka.apache.org/blog/2025/03/18/apache-kafka-4.0.0-release-announcement/" target="_blank" rel="noopener">Apache Kafka 4.0 release announcement</a></div>
+      <p><b>How:</b> KIP-500 proposed replacing ZooKeeper with a self-managed metadata quorum (KRaft). Kafka 4.0 was the first major release to run entirely without ZooKeeper, after ZooKeeper had backed Kafka for more than 10 years.</p>
+      <p><b>Why this method:</b> one system to deploy instead of two, and metadata kept in a Raft log inside Kafka instead of a separate store that could drift from the controller's memory.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Raft-based failover, and its edge case</b> <span class="tag co">🏢 GitHub · 2018</span> <a href="https://github.blog/news-insights/company-news/oct21-post-incident-analysis/" target="_blank" rel="noopener">October 21 post-incident analysis</a></div>
+      <p><b>How:</b> Orchestrator nodes use Raft to agree on database topology; after the 43-second partition, the West and cloud nodes formed a quorum and promoted West Coast primaries.</p>
+      <p><b>Why this method:</b> automatic failover survives a real region loss; the incident showed it also needs guardrails for brief partitions and un-replicated writes.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Designed to be understood</b> <span class="tag hist">📜 History · 2014</span> <a href="https://raft.github.io/" target="_blank" rel="noopener">The Raft consensus algorithm</a></div>
+      <p><b>How:</b> Ongaro and Ousterhout split consensus into leader election, log replication and safety. The paper won a Best Paper Award at USENIX ATC 2014 and Raft now has implementations in most languages.</p>
+      <p><b>Why this method:</b> Paxos was famously hard to implement correctly; an algorithm engineers can understand is one they can build and debug.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · tested on students</span>
+    <p>The Raft paper includes a user study: 43 students at two universities learned both Raft and Paxos and took a quiz on each. 33 of them scored higher on Raft. It's rare for an algorithm paper to measure how easy the algorithm is to learn.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Raft is leader-follower replication (Lesson 2.3) with elections and majority commits; it's the CP choice in CAP (Lesson 2.6). Kafka's controller now uses it (Lesson 3.2). Distributed transactions need a reliable coordinator, which is where 2PC struggles (Lesson 3.5). Kubernetes stores everything in etcd (Lesson 5.2), and chaos engineering kills leaders on purpose (Lesson 8.4).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://raft.github.io/raft.pdf" target="_blank" rel="noopener">In Search of an Understandable Consensus Algorithm</a>. The Raft paper; section 5 is the whole algorithm in 10 pages.</li>
+      <li><span class="kind">Site</span> <a href="https://raft.github.io/" target="_blank" rel="noopener">raft.github.io</a>. An interactive visualization of Raft, plus a list of real implementations.</li>
+      <li><span class="kind">Docs</span> <a href="https://etcd.io/docs/v3.5/faq/" target="_blank" rel="noopener">etcd FAQ</a>. Why odd member counts, maximum cluster size and failure tolerance, in plain language.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. How many node failures can a 6-node consensus cluster tolerate while still committing writes?</div>
+    <div class="opts"><button class="opt">3</button><button class="opt" data-ok>2</button><button class="opt">5</button></div>
+    <div class="explain">Quorum = ⌊6/2⌋ + 1 = 4, so 6 − 4 = <b>2</b> failures. That's the same as 5 nodes, with one more machine that can break. Even sizes add cost without adding tolerance.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A network partition splits a 5-node Raft cluster into 2 nodes (including the old leader) and 3 nodes. Which statement is true?</div>
+    <div class="opts"><button class="opt">Both sides keep committing writes and merge later</button><button class="opt" data-ok>Only the 3-node side can elect a leader and commit; the old leader can accept writes but never commit them</button><button class="opt">The cluster stops completely until the network heals</button></div>
+    <div class="explain">Committing needs 3 of 5. The 2-node side can't reach that, so its writes stay uncommitted and clients never get an “OK”. The 3-node side elects a leader in a higher term. When the network heals, the old leader sees the higher term and steps down.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Ten servers run a cron job, and the nightly billing run must happen on exactly one of them. What's the most robust design?</div>
+    <div class="opts"><button class="opt">Each server checks a shared file and runs if nobody else has written to it yet</button><button class="opt">Pick the server with the lowest IP address</button><button class="opt" data-ok>Elect a leader through etcd or ZooKeeper with a lease, and have billing writes carry a fencing token</button></div>
+    <div class="explain">A shared file has a check-then-write race; “lowest IP” breaks when servers can't see each other. A consensus-backed lease gives one owner at a time, expiring if it dies, and a fencing token stops a paused old owner from writing after its lease ran out.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Consensus = agreeing on one leader and one ordered log despite failures. Nothing commits without a majority.</li>
+      <li>quorum = ⌊n/2⌋ + 1; use 3 or 5 nodes; even sizes don't help.</li>
+      <li>Raft: terms, randomized election timeouts, one vote per term for an up-to-date candidate, commit after majority replication.</li>
+      <li>Prevent split brain with majorities, leases and fencing tokens. A minority side stays read-only or unavailable, by design.</li>
+      <li>Use etcd/ZooKeeper/Consul or built-in Raft for small critical state; every write pays a round trip to a majority.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- Raft-lite simulator ----------
+  const IDS = ["A", "B", "C", "D", "E"], MAJ = 3, HB = 500;
+  const pos = IDS.map((_, i) => { const a = -Math.PI / 2 + i * 2 * Math.PI / 5; return [360 + 230 * Math.cos(a), 150 + 115 * Math.sin(a)]; });
+  const F = new Flow($("rf"), { width: 720, height: 300 });
+  IDS.forEach((id, i) => F.node(id, { x: pos[i][0], y: pos[i][1], w: 120, h: 46, label: id, sub: "", kind: "sv" }));
+  for (let i = 0; i < 5; i++) for (let j = i + 1; j < 5; j++) F.edge(IDS[i], IDS[j], { noArrow: true });
+  F.render();
+  const rnd = () => 1500 + Math.random() * 1500;
+  let N = {}, now = 0, running = true, elections = 0, value = 1, lost = 0, acked = new Set(), events = [];
+  const group = {};
+  function reset() {
+    N = {}; IDS.forEach(id => (N[id] = { id, alive: true, term: 1, role: "F", voted: null, log: [], commit: 0, deadline: now + rnd() }));
+    N.A.role = "L"; N.A.voted = "A"; N.A.nextHb = now;     // start with A as leader of term 1
+    IDS.forEach(id => (group[id] = 0));
+  }
+  const ev = s => { events.unshift(`t=${(now / 1000).toFixed(1)}s · ${s}`); events = events.slice(0, 6); $("rev").innerHTML = events.map(e => `<div>${e}</div>`).join(""); };
+  const talk = (a, b) => N[a].alive && N[b].alive && group[a] === group[b];
+  const lastTerm = n => (n.log.length ? n.log[n.log.length - 1].term : 0);
+  const stepDown = (n, term) => { if (n.role === "L") ev(`${n.id} sees term ${term} and steps down`); n.term = term; n.role = "F"; n.voted = null; n.deadline = now + rnd(); };
+  function heartbeat(L) {
+    let reach = 1;
+    for (const id of IDS) {
+      if (id === L.id || !talk(L.id, id)) continue;
+      const f = N[id];
+      if (f.term > L.term) { stepDown(L, f.term); return; }
+      F.packet([L.id, id], { color: "--c-nw", dur: 280, r: 4 });
+      if (f.role === "L" && f.term === L.term) continue;
+      f.term = L.term; f.role = "F"; f.deadline = now + rnd();
+      const dropped = f.log.filter((e, i) => !L.log[i] || L.log[i].v !== e.v);
+      if (dropped.length) ev(`${id} discards ${dropped.length} uncommitted entr${dropped.length > 1 ? "ies" : "y"} that ${L.id}'s log doesn't have`);
+      f.log = L.log.slice();
+      reach++;
+    }
+    if (reach >= MAJ && L.log.length > L.commit) {
+      for (let i = L.commit; i < L.log.length; i++) { acked.add(L.log[i].v); ev(`x=${L.log[i].v} committed on a majority → client gets “OK”`); }
+      L.commit = L.log.length;
+    }
+    for (const id of IDS) if (id !== L.id && talk(L.id, id)) N[id].commit = Math.min(L.commit, N[id].log.length);
+  }
+  function election(c) {
+    c.term++; c.role = "C"; c.voted = c.id; elections++;
+    let votes = 1;
+    for (const id of IDS) {
+      if (id === c.id || !talk(c.id, id)) continue;
+      const p = N[id];
+      F.packet([c.id, id], { color: "--c-lt", dur: 250, r: 4 });
+      if (p.term > c.term) { stepDown(c, p.term); return; }
+      if (p.term < c.term) { p.term = c.term; if (p.role !== "F") p.role = "F"; p.voted = null; }
+      const upToDate = lastTerm(c) > lastTerm(p) || (lastTerm(c) === lastTerm(p) && c.log.length >= p.log.length);
+      if ((p.voted === null || p.voted === c.id) && upToDate) { p.voted = c.id; votes++; p.deadline = now + rnd(); }
+    }
+    if (votes >= MAJ) { c.role = "L"; c.nextHb = now; ev(`${c.id} wins term ${c.term} with ${votes} votes 👑`); }
+    else { c.deadline = now + rnd(); ev(`${c.id} starts term ${c.term} but gets only ${votes} vote${votes > 1 ? "s" : ""}: no majority`); }
+  }
+  function step() {
+    if (!running) return;
+    now += 100;
+    for (const id of IDS) {
+      const n = N[id];
+      if (!n.alive) continue;
+      if (n.role === "L") { if (now >= n.nextHb) { n.nextHb = now + HB; heartbeat(n); } }
+      else if (now >= n.deadline) election(n);
+    }
+    // anything acked but no longer in a majority's log would be a lost write (Raft guarantees this stays 0)
+    lost = [...acked].filter(v => IDS.filter(id => N[id].log.some(e => e.v === v)).length < MAJ && IDS.every(id => N[id].alive)).length;
+    paint();
+  }
+  function paint() {
+    const leaders = IDS.filter(id => N[id].alive && N[id].role === "L");
+    IDS.forEach(id => {
+      const n = N[id];
+      F.set(id, { label: `${id}${n.role === "L" ? " 👑" : n.role === "C" ? " ✋" : ""}`, sub: n.alive ? `term ${n.term} · ${n.role === "L" ? "leader" : n.role === "C" ? "candidate" : "follower"}` : "💀 down", down: !n.alive, hot: n.role === "L" });
+    });
+    for (let i = 0; i < 5; i++) for (let j = i + 1; j < 5; j++) {
+      const a = IDS[i], b = IDS[j], cut = group[a] !== group[b];
+      F.edgeStyle(a, b, { color: cut ? "--c-er" : "--line", dashed: cut, hidden: false });
+    }
+    $("rl").textContent = leaders.length ? leaders.map(id => `${id} (term ${N[id].term})`).join(", ") : "none";
+    $("rt").textContent = Math.max(...IDS.map(id => N[id].term));
+    $("rc").textContent = Math.max(...IDS.map(id => N[id].commit));
+    $("re").textContent = elections; $("rlost").textContent = lost;
+    $("rlogs").innerHTML = IDS.map(id => {
+      const n = N[id];
+      return `<div class="row"><span class="who">${id}</span>${n.log.map((e, i) => `<span class="e ${i < n.commit ? "c" : "u"}" title="term ${e.term}">x=${e.v}</span>`).join("") || '<span class="muted">(empty log)</span>'}${n.alive ? "" : " 💀"}</div>`;
+    }).join("");
+  }
+  $("write").onclick = () => {
+    const leaders = IDS.filter(id => N[id].alive && N[id].role === "L");
+    if (!leaders.length) { ev("No leader right now: the write is refused. Try again after an election."); return; }
+    leaders.forEach(id => { const v = value++; N[id].log.push({ term: N[id].term, v }); ev(`${id} (term ${N[id].term}) appends x=${v}; waiting for a majority…`); });
+    paint();
+  };
+  $("kill").onclick = () => {
+    const L = IDS.find(id => N[id].alive && N[id].role === "L");
+    if (!L) { ev("There's no live leader to kill."); return; }
+    N[L].alive = false; N[L].role = "F"; ev(`${L} crashed 💀. Followers will time out in 1.5–3 s.`); paint();
+  };
+  $("part").onclick = () => {
+    const on = !$("part").classList.contains("on");
+    $("part").classList.toggle("on", on);
+    if (on) {
+      const L = IDS.find(id => N[id].alive && N[id].role === "L") || "A";
+      const buddy = IDS.find(id => id !== L);
+      IDS.forEach(id => (group[id] = id === L || id === buddy ? 1 : 0));
+      $("part").textContent = "🩹 Heal the network";
+      ev(`Network split: {${L}, ${buddy}} vs {${IDS.filter(id => group[id] === 0).join(", ")}}`);
+    } else {
+      IDS.forEach(id => (group[id] = 0));
+      $("part").textContent = "✂️ Partition: leader + 1 vs 3";
+      ev("Network healed: everyone can talk again.");
+    }
+    paint();
+  };
+  $("revive").onclick = () => { IDS.forEach(id => { if (!N[id].alive) { N[id].alive = true; N[id].role = "F"; N[id].deadline = now + rnd(); } }); ev("All nodes restarted (they keep their term and log on disk)."); paint(); };
+  $("rpause").onclick = () => { running = !running; $("rpause").textContent = running ? "⏸ Pause" : "▶ Resume"; };
+  reset(); ev("A is leader of term 1. Send a write."); paint();
+  setInterval(step, 100);
+
+  // ---------- quorum calculator ----------
+  // typical round-trip times from the leader (ms), by placement
+  const RTT = {
+    zone: i => [0.5, 1.5, 1.5][i % 3],                 // followers spread over the leader's zone and 2 others
+    region: i => [1, 70, 80][i % 3],                    // US-East (leader), US-West, EU
+  };
+  const getPlace = seg("qplace", () => quorum());
+  function quorum() {
+    const n = +$("qn").value; let f = +$("qf").value;
+    if (f > n) { f = n; $("qf").value = n; }
+    $("qnv").textContent = n; $("qfv").textContent = f;
+    const q = Math.floor(n / 2) + 1, tol = n - q, ok = n - f >= q;
+    // followers 1..n-1 placed round-robin starting with the leader's own zone/region
+    const rtts = [];
+    for (let i = 1; i < n; i++) rtts.push(RTT[getPlace()](i));
+    rtts.sort((a, b) => a - b);
+    const need = q - 1, rest = rtts.slice(f);     // worst case: the failed nodes were the closest ones
+    const lat = need === 0 ? 0 : rest.length >= need ? rest[need - 1] : null;
+    $("qq").textContent = q; $("qt").textContent = tol;
+    $("qs").textContent = ok ? "✅ can commit" : "❌ stuck (no majority)";
+    $("ql").textContent = !ok || lat === null ? "–" : lat + " ms";
+    Plot.bars($("qc"), { bars: [1, 2, 3, 4, 5, 6, 7, 8, 9].map(k => ({ label: k + (k === 1 ? " node" : " nodes"), value: k - (Math.floor(k / 2) + 1), color: MX.css(k === n ? "--accent" : k % 2 ? "--c-db" : "--c-er") })), yMin: 0, yMax: 4, yLabel: "failures tolerated" });
+    $("qmsg").textContent = n === 1 ? "One node: any failure stops everything." :
+      n % 2 === 0 ? `${n} nodes tolerate ${tol} failure(s), exactly like ${n - 1} nodes. The extra node only adds cost and one more thing to fail.` :
+      !ok ? `${f} of ${n} failed: only ${n - f} remain, below the quorum of ${q}. The cluster refuses writes rather than risk two histories.` :
+      getPlace() === "region" ? `Every commit waits for ${need} follower(s), and the nearest majority crosses regions: about ${lat} ms per write, but the cluster survives losing a whole region.` :
+      `Every commit waits for ${need} follower(s) at about ${lat} ms each round trip. Fast, and it survives a zone outage.`;
+  }
+  $("qn").oninput = quorum; $("qf").oninput = quorum;
+  quorum();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,437 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.1 Fine-tuning: when it beats prompting, SFT data &amp; LoRA · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .fitrow { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .fitrow span { font-size: .85rem; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--line); }
+  .fitrow .yes { border-color: var(--good); color: var(--good); }
+  .fitrow .no { color: var(--muted); text-decoration: line-through; }
+  td.num { font-family: var(--mono); text-align: right; }
+  tr.best td { background: color-mix(in srgb, var(--good) 12%, transparent); }
+</style>
+</head>
+<body data-lesson="a7-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 1</div>
+  <h1>Fine-tuning: when it beats prompting, SFT data &amp; LoRA</h1>
+  <p class="subtitle">Changing a model's weights is the most powerful way to customize it, and the easiest to misuse. Learn when it pays off, what data it needs, and how LoRA makes it fit on a single GPU.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Tokens and cost</b>: you pay per input and output token, and longer prompts are slower to start answering (Lesson 0.3).</li>
+      <li><b>Few-shot prompting</b>: showing the model worked examples inside the prompt (Lesson 1.1).</li>
+      <li><b>RAG</b> (retrieval-augmented generation) puts fresh documents into the prompt at question time (Lesson 3.1).</li>
+      <li><b>A golden eval set</b>: labelled examples you score every change against (Lesson 5.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2024 the team at Predibase fine-tuned <b>310 models</b>: 10 open base models × 31 tasks, each with a small 4-bit adapter. On average the fine-tuned models beat their own base models by <b>34 points</b> and beat <b>GPT-4 by 10 points</b> on those tasks. They then served 25 of these fine-tuned 7B models from a <b>single 80 GB GPU</b>, all sharing one copy of the base model.</p>
+    <p>The catch is in the words “on those tasks”. They were narrow jobs with clear right answers. This lesson is about telling those jobs apart from the ones where fine-tuning wastes a month.</p>
+  </div>
+
+  <h2>Numbers first: moving the prompt into the weights</h2>
+  <p>You route 1 million support tickets a month into 12 categories. The prompted version needs instructions plus 20 worked examples: about <b>3,000 input tokens</b> per ticket for a 20-token answer. A fine-tuned small model has learned the examples, so it needs only the ticket: about <b>150 tokens</b>.</p>
+  <table>
+    <tr><th></th><th>Big model + 20-shot prompt</th><th>Fine-tuned small model</th></tr>
+    <tr><td>Input tokens per ticket</td><td class="tk">3,000</td><td class="tk">150</td></tr>
+    <tr><td>Illustrative price (per million in / out)</td><td>$3 / $15</td><td>$0.20 / $0.80</td></tr>
+    <tr><td>Cost per ticket</td><td>3,000 × $3/M + 20 × $15/M = $0.0093</td><td>150 × $0.20/M + 20 × $0.80/M = $0.000046</td></tr>
+    <tr><td>Per month (1M tickets)</td><td class="rk">$9,300</td><td class="ev">$46 (about 200× less)</td></tr>
+    <tr><td>Time to first token</td><td>Slower: 3,000 tokens to read first</td><td>Faster: 20× less to read, smaller model</td></tr>
+  </table>
+  <p class="muted">Prices are illustrative, not quotes. Prompt caching (Lesson 1.4) shrinks the left column a lot, and the right column adds a one-off training cost and maybe a dedicated endpoint. The shape of the result holds: at high volume, the per-request savings of a small specialist add up fast.</p>
+  <p>In plain words: <b>a prompt teaches the model again on every request; fine-tuning teaches it once.</b> That only helps if what you're teaching is a <i>behaviour</i>: a format, a style, a narrow skill.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Fine-tune for <b>behaviour</b> (format, tone, a narrow skill, a smaller and cheaper model). Retrieve for <b>knowledge</b> (facts, documents, anything that changes). And fine-tune only after a prompted baseline and an eval set tell you exactly what you're trying to beat.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the expert, the sheet and the cheat card</span>
+    <p>Prompting is handing a brilliant temp a two-page instruction sheet every morning. RAG is giving them the filing cabinet. Full fine-tuning is sending them on a month-long course that rewires how they work, and they might forget other things along the way. <b>LoRA</b> is clipping a small laminated cheat card to their badge: the expert is unchanged, the card is tiny, and you can keep a different card for every job and swap them in seconds.</p>
+  </div>
+
+  <h2>When fine-tuning beats prompting, and when it doesn't</h2>
+  <table>
+    <tr><th>Situation</th><th>Fine-tune?</th><th>Why</th></tr>
+    <tr><td>Always emit an exact schema or house format</td><td class="ev">✅ Often</td><td>Hundreds of examples in the weights are steadier than rules in a prompt. Try structured output (Lesson 1.3) first.</td></tr>
+    <tr><td>A voice or style that's hard to describe</td><td class="ev">✅ Yes</td><td>You can show style far more easily than you can explain it.</td></tr>
+    <tr><td>Narrow, high-volume task (classify, extract, route)</td><td class="ev">✅ Yes</td><td>A small fine-tuned model can match a big prompted one: cheaper and faster (the table above).</td></tr>
+    <tr><td>A skill that needs many examples (your SQL dialect, a DSL)</td><td class="ev">✅ Often</td><td>More examples than fit in a prompt.</td></tr>
+    <tr><td>Teach facts, or keep them up to date</td><td class="rk">❌ No, use RAG</td><td>Models learn new facts slowly from fine-tuning, and learning them makes hallucination more likely (see research below). Retrieval wins and stays fresh.</td></tr>
+    <tr><td>Fewer than ~50 good examples, or no eval set</td><td class="rk">❌ Not yet</td><td>You can't tell whether it helped. Prompt, collect data, measure.</td></tr>
+    <tr><td>Requirements change every week</td><td class="rk">❌ Usually not</td><td>Editing a prompt takes minutes; retraining takes a pipeline.</td></tr>
+    <tr><td>Broad, open-ended reasoning</td><td class="rk">❌ Usually not</td><td>Your small fine-tune won't out-think a frontier model across many topics.</td></tr>
+  </table>
+  <p>The usual ladder is: <b>prompt → few-shot → RAG → fine-tune a smaller model → preference-tune it</b> (Lesson 7.2). Each step costs more engineering than the one before it, so climb only when your eval shows the step below has stopped improving. Making a model an expert in a whole field (continued pretraining on domain text, domain vocabulary, fine-tuned embedding models, expert-built evals) is its own topic: Lesson 7.5.</p>
+
+  <h2>SFT: what the training data looks like</h2>
+  <p><b>SFT</b> (supervised fine-tuning) means training on pairs of <i>(prompt, ideal response)</i>. The loss is the usual next-token loss (Lesson 0.2), counted only on the response tokens, so the model learns to <i>write the answers</i>, not to predict your prompts. Data is usually a JSONL file of chat messages, in the same roles the model will see in production:</p>
+  <div class="prompt">{"messages": [
+  {"role": "system", "content": "Route the ticket. Reply with one label."},
+  {"role": "user", "content": "I was charged twice for my March invoice."},
+  {"role": "assistant", "content": "billing.duplicate_charge"}]}
+{"messages": [ … one line per example … ]}</div>
+  <ul>
+    <li><b>Quality beats quantity.</b> Meta's LIMA study tuned a 65B model on just <b>1,000</b> carefully chosen examples and got strong results; the authors concluded that most knowledge comes from pre-training and fine-tuning mainly teaches format. One wrong label repeated 200 times teaches the wrong thing 200 times.</li>
+    <li><b>Typical sizes</b> (rules of thumb, not laws): tens to a few hundred examples to fix a format or style; a few hundred to a few thousand for a narrow task; more if the task is hard or the inputs vary a lot.</li>
+    <li><b>Cover the edges</b>: rare classes, messy inputs, and examples where the right answer is “I don't know” or “escalate to a human”.</li>
+    <li><b>Hold out an eval set</b> before you train, and split it so it can't leak: by customer or by date, not by random line, or near-duplicates end up on both sides.</li>
+    <li><b>Use the model's own chat template.</b> Training in one format and serving in another quietly ruins results. Libraries like TRL apply the template for you.</li>
+  </ul>
+
+  <h2>Full fine-tuning vs LoRA vs QLoRA</h2>
+  <p><b>Full fine-tuning</b> updates every weight. The expensive part isn't the weights, it's the training state. Mixed-precision training with the Adam optimizer keeps, for every parameter, a 16-bit weight (2 bytes), a 16-bit gradient (2 bytes) and three 32-bit optimizer values (a master copy, momentum and variance: 12 bytes). That's the classic <b>16 bytes per parameter</b> from Microsoft's ZeRO paper, before counting activations. An 8B model needs about 128 GB just for that: several GPUs.</p>
+  <p><b>LoRA</b> (low-rank adaptation; Hu et al., 2021) freezes the original weight matrix <i>W</i> and learns a small correction made of two thin matrices:</p>
+  <div class="eq"><span class="md">W′</span> = <span class="md">W</span> + (α / r) · <span class="tl">B</span> · <span class="tl">A</span>
+    <span class="say"><i>W</i> is d × k and frozen. <i>B</i> is d × r, <i>A</i> is r × k, and only they are trained. The rank <i>r</i> is small (often 8–64); α scales the update. <i>B</i> starts at zero, so training starts from exactly the base model.</span></div>
+  <p>Why can such a thin correction work? The changes fine-tuning makes tend to be “low-rank”: a few directions matter. The Math for AI course explains rank and <a href="../../math-course/phase2/4-rank.html">why LoRA works</a>.</p>
+  <p><b>QLoRA</b> (Dettmers et al., 2023) goes one step further: store the frozen base model in <b>4-bit NF4</b> (NormalFloat 4, a 4-bit format designed for the bell-shaped distribution of weights), quantize the quantization constants too (“double quantization”, about 4.127 bits per weight in total), and page optimizer memory to the CPU when it spikes. Gradients flow through the frozen 4-bit weights into 16-bit LoRA adapters. The headline: fine-tuning a 65B model went from more than 780 GB of GPU memory to <b>under 48 GB</b>.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what fits on one GPU?</span>
+    <p>Llama 3.1 8B (8.03B parameters, 32 layers, hidden size 4,096), one sequence of 2,048 tokens, gradient checkpointing on.</p>
+    <table>
+      <tr><th></th><th>Full fine-tune</th><th>LoRA r = 16, all linear layers</th><th>QLoRA (4-bit base)</th></tr>
+      <tr><td>Trainable parameters</td><td>8.03 B</td><td>41.9 M (0.52%)</td><td>41.9 M</td></tr>
+      <tr><td>Frozen or trained weights</td><td>8.03 B × 2 B = 16.1 GB</td><td>16.1 GB</td><td>8.03 B × 4.127 bits ÷ 8 = 4.1 GB</td></tr>
+      <tr><td>Gradients + Adam state</td><td>8.03 B × 14 B = 112.4 GB</td><td>41.9 M × 16 B = 0.7 GB</td><td>0.7 GB</td></tr>
+      <tr><td>Activations + logits (estimate)</td><td>1.9 GB</td><td>1.9 GB</td><td>1.9 GB</td></tr>
+      <tr><td>+ ~1 GB framework overhead</td><td class="rk"><b>≈ 131 GB</b>: multi-GPU</td><td class="tk"><b>≈ 20 GB</b>: one 24 GB GPU, tightly</td><td class="ev"><b>≈ 8 GB</b>: a gaming GPU</td></tr>
+    </table>
+    <p>LoRA's count, one matrix at a time: a 4,096 × 4,096 attention projection has 16.8 M weights; at r = 16 the adapter has 16 × (4,096 + 4,096) = <b>131,072</b>, 0.78% of it. The whole adapter is 41.9 M parameters, about <b>84 MB</b> on disk in 16-bit, against 16 GB for the model.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · GPU memory calculator</span>
+    <p class="hint">Pick a model and a method, then push the batch size and sequence length until it no longer fits. Then try to fine-tune the 70B model on a single 48 GB card. These are <b>estimates</b> from the formulas shown below; real numbers vary by framework, kernels and settings.</p>
+    <div class="controls">
+      <label>model <select id="mm-model" class="btn small"></select></label>
+      <span class="seg" id="mm-meth"><button id="mm-full" data-v="full">Full fine-tune</button><button id="mm-lora" data-v="lora" class="on">LoRA</button><button id="mm-qlora" data-v="qlora">QLoRA</button></span>
+    </div>
+    <div class="controls">
+      <label>LoRA rank r <input type="range" id="mm-r" min="2" max="7" step="1" value="4"> <b class="mono" id="mm-rv"></b></label>
+      <label>adapt <select id="mm-tgt" class="btn small"><option value="all">all linear layers</option><option value="qv">attention q, v only</option></select></label>
+    </div>
+    <div class="controls">
+      <label>batch size <input type="range" id="mm-b" min="0" max="5" step="1" value="0"> <b class="mono" id="mm-bv"></b></label>
+      <label>sequence length <input type="range" id="mm-s" min="0" max="6" step="1" value="2"> <b class="mono" id="mm-sv"></b></label>
+      <label><input type="checkbox" id="mm-ck" checked> gradient checkpointing</label>
+      <button class="btn small" id="mm-try70">Try: 70B on one 48 GB GPU</button>
+    </div>
+    <canvas class="chart" id="mm-chart" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">total (estimate) <b id="mm-total">–</b></div>
+      <div class="stat">trainable params <b id="mm-train">–</b></div>
+      <div class="stat">saved file <b id="mm-file">–</b></div>
+    </div>
+    <div class="fitrow" id="mm-fit"></div>
+    <div class="calc" id="mm-calc"></div>
+    <p class="hint">Activations use the per-layer estimate from Korthikanti et al. (NVIDIA, 2022): 34·s·b·h bytes per layer without checkpointing, 2·s·b·h with full checkpointing (plus one layer being recomputed), assuming a FlashAttention-style kernel; logits are 4·s·b·V bytes in 32-bit. s = sequence length, b = batch, h = hidden size, V = vocabulary size.</p>
+  </div>
+  <p>What you should see: full fine-tuning is dominated by optimizer state (the orange bar), so batch size barely matters until it's already hopeless. With LoRA the frozen weights dominate, which is exactly what QLoRA shrinks by 4×. Turn off gradient checkpointing and raise the sequence length: activations explode. That's why long-context fine-tuning needs checkpointing even with LoRA.</p>
+
+  <h2>Overfitting and catastrophic forgetting</h2>
+  <ul>
+    <li><b>Overfitting</b>: training loss keeps falling while the held-out eval loss turns up, and the model starts parroting training answers. Usual fixes: fewer epochs (1–3 is typical), a lower learning rate, more varied data, stop at the best eval checkpoint.</li>
+    <li><b>Catastrophic forgetting</b>: the model gets better at your task and worse at everything else, such as following other instructions or staying safe. A 2024 study, <i>LoRA Learns Less and Forgets Less</i>, found exactly that trade: LoRA learned less of a new domain than full fine-tuning, but kept more of the base model's other skills. Keep a small <b>regression eval</b> of general abilities next to your task eval, and mix some general instruction data into training if it drops.</li>
+  </ul>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Should I fine-tune?</span>
+    <p class="hint">Describe the job. The simulator compares four options on monthly cost and an <b>illustrative</b> quality score (real scores come from your eval set, Lesson 5.1). Start with a preset, then try to make fine-tuning the wrong answer: change the goal to fresh knowledge, or drop the examples to 30.</p>
+    <div class="controls">
+      <button class="btn small" id="ft-p1">Preset: ticket router</button>
+      <button class="btn small" id="ft-p2">Preset: docs Q&amp;A</button>
+      <button class="btn small" id="ft-p3">Preset: brand voice, 30 examples</button>
+    </div>
+    <div class="controls">
+      <label>goal <select id="ft-goal" class="btn small">
+        <option value="format">Always output our exact format / schema</option>
+        <option value="style">Write in our brand voice</option>
+        <option value="narrow">Classify / extract / route at volume</option>
+        <option value="fresh">Answer from docs that change weekly</option>
+        <option value="facts">Teach it our static product facts</option>
+        <option value="broad">Open-ended reasoning on any topic</option>
+      </select></label>
+    </div>
+    <div class="controls">
+      <label>labelled examples <input type="range" id="ft-n" min="0" max="8" step="1" value="5"> <b class="mono" id="ft-nv"></b></label>
+      <label>requests per day <input type="range" id="ft-q" min="0" max="7" step="1" value="4"> <b class="mono" id="ft-qv"></b></label>
+      <label>few-shot prompt <input type="range" id="ft-fs" min="0" max="6000" step="250" value="3000"> <b class="mono" id="ft-fsv"></b></label>
+    </div>
+    <div class="verdict" id="ft-verdict"></div>
+    <table id="ft-table"></table>
+    <p class="hint" id="ft-note"></p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Hugging Face TRL</b> (trainers for SFT, DPO and more) with <b>PEFT</b> (LoRA and other adapters) is the standard open stack; <b>Unsloth</b> wraps the same workflow with custom kernels and claims about 2× faster training with up to 70% less GPU memory. Managed options as of 2026: <b>Google Vertex AI</b> (supervised tuning of Gemini models), <b>Amazon Bedrock</b> (supervised, reinforcement fine-tuning and distillation), and open-model platforms like <b>Together AI</b> (LoRA or full fine-tuning). Check before you build on any of them: OpenAI <a href="https://developers.openai.com/api/docs/deprecations" target="_blank" rel="noopener">announced in May 2026</a> that it is winding down self-serve fine-tuning (no new jobs for active customers after 6 January 2027; existing fine-tuned models keep serving until their base models are retired).</p>
+<pre><code><span class="c"># pip install trl peft datasets   (TRL 1.x, as of late 2026)</span>
+<span class="k">from</span> datasets <span class="k">import</span> load_dataset
+<span class="k">from</span> peft <span class="k">import</span> LoraConfig
+<span class="k">from</span> trl <span class="k">import</span> SFTConfig, SFTTrainer
+
+<span class="c"># JSONL rows: {"messages": [{"role": "user", ...}, {"role": "assistant", ...}]}</span>
+data = load_dataset(<span class="s">"json"</span>, data_files={<span class="s">"train"</span>: <span class="s">"train.jsonl"</span>, <span class="s">"eval"</span>: <span class="s">"eval.jsonl"</span>})
+
+peft_config = LoraConfig(
+    r=<span class="n">16</span>,                          <span class="c"># rank of the update</span>
+    lora_alpha=<span class="n">32</span>,                 <span class="c"># update is scaled by alpha / r</span>
+    lora_dropout=<span class="n">0.05</span>,
+    target_modules=<span class="s">"all-linear"</span>,   <span class="c"># attention + MLP projections, as in QLoRA</span>
+    task_type=<span class="s">"CAUSAL_LM"</span>,
+)
+args = SFTConfig(
+    output_dir=<span class="s">"ticket-router-lora"</span>,
+    num_train_epochs=<span class="n">2</span>,
+    learning_rate=<span class="n">1e-4</span>,             <span class="c"># adapters take a higher LR than full fine-tuning</span>
+    per_device_train_batch_size=<span class="n">4</span>, gradient_accumulation_steps=<span class="n">4</span>,
+    max_length=<span class="n">2048</span>,
+    assistant_only_loss=<span class="k">True</span>,      <span class="c"># learn the answers, not the prompts</span>
+    eval_strategy=<span class="s">"steps"</span>, eval_steps=<span class="n">100</span>,
+)
+trainer = SFTTrainer(model=<span class="s">"Qwen/Qwen3-8B"</span>, args=args, peft_config=peft_config,
+                     train_dataset=data[<span class="s">"train"</span>], eval_dataset=data[<span class="s">"eval"</span>])
+trainer.train()
+trainer.save_model()                    <span class="c"># saves just the adapter: tens of MB</span>
+
+<span class="c"># QLoRA: same trainer, base model loaded in 4-bit NF4</span>
+<span class="k">import</span> torch
+<span class="k">from</span> transformers <span class="k">import</span> BitsAndBytesConfig
+bnb = BitsAndBytesConfig(load_in_4bit=<span class="k">True</span>, bnb_4bit_quant_type=<span class="s">"nf4"</span>,
+                         bnb_4bit_use_double_quant=<span class="k">True</span>, bnb_4bit_compute_dtype=torch.bfloat16)
+<span class="c"># SFTTrainer(model=..., args=args, peft_config=peft_config, quantization_config=bnb, ...)</span></code></pre>
+    <p class="hint">Serving the result: merge the adapter into the weights (PEFT's <code>merge_and_unload()</code>) for one model, or keep adapters separate and serve many on one base model: vLLM's <code>--enable-lora --lora-modules name=path</code>, or LoRAX (Lesson 7.4). Never train with a model you're not allowed to: check the licence first (Lesson 7.3).</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Prompting a big model</td><td>Minutes to change, broad skills, no training pipeline</td><td>Per-request cost and latency of long prompts; behaviour can drift</td></tr>
+      <tr><td>Full fine-tuning</td><td>Most capacity to learn, best for big domain shifts</td><td>16 bytes/param of training state, multi-GPU, more forgetting, one full model copy per task</td></tr>
+      <tr><td>LoRA</td><td>~0.1–1% of params trained, small swappable adapters, forgets less</td><td>Learns less than full fine-tuning on big shifts; rank and targets to tune</td></tr>
+      <tr><td>QLoRA</td><td>Big models on one GPU</td><td>Slower steps (de-quantizing on the fly); small quality risk from the 4-bit base</td></tr>
+      <tr><td>Managed fine-tuning API</td><td>No GPUs to run</td><td>Limited models and knobs; vendor can change or retire the service (as OpenAI's 2026 wind-down shows)</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Startup</h4><p>Ship on a prompted frontier model first, log every request, and let real traffic build the dataset. Fine-tune when cost or latency starts to hurt and you have a few hundred good labelled examples: one LoRA on an open 7–14B model, rented GPUs for an afternoon, and an eval that proves it matches the big model.</p></div>
+      <div><h4>Big tech</h4><p>A training platform with dataset versioning, automated evals and safety regression tests on every run; dozens of task adapters served from a shared base (Apple ships its on-device features this way); and fine-tunes rebuilt whenever the base model is upgraded, which is a hidden recurring cost.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Would you fine-tune for this?” A senior answer:</p>
+    <ul>
+      <li>Asks whether the gap is <b>knowledge</b> (RAG) or <b>behaviour</b> (maybe fine-tune), and what the prompted baseline scores on an eval set.</li>
+      <li>Does the <b>cost maths</b>: tokens saved per request × volume vs. training, hosting and maintenance (re-tuning on every base-model upgrade).</li>
+      <li>Picks <b>LoRA/QLoRA</b> by default and says why (memory, adapters, forgetting), with full fine-tuning for large domain shifts.</li>
+      <li>Talks about <b>data</b>: quality, coverage of edge cases, a leak-proof held-out split, and a regression eval for general skills.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>310 small specialists vs GPT-4</b> <span class="tag co">🏢 Predibase · 2024</span> <a href="https://arxiv.org/abs/2405.00732" target="_blank" rel="noopener">LoRA Land (arXiv 2405.00732)</a></div>
+      <p><b>How:</b> 4-bit LoRA fine-tunes of 10 open base models on 31 tasks, served by LoRAX, an open-source server that shares one base model across many adapters.</p>
+      <p><b>Why this method:</b> on average +34 points over the base models and +10 over GPT-4 on those tasks, with 25 fine-tuned 7B models on one A100 80 GB.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Swappable adapters on your phone</b> <span class="tag co">🏢 Apple · 2024</span> <a href="https://machinelearning.apple.com/research/introducing-apple-foundation-models" target="_blank" rel="noopener">Apple Intelligence foundation models</a></div>
+      <p><b>How:</b> one ~3B on-device model plus rank-16 LoRA adapters per feature, loaded and swapped on the fly.</p>
+      <p><b>Why this method:</b> each adapter needs only tens of megabytes, so many features share one base model in limited phone memory.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A small tuned model beats a giant one</b> <span class="tag hist">📜 History · 2022</span> <a href="https://arxiv.org/abs/2203.02155" target="_blank" rel="noopener">InstructGPT (arXiv 2203.02155)</a></div>
+      <p><b>How:</b> OpenAI fine-tuned GPT-3 on labeller-written demonstrations (SFT), then on human preferences (Lesson 7.2).</p>
+      <p><b>Why this method:</b> people preferred the outputs of the 1.3B tuned model to those of the 175B base model, despite 100× fewer parameters.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Fine-tuning teaches format, not facts</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2405.05904" target="_blank" rel="noopener">Does Fine-Tuning on New Knowledge Encourage Hallucinations?</a></div>
+      <p><b>How:</b> researchers at the Technion and Google varied how many fine-tuning examples contained facts the model didn't already know.</p>
+      <p><b>Why this method:</b> new facts were learned much more slowly than known ones, and as they were learned, the model's tendency to hallucinate rose. Use RAG for facts.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 350 GB → 35 MB</span>
+    <p>In the original LoRA paper, adapting GPT-3 175B with rank 4 on just the query and value matrices shrank each task's checkpoint from 350 GB to about <b>35 MB</b>, roughly 10,000× smaller. Storing 100 task versions took about 354 GB instead of 35 TB.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>RAG (Phase 3) handles knowledge; this lesson handles behaviour. Evals (Phase 5) decide whether a fine-tune shipped or not. Next, Lesson 7.2 goes past SFT to preference tuning and distillation, 7.3 covers where open models come from and their licences, 7.4 serves adapters at scale, and 7.5 covers domain adaptation (continued pretraining vs domain fine-tuning vs RAG). The maths is in the sibling courses: <a href="../../math-course/phase2/4-rank.html">rank and why LoRA works</a> and <a href="../../math-course/phase8/5-numerics.html">floats, bf16 and why 4-bit is possible</a> (Math for AI), and <a href="../../rl-course/phase7/2-pipeline.html">where SFT sits in the post-training pipeline</a> (RL from Zero).</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2106.09685" target="_blank" rel="noopener">LoRA: Low-Rank Adaptation of Large Language Models</a>. Short, readable, and the source of most defaults.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2305.14314" target="_blank" rel="noopener">QLoRA: Efficient Finetuning of Quantized LLMs</a>. NF4, double quantization, paged optimizers.</li>
+      <li><span class="kind">Docs</span> <a href="https://huggingface.co/docs/trl/sft_trainer" target="_blank" rel="noopener">TRL SFT Trainer</a>. Dataset formats, completion-only loss, PEFT integration.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A LoRA adapter of rank 8 on one 4,096 × 4,096 weight matrix. How many trainable parameters?</div>
+    <div class="opts"><button class="opt">32,768</button><button class="opt" data-ok>65,536</button><button class="opt">16,777,216</button></div>
+    <div class="explain">B is 4,096 × 8 and A is 8 × 4,096: 8 × (4,096 + 4,096) = <b>65,536</b>, about 0.4% of the 16.8 M weights in the full matrix (the third option).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your assistant must answer questions about product prices that change every week. A colleague proposes fine-tuning on the price list. Best response?</div>
+    <div class="opts"><button class="opt">Agree, and retrain every week</button><button class="opt" data-ok>Use RAG for the prices; fine-tune only if a behaviour (format, tone) still needs fixing</button><button class="opt">Fine-tune once with a higher learning rate so the prices stick</button></div>
+    <div class="explain">Fine-tuning is a poor way to store changing facts: they're learned slowly, can raise hallucination, and are stale a week later. Retrieval keeps facts fresh and citable. Pushing harder (higher learning rate) mostly causes forgetting.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. During fine-tuning, training loss keeps falling but held-out eval loss started rising after epoch 2, and answers now copy training examples word for word. What's happening, and what do you do?</div>
+    <div class="opts"><button class="opt">Underfitting: train for more epochs</button><button class="opt">The eval set is broken: delete it</button><button class="opt" data-ok>Overfitting: keep the epoch-2 checkpoint, then add more varied data or lower the learning rate</button></div>
+    <div class="explain">Diverging train and eval loss is the textbook sign of memorizing. Early stopping at the best eval checkpoint is the quick fix; more diverse data and gentler training are the lasting ones.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Fine-tune for behaviour (format, style, a narrow skill, a smaller cheaper model); use RAG for knowledge.</li>
+      <li>Start from a prompted baseline and an eval set; a few hundred to a few thousand clean, leak-proof examples beats a big noisy pile.</li>
+      <li>Full fine-tuning costs about 16 bytes per parameter in training state; LoRA trains ~0.1–1% of the parameters; QLoRA adds a 4-bit base so 65–70B models fit on one 48 GB GPU.</li>
+      <li>Watch for overfitting (train vs eval loss) and forgetting (a general-skills regression eval).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  // ---------- GPU memory calculator ----------
+  // configs from each model's config.json on the Hugging Face Hub
+  const MODELS = {
+    "Llama 3.2 1B": { L: 16, h: 2048, nh: 32, kv: 8, hd: 64, i: 8192, V: 128256, tie: true },
+    "Llama 3.2 3B": { L: 28, h: 3072, nh: 24, kv: 8, hd: 128, i: 8192, V: 128256, tie: true },
+    "Llama 3.1 8B": { L: 32, h: 4096, nh: 32, kv: 8, hd: 128, i: 14336, V: 128256, tie: false },
+    "Qwen3 14B": { L: 40, h: 5120, nh: 40, kv: 8, hd: 128, i: 17408, V: 151936, tie: false },
+    "Qwen3 32B": { L: 64, h: 5120, nh: 64, kv: 8, hd: 128, i: 25600, V: 151936, tie: false },
+    "Llama 3.1 70B": { L: 80, h: 8192, nh: 64, kv: 8, hd: 128, i: 28672, V: 128256, tie: false },
+  };
+  const RANKS = [2, 4, 8, 16, 32, 64, 128], BATCH = [1, 2, 4, 8, 16, 32], SEQS = [512, 1024, 2048, 4096, 8192, 16384, 32768];
+  const GPUS = [["16 GB laptop / T4", 16], ["24 GB (L4, gaming GPU)", 24], ["48 GB (L40S, A6000)", 48], ["80 GB (A100, H100)", 80], ["8 × 80 GB node", 640]];
+  $("mm-model").innerHTML = Object.keys(MODELS).map(n => `<option${n === "Llama 3.1 8B" ? " selected" : ""}>${n}</option>`).join("");
+  let meth = "lora";
+  const mBtns = [...$("mm-meth").querySelectorAll("button")];
+  const setMeth = v => { meth = v; mBtns.forEach(b => b.classList.toggle("on", b.dataset.v === v)); mem(); };
+  mBtns.forEach(b => (b.onclick = () => setMeth(b.dataset.v)));
+  const nParams = m => m.L * (m.h * m.nh * m.hd * 2 + 2 * m.h * m.kv * m.hd + 3 * m.h * m.i) + m.V * m.h * (m.tie ? 1 : 2);
+  function loraParams(m, r, all) {
+    const q = [m.h, m.nh * m.hd], kv = [m.h, m.kv * m.hd], o = [m.nh * m.hd, m.h];
+    const mats = all ? [q, kv, kv, o, [m.h, m.i], [m.h, m.i], [m.i, m.h]] : [q, kv];
+    return m.L * mats.reduce((s, [a, b]) => s + r * (a + b), 0);
+  }
+  const fmtN = n => n >= 1e9 ? (n / 1e9).toFixed(2) + " B" : n >= 1e6 ? (n / 1e6).toFixed(1) + " M" : Math.round(n / 1e3) + " k";
+  const GB = x => (x / 1e9).toFixed(x < 1e10 ? 1 : 0) + " GB";
+  function mem() {
+    const m = MODELS[$("mm-model").value], r = RANKS[+$("mm-r").value], all = $("mm-tgt").value === "all";
+    const b = BATCH[+$("mm-b").value], s = SEQS[+$("mm-s").value], ck = $("mm-ck").checked;
+    $("mm-rv").textContent = meth === "full" ? "(not used)" : r; $("mm-bv").textContent = b; $("mm-sv").textContent = s.toLocaleString() + " tokens";
+    const P = nParams(m), Pl = meth === "full" ? P : loraParams(m, r, all);
+    const w = meth === "qlora" ? P * 4.127 / 8 : P * 2;
+    const opt = meth === "full" ? 14 * P : 16 * Pl;
+    const layerAct = ck ? 2 * s * b * m.h * m.L + 34 * s * b * m.h : 34 * s * b * m.h * m.L;
+    const logits = 4 * s * b * m.V, act = layerAct + logits, over = 1e9, tot = w + opt + act + over;
+    Plot.bars($("mm-chart"), { bars: [
+      { label: meth === "qlora" ? "weights (4-bit)" : "weights (16-bit)", value: w / 1e9, color: MX.css("--c-md") },
+      { label: meth === "full" ? "grads + Adam" : "adapter grads + Adam", value: opt / 1e9, color: MX.css("--c-tl") },
+      { label: "activations + logits", value: act / 1e9, color: MX.css("--c-cx") },
+      { label: "overhead", value: 1, color: MX.css("--muted") },
+      { label: "TOTAL", value: tot / 1e9, color: MX.css("--c-tk") },
+    ], yMin: 0, yLabel: "GB" });
+    $("mm-total").textContent = GB(tot);
+    $("mm-train").textContent = fmtN(Pl) + (meth === "full" ? "" : ` (${(100 * Pl / P).toFixed(2)}%)`);
+    $("mm-file").textContent = meth === "full" ? GB(P * 2) + " (whole model)" : (Pl * 2 / 1e6).toFixed(0) + " MB adapter";
+    $("mm-fit").innerHTML = "fits on: " + GPUS.map(([n, g]) => `<span class="${tot <= g * 1e9 * 0.95 ? "yes" : "no"}">${n}</span>`).join("");
+    const wf = meth === "qlora" ? `${fmtN(P)} × 4.127 bits ÷ 8` : `${fmtN(P)} × 2 bytes`;
+    const of = meth === "full" ? `${fmtN(P)} × 14 bytes` : `${fmtN(Pl)} trainable × 16 bytes`;
+    const af = ck ? `(2·s·b·h·L + 34·s·b·h) + 4·s·b·V` : `34·s·b·h·L + 4·s·b·V`;
+    $("mm-calc").innerHTML = `weights ${wf} = ${GB(w)} &nbsp;+&nbsp; optimizer ${of} = ${GB(opt)}<br>activations ${af} = ${GB(act)} &nbsp;+&nbsp; ~1 GB overhead &nbsp;=&nbsp; <b>${GB(tot)}</b>`;
+  }
+  ["mm-model", "mm-r", "mm-tgt", "mm-b", "mm-s"].forEach(id => ($(id).oninput = mem));
+  $("mm-ck").onchange = mem;
+  $("mm-try70").onclick = () => { $("mm-model").value = "Llama 3.1 70B"; $("mm-b").value = 0; $("mm-s").value = 1; $("mm-ck").checked = true; $("mm-r").value = 3; $("mm-tgt").value = "all"; setMeth("qlora"); };
+  mem();
+
+  // ---------- Should I fine-tune? ----------
+  // Illustrative prices per million tokens (not quotes): big model $3 in / $15 out, cached input 10%, small fine-tuned $0.20 / $0.80
+  const NS = [0, 30, 100, 300, 1000, 3000, 10000, 30000, 100000], QS = [1000, 3000, 10000, 30000, 100000, 300000, 1000000, 3000000];
+  const OUT = { format: 150, style: 250, narrow: 20, fresh: 250, facts: 150, broad: 400 };
+  const lg = n => Math.log10(Math.max(1, n));
+  const QUAL = { // illustrative quality (0-100) per option
+    format: { big: 86, ft: n => n < 50 ? 55 : Math.min(97, 70 + 9 * lg(n)), rag: 86 },
+    style: { big: 74, ft: n => n < 50 ? 55 : Math.min(92, 60 + 10 * lg(n)), rag: 74 },
+    narrow: { big: 90, ft: n => n < 50 ? 55 : Math.min(95, 65 + 10 * lg(n)), rag: 88 },
+    fresh: { big: 35, ft: n => 30, rag: 90 },
+    facts: { big: 45, ft: n => Math.min(62, 40 + 5 * lg(n)), rag: 90 },
+    broad: { big: 90, ft: n => Math.min(70, 50 + 4 * lg(n)), rag: 88 },
+  };
+  function decide() {
+    const goal = $("ft-goal").value, n = NS[+$("ft-n").value], qd = QS[+$("ft-q").value], fs = +$("ft-fs").value, out = OUT[goal];
+    $("ft-nv").textContent = n.toLocaleString(); $("ft-qv").textContent = qd.toLocaleString(); $("ft-fsv").textContent = fs.toLocaleString() + " tokens";
+    const user = 250, mo = qd * 30;
+    const cost = (inTok, inP, outP, cachedTok = 0) => mo * (inTok * inP + cachedTok * inP * 0.1 + out * outP) / 1e6;
+    const knowledge = goal === "fresh" || goal === "facts";
+    const opts = [
+      { k: "big", name: "Big model + few-shot prompt", c: cost(user + fs, 3, 15), q: QUAL[goal].big },
+      { k: "cache", name: "Big model + cached few-shot prompt", c: cost(user, 3, 15, fs), q: QUAL[goal].big },
+      { k: "ft", name: "Fine-tuned small model (LoRA)", c: cost(user, 0.2, 0.8), q: QUAL[goal].ft(n) },
+      { k: "rag", name: "RAG: big model + 2,500 retrieved tokens", c: cost(user + 2500, 3, 15), q: QUAL[goal].rag },
+    ];
+    const oneOff = n * (user + out) * 3 * 5 / 1e6 + 8000; // 3 epochs × illustrative $5/M training tokens + ~10 engineer-days at $800
+    const best = Math.max(...opts.map(o => o.q));
+    const pick = opts.filter(o => o.q >= best - 2).sort((a, b) => a.c - b.c)[0];
+    const savings = opts[1].c - opts[2].c, payback = savings > 0 ? oneOff / savings : Infinity;
+    $("ft-table").innerHTML = `<tr><th>Option</th><th>Monthly cost</th><th>Quality (illustrative)</th></tr>` + opts.map(o =>
+      `<tr class="${o === pick ? "best" : ""}"><td>${o.name}</td><td class="num">$${Math.round(o.c).toLocaleString()}</td><td class="num">${Math.round(o.q)}</td></tr>`).join("");
+    let v, note;
+    if (knowledge) {
+      v = `<span class="ev">✅ Use RAG.</span> The gap is knowledge, not behaviour. Fine-tuned facts go stale${goal === "facts" ? ", are learned slowly and raise hallucination risk" : " within a week"}. Fine-tune later only for answer format or tone.`;
+    } else if (pick.k === "ft" && n < 100) {
+      v = `<span class="tk">⏸ Not yet.</span> With only ${n} examples you can't train or measure reliably. Prompt now, log traffic, label a few hundred examples.`;
+    } else if (pick.k === "ft") {
+      v = `<span class="ev">✅ Fine-tune a small model.</span> It matches the big model on this narrow behaviour at ${Math.round(opts[1].c / Math.max(1, opts[2].c))}× lower running cost; the one-off cost of ~$${Math.round(oneOff).toLocaleString()} pays back in ${payback < 1 ? "under a month" : payback < 60 ? payback.toFixed(1) + " months" : "years"}.`;
+    } else {
+      v = `<span class="md">✅ Keep prompting the big model${pick.k === "cache" ? " (with prompt caching)" : ""}.</span> ${goal === "broad" ? "Broad reasoning is where big general models win; a small fine-tune won't catch up." : n < 100 ? "You don't have enough examples for a fine-tune to win yet." : "The fine-tune doesn't reach the big model's quality here."}`;
+    }
+    if (!knowledge && pick.k !== "ft" && n >= 100 && QUAL[goal].ft(n) >= best - 2 && payback >= 24) v += ` At ${qd.toLocaleString()} requests a day, fine-tuning would take ${payback === Infinity ? "forever" : Math.round(payback) + " months"} to pay back.`;
+    note = `One-off fine-tuning cost assumed: ${n.toLocaleString()} examples × 3 epochs at an illustrative $5 per million training tokens, plus ~10 engineer-days at $800 (data, evals, deployment). Prices are illustrative; quality scores are made up to show the typical shape. Your own eval set decides.`;
+    $("ft-verdict").innerHTML = v; $("ft-note").textContent = note;
+  }
+  const preset = (g, n, q, fs) => { $("ft-goal").value = g; $("ft-n").value = n; $("ft-q").value = q; $("ft-fs").value = fs; decide(); };
+  $("ft-p1").onclick = () => preset("narrow", 5, 5, 3000);
+  $("ft-p2").onclick = () => preset("fresh", 4, 3, 1000);
+  $("ft-p3").onclick = () => preset("style", 1, 3, 2000);
+  ["ft-goal", "ft-n", "ft-q", "ft-fs"].forEach(id => ($(id).oninput = decide));
+  decide();
+})();
+</script>
+</body>
+</html>

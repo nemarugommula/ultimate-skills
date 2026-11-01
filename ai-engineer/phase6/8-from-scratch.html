@@ -1,0 +1,573 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.8 Build an agent from scratch · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .msgs { max-height: 380px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; padding: 6px; background: var(--bg2); }
+  .msg { font-family: var(--mono); font-size: .76rem; white-space: pre-wrap; word-break: break-word; border-left: 4px solid var(--line); padding: 4px 8px; margin: 4px 0; border-radius: 4px; }
+  .msg.u { border-left-color: var(--c-in); }
+  .msg.a { border-left-color: var(--c-md); }
+  .msg.r { border-left-color: var(--c-tl); }
+  .msg.err { border-left-color: var(--c-rk); }
+  .msg.new { outline: 2px solid var(--accent); }
+  .msg .who { font-family: var(--font); font-weight: 700; font-size: .78rem; display: block; margin-bottom: 2px; }
+  .trace { font-family: var(--mono); font-size: .8rem; max-height: 200px; overflow: auto; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bg2); }
+  .trace .st { border-bottom: 1px dashed var(--line); padding: 3px 0; }
+  .trace .st:last-child { border-bottom: 0; }
+  .twocol { display: grid; grid-template-columns: 1.4fr 1fr; gap: 10px; }
+  .twocol > div { min-width: 0; }
+  @media (max-width: 760px) { .twocol { grid-template-columns: 1fr; } }
+  .suite { display: flex; flex-wrap: wrap; gap: 6px 12px; align-items: center; border: 1px solid var(--line); border-radius: 10px; padding: 6px 10px; margin: 6px auto; background: var(--bg2); }
+  .suite b { min-width: 0; }
+  .pyr { margin: 8px 0; }
+  .bugrow { display: grid; grid-template-columns: 1fr auto; gap: 8px; padding: 5px 0; border-bottom: 1px dashed var(--line); font-size: .9rem; }
+  .bugrow:last-child { border-bottom: 0; }
+</style>
+</head>
+<body data-lesson="a6-8" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 8</div>
+  <h1>Build an agent from scratch: the raw loop, parsing, errors & testing</h1>
+  <p class="subtitle">The happy path of an agent is twenty lines. The other forty decide what happens when the model sends bad arguments, a tool throws, the API says “slow down”, or the loop won't stop. Then you need tests that catch all of it without paying for a model on every run.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The agent loop</b>: call the model → run the tools it asks for → append the results → repeat until a final answer or a stop condition (Lesson 6.1).</li>
+      <li><b>Function calling</b>: tools are described with JSON Schema; the model answers with a structured call (Lesson 1.3). Tool errors should be actionable (Lesson 6.2).</li>
+      <li><b>Agent evals</b>: success rate over many runs, judged by code or a model (Lessons 5.3, 5.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In April 2025, Thorsten Ball, an engineer working on the Amp coding agent, published “How to Build an Agent”. His claim: a code-editing agent that reads files, lists directories and edits code, the kind of thing that looks like magic in a demo, takes <b>less than 400 lines of Go</b>, most of it boilerplate, with three tools. His summary of what's inside: <i>“an LLM, a loop, and enough tokens.”</i></p>
+    <p>He's right about the core, and it's the best way to demystify agents. But the gap between that weekend agent and one you can put in front of customers is everything this lesson covers: malformed calls, failing tools, rate limits, runaway loops, and tests that prove each of those is handled.</p>
+  </div>
+
+  <h2>Numbers first: rare failures are common in loops</h2>
+  <p>An agent makes many calls per task, so a failure that's rare per call becomes likely per run (the same compounding as Lesson 6.6, applied to plumbing).</p>
+  <table>
+    <tr><th>Per-call failure (illustrative)</th><th>Calls per run</th><th>Runs that hit it at least once</th><th>With the right handling</th></tr>
+    <tr><td>Model API returns 429 “rate limited” on 2% of calls</td><td>20 model calls</td><td class="rk">1 − 0.98²⁰ = 33%</td><td>2 retries with backoff: 1 − (1 − 0.02³)²⁰ ≈ 0.016% of runs fail</td></tr>
+    <tr><td>Text-parsed tool call is malformed 3% of the time</td><td>20 steps</td><td class="rk">1 − 0.97²⁰ = 46%</td><td>Native function calling with strict schemas: OpenAI measured 100% schema adherence vs under 40% before</td></tr>
+    <tr><td>A tool throws (timeout, bug, API down) 5% of the time</td><td>10 tool calls</td><td class="rk">1 − 0.95¹⁰ = 40%</td><td>Return the error as an observation; the model retries or works around it</td></tr>
+  </table>
+  <p class="muted">Retry math assumes independent failures; real 429s cluster, which is why backoff waits longer each time. The 100% vs &lt;40% figure is OpenAI's own eval of complex JSON-schema following (gpt-4o-2024-08-06 with Structured Outputs vs gpt-4-0613), August 2024.</p>
+  <p>Without handling, a third of runs crash on rate limits and nearly half on parsing. With it, both nearly vanish. That's why the “boring” code is most of a production agent.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Every failure in an agent must land in exactly one of three buckets: an <b>observation</b> (the model can fix it: bad arguments, a tool error), a <b>retry</b> (infrastructure can fix it: 429s, timeouts, 5xx), or a <b>stop</b> (a human must fix it: max turns, budget, a spend cap, a refusal). A failure that lands in none of them is a crash. Then test each bucket with a fake model, so the tests are fast, free and deterministic.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: training a pilot</span>
+    <p>You don't test a pilot only by flying passengers. You check each instrument on the ground (unit tests for tools). You put them in a simulator and script the weather: engine failure at 3,000 feet, every time (a mocked model that returns exactly the bad tool call you want). You fly real test flights on a quiet route (integration tests with the real model). And every real flight's black box is kept, so after any change you can replay the recording and see whether the new system would have done the same thing (recorded trajectories as regression tests).</p>
+  </div>
+
+  <h2>Two ways to get a tool call out of a model</h2>
+  <p><b>The old way: text parsing.</b> Before native function calling, ReAct agents asked the model to write a fixed text format, stopped generation at “Observation:”, and parsed the text with a regular expression:</p>
+  <div class="prompt">Thought: I need the order's status first.
+Action: get_order
+Action Input: {"order_id": "ORD-1042"}
+Observation:                       ← generation stopped here (a stop sequence); your code runs the tool and pastes the result
+
+match = re.search(r"Action: (\w+)\nAction Input: (.*)", text)   # hope for the best</div>
+  <p>It works in demos and fails in four ways in production: the model writes “Action: Get order”, emits invalid JSON (a trailing comma, single quotes), adds prose after the JSON, or, if the stop sequence is missing, <b>writes the Observation itself</b>, hallucinating a tool result your code never produced.</p>
+  <p><b>The current way: native tool calling.</b> In June 2023 OpenAI shipped function calling, with models fine-tuned to detect when to call a function and to answer with JSON that fits its signature; every major provider followed. The model now returns a typed block with a <b>name</b>, <b>arguments as JSON</b> and an <b>id</b>; you send back a result referencing that id. Strict modes constrain generation to your schema. Parallel calls in one turn come for free. As of 2026 the shapes are:</p>
+  <table>
+    <tr><th></th><th>Anthropic Messages API</th><th>OpenAI Responses API</th></tr>
+    <tr><td>Declare a tool</td><td><code>{"name", "description", "input_schema"}</code> (+ <code>"strict": true</code>)</td><td><code>{"type": "function", "name", "description", "parameters", "strict": true}</code></td></tr>
+    <tr><td>Model asks for a call</td><td>a <code>tool_use</code> content block <code>{id, name, input}</code>; <code>stop_reason == "tool_use"</code></td><td>an output item <code>{"type": "function_call", call_id, name, arguments}</code> (arguments is a JSON string)</td></tr>
+    <tr><td>You send the result</td><td><code>{"type": "tool_result", "tool_use_id", "content", "is_error"}</code> inside a <b>user</b> message; all results of a turn in one message</td><td><code>{"type": "function_call_output", "call_id", "output"}</code> appended to the input</td></tr>
+    <tr><td>Done when</td><td><code>stop_reason == "end_turn"</code></td><td>the output has no <code>function_call</code> items</td></tr>
+  </table>
+
+  <h2>The loop, in about 60 lines</h2>
+  <p>Lesson 6.1 showed the 25-line happy path. Here's the version with the other buckets filled in: a tool registry, schema validation, errors as observations, a timeout per tool, output capping, retries, and a hard stop. Anthropic's Python SDK as of 2026; the OpenAI version differs only in the shapes above.</p>
+<pre><code><span class="k">import</span> json, logging, concurrent.futures <span class="k">as</span> cf
+<span class="k">import</span> anthropic
+<span class="k">from</span> jsonschema <span class="k">import</span> Draft202012Validator
+
+client = anthropic.Anthropic(max_retries=<span class="n">4</span>)   <span class="c"># retries 408/409/429/5xx + connection errors, with backoff</span>
+MODEL, MAX_TURNS, TOOL_TIMEOUT_S, MAX_RESULT_CHARS = <span class="s">"claude-opus-5-5"</span>, <span class="n">12</span>, <span class="n">20</span>, <span class="n">8000</span>
+pool = cf.ThreadPoolExecutor(max_workers=<span class="n">8</span>)
+TOOLS = {}                                      <span class="c"># name -&gt; (function, JSON Schema)</span>
+log = logging.getLogger(<span class="s">"agent"</span>)
+<span class="k">class</span> AgentStopped(Exception): <span class="k">pass</span>                <span class="c"># bucket: stop (carries the transcript)</span>
+
+<span class="k">def</span> tool(schema):
+    <span class="k">def</span> register(fn):
+        TOOLS[fn.__name__] = (fn, schema)
+        <span class="k">return</span> fn
+    <span class="k">return</span> register
+
+<span class="c">@tool</span>({<span class="s">"type"</span>: <span class="s">"object"</span>, <span class="s">"additionalProperties"</span>: False, <span class="s">"required"</span>: [<span class="s">"order_id"</span>],
+       <span class="s">"properties"</span>: {<span class="s">"order_id"</span>: {<span class="s">"type"</span>: <span class="s">"string"</span>, <span class="s">"pattern"</span>: <span class="s">"^ORD-[0-9]+$"</span>}}})
+<span class="k">def</span> get_order(order_id):
+    <span class="s">"""Look up one order: status, delivery date, total. order_id looks like ORD-1042."""</span>
+    <span class="k">return</span> orders_api.get(order_id)
+
+<span class="k">def</span> run_tool(block):
+    <span class="k">if</span> block.name <span class="k">not in</span> TOOLS:                                   <span class="c"># bucket: observation</span>
+        <span class="k">return</span> f<span class="s">"Unknown tool {block.name!r}. Available: {', '.join(TOOLS)}"</span>, True
+    fn, schema = TOOLS[block.name]
+    errors = [e.message <span class="k">for</span> e <span class="k">in</span> Draft202012Validator(schema).iter_errors(block.input)]
+    <span class="k">if</span> errors:
+        <span class="k">return</span> f<span class="s">"Invalid arguments for {block.name}: {'; '.join(errors)}"</span>, True
+    future = pool.submit(fn, **block.input)
+    <span class="k">try</span>:
+        out = json.dumps(future.result(timeout=TOOL_TIMEOUT_S), default=str)
+        <span class="k">return</span> out[:MAX_RESULT_CHARS], False                         <span class="c"># cap what enters the context</span>
+    <span class="k">except</span> cf.TimeoutError:
+        <span class="k">return</span> f<span class="s">"{block.name} timed out after {TOOL_TIMEOUT_S}s. Try again or another way."</span>, True
+    <span class="k">except</span> Exception <span class="k">as</span> e:                                          <span class="c"># tool bug, API down, ...</span>
+        <span class="k">return</span> f<span class="s">"{type(e).__name__}: {e}"</span>, True
+
+<span class="k">def</span> run_agent(question, system=<span class="s">""</span>):
+    tool_defs = [{<span class="s">"name"</span>: n, <span class="s">"description"</span>: fn.__doc__, <span class="s">"input_schema"</span>: s} <span class="k">for</span> n, (fn, s) <span class="k">in</span> TOOLS.items()]
+    messages = [{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: question}]
+    <span class="k">for</span> turn <span class="k">in</span> range(MAX_TURNS):
+        <span class="k">try</span>:
+            resp = client.messages.create(model=MODEL, max_tokens=<span class="n">16000</span>, system=system,
+                                          tools=tool_defs, messages=messages)
+        <span class="k">except</span> anthropic.RateLimitError <span class="k">as</span> e:                        <span class="c"># retries exhausted: bucket stop</span>
+            <span class="k">raise</span> AgentStopped(<span class="s">"rate limited after retries"</span>, messages) <span class="k">from</span> e
+        messages.append({<span class="s">"role"</span>: <span class="s">"assistant"</span>, <span class="s">"content"</span>: resp.content})  <span class="c"># unchanged, incl. thinking blocks</span>
+        <span class="k">if</span> resp.stop_reason == <span class="s">"end_turn"</span>:
+            <span class="k">return</span> <span class="s">""</span>.join(b.text <span class="k">for</span> b <span class="k">in</span> resp.content <span class="k">if</span> b.type == <span class="s">"text"</span>)
+        <span class="k">if</span> resp.stop_reason != <span class="s">"tool_use"</span>:                           <span class="c"># max_tokens, refusal, ...</span>
+            <span class="k">raise</span> AgentStopped(f<span class="s">"stop_reason={resp.stop_reason}"</span>, messages)
+        results = []
+        <span class="k">for</span> block <span class="k">in</span> [b <span class="k">for</span> b <span class="k">in</span> resp.content <span class="k">if</span> b.type == <span class="s">"tool_use"</span>]:
+            out, is_err = run_tool(block)
+            log.info(<span class="s">"turn %d tool %s %s error=%s"</span>, turn, block.name, block.input, is_err)
+            results.append({<span class="s">"type"</span>: <span class="s">"tool_result"</span>, <span class="s">"tool_use_id"</span>: block.id,
+                            <span class="s">"content"</span>: out, <span class="s">"is_error"</span>: is_err})
+        messages.append({<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: results})        <span class="c"># ALL results, one message</span>
+    <span class="k">raise</span> AgentStopped(<span class="s">"max turns reached"</span>, messages)                <span class="c"># escalate with the transcript</span></code></pre>
+  <p>Details that matter, each one a real bug in someone's first agent:</p>
+  <ul>
+    <li><b>Append the assistant content unchanged</b>, including any thinking blocks, and return <b>every</b> <code>tool_result</code> for a turn in <b>one</b> user message, each with the matching <code>tool_use_id</code>. A missing result makes the next request fail.</li>
+    <li><b>Validate arguments yourself</b> even with strict modes (not every provider or model enforces them, and streamed inputs can arrive truncated). A validator message like “1042 is not of type 'string'” is an instruction the model can follow; a Python traceback isn't.</li>
+    <li><b>A thread timeout doesn't kill the thread.</b> The tool keeps running in the background; for real cancellation run risky tools in a subprocess or container, or use async tools that respect cancellation.</li>
+    <li><b>Not every 429 is temporary.</b> Anthropic's docs note that once an organisation hits its spend cap, requests return 429 with <i>no</i> retry-after header and every retry fails until access resumes. Retry what's transient, and stop and alert on what isn't.</li>
+    <li><b>Message history is state.</b> Persist <code>messages</code> after every turn (a database row per run) so a crash or deploy can resume, and so you have the trajectory for debugging and tests.</li>
+  </ul>
+  <p><b>Streaming</b> changes the plumbing, not the loop. For a chat UI, stream text as it's generated with <code>client.messages.stream(...)</code>, iterate <code>stream.text_stream</code>, then take <code>stream.get_final_message()</code> and continue the loop with it as before. Tool arguments stream as partial JSON fragments: only run a tool once its block is complete, and validate it first.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Step through a raw agent loop</span>
+    <p class="hint">A customer asks: “Has ORD-1042 arrived, and what's 15% of its total for the refund?” Two tools: <code>get_order</code> and <code>calculator</code>. The model is a scripted stand-in (a real LLM in practice) that follows a simple, realistic rule: if an error message says what's wrong, it fixes its call; if it doesn't, it repeats the call and gives up after two failures. Press Step to watch the exact <code>messages</code> array grow (Anthropic format, thinking blocks omitted). Then inject a failure and switch the harness's defences off and on.</p>
+    <div class="controls">
+      <label>inject <select id="inj" class="btn small">
+        <option value="none">nothing (happy path)</option>
+        <option value="malformed">malformed tool call: order_id sent as the number 1042</option>
+        <option value="unknown">model calls a tool that doesn't exist (get_orders)</option>
+        <option value="transient">get_order times out once (orders API slow)</option>
+        <option value="down">orders API is down (503 every time)</option>
+        <option value="ratelimit">model API returns 429 on the 2nd call</option>
+        <option value="loop">model never stops calling tools</option>
+      </select></label>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="cValidate" checked> validate tool name + arguments</label>
+      <label><input type="checkbox" id="cCatch" checked> catch tool exceptions → error observation</label>
+      <label><input type="checkbox" id="cRetry" checked> retry 429s with backoff</label>
+      <label>max turns <input type="range" id="mt" min="2" max="12" step="1" value="6"> <b class="mono" id="mtv"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="dbgStep">⏭ Step</button>
+      <button class="btn" id="dbgRun">▶ Run to the end</button>
+      <button class="btn" id="dbgReset">↺ Reset</button>
+    </div>
+    <div class="twocol">
+      <div><b>messages[ ]</b> <span class="muted">(what the model receives on its next call)</span><div class="msgs" id="msgs"></div></div>
+      <div><b>harness log</b> <span class="muted">(your code, not the model)</span><div class="trace" id="hlog"></div></div>
+    </div>
+    <div class="verdict" id="dbgVerdict"></div>
+    <div class="stat-row">
+      <div class="stat">model calls <b id="dCalls">0</b></div>
+      <div class="stat">messages <b id="dMsgs">1</b></div>
+      <div class="stat">input tokens, last call <b id="dTok">–</b></div>
+      <div class="stat">input tokens, total <b id="dTot">0</b></div>
+      <div class="stat">wall-clock <b id="dTime">0 s</b></div>
+    </div>
+    <p class="hint">Token counts use this course's rough tokenizer on the JSON plus about 900 tokens for the system prompt and tool definitions.</p>
+  </div>
+  <p>What you should see: the happy path takes 3 model calls and 6 messages, and every tool call is followed by a user message carrying its <code>tool_result</code>. Inject the malformed call: with validation on, the error names the problem and the model fixes it in one extra turn. Turn validation off and the tool itself crashes with <code>AttributeError: 'int' object has no attribute 'startswith'</code>; the model can't learn anything from that, retries the same call, and gives up on a question it could have answered. Turn off exception catching too and the whole run dies. A 429 without retries kills the run; with retries it costs 2 seconds. The never-stopping model only ends because max turns fires.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what a timeout really costs</span>
+    <p>The orders API hangs on 1 call in 50. Your tool timeout is 20 s; a model call takes 1.4 s; a normal tool call 0.4 s. A typical run makes 3 model calls and 2 calls to the orders API.</p>
+    <ul>
+      <li>Normal run: 3 × 1.4 + 2 × 0.4 = <b>5.0 s</b>.</li>
+      <li>Run with one hang: the 20 s timeout, plus one extra model call (1.4 s) to read the error and retry, plus the retry (0.4 s): 5.0 + 20 + 1.4 + 0.4 = <b>26.8 s</b>.</li>
+      <li>Average over all runs: 5.0 + 0.02 × 2 calls × 21.8 s ≈ <b>5.9 s</b>, but your p95 latency is now dominated by timeouts.</li>
+    </ul>
+    <p>A 20 s timeout on a call that normally takes 0.4 s is far too generous. Set per-tool timeouts from measured latency (say 3× the p99), and retry once inside the tool before involving the model, which costs a whole extra model call.</p>
+  </div>
+
+  <h2>Testing an agent: four layers</h2>
+  <table>
+    <tr><th>Layer</th><th>What runs</th><th>Catches</th><th>Speed and cost</th></tr>
+    <tr><td><b>Unit tests for tools</b></td><td>Each tool function alone, with fake upstream APIs</td><td>Wrong logic, bad output formats, oversized outputs, unclear error messages</td><td>Milliseconds, free; hundreds of tests</td></tr>
+    <tr><td><b>Mocked-LLM loop tests</b></td><td>The real loop with a fake client that returns scripted responses (a malformed call, two parallel calls, a model that never stops)</td><td>Harness bugs: missing tool_results, crashes on exceptions, no stop condition, retry logic</td><td>Milliseconds, free, deterministic</td></tr>
+    <tr><td><b>Recorded-trajectory replays</b></td><td>Real past runs saved as JSON; replay the recorded model responses through today's harness, and compare the requests and tool calls it makes</td><td>Regressions from refactors: dropped system prompt, changed tool names, reordered messages</td><td>Seconds, free</td></tr>
+    <tr><td><b>Integration and end-to-end evals</b></td><td>The real model with real (sandboxed) tools on a set of tasks, several trials each, scored by code or a judge</td><td>Prompt and model changes, wrong tool choice, flaky behaviour, real API schema rejections</td><td>Minutes, real tokens; run on important PRs or nightly</td></tr>
+  </table>
+  <p>The fake client is the key trick. Your loop only needs an object with <code>messages.create</code>; give it one that returns whatever you script, and you can test the 1-in-100 failure on every commit. For end-to-end evals, remember agents are stochastic: a 75% per-trial success rate passes 3 trials in a row only (0.75)³ ≈ 42% of the time, which is why Anthropic recommends reporting <b>pass^k</b> (all k trials succeed) for customer-facing agents, not just pass@k (at least one succeeds).</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Build your test pyramid</span>
+    <p class="hint">Ten real agent bugs. Pick which test suites you run and when; see which bugs each one catches before production, and what it costs. Numbers are illustrative (20 pull requests a day; token costs for the real-model suites). “Maybe” means the suite catches it only sometimes, because the bug only shows up on some runs or some flows.</p>
+    <div class="pyr" id="pyr"></div>
+    <div id="bugs"></div>
+    <div class="verdict" id="pyrVerdict"></div>
+    <div class="stat-row">
+      <div class="stat">bugs caught before prod (expected) <b id="pCaught">–</b></div>
+      <div class="stat">CI time per pull request <b id="pTime">–</b></div>
+      <div class="stat">model spend per day <b id="pCost">–</b></div>
+    </div>
+    <div class="controls"><button class="btn" id="pyrAll">All suites, real-model ones nightly</button> <button class="btn" id="pyrNone">Only end-to-end evals</button></div>
+  </div>
+  <p>What you should see: end-to-end evals alone catch the obvious failures but cost money on every run and still miss harness bugs that only appear on rare paths. The cheap layers catch most bugs for free in seconds; the real-model layers catch what only a real model reveals (wrong tool choice after a prompt change, flaky behaviour after a model upgrade). That's the pyramid: many cheap, deterministic tests at the bottom, a few expensive, realistic ones at the top.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>The provider SDKs (<code>anthropic</code>, <code>openai</code>) with their built-in retries and typed errors; <code>jsonschema</code> or Pydantic for validation; <code>pytest</code> with a fake client; tracing (LangSmith, Langfuse, Arize Phoenix or OpenTelemetry) to capture trajectories; and an eval harness (Lesson 5.5). A mocked-LLM test of the loop above:</p>
+<pre><code><span class="c"># test_agent.py: the model is a script, so the loop's logic is tested in milliseconds, for free</span>
+<span class="k">from</span> types <span class="k">import</span> SimpleNamespace <span class="k">as</span> NS
+<span class="k">import</span> agent
+
+<span class="k">class</span> FakeMessages:
+    <span class="k">def</span> __init__(self, script):
+        self.script, self.calls = list(script), []
+    <span class="k">def</span> create(self, **kw):
+        self.calls.append({**kw, <span class="s">"messages"</span>: list(kw[<span class="s">"messages"</span>])})   <span class="c"># snapshot of what was sent</span>
+        <span class="k">return</span> self.script.pop(<span class="n">0</span>)
+
+<span class="k">def</span> call(name, args, id=<span class="s">"t1"</span>): <span class="k">return</span> NS(type=<span class="s">"tool_use"</span>, name=name, input=args, id=id)
+<span class="k">def</span> text(t): <span class="k">return</span> NS(type=<span class="s">"text"</span>, text=t)
+
+<span class="k">def</span> test_tool_exception_becomes_an_observation(monkeypatch):
+    fake = FakeMessages([
+        NS(stop_reason=<span class="s">"tool_use"</span>, content=[call(<span class="s">"get_order"</span>, {<span class="s">"order_id"</span>: <span class="s">"ORD-1042"</span>})]),
+        NS(stop_reason=<span class="s">"end_turn"</span>, content=[text(<span class="s">"Sorry, the order system is down."</span>)]),
+    ])
+    monkeypatch.setattr(agent, <span class="s">"client"</span>, NS(messages=fake))
+    schema = agent.TOOLS[<span class="s">"get_order"</span>][<span class="n">1</span>]
+    monkeypatch.setitem(agent.TOOLS, <span class="s">"get_order"</span>, (<span class="k">lambda</span> **_: <span class="n">1</span> / <span class="n">0</span>, schema))   <span class="c"># the tool crashes</span>
+
+    <span class="k">assert</span> <span class="s">"down"</span> <span class="k">in</span> agent.run_agent(<span class="s">"Where is ORD-1042?"</span>)
+    result = fake.calls[<span class="n">1</span>][<span class="s">"messages"</span>][-<span class="n">1</span>][<span class="s">"content"</span>][<span class="n">0</span>]          <span class="c"># what the model saw</span>
+    <span class="k">assert</span> result[<span class="s">"is_error"</span>] <span class="k">and</span> <span class="s">"ZeroDivisionError"</span> <span class="k">in</span> result[<span class="s">"content"</span>]
+
+<span class="k">def</span> test_runaway_model_hits_max_turns(monkeypatch):
+    forever = [NS(stop_reason=<span class="s">"tool_use"</span>, content=[call(<span class="s">"get_order"</span>, {<span class="s">"order_id"</span>: <span class="s">"ORD-1"</span>}, id=f<span class="s">"t{i}"</span>)])
+               <span class="k">for</span> i <span class="k">in</span> range(<span class="n">50</span>)]
+    monkeypatch.setattr(agent, <span class="s">"client"</span>, NS(messages=FakeMessages(forever)))
+    monkeypatch.setitem(agent.TOOLS, <span class="s">"get_order"</span>, (<span class="k">lambda</span> **_: {<span class="s">"status"</span>: <span class="s">"shipped"</span>}, agent.TOOLS[<span class="s">"get_order"</span>][<span class="n">1</span>]))
+    <span class="k">try</span>:
+        agent.run_agent(<span class="s">"loop forever"</span>)
+        <span class="k">assert</span> False, <span class="s">"should have stopped"</span>
+    <span class="k">except</span> agent.AgentStopped <span class="k">as</span> e:
+        <span class="k">assert</span> <span class="s">"max turns"</span> <span class="k">in</span> str(e)</code></pre>
+    <p class="hint">The same loop with OpenAI's Responses API: <code>resp = client.responses.create(model=..., tools=tools, input=items)</code>; append <code>resp.output</code> to <code>items</code>; for each output item with <code>type == "function_call"</code>, parse <code>json.loads(item.arguments)</code>, run the tool and append <code>{"type": "function_call_output", "call_id": item.call_id, "output": result}</code>; stop when there are no function calls. Model IDs change often: check each provider's models page.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Hand-written loop</td><td>Full control, no framework magic, easy to debug and test</td><td>You own retries, persistence, streaming, tracing and every edge case</td></tr>
+      <tr><td>SDK helper or framework loop (tool runners, Agents SDKs, LangGraph)</td><td>Less code; batteries for tracing, sessions, streaming</td><td>Behaviour hidden behind abstractions; upgrades can change it</td></tr>
+      <tr><td>Strict schemas + your own validation</td><td>Malformed calls become rare and always actionable</td><td>Schema limits (strict modes restrict some JSON Schema features)</td></tr>
+      <tr><td>Generous timeouts and retries</td><td>Fewer failed runs</td><td>Worse tail latency; duplicate side effects unless writes are idempotent</td></tr>
+      <tr><td>Mostly mocked tests</td><td>Fast, free, deterministic CI</td><td>Can't tell you whether the real model still behaves; you still need evals</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Write the loop yourself once (this lesson), with validation, errors as observations, a max-turns cap and logging of every message. Save every trajectory as JSON from day one. Add five mocked-LLM tests for the failure buckets and a 20-task eval you run before each prompt or model change.</p></div>
+      <div><h4>At scale</h4><p>A shared agent runtime (or framework) owned by a platform team: persisted runs that resume after deploys, per-tool timeout and retry policies, concurrency and rate-limit budgets per tenant, idempotent writes, OpenTelemetry traces, thousands of recorded trajectories replayed in CI, and nightly multi-trial evals with pass^k dashboards gating model upgrades.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Walk me through how you'd implement and test an agent loop without a framework.” A senior answer:</p>
+    <ul>
+      <li>Sketches the loop and the <b>message contract</b>: append assistant content unchanged, one result per tool call matched by id, all results of a turn in one message.</li>
+      <li>Sorts every failure into observation / retry / stop: validation and tool errors back to the model; 429s, 5xx and timeouts retried with backoff (and idempotent writes); max turns, budgets, spend caps and refusals stop with the transcript.</li>
+      <li>Persists the history per run for resumption, debugging and replay.</li>
+      <li>Describes the test pyramid: unit tests for tools, a fake client for loop logic, recorded trajectories for regressions, multi-trial evals with pass^k for behaviour, and which run on every PR versus nightly.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>An agent in under 400 lines</b> <span class="tag co">🏢 Amp · 2025</span> <a href="https://ampcode.com/how-to-build-an-agent" target="_blank" rel="noopener">How to Build an Agent (Thorsten Ball)</a></div>
+      <p><b>How:</b> a Go program that loops over the Anthropic API with three tools (read_file, list_files, edit_file), appending each tool result to the conversation.</p>
+      <p><b>Why this method:</b> to show there's no secret: the capability comes from the model; everything else in a product agent is practical engineering around the loop.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>From text parsing to function calling</b> <span class="tag co">🏢 OpenAI · 2023</span> <a href="https://openai.com/index/function-calling-and-other-api-updates/" target="_blank" rel="noopener">Function calling and other API updates</a></div>
+      <p><b>How:</b> developers describe functions to the model, which was fine-tuned to decide when a function is needed and to reply with JSON matching its signature.</p>
+      <p><b>Why this method:</b> a more reliable way to connect models to tools than parsing free text, which every provider then adopted in some form.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Schema-constrained outputs</b> <span class="tag co">🏢 OpenAI · 2024</span> <a href="https://openai.com/index/introducing-structured-outputs-in-the-api/" target="_blank" rel="noopener">Introducing Structured Outputs in the API</a></div>
+      <p><b>How:</b> strict mode constrains decoding to the developer's JSON Schema, for both responses and function-call arguments.</p>
+      <p><b>Why this method:</b> on OpenAI's complex-schema eval, 100% adherence versus under 40% for an earlier model that only followed instructions, removing a whole class of parse failures.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Reliability, not just capability</b> <span class="tag co">🏢 Anthropic · 2026</span> <a href="https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents" target="_blank" rel="noopener">Demystifying evals for AI agents</a></div>
+      <p><b>How:</b> evaluate agents over several trials per task and distinguish pass@k (at least one trial succeeds) from pass^k (all k succeed).</p>
+      <p><b>Why this method:</b> a 75% per-trial agent passes 3 out of 3 trials only about 42% of the time; for customer-facing agents, consistency is what users experience.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the model that answered its own questions</span>
+    <p>Early text-parsing agents depended on one fragile line: the stop sequence that halts generation at “Observation:”. Forget it, and the model happily continues the pattern, inventing the tool's output and reasoning from it. Native tool calling ended that failure mode structurally: the model's turn ends at the call, and only your code can write the result.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This is Lesson 6.1's loop with the error handling of 6.2 (actionable errors) and the stopping conditions of 6.6 made concrete. Frameworks (6.5) and the architectures of 6.7 are this loop with more structure around it. Trajectory and multi-trial evals are Lesson 5.5; tracing and dashboards are Phase 7. Retries need backoff and idempotency: see the System Design course on <a href="../../system-design-course/phase4/4-resilience.html">resilience: timeouts, retries, circuit breakers</a>, <a href="../../system-design-course/phase3/3-idempotency.html">idempotency</a> and <a href="../../system-design-course/phase1/5-rate-limiting.html">rate limiting</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://ampcode.com/how-to-build-an-agent" target="_blank" rel="noopener">Thorsten Ball: How to Build an Agent</a>. A complete code-editing agent, built up step by step.</li>
+      <li><span class="kind">Docs</span> <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/implement-tool-use" target="_blank" rel="noopener">Claude: implementing tool use</a>. Tool definitions, tool_use and tool_result in detail.</li>
+      <li><span class="kind">Docs</span> <a href="https://developers.openai.com/api/docs/guides/function-calling" target="_blank" rel="noopener">OpenAI: function calling</a>. The Responses API shapes, strict mode and parallel calls.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Your model API rate-limits 1% of calls, independently, and an agent run makes 30 model calls. Without retries, roughly what share of runs crash?</div>
+    <div class="opts"><button class="opt">About 1%</button><button class="opt" data-ok>About 26%</button><button class="opt">Exactly 30%</button></div>
+    <div class="explain">P(at least one 429) = 1 − 0.99³⁰ ≈ 1 − 0.74 = <b>26%</b>. Rare per call is common per run. With 2 retries per call, the per-call failure becomes 0.01³ = one in a million, and the per-run rate ≈ 0.003%.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. The model calls <code>get_order</code> with <code>{"order_id": 1042}</code> and your tool crashes with a <code>KeyError</code> traceback. What should the harness do?</div>
+    <div class="opts"><button class="opt">Let the exception propagate so the run fails fast</button><button class="opt">Silently drop the call and continue</button><button class="opt" data-ok>Validate before running and return a tool_result with is_error: true and a message like “order_id must be a string like ORD-1042”</button></div>
+    <div class="explain">Bad arguments are the model's mistake, so they belong in the observation bucket: an actionable error lets it fix the call next turn. Dropping the call breaks the message contract (every tool_use needs a tool_result), and crashing loses a run the model could have recovered.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. After a refactor, your agent sometimes stops including the system prompt after the first turn. Which test catches this most cheaply and reliably?</div>
+    <div class="opts"><button class="opt" data-ok>Replaying recorded trajectories (or a mocked-LLM test) and asserting the requests the harness sends</button><button class="opt">A unit test of the calculator tool</button><button class="opt">Waiting for user complaints</button></div>
+    <div class="explain">It's a harness bug: deterministic and visible in the requests. A replay or fake-client test inspects exactly what was sent, in seconds and for free. An end-to-end eval might catch it too, but only indirectly, through a quality drop, at real token cost.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>The loop is short; production is the error handling. Sort every failure into observation, retry or stop.</li>
+      <li>Native tool calling (typed calls with ids, strict schemas, parallel calls) replaced brittle text parsing; still validate arguments yourself.</li>
+      <li>Append assistant content unchanged; one tool_result per tool_use, all in one message; cap tool output; timeout every tool; cap turns.</li>
+      <li>Retries with backoff turn a 33% crash rate into ~0.02%, but not every 429 is temporary.</li>
+      <li>Test in layers: tool unit tests, a fake-client loop test, recorded-trajectory replays, then multi-trial real-model evals (pass^k).</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const Q = "Has ORD-1042 arrived, and what's 15% of its total for the refund?";
+  const FIXED = 900;
+  let S;
+  function reset() {
+    S = { messages: [{ role: "user", content: Q }], phase: "model", turn: 0, t: 0, calls: 0, tot: 0, last: 0, log: [], done: false, verdict: "", cls: "", rlDone: false, tid: 0, orderCalls: 0, newIdx: 0 };
+    render();
+  }
+  const inj = () => $("inj").value;
+  const opt = id => $(id).checked;
+
+  // ---- history helpers ----
+  function history() {
+    const calls = {}, out = [];
+    S.messages.forEach(m => {
+      if (m.role === "assistant") m.content.filter(b => b.type === "tool_use").forEach(b => (calls[b.id] = b));
+      if (m.role === "user" && Array.isArray(m.content)) m.content.forEach(r => { const c = calls[r.tool_use_id]; if (c) out.push({ name: c.name, input: c.input, content: r.content, is_error: r.is_error }); });
+    });
+    return out;
+  }
+  const use = (name, input, text) => { S.tid++; const b = []; if (text) b.push({ type: "text", text }); b.push({ type: "tool_use", id: "toolu_0" + S.tid, name, input }); return { stop: "tool_use", content: b }; };
+  const final = text => ({ stop: "end_turn", content: [{ type: "text", text }] });
+
+  // ---- scripted model stand-in ----
+  function model() {
+    const h = history(), last = h[h.length - 1];
+    const orderOk = h.find(x => x.name === "get_order" && !x.is_error), calcOk = h.find(x => x.name === "calculator" && !x.is_error);
+    if (inj() === "loop" && orderOk) return use("calculator", { expression: "0.15 * 89.00" }, "Let me double-check that calculation.");
+    if (!orderOk) {
+      if (!last) {
+        if (inj() === "malformed") return use("get_order", { order_id: 1042 }, "I'll look up the order first.");
+        if (inj() === "unknown") return use("get_orders", { order_id: "ORD-1042" }, "I'll look up the order first.");
+        return use("get_order", { order_id: "ORD-1042" }, "I'll look up the order first.");
+      }
+      const fails = h.filter(x => x.is_error).length;
+      const actionable = /Invalid arguments|Unknown tool|timed out|TimeoutError/.test(last.content);
+      if (fails >= 3 || (fails >= 2 && (!actionable || /503/.test(last.content)))) return final("I'm sorry, I couldn't look up ORD-1042 right now, so I can't confirm the delivery or the refund amount. I've flagged it for the support team.");
+      if (/Invalid arguments/.test(last.content)) return use("get_order", { order_id: "ORD-1042" }, "The order ID must be a string. Retrying.");
+      if (/Unknown tool/.test(last.content)) return use("get_order", last.input, "The tool is called get_order. Retrying.");
+      return use(last.name, last.input, actionable ? "That timed out; trying once more." : "Let me try that again.");
+    }
+    if (!calcOk) return use("calculator", { expression: "0.15 * 89.00" }, "Delivered. Now 15% of the €89.00 total.");
+    return final("Yes: ORD-1042 was delivered on 28 October 2026. 15% of its €89.00 total is €13.35.");
+  }
+
+  // ---- the harness: running tools ----
+  class Crash extends Error {}
+  function execTool(b) {
+    const TOOLS = ["get_order", "calculator"];
+    if (!TOOLS.includes(b.name)) {
+      if (opt("cValidate")) return { content: `Unknown tool '${b.name}'. Available tools: get_order, calculator.`, is_error: true, dt: 0 };
+      return raise("KeyError", `'${b.name}'`);
+    }
+    if (opt("cValidate") && b.name === "get_order") {
+      const v = b.input.order_id;
+      if (typeof v !== "string") return { content: `Invalid arguments for get_order: ${v} is not of type 'string' (order_id looks like "ORD-1042")`, is_error: true, dt: 0 };
+      if (!/^ORD-[0-9]+$/.test(v)) return { content: `Invalid arguments for get_order: '${v}' does not match '^ORD-[0-9]+$'`, is_error: true, dt: 0 };
+    }
+    if (b.name === "calculator") return { content: "13.35", is_error: false, dt: 0.05 };
+    S.orderCalls++;
+    if (typeof b.input.order_id !== "string") return raise("AttributeError", "'int' object has no attribute 'startswith'", 0.1);
+    if (inj() === "transient" && S.orderCalls === 1) return raise("TimeoutError", "orders API did not respond within 20 s", 20);
+    if (inj() === "down") return raise("ConnectionError", "orders-api returned 503 Service Unavailable", 0.3);
+    return { content: JSON.stringify({ id: "ORD-1042", status: "delivered", delivered_on: "2026-10-28", total_eur: 89.0 }), is_error: false, dt: 0.4 };
+  }
+  function raise(type, msg, dt = 0.1) {
+    if (opt("cCatch")) return { content: `${type}: ${msg}`, is_error: true, dt };
+    throw new Crash(`💥 Uncaught ${type}: ${msg}. The loop dies mid-run; the user gets a 500 error and the half-finished run is lost.`);
+  }
+  const log = (s) => S.log.push(`t=${S.t.toFixed(1)} s · ${s}`);
+  const stop = (v, cls) => { S.done = true; S.verdict = v; S.cls = cls; };
+
+  function step() {
+    if (S.done) return;
+    try {
+      if (S.phase === "model") {
+        if (S.turn >= +$("mt").value) { log(`turn ${S.turn} ≥ max turns → stop`); return stop("🛑 Max turns reached: the harness stops and escalates to a human with the transcript. Without this cap, the run (and the bill) would go on forever.", "rk"); }
+        if (inj() === "ratelimit" && S.calls === 1 && !S.rlDone) {
+          S.rlDone = true;
+          if (!opt("cRetry")) { log("model API → 429 rate_limit_error"); return stop("💥 Uncaught RateLimitError (429). One busy minute on the provider's side kills the whole run.", "rk"); }
+          S.t += 2; log("model API → 429 rate_limit_error, retry-after: 2 → wait 2 s, retry");
+        }
+        const tok = FIXED + AI.countTokens(JSON.stringify(S.messages));
+        S.calls++; S.last = tok; S.tot += tok; S.t += 1.4;
+        const r = model();
+        S.messages.push({ role: "assistant", content: r.content }); S.newIdx = S.messages.length - 1; S.turn++;
+        log(`model call ${S.calls} → stop_reason: ${r.stop}`);
+        if (r.stop === "end_turn") {
+          const txt = r.content[0].text;
+          return /sorry/i.test(txt)
+            ? stop(history().some(x => /AttributeError|KeyError/.test(x.content)) ? "⚠️ The run ended politely, but wrongly: the orders system works fine. The model got a traceback it couldn't learn from. Validate arguments and return actionable errors." : "✅ Graceful failure: the orders API really is down, so apologising and escalating is the right answer.", history().some(x => /AttributeError|KeyError/.test(x.content)) ? "rk" : "ev")
+            : stop(`✅ Answered correctly in ${S.calls} model calls.`, "ev");
+        }
+        S.phase = "tools";
+      } else {
+        const blocks = S.messages[S.messages.length - 1].content.filter(b => b.type === "tool_use");
+        const results = blocks.map(b => {
+          const r = execTool(b); S.t += r.dt;
+          log(`run ${b.name}(${JSON.stringify(b.input)}) → ${r.is_error ? "error: " + r.content : "ok"}`);
+          return { type: "tool_result", tool_use_id: b.id, content: r.content, is_error: r.is_error };
+        });
+        S.messages.push({ role: "user", content: results }); S.newIdx = S.messages.length - 1;
+        S.phase = "model";
+      }
+    } catch (e) {
+      if (e instanceof Crash) { log("exception escaped the loop"); stop(e.message, "rk"); } else throw e;
+    }
+  }
+  function render() {
+    $("mtv").textContent = $("mt").value;
+    $("msgs").innerHTML = S.messages.map((m, i) => {
+      const isRes = m.role === "user" && Array.isArray(m.content), err = isRes && m.content.some(r => r.is_error);
+      const who = i === 0 ? "messages[0] · user (the question)" : m.role === "assistant" ? `messages[${i}] · assistant (model reply)` : `messages[${i}] · user (tool results, written by your code)`;
+      return `<div class="msg ${m.role === "assistant" ? "a" : isRes ? (err ? "r err" : "r") : "u"}${i === S.newIdx && i > 0 ? " new" : ""}"><span class="who">${who}</span>${esc(JSON.stringify(m, null, 1))}</div>`;
+    }).join("");
+    const box = $("msgs"); box.scrollTop = box.scrollHeight;
+    $("hlog").innerHTML = S.log.map(l => `<div class="st">${esc(l)}</div>`).join("") || `<div class="st muted">Press Step.</div>`;
+    $("dbgVerdict").innerHTML = S.verdict ? `<span class="${S.cls}">${esc(S.verdict)}</span>` : "";
+    $("dCalls").textContent = S.calls; $("dMsgs").textContent = S.messages.length; $("dTok").textContent = S.last ? S.last.toLocaleString("en-US") : "–";
+    $("dTot").textContent = S.tot.toLocaleString("en-US"); $("dTime").textContent = S.t.toFixed(1) + " s";
+  }
+  $("dbgStep").onclick = () => { step(); render(); };
+  $("dbgRun").onclick = () => { let n = 0; while (!S.done && n++ < 60) step(); render(); };
+  $("dbgReset").onclick = reset;
+  ["inj", "cValidate", "cCatch", "cRetry"].forEach(id => ($(id).onchange = reset));
+  $("mt").oninput = () => { $("mtv").textContent = $("mt").value; };
+  reset();
+
+  /* ================= Playground 2: test pyramid ================= */
+  const SUITES = [
+    { id: "e2e", name: "End-to-end evals", sub: "100 tasks × 3 trials, real model, judged", time: 25 * 60, cost: 40, freq: true, w: 30 },
+    { id: "integ", name: "Integration tests", sub: "10 key flows, real model, sandboxed tools", time: 4 * 60, cost: 1.5, freq: true, w: 50 },
+    { id: "replay", name: "Recorded-trajectory replays", sub: "30 real runs, recorded model responses", time: 10, cost: 0, w: 70 },
+    { id: "mock", name: "Mocked-LLM loop tests", sub: "15 scripted fake-client scenarios", time: 3, cost: 0, w: 85 },
+    { id: "unit", name: "Tool unit tests", sub: "40 tests, fake upstream APIs", time: 2, cost: 0, w: 100 },
+  ];
+  const BUGS = [
+    ["calculator reads “15%” as 15 instead of 0.15", { unit: 1, integ: 0.3, e2e: 0.6 }],
+    ["get_order returns a 6,000-token raw API dump", { unit: 1, e2e: 0.3 }],
+    ["two parallel tool calls, but only one tool_result sent back", { mock: 1, replay: 1, integ: 0.3, e2e: 0.5 }],
+    ["a tool exception crashes the loop", { mock: 1, integ: 0.1, e2e: 0.2 }],
+    ["no stop when the model keeps calling tools", { mock: 1, e2e: 0.2 }],
+    ["refactor drops the system prompt after turn 1", { replay: 1, integ: 0.4, e2e: 0.9 }],
+    ["a tool schema uses a keyword the provider rejects (400 on the first real call)", { integ: 1, e2e: 1 }],
+    ["new prompt wording: “what's your refund policy?” now triggers a refund", { integ: 0.3, e2e: 0.9 }],
+    ["after a model upgrade, the agent skips the verification step 1 time in 5", { integ: 0.2, e2e: 0.95 }],
+    ["expired credentials for the staging orders API", { integ: 1, e2e: 1 }],
+  ];
+  const label = { unit: "unit", mock: "mocked-LLM", replay: "replay", integ: "integration", e2e: "e2e eval" };
+  $("pyr").innerHTML = SUITES.map(s => `<div class="suite" style="width:${s.w}%"><label><input type="checkbox" id="s-${s.id}" checked> <b>${s.name}</b></label> <span class="muted">${s.sub}</span>${s.freq ? ` <select id="f-${s.id}" class="btn small"><option value="pr">every PR</option><option value="nightly"${s.id === "e2e" ? " selected" : ""}>nightly</option></select>` : ""}</div>`).join("");
+  function pyr() {
+    const on = Object.fromEntries(SUITES.map(s => [s.id, $("s-" + s.id).checked]));
+    let exp = 0, rows = "";
+    BUGS.forEach(([name, p]) => {
+      let miss = 1; const by = [];
+      Object.entries(p).forEach(([k, v]) => { if (on[k]) { miss *= 1 - v; by.push([k, v]); } });
+      const pc = 1 - miss; exp += pc;
+      by.sort((a, b) => b[1] - a[1]);
+      const tag = pc >= 0.999 ? `<span class="ev">✅ caught by ${by.filter(x => x[1] === 1).map(x => label[x[0]]).join(", ")}</span>`
+        : pc > 0 ? `<span class="tk">⚠️ maybe (${Math.round(pc * 100)}%) by ${by.map(x => label[x[0]]).join(", ")}</span>`
+        : `<span class="rk">❌ escapes to production</span>`;
+      rows += `<div class="bugrow"><span>${name}</span>${tag}</div>`;
+    });
+    $("bugs").innerHTML = rows;
+    let tPR = 0, cost = 0;
+    SUITES.forEach(s => { if (!on[s.id]) return; const nightly = s.freq && $("f-" + s.id).value === "nightly"; if (!nightly) tPR += s.time; cost += s.cost * (nightly ? 1 : 20); });
+    $("pCaught").textContent = `${exp.toFixed(1)} / ${BUGS.length}`;
+    $("pTime").textContent = tPR >= 60 ? `${(tPR / 60).toFixed(1)} min` : `${tPR} s`;
+    $("pCost").textContent = `$${cost.toFixed(2)}`;
+    const cheapOn = on.unit || on.mock || on.replay;
+    $("pyrVerdict").innerHTML = !cheapOn && on.e2e ? `<span class="rk">An inverted pyramid: slow, paid and probabilistic. Harness bugs that only appear on rare paths slip through.</span>`
+      : exp > 9.5 ? `<span class="ev">A healthy pyramid: cheap deterministic tests on every PR, real-model tests where only a real model can reveal the bug.</span>`
+      : `<span class="tk">Some bugs reach production. Which layer would catch them cheapest?</span>`;
+  }
+  SUITES.forEach(s => { $("s-" + s.id).onchange = pyr; if (s.freq) $("f-" + s.id).onchange = pyr; });
+  $("pyrAll").onclick = () => { SUITES.forEach(s => { $("s-" + s.id).checked = true; if (s.freq) $("f-" + s.id).value = "nightly"; }); pyr(); };
+  $("pyrNone").onclick = () => { SUITES.forEach(s => { $("s-" + s.id).checked = s.id === "e2e"; }); $("f-e2e").value = "pr"; pyr(); };
+  pyr();
+})();
+</script>
+</body>
+</html>

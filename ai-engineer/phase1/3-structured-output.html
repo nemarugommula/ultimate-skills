@@ -1,0 +1,439 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>1.3 Structured output & function calling · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .stack { display: flex; height: 26px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); margin: 8px 0; }
+  .stack > i { display: block; height: 100%; transition: width .3s; }
+  .legend2 { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: .85rem; }
+  .legend2 span::before { content: "■ "; color: var(--sw); }
+  .twin { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+  .twin h5 { margin: 4px 0; font-size: .9rem; }
+  .bad { color: var(--c-rk); font-weight: 700; }
+  .mask td.x { text-decoration: line-through; color: var(--muted); }
+  #tc-log { max-height: 260px; overflow: auto; font-size: .78rem; }
+  .flow { width: 100%; height: auto; }
+</style>
+</head>
+<body data-lesson="a1-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 1 · Lesson 3</div>
+  <h1>Structured output & function calling</h1>
+  <p class="subtitle">Models write text; your code needs data. Learn the ladder from “please reply in JSON” to schema-constrained decoding, how to validate and retry, and how tool calling lets a model ask your code to act.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>JSON</b> (JavaScript Object Notation): text like <code>{"city": "Paris", "days": 3}</code>; a <b>JSON Schema</b> describes which keys and types are allowed.</li>
+      <li>The model picks one token at a time from a probability distribution over its vocabulary (Lesson 0.2).</li>
+      <li>Output format instructions in a prompt (Lesson 1.1); chat messages and roles (Lesson 0.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In August 2024, OpenAI ran an eval of complex JSON-schema following. Their older GPT-4 model (gpt-4-0613), asked nicely in the prompt, matched the schema <b>less than 40%</b> of the time. Their new model with <b>Structured Outputs</b> switched on scored a perfect <b>100%</b>.</p>
+    <p>The difference wasn't a cleverer prompt. With strict mode on, the API restricts which tokens the model is <i>allowed</i> to pick at each step, so output that breaks the schema simply can't be generated. That is now a standard feature at every major provider, and the reason “parse the LLM's JSON” is no longer a source of 3 a.m. pages.</p>
+  </div>
+
+  <h2>Numbers first: why “usually valid” isn't good enough</h2>
+  <table>
+    <tr><th>Failure rate</th><th>At 1,000 requests/day</th><th>At 1,000,000 requests/day</th></tr>
+    <tr><td>2% (a decent prompt-only extractor)</td><td>20 broken records</td><td class="rk">20,000 broken records a day</td></tr>
+    <tr><td>0.5%</td><td>5</td><td class="rk">5,000</td></tr>
+    <tr><td>0.01%</td><td>0.1</td><td>100</td></tr>
+  </table>
+  <p>At scale, every failure mode happens every day. Worse, the dangerous ones don't crash: a <code>"quantity": "2"</code> string or a missing <code>email</code> sails through <code>json.loads</code> and corrupts your database quietly. Reliability comes from layers, each removing a class of failure:</p>
+  <table>
+    <tr><th>Layer</th><th>Guarantees</th><th>Doesn't guarantee</th></tr>
+    <tr><td>Prompt: “Reply only with JSON like…”</td><td>Nothing; works most of the time</td><td>Valid JSON, right keys, right types</td></tr>
+    <tr><td><b>JSON mode</b></td><td>The output parses as JSON</td><td>That it matches <i>your</i> schema</td></tr>
+    <tr><td><b>Schema-constrained output</b> (OpenAI and Anthropic call it Structured Outputs; Gemini, structured output with a response schema)</td><td>Valid JSON matching your schema: keys, types, enums</td><td>Complete output if it hits the token limit; refusals; <b>correct values</b></td></tr>
+    <tr><td><b>Validation</b> (e.g. Pydantic) + retry</td><td>Your business rules (email format, totals add up); failures are caught, not silent</td><td>That the values are true; that needs evals (Phase 5)</td></tr>
+  </table>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Treat the model's output as <b>untrusted input from an external service</b>. Constrain it at the source when you can (schema-constrained decoding), validate it at the boundary always (a typed model with your rules), and decide in advance what happens on failure (retry with the error, fall back, or flag for a human).
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a blank page vs a paper form</span>
+    <p>Ask a hundred people to “write down your contact details” on a blank page and you'll get a hundred layouts, some with a phone number missing. Hand them a form with labelled boxes, a box that only takes digits and tick-boxes for the options, and almost everything comes back usable. Constrained decoding is the form. Validation is the clerk who checks the form before filing it. Neither checks that the phone number is actually theirs.</p>
+  </div>
+
+  <h2>How constrained decoding works</h2>
+  <p>At every step the model produces a probability for every token in its vocabulary. The API turns your schema into a grammar (a small state machine) and, before sampling, <b>masks</b> every token that would make the output invalid. Halfway through <code>{"name": "Ada", "quantity": </code> the model's preferences might be:</p>
+  <table class="mask">
+    <tr><th>Candidate next token</th><th>Model probability</th><th>Allowed by schema (quantity: integer)?</th></tr>
+    <tr><td class="x"><code>"two"</code></td><td>0.46</td><td>❌ masked: a string, not an integer</td></tr>
+    <tr><td><code>2</code></td><td>0.41</td><td>✅ renormalized to 0.91</td></tr>
+    <tr><td class="x"><code>null</code></td><td>0.09</td><td>❌ masked: field is required, not nullable</td></tr>
+    <tr><td><code>3</code></td><td>0.04</td><td>✅ renormalized to 0.09</td></tr>
+  </table>
+  <p class="muted">Illustrative probabilities. Libraries like Outlines, XGrammar and llguidance do the same for open models served with vLLM or SGLang.</p>
+  <p>So the output always fits the schema, but the model may be pushed off its first choice. Two consequences: put any free-text reasoning <b>before</b> the strict fields (or reason first, then format), and remember that a schema can't stop a well-formed wrong answer.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Break the parser, then harden it</span>
+    <p class="hint">A support-ticket extractor returns <code>{customer, email, quantity, priority}</code>. We send 1,000 simulated requests. Start with everything off (plain <code>json.loads</code>, no checks) and see what reaches your database. Then add layers. Click a failure type to see a real-looking raw output and what your code does with it.</p>
+    <div class="controls">
+      <label><input type="checkbox" id="so-json"> JSON mode</label>
+      <label><input type="checkbox" id="so-schema"> schema-constrained decoding</label>
+      <label><input type="checkbox" id="so-lenient"> lenient parse (extract the {…} block)</label>
+      <label><input type="checkbox" id="so-validate"> validate with Pydantic</label>
+      <label><input type="checkbox" id="so-retry"> retry once with the error message</label>
+      <button class="btn small primary" id="so-run">▶ Send 1,000 requests</button>
+    </div>
+    <div class="stack" id="so-stack"></div>
+    <div class="legend2" id="so-legend"></div>
+    <div class="stat-row">
+      <div class="stat">✅ good <b id="so-good">–</b></div>
+      <div class="stat">☠️ silently bad data <b id="so-silent">–</b></div>
+      <div class="stat">💥 unhandled crashes <b id="so-crash">–</b></div>
+      <div class="stat">🛟 caught, flagged <b id="so-flag">–</b></div>
+      <div class="stat">model calls <b id="so-calls">–</b></div>
+    </div>
+    <div class="verdict" id="so-verdict"></div>
+    <div class="controls"><span class="seg" id="so-case"></span></div>
+    <div class="twin">
+      <div><h5>Raw model output</h5><div class="prompt" id="so-raw"></div></div>
+      <div><h5>What your code does</h5><div class="prompt" id="so-what"></div></div>
+    </div>
+    <p class="hint">The failure mix is a scripted, illustrative stand-in for a prompt-only extractor (about 12% of outputs have some problem); real rates depend on the model and schema. A real model with structured outputs is used in practice. Note what no layer fixes: about 2% plausible-but-wrong values, which only an eval against labelled data can catch.</p>
+  </div>
+  <p>What you should see: with nothing on, 4% of records are silently corrupt and 6% crash. JSON mode removes the crashes from chatty output but not the wrong types. Schema-constrained decoding removes almost everything except truncation. Validation turns “silently bad” into “caught”, and one retry recovers most of those for a few percent more calls.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what retries cost</span>
+    <p>Suppose 4% of responses fail validation and a retry with the error message fixes 90% of them.</p>
+    <ul>
+      <li>Extra model calls: 4% of requests × 1 retry = <b>+4% cost</b>.</li>
+      <li>Still failing after one retry: 4% × 10% = <b>0.4%</b>, handled by a fallback or a human queue. A second retry would cut it to 0.04% for another +0.4% calls.</li>
+      <li>Latency: those 4% take about twice as long. Your p95 (95th-percentile latency) is unchanged, because 96% of requests never retry, but your <b>p99 roughly doubles</b>.</li>
+    </ul>
+    <p>Retries are cheap insurance on cost and expensive on tail latency, which is one more reason to remove failures at the source with constrained decoding.</p>
+  </div>
+
+  <h2>Function calling (tool use): the model asks, your code acts</h2>
+  <p>Structured output answers “give me data”. <b>Function calling</b>, also called <b>tool use</b>, answers “do something”. You describe tools (a name, a description, and a JSON Schema for the arguments). The model can reply with a <b>request</b> to call one, with arguments. <b>The model never runs anything.</b> Your code checks the request, runs the function, and sends the result back; the model then continues, perhaps calling another tool, until it answers.</p>
+  <ol>
+    <li>You send messages + tool definitions.</li>
+    <li>The model returns a tool call: <code>get_weather({"city": "Paris"})</code> (Anthropic: a <code>tool_use</code> block with <code>stop_reason: "tool_use"</code>; OpenAI: a <code>function_call</code> item).</li>
+    <li>Your code validates the arguments, runs the function, and appends the result (<code>tool_result</code> / <code>function_call_output</code>) to the messages.</li>
+    <li>You call the model again; it uses the result to answer or to call the next tool.</li>
+  </ol>
+  <p>That loop, repeated with the model choosing which tool to call next, is the beginning of an <b>agent</b> (Phase 6).</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · A tool-calling round trip</span>
+    <p class="hint">Step through a weather question. Watch which messages travel where (the log shows the JSON). Then switch on “model sends a bad argument” and see the error go back to the model as a tool result, or turn on strict schemas so it can't happen. Try two cities to see parallel calls.</p>
+    <div class="controls">
+      <label><input type="checkbox" id="tc-bad"> model sends a bad argument</label>
+      <label><input type="checkbox" id="tc-strict"> strict tool schema</label>
+      <label><input type="checkbox" id="tc-par"> two cities (parallel calls)</label>
+    </div>
+    <div class="controls">
+      <button class="btn small primary" id="tc-step">Next step ▸</button>
+      <button class="btn small" id="tc-run">▶ Play all</button>
+      <button class="btn small" id="tc-reset">Reset</button>
+    </div>
+    <svg id="tc-svg" class="flow"></svg>
+    <div class="verdict" id="tc-note"></div>
+    <div class="stat-row">
+      <div class="stat">model calls <b id="tc-calls">0</b></div>
+      <div class="stat">tool runs <b id="tc-runs">0</b></div>
+      <div class="stat">step <b id="tc-stepn">0</b></div>
+    </div>
+    <div class="prompt" id="tc-log"></div>
+    <p class="hint">The model's side is scripted to show the protocol. Message shapes follow Anthropic's Messages API (<code>tool_use</code> / <code>tool_result</code>); OpenAI's Responses API has the same flow with <code>function_call</code> / <code>function_call_output</code> items.</p>
+  </div>
+  <p>What you should see: a single question takes <b>two</b> model calls (one to decide, one to answer), and a bad argument costs a third. With parallel calls, one model response asks for both cities and your code returns both results in a single message, so it's still two model calls, not four.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Pydantic</b> for schemas and validation; provider structured outputs (Anthropic <code>messages.parse</code>, OpenAI <code>responses.parse</code>, Gemini <code>response_format</code> with a schema); <b>Instructor</b> for validation + retries across 15+ providers; <b>Outlines</b> or vLLM's structured outputs for open models.</p>
+<pre><code><span class="k">from</span> typing <span class="k">import</span> Literal
+<span class="k">from</span> pydantic <span class="k">import</span> BaseModel, EmailStr, Field, ValidationError
+<span class="k">import</span> anthropic
+
+<span class="k">class</span> <span class="f">Ticket</span>(BaseModel):
+    customer: str
+    email: EmailStr                       <span class="c"># pip install "pydantic[email]"</span>
+    quantity: int = Field(ge=<span class="n">1</span>)
+    priority: Literal[<span class="s">"low"</span>, <span class="s">"normal"</span>, <span class="s">"high"</span>]
+
+client = anthropic.Anthropic()
+
+<span class="c"># 1) Schema-constrained output: the SDK sends the schema, validates, returns a Ticket</span>
+resp = client.messages.parse(
+    model=<span class="s">"claude-opus-5-5"</span>, max_tokens=<span class="n">1024</span>,       <span class="c"># check current model IDs</span>
+    messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">f"Extract the ticket:\n&lt;email&gt;{raw}&lt;/email&gt;"</span>}],
+    output_format=Ticket,
+)
+ticket = resp.parsed_output               <span class="c"># a Ticket; still check stop_reason for max_tokens / refusal</span>
+
+<span class="c"># 2) Validate + retry with the error (for any provider or plain-text output)</span>
+<span class="k">def</span> <span class="f">extract</span>(raw, call_model, retries=<span class="n">1</span>):
+    msgs = [{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">f"Return JSON for Ticket:\n{raw}"</span>}]
+    <span class="k">for</span> _ <span class="k">in</span> range(retries + <span class="n">1</span>):
+        text = call_model(msgs)
+        <span class="k">try</span>:
+            <span class="k">return</span> Ticket.model_validate_json(text)
+        <span class="k">except</span> ValidationError <span class="k">as</span> e:      <span class="c"># bad JSON or bad fields: tell the model exactly what broke</span>
+            msgs += [{<span class="s">"role"</span>: <span class="s">"assistant"</span>, <span class="s">"content"</span>: text},
+                     {<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">f"Invalid: {e}. Return corrected JSON only."</span>}]
+    <span class="k">return None</span>                           <span class="c"># caller flags it for review instead of crashing</span>
+
+<span class="c"># OpenAI: client.responses.parse(model=..., input=..., text_format=Ticket).output_parsed</span>
+<span class="c"># Instructor: instructor.from_provider("anthropic/...").create(response_model=Ticket, max_retries=2, messages=...)</span></code></pre>
+    <p class="hint">Provider schema support is a subset of JSON Schema (some keywords like numeric ranges are moved into descriptions or rejected), so keep schemas simple and validate your own rules in Pydantic. The older Anthropic <code>output_format</code> request field is deprecated in favour of <code>output_config.format</code>; the SDK's <code>parse()</code> helper handles that for you.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Schema-constrained decoding</td><td>Schema-valid output by construction; simpler code</td><td>Schema-language limits; can hurt reasoning if the format forces an early answer; needs provider or server support</td></tr>
+      <tr><td>JSON mode only</td><td>Always parses; works with any shape</td><td>Keys and types still unchecked</td></tr>
+      <tr><td>Validation + retry</td><td>Business rules enforced; failures visible</td><td>Extra calls and tail latency on failures</td></tr>
+      <tr><td>Tool calling</td><td>The model can fetch data and act; arguments arrive structured</td><td>More round trips; every tool is an attack surface (Lesson 8.3); you own the loop</td></tr>
+      <tr><td>Big nested schemas</td><td>One call gets everything</td><td>More ways to be subtly wrong; split into smaller calls when accuracy drops</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>One Pydantic model per output, provider structured outputs on, a <code>try/except</code> around every parse, and failures logged with the raw text. Tools: a handful, with clear names and descriptions, strict schemas, and arguments validated before anything runs.</p></div>
+      <div><h4>At scale</h4><p>Schemas versioned with the prompt (Lesson 1.5), failure and retry rates on a dashboard per schema version, constrained decoding on self-hosted models via vLLM, dead-letter queues for records that fail twice, and evals that check values, not just shapes. Tool calls go through permission checks and audit logs.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“We extract invoices with an LLM into our billing database. How do you make it reliable?” A senior answer:</p>
+    <ul>
+      <li>Layers: schema-constrained output, a typed model with business rules (totals add up, dates valid), retry with the validation error, then a human queue.</li>
+      <li>Handles the edges the schema can't: <code>max_tokens</code> truncation, refusals, empty documents.</li>
+      <li>Separates <b>shape</b> from <b>truth</b>: a labelled eval set measures field-level accuracy (Phase 5); confidence or cross-checks route doubtful records to review.</li>
+      <li>For tools: least-privilege tools, arguments validated before execution, idempotent actions, and confirmation for anything irreversible.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Structured Outputs: 100% schema match</b> <span class="tag co">🏢 OpenAI · 2024</span> <a href="https://openai.com/index/introducing-structured-outputs-in-the-api/" target="_blank" rel="noopener">Introducing Structured Outputs in the API</a></div>
+      <p><b>How:</b> developer-supplied JSON Schemas enforced with constrained decoding (<code>strict: true</code>), for both response formats and function arguments, plus training the model on complex schemas.</p>
+      <p><b>Why this method:</b> on their complex-schema eval, gpt-4o-2024-08-06 with Structured Outputs scored 100%, against under 40% for gpt-4-0613 with prompting alone.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Constrained decoding for JSON and strict tools</b> <span class="tag co">🏢 Anthropic · 2026</span> <a href="https://platform.claude.com/docs/en/build-with-claude/structured-outputs" target="_blank" rel="noopener">Structured outputs docs</a></div>
+      <p><b>How:</b> a JSON Schema sent in <code>output_config.format</code>, or <code>strict: true</code> on a tool definition, compiled into a grammar that constrains generation; SDK helpers take a Pydantic or Zod model and return a parsed object.</p>
+      <p><b>Why this method:</b> schema-compliant responses by construction, so no <code>JSON.parse()</code> errors and no missing required fields.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Guided generation as a state machine</b> <span class="tag oss">🧰 Open source · 2023</span> <a href="https://arxiv.org/abs/2307.09702" target="_blank" rel="noopener">Willard & Louf: Outlines</a></div>
+      <p><b>How:</b> turns regular expressions and grammars into a finite-state machine and pre-indexes which vocabulary tokens are valid in each state.</p>
+      <p><b>Why this method:</b> enforcing structure adds little overhead per token and works with any open model; it's the idea behind structured outputs in vLLM and friends.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Format restrictions can cost reasoning</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2408.02442" target="_blank" rel="noopener">Tam et al.: Let Me Speak Freely?</a></div>
+      <p><b>How:</b> compared models answering freely versus under JSON/XML format constraints on reasoning and knowledge tasks.</p>
+      <p><b>Why this method:</b> they saw a significant drop in reasoning under strict formats, larger for stricter constraints. Hence: reason first (or in a free-text field placed first), then emit the structured answer.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the model never presses the button</span>
+    <p>“The AI booked my flight” is never literally true. In every function-calling API, the model only produces a JSON request; some ordinary code decides whether to run it. That boundary is where you put validation, permissions and confirmations, and it's why tool safety is an engineering problem you control (Lesson 6.6).</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Output formats started as prompt instructions (Lesson 1.1); the final answer of a reasoning chain (1.2) is easiest to vote on when it's a schema field. Tool results become part of the context window (1.4), and schemas are versioned with prompts (1.5). Tool calling grows into agents and MCP, the Model Context Protocol for sharing tools across apps (Lessons 6.1–6.2); text-to-SQL is structured output with a grammar (4.6); validating values is Phase 5's job. Masking tokens is just renormalizing a <a href="../../math-course/phase8/2-softmax.html">softmax</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://developers.openai.com/api/docs/guides/structured-outputs" target="_blank" rel="noopener">OpenAI: Structured outputs</a>. JSON mode vs schemas, refusals, schema limits.</li>
+      <li><span class="kind">Docs</span> <a href="https://platform.claude.com/docs/en/agents-and-tools/tool-use/overview" target="_blank" rel="noopener">Anthropic: Tool use overview</a>. Client vs server tools and the full round trip.</li>
+      <li><span class="kind">Library</span> <a href="https://python.useinstructor.com/" target="_blank" rel="noopener">Instructor</a>. Pydantic models, validation and automatic retries for many providers.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Your extractor fails validation on 5% of 200,000 daily requests. One retry fixes 80% of those. How many records a day still need a fallback?</div>
+    <div class="opts"><button class="opt" data-ok>2,000</button><button class="opt">8,000</button><button class="opt">10,000</button></div>
+    <div class="explain">5% × 200,000 = 10,000 retried; 20% of them still fail: <b>2,000</b>. The retries also add 10,000 calls (+5% cost) and double latency for those requests.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. With JSON mode on, your pipeline stores <code>{"amount": "12,50"}</code> and later reports crash on the string. What's the best fix?</div>
+    <div class="opts"><button class="opt">Add “amount must be a number!!” to the prompt</button><button class="opt" data-ok>Use a schema (structured outputs) where amount is a number, and validate with a typed model before storing</button><button class="opt">Switch JSON mode off and parse with a regex</button></div>
+    <div class="explain">JSON mode only guarantees parseable JSON, not your types. A schema constrains the type at generation time; validation at the boundary stops anything else from reaching storage.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A model with a <code>refund_order(order_id)</code> tool returns a call for an order the user doesn't own. What should happen?</div>
+    <div class="opts"><button class="opt">Nothing to worry about: the model already decided</button><button class="opt">Run it; the model is usually right</button><button class="opt" data-ok>Your code checks permissions before running, refuses, and returns an error tool result the model can explain to the user</button></div>
+    <div class="explain">The model only proposes calls. Authorization, validation and confirmation live in your code; return failures as tool results (with an error flag) so the conversation can recover.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Prompt-only JSON fails a few percent of the time; at scale that's thousands of bad records a day, many of them silent.</li>
+      <li>JSON mode guarantees parseable JSON; schema-constrained decoding guarantees your schema by masking invalid tokens.</li>
+      <li>Always validate at the boundary (Pydantic), retry with the error, and handle truncation and refusals. Shape is not truth: evals check values.</li>
+      <li>Function calling: the model proposes a call, your code validates and runs it, the result goes back as a message. Two model calls per tool use; parallel calls share one round trip.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+
+  /* ---------- Playground 1: structured output pipeline ---------- */
+  // failure mix of a prompt-only extractor, per 1,000 requests (illustrative)
+  const MIX = [
+    { k: "clean", n: 880, label: "clean JSON" },
+    { k: "prose", n: 40, label: "prose + ```json fences" },
+    { k: "trail", n: 15, label: "trailing text" },
+    { k: "type", n: 15, label: "wrong type" },
+    { k: "missing", n: 15, label: "missing field" },
+    { k: "enum", n: 10, label: "invalid enum" },
+    { k: "trunc", n: 5, label: "truncated (max_tokens)" },
+    { k: "wrongval", n: 20, label: "plausible wrong value" },
+  ];
+  const RAW = {
+    clean: '{"customer": "Ada Lin", "email": "ada@example.com", "quantity": 2, "priority": "high"}',
+    prose: 'Sure! Here is the extracted ticket:\n```json\n{"customer": "Ada Lin", "email": "ada@example.com", "quantity": 2, "priority": "high"}\n```',
+    trail: '{"customer": "Ada Lin", "email": "ada@example.com", "quantity": 2, "priority": "high"}\n\nNote: priority inferred from tone.',
+    type: '{"customer": "Ada Lin", "email": "ada@example.com", "quantity": "two", "priority": "high"}',
+    missing: '{"customer": "Ada Lin", "quantity": 2, "priority": "high"}',
+    enum: '{"customer": "Ada Lin", "email": "ada@example.com", "quantity": 2, "priority": "URGENT!!"}',
+    trunc: '{"customer": "Ada Lin", "email": "ada@exam',
+    wrongval: '{"customer": "Ada Lin", "email": "ada@example.com", "quantity": 3, "priority": "high"}',
+  };
+  const COL = { good: "--good", fixed: "--c-ev", silent: "--c-rk", crash: "--bad", flag: "--c-tk", wrongval: "--c-md" };
+  const NAMES = { good: "✅ good", fixed: "🔁 good after retry", silent: "☠️ silently bad data", crash: "💥 unhandled crash", flag: "🛟 caught, flagged", wrongval: "🤷 valid but wrong" };
+  const opt = () => ({ json: $("so-json").checked, schema: $("so-schema").checked, lenient: $("so-lenient").checked, validate: $("so-validate").checked, retry: $("so-retry").checked });
+  // what happens to one output of kind k under options o: returns {stage, out}
+  function fate(k, o) {
+    if (k === "wrongval") return { out: "wrongval", why: "Valid JSON, right types, wrong value (the email said 2 jackets). No parser or schema can know; only an eval against labelled data catches it." };
+    let kind = k;
+    if (o.schema && kind !== "trunc") kind = "clean";
+    if (o.json && (kind === "prose" || kind === "trail")) kind = "clean";
+    if (o.lenient && (kind === "prose" || kind === "trail")) kind = "clean";
+    if (kind === "clean") return { out: "good", why: k === "clean" ? "json.loads → dict → validated. Stored." : `Fixed upstream by ${o.schema ? "schema-constrained decoding" : o.json ? "JSON mode" : "lenient parsing"}: parses cleanly. Stored.` };
+    const parseErr = kind === "prose" || kind === "trail" || kind === "trunc";
+    const caught = parseErr ? (o.validate || o.retry) : o.validate;
+    const err = { prose: "JSONDecodeError: Expecting value: line 1 column 1", trail: "JSONDecodeError: Extra data: line 3 column 1", trunc: "JSONDecodeError: Unterminated string at line 1 column 40", type: "ValidationError: quantity: Input should be a valid integer", missing: "ValidationError: email: Field required", enum: "ValidationError: priority: Input should be 'low', 'normal' or 'high'" }[kind];
+    if (!caught) return parseErr ? { out: "crash", why: `json.loads raises ${err.split(":")[0]} and nothing catches it: the request fails with a 500.` } : { out: "silent", why: `json.loads succeeds and nothing checks the fields. ${kind === "missing" ? "A ticket with no email" : kind === "type" ? "quantity = “two”" : "priority = “URGENT!!”"} goes into the database.` };
+    if (o.retry) return { out: "retry", why: `Caught: ${err}. Sent back to the model with the error; a retry usually fixes it (90% here).` };
+    return { out: "flag", why: `Caught: ${err}. No retry, so it goes to a review queue instead of the database.` };
+  }
+  function run() {
+    const o = opt(), tot = { good: 0, fixed: 0, silent: 0, crash: 0, flag: 0, wrongval: 0 };
+    let calls = 1000;
+    MIX.forEach(m => {
+      const f = fate(m.k, o).out;
+      if (f === "retry") { calls += m.n; tot.fixed += m.n * 0.9; tot.flag += m.n * 0.1; }
+      else tot[f] += m.n;
+    });
+    $("so-stack").innerHTML = Object.keys(tot).map(k => `<i style="width:${tot[k] / 10}%;background:${MX.css(COL[k])}" title="${NAMES[k]}: ${Math.round(tot[k])}"></i>`).join("");
+    $("so-legend").innerHTML = Object.keys(tot).map(k => `<span style="--sw:${MX.css(COL[k])}">${NAMES[k]} ${Math.round(tot[k])}</span>`).join("");
+    $("so-good").textContent = Math.round(tot.good + tot.fixed);
+    $("so-silent").textContent = Math.round(tot.silent);
+    $("so-crash").textContent = Math.round(tot.crash);
+    $("so-flag").textContent = Math.round(tot.flag);
+    $("so-calls").textContent = calls.toLocaleString();
+    $("so-verdict").innerHTML = tot.silent + tot.crash > 0
+      ? `<span class="rk">❌ ${Math.round(tot.silent)} corrupt records stored and ${Math.round(tot.crash)} crashes per 1,000 requests. At a million requests a day that's ${Math.round((tot.silent + tot.crash) * 1000).toLocaleString()} incidents.</span>`
+      : tot.flag > 3 ? `<span class="tk">⚠️ Nothing silent, nothing crashes, but ${Math.round(tot.flag)} per 1,000 go to a review queue. ${o.retry ? "Constrained decoding would remove most of them at the source." : "Add a retry or constrained decoding."}</span>`
+      : `<span class="ev">✅ Hardened: ${Math.round(tot.good + tot.fixed)} good, ${Math.round(tot.flag)} flagged, for ${calls.toLocaleString()} model calls. The remaining ${tot.wrongval} wrong values need evals (Phase 5).</span>`;
+    showCase();
+  }
+  let cur = "type";
+  $("so-case").innerHTML = MIX.map(m => `<button data-v="${m.k}"${m.k === cur ? ' class="on"' : ""}>${esc(m.label)}</button>`).join("");
+  const caseBtns = [...$("so-case").querySelectorAll("button")];
+  caseBtns.forEach(b => (b.onclick = () => { caseBtns.forEach(x => x.classList.toggle("on", x === b)); cur = b.dataset.v; showCase(); }));
+  function showCase() {
+    const o = opt(), f = fate(cur, o);
+    const constrained = o.schema && cur !== "trunc" && cur !== "wrongval";
+    $("so-raw").innerHTML = constrained ? esc(RAW.clean) + `\n\n<span class="muted">(constrained decoding: the ${esc(MIX.find(m => m.k === cur).label)} version can't be generated)</span>` : esc(RAW[cur]);
+    const cls = { good: "ev", retry: "ev", silent: "rk", crash: "rk", flag: "tk", wrongval: "md" }[f.out];
+    $("so-what").innerHTML = `<span class="${cls}">${esc(f.why)}</span>`;
+  }
+  ["so-json", "so-schema", "so-lenient", "so-validate", "so-retry"].forEach(id => ($(id).onchange = run));
+  $("so-run").onclick = () => { run(); $("so-stack").classList.remove("flash-good"); void $("so-stack").offsetWidth; $("so-stack").classList.add("flash-good"); };
+  run();
+
+  /* ---------- Playground 2: tool-calling round trip ---------- */
+  const F = new Flow($("tc-svg"), { width: 720, height: 270 });
+  F.node("user", { x: 75, y: 135, w: 110, h: 50, label: "User", kind: "cl" })
+   .node("app", { x: 290, y: 135, w: 150, h: 54, label: "Your app", sub: "holds the messages", kind: "db" })
+   .node("model", { x: 560, y: 55, w: 150, h: 54, label: "LLM", sub: "proposes calls", kind: "nw" })
+   .node("tool", { x: 560, y: 215, w: 150, h: 54, label: "get_weather()", sub: "your function", kind: "sv" })
+   .edge("user", "app").edge("app", "model", { label: "messages + tools" }).edge("app", "tool", { label: "you run it" }).render();
+  const J = o => JSON.stringify(o);
+  let steps = [], si = 0, busy = false, calls = 0, runs = 0;
+  function build() {
+    const bad = $("tc-bad").checked && !$("tc-strict").checked, par = $("tc-par").checked;
+    const cities = par ? ["Paris", "Tokyo"] : ["Paris"];
+    const q = par ? "What's the weather in Paris and Tokyo?" : "What's the weather in Paris?";
+    const use = (c, i, unit) => ({ type: "tool_use", id: "toolu_0" + (i + 1), name: "get_weather", input: { city: c, unit: unit || "celsius" } });
+    const temps = { Paris: "15°C, partly cloudy", Tokyo: "22°C, clear" };
+    const s = [];
+    s.push({ path: ["user", "app"], color: "--c-cl", log: `user → app: ${J({ role: "user", content: q })}`, note: "The question arrives at your code, not at the model." });
+    s.push({ path: ["app", "model"], color: "--c-db", call: 1, log: `app → model (call 1): messages + tools: ${J([{ name: "get_weather", input_schema: { city: "string", unit: ["celsius", "fahrenheit"] }, strict: $("tc-strict").checked }])}`, note: "You send the conversation and the tool definitions." });
+    const first = cities.map((c, i) => use(c, i, bad && i === 0 ? "kelvin" : null));
+    s.push({ path: ["model", "app"], color: "--c-nw", log: `model → app: stop_reason "tool_use", content ${J(first)}`, note: par ? "One response, two tool calls: the model asks for both cities at once." : "The model doesn't run anything. It returns a request to call get_weather." });
+    if (bad) {
+      s.push({ path: ["app", "model"], color: "--c-er", call: 1, log: `app validates → ✗ unit "kelvin" not in enum. app → model (call 2): ${J({ type: "tool_result", tool_use_id: "toolu_01", is_error: true, content: "unit must be 'celsius' or 'fahrenheit'" })}`, note: "Your code checks the arguments before running anything and sends the error back as a tool result." });
+      s.push({ path: ["model", "app"], color: "--c-nw", log: `model → app: ${J([use("Paris", 0)])}`, note: "The model reads the error and corrects its call. It cost one extra round trip." });
+    }
+    s.push({ path: ["app", "tool"], color: "--c-sv", back: true, run: cities.length, log: cities.map((c, i) => `app runs get_weather(${J({ city: c, unit: "celsius" })}) → "${temps[c]}"`).join("\n"), note: par ? "Your code runs both calls (in parallel)." : "Arguments validated; your code runs the function." });
+    s.push({ path: ["app", "model"], color: "--c-db", call: 1, log: `app → model (call ${bad ? 3 : 2}): one user message with ${J(cities.map((c, i) => ({ type: "tool_result", tool_use_id: "toolu_0" + (i + 1), content: temps[c] })))}`, note: par ? "All tool results go back together in a single message." : "The result goes back as a tool_result linked by id." });
+    s.push({ path: ["model", "app"], color: "--c-nw", log: `model → app: stop_reason "end_turn", text: "${par ? "Paris is 15°C and partly cloudy; Tokyo is 22°C and clear." : "It's 15°C and partly cloudy in Paris."}"`, note: "With the data in context, the model writes the answer." });
+    s.push({ path: ["app", "user"], color: "--c-cl", log: "app → user: shows the answer ✅", note: `Done: ${bad ? 3 : 2} model calls, ${cities.length} tool run${cities.length > 1 ? "s" : ""}.`, done: true });
+    return s;
+  }
+  function reset() { steps = build(); si = 0; calls = 0; runs = 0; F.clearPackets(); $("tc-log").textContent = ""; $("tc-note").textContent = "Press “Next step” to send the question."; paint(); }
+  function paint() { $("tc-calls").textContent = calls; $("tc-runs").textContent = runs; $("tc-stepn").textContent = `${si} / ${steps.length}`; }
+  async function step() {
+    if (busy || si >= steps.length) return false;
+    busy = true;
+    const s = steps[si++];
+    calls += s.call || 0; runs += s.run || 0;
+    $("tc-log").textContent += (si > 1 ? "\n" : "") + `${si}. ${s.log}`;
+    $("tc-log").scrollTop = $("tc-log").scrollHeight;
+    $("tc-note").innerHTML = s.path[0] === "app" && s.color === "--c-er" ? `<span class="rk">${esc(s.note)}</span>` : s.done ? `<span class="ev">${esc(s.note)}</span>` : esc(s.note);
+    F.set("model", { hot: s.path.includes("model") }); F.set("tool", { hot: s.path.includes("tool") });
+    paint();
+    await F.packet(s.path, { color: s.color, dur: 650, back: !!s.back });
+    busy = false;
+    return si < steps.length;
+  }
+  $("tc-step").onclick = step;
+  $("tc-run").onclick = async () => { if (busy) return; if (si >= steps.length) reset(); while (await step()) { /* keep going */ } };
+  $("tc-reset").onclick = reset;
+  ["tc-bad", "tc-strict", "tc-par"].forEach(id => ($(id).onchange = reset));
+  reset();
+})();
+</script>
+</body>
+</html>

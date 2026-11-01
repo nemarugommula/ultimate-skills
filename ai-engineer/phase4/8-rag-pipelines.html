@@ -1,0 +1,602 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.8 RAG pipelines at scale · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .log { font-family: var(--mono); font-size: .78rem; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; height: 150px; overflow-y: auto; white-space: pre-wrap; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+  .chip { font-family: var(--mono); font-size: .72rem; padding: 3px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); }
+  .chip.ok { border-color: var(--c-cx); } .chip.skip { border-color: var(--c-ev); opacity: .8; }
+  .chip.dlq, .chip.stale, .chip.dup { border-color: var(--c-rk); color: var(--c-rk); }
+  .chip.new { border-color: var(--muted); border-style: dashed; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .tl { display: flex; height: 30px; border-radius: 8px; overflow: hidden; border: 1px solid var(--line); margin: 10px 0 4px; }
+  .tl div { display: flex; align-items: center; justify-content: center; font-size: .72rem; font-weight: 700; color: #fff; white-space: nowrap; overflow: hidden; min-width: 3px; }
+  .ph0 { background: var(--muted); } .ph1 { background: var(--c-md); } .ph2 { background: var(--c-tk); } .ph3 { background: var(--c-ev); } .ph4 { background: var(--c-cx); } .ph5 { background: var(--c-tl); }
+  .caps td.bind { color: var(--c-rk); font-weight: 700; }
+  svg.flow { width: 100%; max-width: 820px; display: block; margin: auto; }
+</style>
+</head>
+<body data-lesson="a4-8" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 8</div>
+  <h1>RAG pipelines at scale: ingestion orchestration, batch embedding &amp; backfills</h1>
+  <p class="subtitle">A notebook that indexes 50 PDFs is a script. Keeping millions of changing documents indexed, fresh and correct, and rebuilding the whole index when you change models, is a data pipeline. Build it like one.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>The indexing path</b>: parse documents (Lesson 3.2), cut them into chunks (3.3), embed each chunk into a vector (2.1) and store it in a vector database (2.3).</li>
+      <li><b>Rate limits</b>: providers cap requests per minute and tokens per minute, and answer HTTP 429 when you exceed them (Lesson 0.5).</li>
+      <li><b>Freshness and permissions</b>: a stale or wrongly-permissioned index gives wrong answers (Lesson 4.7).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Notion's AI Q&amp;A chunks every page into spans, embeds them and stores them with metadata such as authors and permissions. In the original pipeline, <b>any edit to a page re-chunked, re-embedded and re-uploaded every span</b> on it, even if a single character changed.</p>
+    <p>In 2025 they started storing two fingerprints per span: a hash of its text and a hash of its metadata. Text changed? Re-embed only that span. Only permissions changed? Skip embedding entirely and patch the metadata in place. That cut the data volume flowing through the pipeline by <b>70%</b>, saving on both embedding API costs and vector-database writes (Notion engineering, February 2026). Same model, same index. The win was pipeline engineering.</p>
+  </div>
+
+  <h2>Numbers first: embedding is cheap, throughput is not</h2>
+  <p>A company wiki plus document store: <b>2 million documents</b>, about <b>3,000 tokens</b> each.</p>
+  <table>
+    <tr><th></th><th>Value</th><th>How</th></tr>
+    <tr><td>Tokens to embed</td><td class="tk">6 billion</td><td>2M × 3,000</td></tr>
+    <tr><td>Chunks (≈ 500 tokens)</td><td>12 million</td><td>6B ÷ 500</td></tr>
+    <tr><td>Cost, <code>text-embedding-3-small</code> at $0.02 / 1M tokens</td><td class="tk">$120</td><td>6,000 × $0.02 (OpenAI pricing page, Oct 2026)</td></tr>
+    <tr><td>… with the Batch API (50% off)</td><td class="tk">$60</td><td></td></tr>
+    <tr><td>Time at a 1M tokens/minute limit</td><td class="rk">100 hours (4+ days)</td><td>6B ÷ 1M = 6,000 minutes</td></tr>
+    <tr><td>Raw vector storage (1,536 floats × 4 bytes)</td><td>≈ 74 GB</td><td>12M × 1,536 × 4 bytes</td></tr>
+  </table>
+  <p class="muted">Your actual rate limits depend on your provider and usage tier; read them from your account's limits page. The 1M-token figure is illustrative.</p>
+  <p>The embedding bill is often the <b>smallest</b> number in the project: OpenAI's own guide estimates about 62,500 pages per dollar for its small model. What hurts is <b>time</b> (rate limits), <b>failures</b> (millions of files means thousands of broken ones), <b>re-work</b> (re-embedding what didn't change), and the day you change the embedding model and must redo all 12 million chunks without taking search down.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Your vector index is a <b>derived dataset</b>: a function of (source documents, parser version, chunker config, embedding model). Build the pipeline so every stage is <b>idempotent</b> (running it twice = running it once) and keyed by stable IDs and content hashes. Then you can retry anything, re-run only what changed, and rebuild everything into a <b>new</b> index and switch over atomically when any of those versions changes.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a warehouse that re-labels its stock</span>
+    <p>Goods arrive on conveyor belts (connectors), get unpacked (parse), split into boxes (chunks) and labelled (embed) before going on shelves (the index). A fingerprint on each box means you only re-label boxes whose contents changed. Damaged goods go to a <b>returns shelf</b> instead of jamming the belt (the dead-letter queue). And when you adopt a new labelling system, you don't re-label the shelves while customers shop: you fill a <b>second warehouse</b> next door, check it, then swap the address on the sign overnight (a blue-green cut-over).</p>
+  </div>
+
+  <h2>The indexing pipeline is a data pipeline</h2>
+  <table>
+    <tr><th>Stage</th><th>Does</th><th>Typical failure</th><th>Make it safe with</th></tr>
+    <tr><td><b>Connectors</b></td><td>List and fetch new, changed and <b>deleted</b> docs from Drive, Confluence, S3, Slack…</td><td>API quotas, expired tokens, missed deletions</td><td>Cursors (“changed since T”), webhooks, periodic full listings to catch missed deletes</td></tr>
+    <tr><td><b>Parse</b></td><td>File → clean text + structure + metadata (3.2)</td><td>Corrupt or password-protected files, timeouts on 900-page PDFs</td><td>Timeouts, retries, a dead-letter queue</td></tr>
+    <tr><td><b>OCR / vision</b></td><td>Scanned pages and images → text or captions (4.5)</td><td>Slow and costly; GPU capacity</td><td>A <b>separate stage</b> with its own queue and worker pool; only route pages with no text layer</td></tr>
+    <tr><td><b>Chunk</b></td><td>Text → chunks with stable IDs (3.3)</td><td>A chunker change shifts every boundary</td><td>Versioned config; chunk ID = doc ID + position</td></tr>
+    <tr><td><b>Embed</b></td><td>Chunks → vectors, many chunks per request</td><td>429 rate limits, 5xx errors</td><td>Batching, bounded concurrency, backoff with jitter, a batch API for bulk</td></tr>
+    <tr><td><b>Upsert</b></td><td>Write vectors + metadata; delete stale chunks</td><td>Duplicates on re-run; orphaned chunks of deleted docs</td><td>Upsert by deterministic ID; tombstones for deletes</td></tr>
+  </table>
+  <p>Stages talk through <b>queues</b> (a durable list of work items that workers pull from: SQS, Kafka, Redis, or a database table), so a slow stage doesn't block a fast one and each can scale on its own. Figma's AI search pipeline splits steps into discrete jobs for exactly this reason: “more precise control over batching and retry behavior”. A message that keeps failing (a “poison message”) is moved after N attempts to a <b>dead-letter queue (DLQ)</b>, a holding area you inspect and replay later, instead of retrying forever or blocking the line.</p>
+
+  <h3>Idempotency: IDs and hashes</h3>
+  <ul>
+    <li><b>Document ID</b>: stable and from the source, e.g. <code>confluence:123456</code>, never a random UUID generated at ingest time.</li>
+    <li><b>Chunk ID</b>: derived, e.g. <code>confluence:123456:7</code> (or a UUID computed from that string, since some databases such as Qdrant require integer or UUID point IDs). Re-running produces the same IDs, so an <b>upsert</b> (insert-or-replace) overwrites instead of duplicating.</li>
+    <li><b>Content hash</b>: a fingerprint of the chunk text (SHA-256, or a fast hash like Notion's 64-bit xxHash). Same hash as last time → skip embedding. Keep a separate metadata hash so permission changes become cheap metadata patches.</li>
+    <li><b>Pipeline version</b>: store parser, chunker and model versions on every chunk. When they change, the hash check alone isn't enough: everything is “changed”, which is a backfill (below).</li>
+    <li><b>Deletes</b>: if a doc disappears or shrinks from 9 chunks to 6, delete chunks 6–8. Forgotten deletes are the classic source of “the bot quoted a policy we removed last year”.</li>
+  </ul>
+
+  <h3>Incremental vs full re-index</h3>
+  <p><b>Incremental</b> processes only what changed since the last run: cheap and fast, but it can drift (missed webhooks, missed deletes). <b>Full</b> re-processes everything: slow and expensive, but it resets drift. Most teams run incremental continuously and a full <i>reconciliation</i> (compare source listing to index, fix differences) weekly. You also don't need to index every keystroke: Figma found that indexing a file at most every four hours, instead of on every change, meant processing only <b>12%</b> of the data.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Run the pipeline, break it, re-run it</span>
+    <p class="hint">Twelve documents, three workers. Press <b>Run ingest</b>: one PDF is corrupt and the provider throws a rate-limit spike mid-run. Then press <b>Edit 2 docs + delete 1</b> and <b>Incremental re-run</b>. Now switch off the safety toggles one at a time and re-run to see what each one protects you from.</p>
+    <svg id="pipe"></svg>
+    <div class="controls">
+      <button class="btn primary" id="run">▶ Run ingest</button>
+      <button class="btn" id="edit">✏️ Edit 2 docs + delete 1</button>
+      <button class="btn" id="rerun">↻ Incremental re-run</button>
+      <button class="btn" id="replay">🔧 Fix parser &amp; replay DLQ</button>
+      <button class="btn small" id="preset">↺ Reset</button>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="tCorrupt" checked> corrupt PDF in the batch</label>
+      <label><input type="checkbox" id="tSpike" checked> rate-limit spike</label>
+      <label><input type="checkbox" id="tHash" checked> hash check (skip unchanged)</label>
+      <label><input type="checkbox" id="tIds" checked> stable chunk IDs (idempotent upsert)</label>
+      <label><input type="checkbox" id="tDel" checked> propagate deletes</label>
+    </div>
+    <div class="chips" id="chips"></div>
+    <div class="stat-row">
+      <div class="stat">chunks in index <b id="sChunks">0</b></div>
+      <div class="stat">duplicates <b id="sDup">0</b></div>
+      <div class="stat">stale chunks <b id="sStale">0</b></div>
+      <div class="stat">DLQ <b id="sDlq">0</b></div>
+      <div class="stat">retries <b id="sRetry">0</b></div>
+      <div class="stat">tokens embedded (last run) <b id="sTok">0</b></div>
+      <div class="stat">last run scaled to 1M docs <b id="sCost">–</b></div>
+    </div>
+    <div class="log" id="plog">Press ▶ Run ingest.</div>
+    <div class="verdict" id="pVerdict"></div>
+    <p class="hint">A simulation: no real files or APIs. Costs use $0.02 per million tokens; “scaled to 1M docs” multiplies this run's tokens per document by a million.</p>
+  </div>
+  <p>What you should see: the corrupt PDF fails three times and lands in the DLQ while the other 11 finish; the 429 spike slows embedding but loses nothing. With the hash check, the re-run embeds only the 2 edited docs, a fraction of the full run's tokens. Turn off stable IDs and re-run: the edited docs' old chunks stay next to the new ones, so search returns both versions. Turn off delete propagation: the deleted glossary's chunks keep answering questions.</p>
+
+  <h2>Embedding throughput: the math under rate limits</h2>
+  <p>Three things cap your speed, and the smallest one wins:</p>
+  <div class="prompt">tokens/min  =  min(  TPM limit,
+                      RPM limit × tokens per request,
+                      workers × (60 ÷ seconds per request) × tokens per request  )</div>
+  <ul>
+    <li><b>TPM / RPM</b>: tokens per minute and requests per minute your account may send.</li>
+    <li><b>Batch many chunks per request.</b> OpenAI's embeddings endpoint takes up to 2,048 inputs and 300,000 tokens per request. One chunk per request makes you RPM-bound: 12M chunks at 3,000 RPM is 4,000 minutes (67 hours). A hundred per request is 120,000 requests: at a 1M TPM limit that's only 20 requests a minute.</li>
+    <li><b>Concurrency</b> (Little's law: work in flight = rate × time each item takes): 20 requests/minute × 2 s each ≈ 0.7 requests in flight, so a couple of workers suffice. More workers than your limits allow just collect 429s.</li>
+    <li><b>Backoff</b>: on a 429, wait for the <code>Retry-After</code> header if present, otherwise back off exponentially with random <b>jitter</b> (so workers don't retry in lockstep), and cap total attempts. If you manage retries yourself, disable the SDK's built-in ones to avoid nested retry loops (both from OpenAI's rate-limit guide). The same guide warns that above ~1M TPM, ramping traffic faster than ~50% every 15 minutes can trigger slow-down errors: warm up a backfill, don't slam it.</li>
+    <li><b>Batch APIs</b> trade latency for price and headroom. OpenAI's Batch API is 50% cheaper, uses a <b>separate</b> rate-limit pool, and completes within 24 hours (up to 50,000 embedding inputs per batch). Perfect for backfills; useless for “this edit should be searchable in a minute”. That's why Notion ran two paths: batch jobs for onboarding whole workspaces, and a streaming path (Kafka consumers) for live edits.</li>
+    <li><b>Self-hosting</b> an open embedding model on GPUs removes rate limits and per-token fees but adds a cluster to run (Lesson 7.4). Figma serves its model on SageMaker; Notion began moving its embedding pipeline to Ray in 2025.</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how long is the backfill?</span>
+    <p>You're switching all 2M docs (6B tokens, 12M chunks) to a new embedding model.</p>
+    <ul>
+      <li><b>Sync API at 1M TPM</b>, 100 chunks per request: 6B ÷ 1M = 6,000 min = <b>100 h</b>. At 5M TPM: <b>20 h</b>. Cost $120 on the small model, $780 at $0.13/1M on the large one.</li>
+      <li><b>Batch API</b>: 12M inputs ÷ 50,000 per batch = <b>240 batches</b>, well under the 2,000-per-hour creation limit. The real cap is the <i>queued tokens per model</i> limit on your account: if it's 2B tokens, you submit 3 waves, each finishing within 24 h. Cost $60 (small) or $390 (large).</li>
+      <li><b>Storage</b>: 74 GB of raw vectors per index, and you'll hold <b>two</b> indexes until the old one is deleted (3,072 dimensions on the large model doubles it again).</li>
+    </ul>
+    <p>The dollars are small. The calendar is not: plan the backfill like a database migration, with a timeline.</p>
+  </div>
+
+  <h2>Backfills: changing the model or the chunker without downtime</h2>
+  <p>Vectors from two different embedding models live in <b>different spaces</b>: a query embedded with model B compared against chunks embedded with model A returns noise. So you can't upgrade “gradually in place”. The standard move is <b>blue-green</b> (two full copies, “blue” serving while “green” is built):</p>
+  <ol>
+    <li><b>Provision v2</b>: a new collection/index, and pipeline code with the new model or chunker version.</li>
+    <li><b>Backfill</b>: run every document through the v2 pipeline (batch API, high concurrency off-peak).</li>
+    <li><b>Keep v2 current</b>: either <b>dual-write</b> (live edits go to both v1 and v2 during the backfill) or record a change log and <b>replay</b> it after. Skip this and v2 is missing everything edited during a multi-day backfill.</li>
+    <li><b>Validate</b>: counts per source, spot checks, and your retrieval eval (recall@k on a golden question set, Lesson 5.4) must be at least as good as v1. Optionally shadow real queries to both.</li>
+    <li><b>Cut over</b>: point the alias at v2 <b>and</b> switch the query embedder to the new model in the same release. Qdrant documents that alias changes are atomic, so concurrent queries aren't affected.</li>
+    <li><b>Keep v1</b> for a rollback window (days), then delete it.</li>
+  </ol>
+  <p>Notion did exactly this when moving to a new vector database: full re-index with a newer embedding model, migrated “generations one at a time, validating correctness before moving to the next.”</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Backfill planner</span>
+    <p class="hint">Size the re-embed of your corpus and see the cut-over timeline. Try the presets, then cause the classic failures: one chunk per request, more workers than your limits, no dual-write during a long backfill, or forgetting to switch the query embedder.</p>
+    <div class="controls">
+      <button class="btn small" id="pStart">Preset: startup (50k docs)</button>
+      <button class="btn small" id="pBig">Preset: enterprise (20M docs)</button>
+      <button class="btn small" id="pOne">Preset: one chunk per request</button>
+    </div>
+    <div class="controls">
+      <label>documents <input type="range" id="bDocs" min="4" max="8" step="0.1" value="6.3"> <b class="mono" id="bDocsV"></b></label>
+      <label>tokens / doc <input type="range" id="bTok" min="200" max="20000" step="100" value="3000"> <b class="mono" id="bTokV"></b></label>
+      <label>chunk size <input type="range" id="bChunk" min="200" max="1000" step="50" value="500"> <b class="mono" id="bChunkV"></b></label>
+      <label>chunks per request <input type="range" id="bBatch" min="0" max="8" step="1" value="4"> <b class="mono" id="bBatchV"></b></label>
+    </div>
+    <div class="controls">
+      <label>TPM limit <input type="range" id="bTpm" min="5" max="7.7" step="0.1" value="6"> <b class="mono" id="bTpmV"></b></label>
+      <label>RPM limit <input type="range" id="bRpm" min="2" max="4.3" step="0.1" value="3.5"> <b class="mono" id="bRpmV"></b></label>
+      <label>workers <input type="range" id="bWork" min="1" max="128" step="1" value="1"> <b class="mono" id="bWorkV"></b></label>
+      <label>docs changed / day <input type="range" id="bChurn" min="0" max="10" step="0.5" value="2"> <b class="mono" id="bChurnV"></b></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="bModel"><button id="m-small" data-v="small" class="on">3-small · $0.02/1M · 1,536 dims</button><button id="m-large" data-v="large">3-large · $0.13/1M · 3,072 dims</button></span>
+      <label><input type="checkbox" id="bApi"> use the Batch API</label>
+      <label>queued-token limit <input type="range" id="bQueue" min="8" max="10.5" step="0.1" value="9.3"> <b class="mono" id="bQueueV"></b></label>
+      <label><input type="checkbox" id="bDual" checked> dual-write during backfill</label>
+      <label><input type="checkbox" id="bQuery" checked> switch query embedder at cut-over</label>
+    </div>
+    <table class="caps">
+      <tr><th>Limit</th><th>Tokens / minute it allows</th></tr>
+      <tr><td>Your TPM limit</td><td id="cap0"></td></tr>
+      <tr><td>RPM × tokens per request</td><td id="cap1"></td></tr>
+      <tr><td>Workers × requests each can make</td><td id="cap2"></td></tr>
+    </table>
+    <div class="tl" id="tline"></div>
+    <p class="hint" id="tlegend" style="margin-top:0"></p>
+    <div class="stat-row">
+      <div class="stat">chunks <b id="oChunks">–</b></div>
+      <div class="stat">backfill time <b id="oHours">–</b></div>
+      <div class="stat">embedding cost <b id="oCost">–</b></div>
+      <div class="stat">peak vector storage (both indexes) <b id="oStore">–</b></div>
+      <div class="stat">time to cut-over <b id="oTotal">–</b></div>
+    </div>
+    <canvas class="chart" id="bChart" style="height:190px"></canvas>
+    <div class="verdict" id="bVerdict"></div>
+    <p class="hint">Assumptions (illustrative): a request takes 0.25 s + 1 s per 150k tokens; each Batch API wave takes up to 24 h (often less); provisioning 1 h, validation 4 h, rollback window 7 days. Prices and dimensions from OpenAI's docs (Oct 2026). Plug in your provider's limits.</p>
+  </div>
+  <p>What you should see: on the defaults the backfill takes days on the sync API and the TPM limit is the bottleneck. Set one chunk per request and RPM becomes the bottleneck. Push workers to 20 or more and the verdict warns that the extra workers only produce 429s. Untick dual-write: a catch-up phase appears, because v2 missed every edit made during the backfill. Untick the query embedder: the cut-over “succeeds” and search quality collapses.</p>
+
+  <h2>Multimodal documents at scale</h2>
+  <p>OCR and vision captioning (Lessons 3.2 and 4.5) are the expensive, slow stages, so they get their own queue, their own (often GPU) worker pool and their own autoscaling. Route only what needs them: a page with a usable text layer skips OCR; a page with no text, or with charts and figures, goes to the vision stage. Measure per stage: Figma found its major compute cost came not from embedding but from identifying and rendering thumbnails of designs, and attacked that stage (a Ruby → C++ rewrite, cheaper CPU rendering, autoscaling).</p>
+
+  <h2>Monitoring: what to put on the dashboard</h2>
+  <table>
+    <tr><th>Metric</th><th>Why</th><th>Alert when</th></tr>
+    <tr><td><b>Index lag</b> (now − last-modified time of the newest source change not yet indexed)</td><td>The freshness users feel</td><td>Above your freshness target, e.g. 15 min for tickets, 24 h for archives</td></tr>
+    <tr><td><b>Docs failed / DLQ depth</b></td><td>Silent gaps in the index</td><td>DLQ growing; a source's failure rate jumps</td></tr>
+    <tr><td><b>Queue depth per stage</b></td><td>Which stage is the bottleneck</td><td>One queue grows while others drain</td></tr>
+    <tr><td><b>429 / retry rate</b></td><td>You're at your limits</td><td>Sustained retries; time spent backing off</td></tr>
+    <tr><td><b>Chunks per doc, tokens per doc</b></td><td>A parser regression shows up as a shape change</td><td>Distribution shifts after a deploy</td></tr>
+    <tr><td><b>Index count vs source count</b></td><td>Duplicates and orphans</td><td>Ratio drifts from expected</td></tr>
+    <tr><td><b>Cost per document</b> (parse + OCR + embed + write)</td><td>Budget and per-tenant pricing</td><td>Jumps after a config change</td></tr>
+  </table>
+
+  <h2>Orchestration: who runs all this?</h2>
+  <table>
+    <tr><th>Tool</th><th>Model</th><th>Good fit</th></tr>
+    <tr><td><b>Cron + a script + a queue</b></td><td>A scheduled job that enqueues work; workers pull</td><td>Small corpora, one team, week one</td></tr>
+    <tr><td><b>Apache Airflow</b> (3.x)</td><td>DAGs of tasks on schedules; since Airflow 3 (April 2025) also data assets and event-driven scheduling</td><td>Teams already running Airflow for data; batch onboarding (Notion used Airflow scheduling)</td></tr>
+    <tr><td><b>Dagster</b></td><td><b>Assets</b>: you declare the datasets that should exist (parsed docs, embeddings, the index) and how to build them</td><td>Index-as-a-dataset thinking, lineage, partitions per source or tenant</td></tr>
+    <tr><td><b>Prefect</b></td><td>Python functions decorated as flows and tasks, with retries and caching</td><td>Python-first teams wanting little ceremony</td></tr>
+    <tr><td><b>Temporal</b></td><td><b>Durable execution</b>: workflow code whose state survives crashes and restarts, recorded as an event history</td><td>Long-running per-document workflows with many steps, waits and retries</td></tr>
+    <tr><td><b>Spark / Ray</b></td><td>Distributed compute for bulk processing (Ray also pipelines CPU and GPU work)</td><td>Big backfills, self-hosted embedding (Notion: Spark, then Ray)</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>An <b>async embedding worker</b> with bounded concurrency and your own backoff (OpenAI Python SDK; other providers are similar), then a <b>Dagster</b> asset sketch for scheduling it, then the <b>Qdrant</b> alias swap for cut-over.</p>
+<pre><code><span class="k">import</span> asyncio, hashlib, random, uuid
+<span class="k">from</span> openai <span class="k">import</span> AsyncOpenAI, RateLimitError, APIConnectionError, InternalServerError
+
+client = AsyncOpenAI(max_retries=<span class="n">0</span>)          <span class="c"># we own retries: no nested retry loops</span>
+sem = asyncio.Semaphore(<span class="n">8</span>)                    <span class="c"># at most 8 requests in flight</span>
+
+<span class="k">def</span> chunk_id(doc_id: str, i: int) -> str:      <span class="c"># deterministic → idempotent upserts</span>
+    <span class="k">return</span> str(uuid.uuid5(uuid.NAMESPACE_URL, <span class="s">f"{doc_id}:{i}"</span>))
+
+<span class="k">def</span> text_hash(text: str) -> str:
+    <span class="k">return</span> hashlib.sha256(text.encode()).hexdigest()
+
+<span class="k">async def</span> embed_batch(batch: list[dict]) -> list[dict]:
+    <span class="k">async with</span> sem:
+        <span class="k">for</span> attempt <span class="k">in</span> range(<span class="n">6</span>):
+            <span class="k">try</span>:
+                resp = <span class="k">await</span> client.embeddings.create(
+                    model=<span class="s">"text-embedding-3-small"</span>, input=[c[<span class="s">"text"</span>] <span class="k">for</span> c <span class="k">in</span> batch])
+                <span class="k">return</span> [{**c, <span class="s">"vector"</span>: d.embedding} <span class="k">for</span> c, d <span class="k">in</span> zip(batch, resp.data)]
+            <span class="k">except</span> (RateLimitError, APIConnectionError, InternalServerError) <span class="k">as</span> e:
+                resp_ = getattr(e, <span class="s">"response"</span>, <span class="k">None</span>)
+                wait = resp_.headers.get(<span class="s">"retry-after"</span>) <span class="k">if</span> resp_ <span class="k">else None</span>
+                <span class="k">await</span> asyncio.sleep(float(wait) <span class="k">if</span> wait <span class="k">else</span> min(<span class="n">60</span>, <span class="n">2</span> ** attempt) * random.uniform(<span class="n">0.5</span>, <span class="n">1.5</span>))
+        <span class="k">raise</span> RuntimeError(<span class="s">"retries exhausted"</span>)       <span class="c"># caller sends the batch to the DLQ</span>
+
+<span class="k">async def</span> embed_changed(chunks: list[dict], seen: dict[str, str], size: int = <span class="n">100</span>):
+    todo = [c <span class="k">for</span> c <span class="k">in</span> chunks <span class="k">if</span> seen.get(c[<span class="s">"id"</span>]) != text_hash(c[<span class="s">"text"</span>])]  <span class="c"># hash check</span>
+    batches = [todo[i:i + size] <span class="k">for</span> i <span class="k">in</span> range(<span class="n">0</span>, len(todo), size)]
+    <span class="k">return await</span> asyncio.gather(*(embed_batch(b) <span class="k">for</span> b <span class="k">in</span> batches), return_exceptions=<span class="k">True</span>)</code></pre>
+<pre><code><span class="k">import</span> dagster <span class="k">as</span> dg
+
+@dg.asset(retry_policy=dg.RetryPolicy(max_retries=<span class="n">3</span>, delay=<span class="n">30</span>, backoff=dg.Backoff.EXPONENTIAL))
+<span class="k">def</span> parsed_docs(context: dg.AssetExecutionContext) -> <span class="k">None</span>:
+    changed = list_changed_since(load_cursor())          <span class="c"># your connector: new, updated AND deleted</span>
+    context.log.info(<span class="s">f"{len(changed)} changed docs"</span>)
+    write_parsed(parse_all(changed))
+
+@dg.asset(deps=[parsed_docs])
+<span class="k">def</span> chunk_embeddings() -> dg.MaterializeResult:
+    n = upsert_and_delete(asyncio.run(embed_changed(load_chunks(), load_hashes())))
+    <span class="k">return</span> dg.MaterializeResult(metadata={<span class="s">"chunks_upserted"</span>: n})
+
+defs = dg.Definitions(
+    assets=[parsed_docs, chunk_embeddings],
+    schedules=[dg.ScheduleDefinition(name=<span class="s">"index_hourly"</span>, target=dg.AssetSelection.all(),
+                                     cron_schedule=<span class="s">"0 * * * *"</span>)])</code></pre>
+<pre><code><span class="c"># Cut-over: both alias actions are applied atomically (Qdrant docs)</span>
+<span class="k">from</span> qdrant_client <span class="k">import</span> models
+qdrant.update_collection_aliases(change_aliases_operations=[
+    models.DeleteAliasOperation(delete_alias=models.DeleteAlias(alias_name=<span class="s">"docs"</span>)),
+    models.CreateAliasOperation(create_alias=models.CreateAlias(collection_name=<span class="s">"docs_v2"</span>, alias_name=<span class="s">"docs"</span>)),
+])   <span class="c"># ship the query-embedder switch in the same release</span></code></pre>
+    <p class="hint">For bulk backfills, write the same requests as JSONL lines (each with a <code>custom_id</code> = your chunk ID) and submit them with <code>client.batches.create(input_file_id=…, endpoint="/v1/embeddings", completion_window="24h")</code>. Prefect's equivalent of the retry policy is <code>@task(retries=3, retry_delay_seconds=exponential_backoff(backoff_factor=10))</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Incremental (hash/cursor)</td><td>Fast, cheap, fresh</td><td>Drift from missed events and deletes; needs periodic reconciliation</td></tr>
+      <tr><td>Full re-index</td><td>Simple, resets drift</td><td>Slow and costly at scale; burns rate limits</td></tr>
+      <tr><td>Index every change vs debounce</td><td>Every edit searchable at once</td><td>Most work is wasted on intermediate versions (Figma: 4 h debounce → 12% of the data)</td></tr>
+      <tr><td>Sync API vs Batch API</td><td>Sync: minutes. Batch: 50% off, separate limits</td><td>Sync: rate limits, full price. Batch: up to 24 h, more plumbing</td></tr>
+      <tr><td>Hosted vs self-hosted embeddings</td><td>Hosted: no ops. Self-hosted: no rate limits or per-token fees, any open model</td><td>Hosted: limits, provider dependency. Self-hosted: a GPU cluster to run</td></tr>
+      <tr><td>Blue-green vs in-place</td><td>Atomic cut-over, instant rollback, no mixed vectors</td><td>2× storage during overlap; dual-write complexity</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Startup</h4><p>One worker process, a Postgres table of <code>(chunk_id, text_hash, pipeline_version)</code>, pgvector, and a cron job or a light orchestrator. Deterministic IDs and delete handling from day one: they cost nothing now and are miserable to retrofit. Backfills run overnight through a batch API into a new table, then a rename.</p></div>
+      <div><h4>Big tech</h4><p>Two paths (bulk batch jobs on Spark or Ray for onboarding and backfills, streaming consumers on Kafka for live edits), per-tenant namespaces, self-hosted embedding on GPUs, freshness and DLQ SLOs with on-call, blue-green for every model or chunker change, and per-stage cost dashboards. Notion and Figma both describe this shape.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Design the indexing pipeline for 50 million documents across five SaaS sources, updated continuously. Next quarter we'll change embedding models.” A senior answer:</p>
+    <ul>
+      <li>Draws the <b>stages with queues</b> between them, sizes throughput with the rate-limit math, and separates OCR/vision as its own scaled stage.</li>
+      <li>Makes it <b>idempotent</b>: source doc IDs, deterministic chunk IDs, content hashes, upserts, tombstones for deletes, a DLQ with replay.</li>
+      <li>Runs <b>two paths</b>: streaming incremental for freshness (with a debounce) and bulk batch for onboarding and reconciliation.</li>
+      <li>Plans the model change as a <b>blue-green backfill</b>: new index, batch API, dual-write, eval-gated validation, atomic alias flip together with the query embedder, rollback window.</li>
+      <li>Names the <b>metrics</b>: index lag, DLQ depth, retry rate, chunks per doc, cost per doc.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Hash-based change detection and a full re-index</b> <span class="tag co">🏢 Notion · 2026</span> <a href="https://www.notion.com/blog/two-years-of-vector-search-at-notion" target="_blank" rel="noopener">Two years of vector search at Notion</a></div>
+      <p><b>How:</b> offline Spark batch jobs plus online Kafka consumers; per-span text and metadata hashes (xxHash64, stored in DynamoDB); a full re-index with a newer embedding model during a database migration, cut over one generation at a time.</p>
+      <p><b>Why this method:</b> 70% less data through the pipeline from the hashes; the migration cut search-engine spend by 60% and improved p50 query latency from 70–100 ms to 50–70 ms.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Discrete jobs, debounced indexing</b> <span class="tag co">🏢 Figma · 2024</span> <a href="https://www.figma.com/blog/the-infrastructure-behind-ai-search-in-figma/" target="_blank" rel="noopener">The infrastructure behind AI search in Figma</a></div>
+      <p><b>How:</b> separate queued jobs for identifying designs and thumbnailing, batch embedding on a SageMaker endpoint, then writing to OpenSearch; indexing debounced to at most every four hours.</p>
+      <p><b>Why this method:</b> separate jobs gave precise control over batching and retries; the debounce meant processing only 12% of the data; most compute went to the pre-embedding stages, so that's where they optimized.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Half-price bulk embedding</b> <span class="tag co">🏢 OpenAI · docs</span> <a href="https://developers.openai.com/api/docs/guides/batch" target="_blank" rel="noopener">Batch API guide</a></div>
+      <p><b>How:</b> upload a JSONL file of requests, get results within a 24-hour window; embeddings batches hold up to 50,000 inputs.</p>
+      <p><b>Why this method:</b> 50% discount and a separate rate-limit pool that doesn't eat the limits your live pipeline needs. The guide lists “embedding content repositories” as a target use case.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Atomic cut-over with aliases</b> <span class="tag oss">🧰 Open source</span> <a href="https://qdrant.tech/documentation/concepts/collections/" target="_blank" rel="noopener">Qdrant collection aliases</a></div>
+      <p><b>How:</b> queries use an alias; build a second collection in the background (e.g. with a new model), then delete and re-create the alias in one call.</p>
+      <p><b>Why this method:</b> alias changes happen atomically, so no concurrent request is affected, and rolling back is one more alias change.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · decades of waitlist</span>
+    <p>When Notion launched AI Q&amp;A in November 2023, millions of workspaces joined the waitlist, but the pipeline could onboard only a few hundred workspaces a day: at that rate, clearing the waitlist “would take decades”. With Airflow scheduling, pipelining and Spark tuning they raised daily onboarding capacity <b>600×</b> and cleared the waitlist by April 2024. The model didn't change. The pipeline did.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This lesson industrializes Lessons 3.2 (parsing), 3.3 (chunking), 2.1 and 2.3 (embeddings and vector databases), and 4.5 (multimodal stages). Freshness, permissions and caching at query time are 4.7; the retrieval eval that gates a cut-over is 5.4; tracing and dashboards are 8.1; batch discounts and routing are 8.2; self-hosting an embedding model is 7.4. The distributed-systems foundations are in the System Design course: <a href="../../system-design-course/phase3/1-queues.html">message queues</a>, <a href="../../system-design-course/phase3/3-idempotency.html">retries &amp; idempotency</a> and <a href="../../system-design-course/phase3/6-pipelines.html">batch &amp; stream processing</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://www.notion.com/blog/two-years-of-vector-search-at-notion" target="_blank" rel="noopener">Notion: two years of vector search</a>. Dual paths, hashing, migrations and Ray, with numbers.</li>
+      <li><span class="kind">Docs</span> <a href="https://developers.openai.com/api/docs/guides/rate-limits" target="_blank" rel="noopener">OpenAI: rate limits</a>. RPM/TPM, Retry-After, backoff with jitter and ramp-rate advice.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.dagster.io/guides/build/assets" target="_blank" rel="noopener">Dagster: assets</a>. Modelling the index as a dataset you materialize.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 1 million documents × 2,000 tokens each, embedded on a sync API with a 1M tokens-per-minute limit. Roughly how long?</div>
+    <div class="opts"><button class="opt">About 3.3 hours</button><button class="opt" data-ok>About 33 hours</button><button class="opt">About 330 hours</button></div>
+    <div class="explain">2 billion tokens ÷ 1M per minute = 2,000 minutes ≈ <b>33 hours</b>, if you batch well enough that TPM is the bottleneck. A batch API with its own limits, or a higher tier, shortens it; one chunk per request would make it far longer.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After switching to a new embedding model, the team started writing new-model vectors into the live index as documents changed. Within days, retrieval quality collapsed. Why, and what's the fix?</div>
+    <div class="opts"><button class="opt">The new model is worse; roll back permanently</button><button class="opt" data-ok>Vectors from different models aren't comparable, so the index is now mixed. Build a separate v2 index, backfill it, validate, and flip the alias together with the query embedder</button><button class="opt">Increase top-k so both kinds of vectors get retrieved</button></div>
+    <div class="explain">Each model has its own vector space: similarity between a model-A vector and a model-B vector is meaningless. Upgrades are blue-green: full backfill into a new index, dual-write or replay changes, eval-gated validation, then an atomic cut-over of index <i>and</i> query model.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Each nightly re-run of your indexing job makes the index grow by the size of the corpus, and search starts returning the same passage several times. Most likely cause?</div>
+    <div class="opts"><button class="opt" data-ok>Chunk IDs are generated randomly per run, so upserts insert new points instead of replacing old ones</button><button class="opt">The embedding model is non-deterministic</button><button class="opt">The vector database's ANN index is corrupt</button></div>
+    <div class="explain">Idempotency needs deterministic IDs: doc ID + chunk position (or a UUID derived from them). Then a re-run overwrites, a hash check skips unchanged chunks, and stale chunks (a doc that shrank or was deleted) are explicitly deleted.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>The index is a derived dataset: stages with queues, stable doc and chunk IDs, content hashes, upserts, deletes and a DLQ.</li>
+      <li>Re-embed only what changed (hashes, cursors, debouncing); reconcile with a periodic full check.</li>
+      <li>Throughput = the smallest of TPM, RPM × tokens per request, and worker capacity. Batch many chunks per request, bound concurrency, back off with jitter, use batch APIs for bulk.</li>
+      <li>Model or chunker change = blue-green backfill: new index, dual-write, eval-gated validation, atomic alias flip with the query embedder, rollback window.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const nf = v => Math.round(v).toLocaleString("en-US");
+
+  // ---------- pipeline simulator ----------
+  const F = new Flow($("pipe"), { width: 800, height: 250 });
+  F.node("src", { x: 58, y: 80, w: 100, label: "Sources", sub: "12 docs", kind: "cl" })
+   .node("parse", { x: 190, y: 80, w: 100, label: "Parse", sub: "", kind: "sv" })
+   .node("ocr", { x: 280, y: 200, w: 120, label: "OCR / vision", sub: "scanned pages", kind: "sv" })
+   .node("chunk", { x: 370, y: 80, w: 100, label: "Chunk", sub: "", kind: "sv" })
+   .node("hash", { x: 500, y: 80, w: 110, label: "Hash check", sub: "skip if same", kind: "ca" })
+   .node("embed", { x: 625, y: 80, w: 100, label: "Embed", sub: "", kind: "nw" })
+   .node("index", { x: 740, y: 160, w: 110, label: "Vector index", sub: "0 chunks", kind: "db" })
+   .node("dlq", { x: 100, y: 200, w: 140, label: "Dead-letter queue", sub: "empty", kind: "er" })
+   .edge("src", "parse").edge("parse", "chunk").edge("parse", "ocr", { dashed: true, label: "no text layer" })
+   .edge("ocr", "chunk").edge("chunk", "hash").edge("hash", "embed")
+   .edge("embed", "index", { label: "upsert" }).edge("parse", "dlq", { dashed: true, label: "3 failures" })
+   .render();
+
+  const BASE = [
+    ["handbook.pdf", "pdf", 4200], ["pricing.html", "html", 1800], ["api-guide.md", "md", 6400], ["contract-07.pdf", "pdf", 3000],
+    ["invoice-scan.pdf", "scan", 900], ["faq.html", "html", 2200], ["release-notes.md", "md", 2600], ["security.pdf", "pdf", 3800],
+    ["onboarding.docx", "docx", 2400], ["warranty-scan.pdf", "scan", 1200], ["roadmap.md", "md", 1600], ["glossary.html", "html", 1400],
+  ];
+  let S;
+  function reset() {
+    S = { docs: BASE.map(([id, type, tok]) => ({ id, type, tok, v: 1, deleted: false, corrupt: id === "contract-07.pdf" })),
+          index: [], hashes: {}, dlq: new Set(), fixed: false, retries: 0, runs: 0, lastTok: 0, lastDocs: 0, status: {} };
+    F.set("dlq", { sub: "empty", hot: false }); F.set("index", { sub: "0 chunks" }); F.set("embed", { down: false, sub: "" });
+    F.set("src", { sub: "12 docs" });
+    $("plog").textContent = "Press ▶ Run ingest."; $("pVerdict").textContent = "";
+    paint();
+  }
+  const fp = d => { let h = 2166136261; for (const c of d.id + "|v" + d.v + "|" + d.tok) h = Math.imul(h ^ c.charCodeAt(0), 16777619); return (h >>> 0).toString(16).padStart(8, "0"); };
+  const nChunks = d => Math.ceil(d.tok / 500);
+  const log = s => { const el = $("plog"); el.textContent += "\n" + s; el.scrollTop = el.scrollHeight; };
+  function stats() {
+    const live = new Map(S.docs.filter(d => !d.deleted).map(d => [d.id, d]));
+    let dup = 0, stale = 0; const per = {};
+    S.index.forEach(c => { if (!live.has(c.doc)) stale++; per[c.doc] = (per[c.doc] || 0) + 1; });
+    live.forEach(d => { if (S.status[d.id] !== "new") dup += Math.max(0, (per[d.id] || 0) - nChunks(d)); });
+    return { dup, stale, per };
+  }
+  function paint() {
+    const st = stats();
+    $("chips").innerHTML = S.docs.map(d => {
+      const s = S.status[d.id] || "new", n = st.per[d.id] || 0;
+      const cls = d.deleted ? (n ? "stale" : "skip") : S.dlq.has(d.id) ? "dlq" : s === "dup" ? "dup" : s;
+      const txt = d.deleted ? (n ? `deleted at source · ${n} stale chunks` : "deleted ✓") : S.dlq.has(d.id) ? "DLQ" : s === "new" ? "not indexed" : s === "skip" ? `unchanged · v${d.v}` : s === "dup" ? `v${d.v} + old copies` : `v${d.v} · ${n} chunks`;
+      return `<span class="chip ${cls}">${d.id} · ${txt}</span>`;
+    }).join("");
+    $("sChunks").textContent = S.index.length; $("sDup").textContent = st.dup; $("sStale").textContent = st.stale;
+    $("sDlq").textContent = S.dlq.size; $("sRetry").textContent = S.retries; $("sTok").textContent = nf(S.lastTok);
+    $("sCost").textContent = S.lastDocs ? "$" + nf(S.lastTok / S.docs.filter(d => !d.deleted).length * 1e6 * 0.02 / 1e6) : "–";
+    F.set("index", { sub: S.index.length + " chunks" });
+    F.set("dlq", { sub: S.dlq.size ? S.dlq.size + " doc" + (S.dlq.size > 1 ? "s" : "") : "empty", hot: S.dlq.size > 0 });
+  }
+  let busy = false;
+  const BTN = ["run", "edit", "rerun", "replay", "preset"];
+  const lock = on => { busy = on; BTN.forEach(id => ($(id).disabled = on)); };
+  const D = 230;
+  async function processDoc(d, ctx) {
+    await F.packet(["src", "parse"], { color: "--c-cl", dur: D });
+    if (d.corrupt && !S.fixed) {
+      for (let a = 1; a <= 3; a++) { F.set("parse", { down: true }); log(`✗ ${d.id}: parse failed (attempt ${a}/3: invalid xref table)`); S.retries += a < 3; await sleep(D); F.set("parse", { down: false }); }
+      await F.packet(["parse", "dlq"], { color: "--c-er", dur: D });
+      S.dlq.add(d.id); log(`→ ${d.id} moved to the dead-letter queue; the run continues`); paint(); return;
+    }
+    if (d.type === "scan" || (d.corrupt && S.fixed)) { await F.packet(["parse", "ocr", "chunk"], { color: "--c-cl", dur: D }); log(`  ${d.id}: ${d.corrupt ? "repaired file re-parsed with the fallback (OCR) path" : "no text layer → OCR stage"}`); }
+    else await F.packet(["parse", "chunk"], { color: "--c-cl", dur: D });
+    await F.packet(["chunk", "hash"], { color: "--c-cl", dur: D });
+    const h = fp(d);
+    if (ctx.hash && S.hashes[d.id] === h) { S.status[d.id] = "skip"; log(`  ${d.id}: hash ${h} unchanged → skipped (0 tokens)`); paint(); return; }
+    if (ctx.spike && ctx.n++ >= 4 && ctx.spikeLeft > 0) {
+      ctx.spikeLeft--; F.set("embed", { down: true, sub: "429" });
+      const w = [1, 2, 4][2 - ctx.spikeLeft] || 1;
+      log(`⚠ ${d.id}: 429 Too Many Requests · Retry-After ${w}s → backing off`); S.retries++; paint();
+      await sleep(D * (1 + w)); F.set("embed", { down: false, sub: "" });
+    }
+    await F.packet(["hash", "embed", "index"], { color: "--c-md", dur: D });
+    const n = nChunks(d);
+    if (ctx.ids) S.index = S.index.filter(c => c.doc !== d.id);  // upsert by deterministic id: replace this doc's chunks
+    for (let i = 0; i < n; i++) S.index.push({ doc: d.id, i, v: d.v, id: ctx.ids ? `${d.id}:${i}` : Math.random().toString(36).slice(2) });
+    S.status[d.id] = S.index.filter(c => c.doc === d.id).length > n ? "dup" : "ok";
+    S.hashes[d.id] = h; S.dlq.delete(d.id);
+    ctx.tok += d.tok; ctx.docs++;
+    log(`✓ ${d.id}: ${n} chunks embedded (${nf(d.tok)} tokens), upserted${ctx.ids ? "" : " with NEW random ids"}`); paint();
+  }
+  async function pipeline(label, onlyDlq) {
+    if (busy) return; lock(true);
+    S.runs++;
+    const ctx = { hash: $("tHash").checked, ids: $("tIds").checked, spike: $("tSpike").checked && !onlyDlq, spikeLeft: 3, n: 0, tok: 0, docs: 0 };
+    S.docs.forEach(d => { if (d.id === "contract-07.pdf") d.corrupt = $("tCorrupt").checked; });
+    $("plog").textContent = `— ${label} —`;
+    // deletes first
+    const gone = S.docs.filter(d => d.deleted && S.index.some(c => c.doc === d.id));
+    gone.forEach(d => {
+      if ($("tDel").checked) { S.index = S.index.filter(c => c.doc !== d.id); delete S.hashes[d.id]; log(`🗑 ${d.id}: deleted at source → tombstone, its chunks removed`); }
+      else log(`⚠ ${d.id}: deleted at source, but deletes aren't propagated: its chunks stay searchable`);
+    });
+    paint();
+    const queue = S.docs.filter(d => !d.deleted && (!onlyDlq || S.dlq.has(d.id)));
+    const worker = async () => { while (queue.length) await processDoc(queue.shift(), ctx); };
+    await Promise.all([worker(), worker(), worker()]);
+    S.lastTok = ctx.tok; S.lastDocs = ctx.docs; paint();
+    const st = stats(), live = S.docs.filter(d => !d.deleted).length;
+    log(`— done: ${ctx.docs} docs embedded, ${nf(ctx.tok)} tokens, ${S.dlq.size} in DLQ, ${S.retries} retries so far —`);
+    let v;
+    if (st.dup) v = `<span class="rk">❌ ${st.dup} duplicate chunks: old versions are still searchable next to new ones. Random IDs made the re-run insert instead of replace.</span>`;
+    else if (st.stale) v = `<span class="rk">❌ ${st.stale} stale chunks from a deleted document still answer questions. Propagate deletes.</span>`;
+    else if (S.runs > 1 && !ctx.hash && !onlyDlq) v = `<span class="tk">🟡 Correct, but this re-run re-embedded ${ctx.docs} docs (${nf(ctx.tok)} tokens) even though most didn't change. Turn the hash check on.</span>`;
+    else if (S.dlq.size) v = `<span class="tk">🟡 ${live - S.dlq.size} of ${live} docs indexed; ${S.dlq.size} waiting in the DLQ. Nothing was lost and nothing blocked the run. Fix the parser and replay.</span>`;
+    else v = `<span class="ev">✅ Index matches the sources: ${S.index.length} chunks, no duplicates, nothing stale, empty DLQ.</span>`;
+    $("pVerdict").innerHTML = v;
+    lock(false);
+  }
+  $("run").onclick = () => pipeline(S.runs ? "Run ingest (again)" : "Initial ingest");
+  $("rerun").onclick = () => pipeline("Incremental re-run");
+  $("replay").onclick = () => { if (busy) return; if (!S.dlq.size) { $("pVerdict").innerHTML = `<span class="muted">The DLQ is empty: nothing to replay.</span>`; return; } S.fixed = true; pipeline("Replay DLQ with the fixed parser", true); };
+  $("edit").onclick = () => {
+    if (busy) return;
+    const a = S.docs.find(d => d.id === "handbook.pdf"), b = S.docs.find(d => d.id === "pricing.html"), g = S.docs.find(d => d.id === "glossary.html");
+    a.v++; a.tok += 600; b.v++; g.deleted = true;
+    S.status[a.id] = S.status[b.id] = "new";
+    F.set("src", { sub: S.docs.filter(d => !d.deleted).length + " docs" });
+    $("plog").textContent += `\n✏️ handbook.pdf → v${a.v} (+600 tokens), pricing.html → v${b.v}, glossary.html deleted at source. Now re-run.`;
+    $("plog").scrollTop = 1e9; paint();
+  };
+  $("preset").onclick = () => { if (!busy) reset(); };
+  reset();
+
+  // ---------- backfill planner ----------
+  const BATCH = [1, 8, 32, 64, 100, 256, 512, 1024, 2048];
+  const MODEL = { small: { p: 0.02, dims: 1536, name: "text-embedding-3-small" }, large: { p: 0.13, dims: 3072, name: "text-embedding-3-large" } };
+  let model = "small";
+  const mBtns = [...$("bModel").querySelectorAll("button")];
+  mBtns.forEach(b => (b.onclick = () => { model = b.dataset.v; mBtns.forEach(x => x.classList.toggle("on", x === b)); plan(); }));
+  const big = v => v >= 1e9 ? (v / 1e9).toFixed(v >= 1e10 ? 0 : 1) + "B" : v >= 1e6 ? (v / 1e6).toFixed(v >= 1e7 ? 0 : 1) + "M" : v >= 1e3 ? (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + "k" : Math.round(v) + "";
+  const hrs = h => h * 60 < 1 ? "< 1 min" : h < 1 ? Math.round(h * 60) + " min" : h < 48 ? h.toFixed(h < 10 ? 1 : 0) + " h" : (h / 24).toFixed(1) + " days";
+  const usd = v => "$" + (v < 10 ? v.toFixed(2) : nf(v));
+  function plan() {
+    const D = Math.round(10 ** +$("bDocs").value), T = +$("bTok").value, C = +$("bChunk").value;
+    let B = BATCH[+$("bBatch").value];
+    const tpm = 10 ** +$("bTpm").value, rpm = 10 ** +$("bRpm").value, W = +$("bWork").value, churn = +$("bChurn").value / 100;
+    const useBatch = $("bApi").checked, queue = 10 ** +$("bQueue").value, M = MODEL[model];
+    $("bDocsV").textContent = big(D); $("bTokV").textContent = nf(T); $("bChunkV").textContent = C + " tok";
+    $("bTpmV").textContent = big(tpm); $("bRpmV").textContent = big(rpm); $("bWorkV").textContent = W; $("bChurnV").textContent = (churn * 100).toFixed(1) + "%";
+    $("bQueueV").textContent = big(queue) + " tok"; $("bQueue").disabled = !useBatch;
+    let tooBig = false;
+    if (B * C > 300000) { tooBig = true; B = Math.floor(300000 / C); }
+    $("bBatchV").textContent = B + (tooBig ? " (capped)" : "");
+    const perDoc = Math.ceil(T / C), chunks = D * perDoc, tokens = D * T, tpr = B * C;
+    const lat = 0.25 + tpr / 150000;
+    const caps = [tpm, rpm * tpr, W * (60 / lat) * tpr];
+    const eff = Math.min(...caps), bi = caps.indexOf(eff);
+    caps.forEach((c, i) => { $("cap" + i).textContent = big(c) + " tokens/min"; $("cap" + i).className = i === bi ? "bind" : ""; });
+    const syncH = tokens / eff / 60;
+    const waves = Math.ceil(tokens / queue), batches = Math.ceil(chunks / 50000);
+    const batchH = waves * 24 + batches / 2000;
+    const backH = useBatch ? batchH : syncH;
+    const cost = tokens / 1e6 * M.p * (useBatch ? 0.5 : 1);
+    const changedDuring = D * churn * (backH / 24);
+    const catchH = $("bDual").checked ? 0 : changedDuring * T / eff / 60;
+    const phases = [["provision v2", 1, "ph0"], ["backfill", backH, "ph1"], ["catch-up replay", catchH, "ph2"], ["validate (eval)", 4, "ph3"], ["cut-over", 0.02, "ph4"], ["rollback window", 168, "ph5"]];
+    const total = phases.reduce((s, p) => s + p[1], 0);
+    $("tline").innerHTML = phases.filter(p => p[1] > 0).map(p => `<div class="${p[2]}" style="width:${Math.max(0.6, 100 * p[1] / total)}%" title="${p[0]}: ${hrs(p[1])}">${100 * p[1] / total > 9 ? p[0] : ""}</div>`).join("");
+    $("tlegend").textContent = phases.filter(p => p[1] > 0).map(p => `${p[0]} ${p[0] === "cut-over" ? "≈ seconds" : hrs(p[1])}`).join(" → ");
+    $("oChunks").textContent = big(chunks);
+    $("oHours").textContent = hrs(backH) + (useBatch ? ` (${waves} wave${waves > 1 ? "s" : ""}, ≤ 24 h each)` : "");
+    $("oCost").textContent = usd(cost);
+    $("oStore").textContent = (2 * chunks * M.dims * 4 / 1e9).toFixed(1) + " GB";
+    $("oTotal").textContent = hrs(1 + backH + catchH + 4);
+    Plot.bars($("bChart"), { bars: [
+      { label: "Sync API (" + usd(tokens / 1e6 * M.p) + ")", value: syncH, color: MX.css("--c-md") },
+      { label: "Batch API (" + usd(tokens / 1e6 * M.p / 2) + ")", value: batchH, color: MX.css("--c-ev") },
+    ], yMin: 0, yLabel: "hours to re-embed" });
+    const names = ["your TPM limit", "your RPM limit: you're making too many small requests", "your worker pool"];
+    let v;
+    if (!$("bQuery").checked) v = `<span class="rk">❌ Cut-over flips the index to ${M.name} vectors but queries are still embedded with the old model. Similarities are meaningless: search quality collapses. Ship the query-embedder switch with the alias flip.</span>`;
+    else if (!$("bDual").checked && catchH > 0) v = `<span class="rk">⚠️ No dual-write: about ${big(changedDuring)} docs changed during the backfill and must be replayed (${hrs(catchH)}) before v2 is safe to serve. Skip it and users get stale answers.</span>`;
+    else if (!useBatch && W >= 3 && W > 2 * Math.ceil(Math.min(caps[0], caps[1]) / (caps[2] / W))) v = `<span class="tk">🟡 Your ${W} workers could send ${big(caps[2])} tokens/min, far above what your limits allow. The extra workers only collect 429s; cut them or raise your limits.</span>`;
+    else if (!useBatch && bi === 1) v = `<span class="tk">🟡 Bottleneck: ${names[1]}. Pack more chunks per request.</span>`;
+    else v = `<span class="ev">✅ ${useBatch ? `Batch API: bound by your queued-token limit (${waves} wave${waves > 1 ? "s" : ""})` : "Bottleneck: " + names[bi]}. Backfill ${hrs(backH)} for ${usd(cost)}; v2 ready to cut over after ${hrs(1 + backH + catchH + 4)}.${tooBig ? " (Chunks per request capped by the 300k-token request limit.)" : ""}</span>`;
+    $("bVerdict").innerHTML = v;
+  }
+  ["bDocs", "bTok", "bChunk", "bBatch", "bTpm", "bRpm", "bWork", "bChurn", "bQueue"].forEach(id => ($(id).oninput = plan));
+  ["bApi", "bDual", "bQuery"].forEach(id => ($(id).onchange = plan));
+  const setP = o => { Object.entries(o).forEach(([k, v]) => { const el = $(k); if (el.type === "checkbox") el.checked = v; else el.value = v; }); plan(); };
+  $("pStart").onclick = () => setP({ bDocs: 4.7, bTok: 2000, bBatch: 4, bTpm: 6, bRpm: 3.5, bWork: 1, bApi: false });
+  $("pBig").onclick = () => setP({ bDocs: 7.3, bTok: 3000, bBatch: 4, bTpm: 7, bRpm: 4, bWork: 4, bApi: true, bQueue: 10.5 });
+  $("pOne").onclick = () => setP({ bBatch: 0, bTpm: 6.7, bRpm: 3.5, bWork: 16, bApi: false });
+  plan();
+})();
+</script>
+</body>
+</html>

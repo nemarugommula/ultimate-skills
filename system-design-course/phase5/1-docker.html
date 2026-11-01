@@ -1,0 +1,470 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.1 Docker: images, layers & containers · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .seg button:disabled { opacity: .4; cursor: not-allowed; }
+  table.layers td { font-size: .88rem; padding: 4px 8px; }
+  table.layers td.ins { font-family: var(--mono); }
+  table.layers button { font: inherit; font-size: .75rem; padding: 0 6px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); border-radius: 6px; cursor: pointer; }
+  .chip { display: inline-block; font-size: .72rem; font-weight: 800; padding: 1px 8px; border-radius: 999px; color: #fff; }
+  .chip.hit { background: var(--c-ca); } .chip.run { background: var(--c-er); } .chip.err { background: #636e72; } .chip.skip { background: var(--line); color: var(--muted); }
+</style>
+</head>
+<body data-lesson="s5-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 5 · Lesson 1</div>
+  <h1>Docker: images, layers & containers</h1>
+  <p class="subtitle">Package your app with everything it needs into one image that runs the same on your laptop, in CI and on a thousand servers. Every modern deployment, from a two-person startup to Google, starts here.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Stateless app servers</b>: any copy can serve any request, so you scale by running more copies (Lesson 1.1).</li>
+      <li><b>Back-of-the-envelope math</b>: rough sizes and times, multiplied out (Lesson 0.3).</li>
+      <li>A <b>process</b> is just a running program. Your laptop runs hundreds of them at once.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In March 2013, Solomon Hykes gave a <b>5-minute lightning talk</b> at PyCon called “The future of Linux Containers”. He showed a tool called Docker. According to the Kubernetes project's own history, that talk inspired a small team at Google to start the project that became Kubernetes.</p>
+    <p>Google wasn't new to the idea. Its own site says it has used containers since the early 2000s: “from Gmail to YouTube and Search, everything at Google operates in containers.” Docker made the same trick easy for everyone else. By the end of this lesson you'll be able to write a small, fast, safe image, and explain what a container really is.</p>
+  </div>
+
+  <h2>Numbers first: why “works on my machine” stops working</h2>
+  <p>Your app runs on your laptop with Node 22, a certain version of OpenSSL, and a few libraries you installed months ago. The server has Node 20 and different libraries. It crashes. Multiply that by 50 engineers and 200 servers and you get the oldest bug in software: <b>“works on my machine”</b>.</p>
+  <p>A container image fixes this by shipping the app <b>together with its whole user-space</b>: the runtime, the libraries, the config. Here's what the official base images weigh (compressed download size on Docker Hub, amd64, October 2026):</p>
+  <table>
+    <tr><th>Base image</th><th>Compressed size</th><th>What's inside</th></tr>
+    <tr><td><code>node:22</code></td><td class="er">≈ 408 MB</td><td>Full Debian + compilers + Node</td></tr>
+    <tr><td><code>node:22-slim</code></td><td class="lt">≈ 80 MB</td><td>Minimal Debian + Node</td></tr>
+    <tr><td><code>node:22-alpine</code></td><td class="db">≈ 61 MB</td><td>Alpine Linux (tiny distro) + Node</td></tr>
+    <tr><td><code>python:3.12</code> / <code>-slim</code> / <code>-alpine</code></td><td>≈ 412 / 43 / 18 MB</td><td>Same pattern for Python</td></tr>
+    <tr><td><code>alpine:3.21</code></td><td class="db">≈ 3.6 MB</td><td>Just a tiny Linux user-space</td></tr>
+  </table>
+  <p>Size matters at scale. When traffic spikes and 50 new servers each download a 560 MB image, that's <b>28 GB</b> pulled at the exact moment you need speed. A 100 MB image is about <b>5 GB</b>. We'll work this out below.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    An <b>image</b> is a read-only, layered snapshot of a filesystem plus a start command. A <b>container</b> is an ordinary Linux process started from that image, which the kernel fences off so it sees only its own files, network and process list (<b>namespaces</b>) and can only use its share of CPU and memory (<b>cgroups</b>). No virtual hardware, no second operating system: that's why containers start in about a second instead of a minute.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the shipping container</span>
+    <p>Before the 1950s, ships were loaded crate by crate, each one a different shape. The steel shipping container made every load look the same to cranes, trucks and ships. A Docker image does that for software: whatever is inside (Node, Python, Go, a database), every server, CI runner and orchestrator handles it the same way: <b>pull, run, stop</b>.</p>
+    <p>And the image is built like a stack of transparent sheets: the base OS on the bottom, then your libraries, then your code on top. Change the top sheet and the ones below are reused.</p>
+  </div>
+
+  <h2>Containers vs virtual machines</h2>
+  <p>A <b>virtual machine</b> (VM) pretends to be a whole computer: virtual CPU, virtual disk, its own operating-system kernel. A container shares the host's kernel and is isolated by two Linux kernel features:</p>
+  <ul>
+    <li><b>Namespaces</b> give a process its own view of the system. The Linux manual lists eight kinds: <b>PID</b> (process IDs: your app thinks it's process 1), <b>network</b> (its own IP and ports), <b>mount</b> (its own filesystem), <b>UTS</b> (its own hostname), <b>IPC</b>, <b>user</b>, <b>cgroup</b> and <b>time</b>.</li>
+    <li><b>cgroups</b> (control groups) put processes in groups whose CPU, memory and I/O can be <b>limited and monitored</b>. This is how “this container gets 0.5 CPU and 512 MB” is enforced (you'll set these in Kubernetes in Lesson 5.3).</li>
+  </ul>
+  <table>
+    <tr><th></th><th>Virtual machine</th><th>Container</th></tr>
+    <tr><td>What it virtualizes</td><td>Hardware (runs its own kernel)</td><td>The operating system's view (shares the host kernel)</td></tr>
+    <tr><td class="lt">Typical start time</td><td>Tens of seconds to minutes (boots an OS)</td><td>Under a second to a few seconds (starts a process)</td></tr>
+    <tr><td>Typical size</td><td>Gigabytes (a whole OS disk)</td><td>Megabytes to a few hundred MB</td></tr>
+    <tr><td class="er">Isolation</td><td>Strong: a kernel bug in one VM doesn't reach others</td><td>Weaker: all containers share one kernel</td></tr>
+    <tr><td>Used for</td><td>Separating customers (cloud servers are VMs)</td><td>Packaging and running your own apps densely</td></tr>
+  </table>
+  <p class="muted">In practice you use both: the cloud gives you VMs, and you run many containers on each VM. When strong isolation matters (running strangers' code), people add a sandbox layer such as gVisor or Firecracker micro-VMs.</p>
+
+  <h2>Images are made of layers, and layers are cached</h2>
+  <p>You build an image from a <b>Dockerfile</b>: a list of instructions run top to bottom. Each instruction that changes files (<code>RUN</code>, <code>COPY</code>, <code>ADD</code>) creates a <b>layer</b>, a diff on top of the layer before. When you rebuild, Docker checks each step: has the instruction or its input files changed? If not, it reuses the cached layer instantly.</p>
+  <p>The one rule that matters, straight from Docker's docs: <b>once a layer changes, every layer after it must be rebuilt</b>, even if those steps would produce exactly the same result. So the order of your Dockerfile decides how fast every build is.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: same Dockerfile, two orders</span>
+    <p>A Node app. Typical step times: installing dependencies (<code>npm ci</code>) takes about 45 s, compiling (<code>npm run build</code>) about 15 s, copying the source about 1 s. You change one line of code.</p>
+    <ul>
+      <li><b>Bad order</b>: <code>COPY . .</code> then <code>RUN npm ci</code> then build. Your code changed, so <code>COPY . .</code> misses, and everything after it reruns: 1 + 45 + 15 = <b>61 s</b>.</li>
+      <li><b>Good order</b>: copy only <code>package.json</code> + lock file, run <code>npm ci</code>, <i>then</i> <code>COPY . .</code> and build. The dependency files didn't change, so <code>npm ci</code> is cached: 1 + 15 = <b>16 s</b>.</li>
+      <li>A team of 10 engineers doing 200 builds a day saves 45 s × 200 = 9,000 s = <b>2.5 hours of build time per day</b>, from moving one line.</li>
+    </ul>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The layer-cache simulator</span>
+    <p class="hint">Each row is one Dockerfile instruction. Change something (your code, a dependency, a README commit, the base image) and the image rebuilds. Teal = reused from cache, red = had to run. Reorder rows with ↑ ↓, try the bad order, and switch off <code>.dockerignore</code> to see why a README edit can trigger a rebuild.</p>
+    <div class="controls">
+      <button class="btn" id="pgood">Good order</button>
+      <button class="btn" id="pbad">Bad order (COPY . . first)</button>
+      <label><input type="checkbox" id="dign" checked> use a <code>.dockerignore</code> (skip .git, node_modules, docs)</label>
+    </div>
+    <table class="layers" id="ltab"></table>
+    <div class="controls">
+      <button class="btn primary" id="bcode">✏️ Edit app code</button>
+      <button class="btn" id="bdep">📦 Add a dependency</button>
+      <button class="btn" id="bdoc">📝 Commit a README change</button>
+      <button class="btn" id="bbase">⬆️ New base image</button>
+      <button class="btn" id="bsame">🔁 Rebuild, nothing changed</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">build time <b id="lt">–</b></div>
+      <div class="stat">steps run / cached <b id="lr">–</b></div>
+      <div class="stat">build context sent <b id="lc">–</b></div>
+      <div class="stat">what triggered it <b id="lw">–</b></div>
+    </div>
+    <canvas class="chart" id="lch" style="height:180px"></canvas>
+    <p class="hint" id="lmsg"></p>
+  </div>
+  <p>Things to try: in the good order, press “Edit app code” a few times (about 16 s each). Switch to the bad order and do it again (about 61 s). Now go back to the good order, untick <code>.dockerignore</code> and commit a README change: the <code>.git</code> folder changed, so <code>COPY . .</code> misses even though no code did. Finally move <code>RUN npm ci</code> above the package copy to watch the build break.</p>
+
+  <h2>Dockerfile habits that pay off at scale</h2>
+  <table>
+    <tr><th>Habit</th><th>Why</th></tr>
+    <tr><td><b>Copy dependency files first</b>, install, then copy the code</td><td>Code changes daily, dependencies weekly: keep the slow step cached.</td></tr>
+    <tr><td><b>Multi-stage builds</b>: build in one <code>FROM</code>, copy only the result into a small final <code>FROM</code></td><td>Compilers, dev dependencies and caches stay behind. Docker's docs: you “selectively copy artifacts from one stage to another, leaving behind everything you don't want”.</td></tr>
+    <tr><td><b>Small base images</b> (<code>-slim</code>, <code>-alpine</code>, distroless, or <code>scratch</code> for a static Go binary)</td><td>Faster pulls, fewer packages that can carry security holes. Docker notes Alpine is under 6 MB.</td></tr>
+    <tr><td><b>Run as a non-root user</b> (<code>USER node</code>)</td><td>If someone breaks into your app, they don't get root inside the container.</td></tr>
+    <tr><td><b>A <code>.dockerignore</code></b> file</td><td>Keeps <code>.git</code>, <code>node_modules</code> and secrets out of the build context and the image.</td></tr>
+    <tr><td><b>Pin versions</b> (<code>node:22.11-alpine</code>, or a <code>@sha256:</code> digest)</td><td>Tags move. Pinning makes builds repeatable; a bot (e.g. Dependabot) bumps them on purpose.</td></tr>
+    <tr><td><code>RUN apt-get update &amp;&amp; apt-get install …</code> in <b>one</b> line</td><td>Separate lines cache a stale package list (Docker's docs call this out).</td></tr>
+    <tr><td><b>Exec-form</b> <code>CMD ["node", "server.js"]</code></td><td>Your app becomes process 1 and receives the stop signal, so it can shut down gracefully.</td></tr>
+  </table>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The image-size calculator</span>
+    <p class="hint">Pick a language and a base image, with or without a multi-stage build. Base sizes are real (compressed, from Docker Hub, October 2026); the app's own layers are <b>typical, illustrative</b> numbers. Then see what it costs when a traffic spike makes many servers pull the image at once.</p>
+    <div class="controls">
+      <span class="seg" id="lang"><button data-v="node" class="on">Node</button><button data-v="py">Python</button><button data-v="go">Go</button></span>
+      <span class="seg" id="base"><button data-v="full" class="on">full</button><button data-v="slim">slim</button><button data-v="alpine">alpine</button><button data-v="scratch">scratch</button></span>
+      <label><input type="checkbox" id="ms"> multi-stage build</label>
+    </div>
+    <div class="controls">
+      <label>new servers pulling at once <input type="range" id="nn" min="1" max="200" step="1" value="50"> <b class="mono" id="nnv"></b></label>
+      <label>download speed per server <input type="range" id="bw" min="10" max="500" step="10" value="100"> <b class="mono" id="bwv"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">image size <b id="isz">–</b></div>
+      <div class="stat">pull time per server <b id="ipt">–</b></div>
+      <div class="stat">total pulled in the spike <b id="itot">–</b></div>
+      <div class="stat">vs. the best option <b id="ibest">–</b></div>
+    </div>
+    <canvas class="chart" id="ich" style="height:200px"></canvas>
+    <p class="hint" id="imsg"></p>
+  </div>
+
+  <h2>The rest of the Docker toolbox</h2>
+  <table>
+    <tr><th>Piece</th><th>What it is</th><th>Watch out for</th></tr>
+    <tr><td class="db"><b>Registry</b></td><td>Where images live: Docker Hub, GitHub Container Registry, AWS ECR, Google Artifact Registry. CI pushes, servers pull.</td><td>Tag every build with the git commit (<code>api:3f9c2e1</code>), not just <code>latest</code>, so you know exactly what's running.</td></tr>
+    <tr><td class="db"><b>Volumes</b></td><td>Storage that outlives the container. A container's own filesystem is thrown away when it's removed.</td><td>Never keep a database's data only inside the container.</td></tr>
+    <tr><td class="nw"><b>Networking</b></td><td>Each container gets its own network namespace. <code>-p 8080:3000</code> maps host port 8080 to the container's 3000. Containers on one user-defined network find each other by name.</td><td>Inside a container, <code>localhost</code> means the container itself, not your laptop.</td></tr>
+    <tr><td class="sv"><b>Docker Compose</b></td><td>A YAML file that defines several containers (app + Postgres + Redis) and starts them together.</td><td>Great for dev and small single-server setups; for many servers you need an orchestrator (Lesson 5.2).</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Docker</b> / <b>Docker Desktop</b>, <b>BuildKit</b> (Docker's modern builder), <b>Podman</b> (daemonless, Docker-compatible), registries like <b>Amazon ECR</b>, <b>Google Artifact Registry</b>, <b>GitHub Container Registry</b>, and scanners like <b>Trivy</b> or <b>Docker Scout</b>. A production-style multi-stage Dockerfile for Node:</p>
+<pre><code><span class="c"># syntax=docker/dockerfile:1</span>
+<span class="c"># ---- stage 1: build (has dev dependencies and the compiler) ----</span>
+<span class="k">FROM</span> node:22-alpine <span class="k">AS</span> build
+<span class="k">WORKDIR</span> /app
+<span class="k">COPY</span> package.json package-lock.json ./      <span class="c"># dependency files first: cached until they change</span>
+<span class="k">RUN</span> npm ci
+<span class="k">COPY</span> . .                                     <span class="c"># code last: changes every commit</span>
+<span class="k">RUN</span> npm run build &amp;&amp; npm prune --omit=dev     <span class="c"># drop dev dependencies after building</span>
+
+<span class="c"># ---- stage 2: run (only what production needs) ----</span>
+<span class="k">FROM</span> node:22-alpine
+<span class="k">WORKDIR</span> /app
+<span class="k">ENV</span> NODE_ENV=production
+<span class="k">COPY</span> --from=build /app/node_modules ./node_modules
+<span class="k">COPY</span> --from=build /app/dist ./dist
+<span class="k">USER</span> node                                    <span class="c"># non-root user that ships with the image</span>
+<span class="k">EXPOSE</span> <span class="n">3000</span>
+<span class="k">CMD</span> [<span class="s">"node"</span>, <span class="s">"dist/server.js"</span>]               <span class="c"># exec form: node is PID 1 and gets SIGTERM</span></code></pre>
+    <p>A <code>.dockerignore</code> next to it (<code>.git</code>, <code>node_modules</code>, <code>*.md</code>, <code>.env</code>), and a <code>compose.yaml</code> to run the app with its database locally:</p>
+<pre><code><span class="k">services:</span>
+  <span class="k">api:</span>
+    build: .
+    ports: [<span class="s">"8080:3000"</span>]                <span class="c"># host:container</span>
+    environment:
+      DATABASE_URL: postgres://app:secret@db:5432/app   <span class="c"># "db" = the service name below</span>
+    depends_on: [db]
+  <span class="k">db:</span>
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+    volumes: [<span class="s">"pgdata:/var/lib/postgresql/data"</span>]   <span class="c"># data survives container restarts</span>
+<span class="k">volumes:</span>
+  pgdata: {}</code></pre>
+<pre><code>docker build -t api:3f9c2e1 .          <span class="c"># build and tag with the git commit</span>
+docker run -d -p 8080:3000 --name api api:3f9c2e1
+docker ps                              <span class="c"># what's running</span>
+docker logs -f api                     <span class="c"># follow its stdout/stderr</span>
+docker exec -it api sh                 <span class="c"># a shell inside the running container</span>
+docker image history api:3f9c2e1       <span class="c"># every layer and its size</span>
+docker compose up -d                   <span class="c"># start everything in compose.yaml</span></code></pre>
+    <p class="hint">Try it locally: <code>docker run --rm -it alpine:3.21 sh</code>, then run <code>ps</code> inside. You'll see your shell as PID 1: that's a PID namespace at work.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>✅ Containers shine when…</th><th>❌ Think twice when…</th></tr>
+      <tr><td>Many services, languages or versions share the same servers</td><td>You run untrusted code from strangers: a shared kernel is weaker isolation than a VM</td></tr>
+      <tr><td>You want the exact same artifact in dev, CI, staging and prod</td><td>One small app on a platform that already builds for you (Heroku-style buildpacks, Vercel)</td></tr>
+      <tr><td>You need fast start and dense packing (scale out in seconds)</td><td>Heavy stateful systems (big databases) where a managed service is simpler (Lesson 5.5)</td></tr>
+      <tr><td>You'll use an orchestrator later (Kubernetes, ECS, Cloud Run all run images)</td><td>Your team can't yet maintain images: base images need regular rebuilds for security patches</td></tr>
+    </table>
+    <p class="muted">Alpine uses a different C library (musl) from Debian (glibc). Most apps don't notice; some native libraries and Python wheels do. If Alpine causes trouble, <code>-slim</code> is the safe middle ground.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>One multi-stage Dockerfile per service, a <code>compose.yaml</code> for local dev, images built in CI and pushed to your cloud's registry, tagged by commit. Run them on a managed platform (Cloud Run, ECS Fargate, Fly.io, Render: Lesson 5.5) long before you think about Kubernetes.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Golden base images owned by a platform team and rebuilt on every security patch, image scanning and signing in CI, internal registry mirrors near every cluster, strict size budgets, and policies that refuse images running as root or without a pinned digest (Lesson 6.1 covers the pipeline).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Few interviews ask you to write a Dockerfile, but “how would you deploy this?” comes up constantly. A senior answer covers:</p>
+    <ul>
+      <li>The <b>artifact</b>: one immutable image per commit, promoted unchanged from staging to production.</li>
+      <li><b>Image hygiene</b>: multi-stage, small base, non-root, no secrets baked in (pass them at runtime: Lesson 5.3).</li>
+      <li><b>Where state lives</b>: containers are disposable, so data goes in volumes or managed databases.</li>
+      <li><b>Containers vs VMs</b>: what isolation you actually get from namespaces and cgroups.</li>
+    </ul>
+    <p>Common follow-ups: “Why is our build slow?” (layer order). “Why is our image 2 GB?” (single stage, full base, caches). “What happens to files written inside the container?” (gone when it's removed).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Everything in containers</b> <span class="tag co">🏢 Google · 2000s–today</span> <a href="https://cloud.google.com/containers" target="_blank" rel="noopener">Google Cloud: Containers at Google</a></div>
+      <p><b>How:</b> Google says it has run on containers since the early 2000s, with Gmail, YouTube and Search all running in them, managed by its internal cluster system Borg (Lesson 5.2).</p>
+      <p><b>Why this method:</b> packing many isolated workloads onto shared machines uses hardware far better than one app per server.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Namespaces and cgroups</b> <span class="tag hist">📜 Linux kernel</span> <a href="https://man7.org/linux/man-pages/man7/namespaces.7.html" target="_blank" rel="noopener">namespaces(7)</a> · <a href="https://man7.org/linux/man-pages/man7/cgroups.7.html" target="_blank" rel="noopener">cgroups(7)</a></div>
+      <p><b>How:</b> the manual pages list the namespace types (PID, network, mount, UTS, IPC, user, cgroup, time) and describe cgroups as grouping processes so their resource use can be limited and monitored.</p>
+      <p><b>Why this method:</b> Docker didn't invent isolation; it packaged existing kernel features behind a simple build-ship-run workflow.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The build cache rule</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.docker.com/build/cache/" target="_blank" rel="noopener">Docker docs: Docker build cache</a></div>
+      <p><b>How:</b> each instruction becomes a layer; when one layer changes, all the layers after it rerun. The docs show exactly the “copy dependency files first” trick from the simulator.</p>
+      <p><b>Why this method:</b> layers are diffs on top of their parent, so a changed parent makes every later diff invalid.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Distroless images</b> <span class="tag oss">🧰 Google open source</span> <a href="https://github.com/GoogleContainerTools/distroless" target="_blank" rel="noopener">GoogleContainerTools/distroless</a></div>
+      <p><b>How:</b> base images that contain only your app's runtime dependencies: no package manager, no shell, none of the usual Linux programs.</p>
+      <p><b>Why this method:</b> nothing to exploit that isn't needed, and nothing extra to patch or download.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · smaller than a photo</span>
+    <p>The <code>alpine:3.21</code> image is about 3.6 MB compressed on Docker Hub: a complete Linux user-space smaller than a typical phone photo. And the smallest possible base, <code>FROM scratch</code>, is empty: a statically compiled Go binary can be the only file in the image.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Images are the unit everything else in this phase moves around: Kubernetes schedules them (Lesson 5.2) and limits their CPU and memory with the same cgroups (Lesson 5.3), Helm and GitOps decide which image tag runs where (Lesson 5.4), and Cloud Run or Lambda can run them without servers (Lesson 5.5). CI/CD builds and scans them (Lesson 6.1). In AI systems, model-serving images often weigh several GB because of GPU libraries, which makes layer order and pull time even more important.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.docker.com/build/building/best-practices/" target="_blank" rel="noopener">Docker: building best practices</a>. Multi-stage, base images, pinning, <code>.dockerignore</code>, <code>USER</code>, all in one page.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.docker.com/build/building/multi-stage/" target="_blank" rel="noopener">Docker: multi-stage builds</a>. Short, with a Go example that leaves the whole SDK behind.</li>
+      <li><span class="kind">Video</span> <a href="https://www.youtube.com/watch?v=wW9CAH9nSLs" target="_blank" rel="noopener">Solomon Hykes: The future of Linux Containers (PyCon 2013)</a>. The 5-minute talk where Docker was shown publicly.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Your image is 600 MB. A traffic spike makes the autoscaler add 40 servers, each downloading at about 100 MB/s. Roughly how much data is pulled, and how long does each server wait for the image?</div>
+    <div class="opts"><button class="opt">2.4 GB, about 0.6 s each</button><button class="opt" data-ok>24 GB, about 6 s each</button><button class="opt">240 GB, about 60 s each</button></div>
+    <div class="explain">40 × 600 MB = 24,000 MB = <b>24 GB</b>, and 600 MB ÷ 100 MB/s = <b>6 s</b> per server before the app can even start. A 100 MB multi-stage image would be 4 GB and 1 s. Image size is part of your scale-out speed.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Every build reinstalls all dependencies (60 s) even when only one line of code changed. What's the fix?</div>
+    <div class="opts"><button class="opt">Use a bigger CI machine</button><button class="opt" data-ok>Copy only the dependency files, install, then copy the rest of the code</button><button class="opt">Combine every instruction into one giant RUN line</button></div>
+    <div class="explain">A changed layer invalidates every layer after it. If <code>COPY . .</code> comes before the install, any code change reruns it. Copy <code>package.json</code> and the lock file first so the install stays cached until dependencies actually change.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You must run code uploaded by anonymous users (an online code playground). Which is the safest way to isolate each run?</div>
+    <div class="opts"><button class="opt">A plain container: namespaces already isolate it fully</button><button class="opt">Run each script as a different user on one shared server</button><button class="opt" data-ok>A VM-strength sandbox (micro-VM or gVisor-style), not just a container</button></div>
+    <div class="explain">Containers share the host's kernel, so a kernel bug can let hostile code escape. For untrusted code you add a stronger boundary: a lightweight VM (e.g. Firecracker) or a sandboxed kernel (gVisor). For your own trusted services, plain containers are fine.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Image = layered, read-only filesystem + start command. Container = a normal process, isolated by <b>namespaces</b> and limited by <b>cgroups</b>.</li>
+      <li>A changed layer rebuilds everything after it: copy dependency files, install, <i>then</i> copy code.</li>
+      <li>Multi-stage + small base + non-root + <code>.dockerignore</code> = small, fast, safer images.</li>
+      <li>Image size × servers pulling = scale-out cost: 560 MB × 50 = 28 GB vs 104 MB × 50 = 5 GB.</li>
+      <li>Containers are disposable: state goes in volumes or managed databases.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { if (b.disabled) return; bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- layer-cache simulator ----------
+  // each step: text, seconds when it runs, inputs (which file groups a COPY reads), provides/needs for validity
+  const STEPS = {
+    from:  { text: "FROM node:22-slim", t: 6, inputs: ["base"] },
+    wd:    { text: "WORKDIR /app", t: 0.1 },
+    cpkg:  { text: "COPY package.json package-lock.json ./", t: 0.2, inputs: ["pkg"], provides: ["pkg"] },
+    ci:    { text: "RUN npm ci", t: 45, needs: ["pkg"], provides: ["deps"] },
+    call:  { text: "COPY . .", t: 1, inputs: ["pkg", "code", "docs", "git"], provides: ["pkg", "code"] },
+    build: { text: "RUN npm run build", t: 15, needs: ["deps", "code"] },
+    user:  { text: "USER node", t: 0.1 },
+    cmd:   { text: 'CMD ["node", "dist/server.js"]', t: 0 },
+  };
+  const GOOD = ["from", "wd", "cpkg", "ci", "call", "build", "user", "cmd"];
+  const BAD = ["from", "wd", "call", "ci", "build", "user", "cmd"];
+  let order = GOOD.slice();
+  const ver = { base: 1, pkg: 1, code: 1, docs: 1, git: 1 };
+  const cache = new Set();
+  const history = [];
+  let last = null;
+
+  function build(trigger) {
+    const ignore = $("dign").checked;
+    const have = new Set();
+    let parent = "root", broke = false, total = 0, ran = 0, hit = 0, err = null;
+    const ctxMB = ignore ? 6 : 420;           // typical: .git + node_modules make the context huge
+    total += ctxMB / 100;                      // sending the context to the builder at ~100 MB/s
+    const rows = order.map((id, i) => {
+      const s = STEPS[id];
+      if (err) return { id, st: "skip", t: 0 };
+      if (i === 0 && id !== "from") { err = "The first instruction must be FROM."; return { id, st: "err", t: 0 }; }
+      const miss = (s.needs || []).filter(n => !have.has(n));
+      if (miss.length) {
+        err = id === "ci" ? "npm ci failed: no package.json yet. Copy the dependency files before installing." :
+          "npm run build failed: " + (miss.includes("deps") ? "dependencies aren't installed yet." : "the source code isn't copied yet.");
+        return { id, st: "err", t: 0 };
+      }
+      const ins = (s.inputs || []).filter(k => !(ignore && (k === "git" || k === "docs")));
+      const key = parent + "|" + s.text + "|" + ins.map(k => k + ver[k]).join(",");
+      (s.provides || []).forEach(p => have.add(p));
+      parent = key;
+      if (cache.has(key) && !broke) { hit++; return { id, st: "hit", t: 0 }; }
+      broke = true; cache.add(key); ran++; total += s.t;
+      return { id, st: "run", t: s.t };
+    });
+    last = { rows, total, ran, hit, err, ctxMB, trigger };
+    if (!err) { history.push({ t: total, trigger }); if (history.length > 10) history.shift(); }
+    render();
+  }
+
+  function render() {
+    const tab = $("ltab");
+    const L = { hit: "CACHED", run: "RAN", err: "ERROR", skip: "skipped" };
+    tab.innerHTML = "<tr><th></th><th>Instruction</th><th>Result</th><th>Time</th></tr>" + order.map((id, i) => {
+      const r = last ? last.rows[i] : { st: "skip", t: 0 };
+      return `<tr><td><button data-up="${i}" aria-label="move up">↑</button> <button data-dn="${i}" aria-label="move down">↓</button></td>` +
+        `<td class="ins">${STEPS[id].text.replace(/</g, "&lt;")}</td><td><span class="chip ${r.st}">${L[r.st]}</span></td><td class="mono">${r.st === "run" ? r.t + " s" : "–"}</td></tr>`;
+    }).join("");
+    tab.querySelectorAll("button[data-up]").forEach(b => (b.onclick = () => move(+b.dataset.up, -1)));
+    tab.querySelectorAll("button[data-dn]").forEach(b => (b.onclick = () => move(+b.dataset.dn, 1)));
+    if (!last) return;
+    $("lt").textContent = last.err ? "failed" : last.total.toFixed(1) + " s";
+    $("lr").textContent = `${last.ran} / ${last.hit}`;
+    $("lc").textContent = last.ctxMB + " MB";
+    $("lw").textContent = last.trigger;
+    const bars = history.map((h, i) => ({ label: "#" + (i + 1), value: +h.t.toFixed(1), color: MX.css(h.t > 30 ? "--c-er" : h.t > 10 ? "--c-lt" : "--c-ca") }));
+    Plot.bars($("lch"), { bars: bars.length ? bars : [{ label: "–", value: 0 }], yMin: 0, yLabel: "build seconds" });
+    const ci = last.rows.find(r => r.id === "ci");
+    $("lmsg").textContent = last.err ? "❌ " + last.err :
+      ci && ci.st === "run" && last.trigger !== "dependency" && last.trigger !== "base image" && last.trigger !== "first build" ?
+        "⚠️ npm ci reran even though no dependency changed: something above it busted the cache. Check the order and the .dockerignore." :
+      last.ran === 0 ? "Everything came from the cache." + (last.ctxMB > 100 ? ` The ${(last.ctxMB / 100).toFixed(1)} s left is just uploading a ${last.ctxMB} MB build context: that is what .dockerignore saves.` : " A rebuild with no changes is almost free.") :
+      last.total < 25 ? "Fast build: only the layers that really changed were rebuilt." :
+      "A slow build, but for a good reason: the change sits low in the stack, so everything above it reran.";
+  }
+  function move(i, d) {
+    const j = i + d;
+    if (j < 0 || j >= order.length) return;
+    [order[i], order[j]] = [order[j], order[i]];
+    build("reordered");
+  }
+  const change = (keys, label) => { keys.forEach(k => ver[k]++); build(label); };
+  $("bcode").onclick = () => change(["code", "git"], "code");
+  $("bdep").onclick = () => change(["pkg", "git"], "dependency");
+  $("bdoc").onclick = () => change(["docs", "git"], "README commit");
+  $("bbase").onclick = () => change(["base"], "base image");
+  $("bsame").onclick = () => build("nothing");
+  $("pgood").onclick = () => { order = GOOD.slice(); build("reordered"); };
+  $("pbad").onclick = () => { order = BAD.slice(); build("reordered"); };
+  $("dign").onchange = () => build(".dockerignore");
+  build("first build");
+  change(["code", "git"], "code");
+
+  // ---------- image-size calculator ----------
+  // base sizes: Docker Hub compressed, amd64, Oct 2026. App layers: illustrative.
+  const LANG = {
+    node: { base: { full: 408, slim: 80, alpine: 61 }, deps: 40, dev: 110, tools: 0, src: 2, out: 3, cache: 0, tag: "node:22" },
+    py:   { base: { full: 412, slim: 43, alpine: 18 }, deps: 60, dev: 0, tools: 150, src: 2, out: 2, cache: 30, tag: "python:3.12" },
+    go:   { base: { full: 303, slim: 28, alpine: 3.6, scratch: 0 }, deps: 0, dev: 80, tools: 0, src: 2, out: 15, cache: 0, tag: "golang:1.23" },
+  };
+  let langV = "node";
+  const getBase = seg("base", () => calc());
+  seg("lang", v => { langV = v; calc(); });
+  function sizeOf(lang, base, multi) {
+    const L = LANG[lang];
+    if (!multi) {
+      const b = lang === "go" ? L.base.full : L.base[base];       // a single-stage Go image needs the compiler image
+      // full images already ship compilers; slim/alpine single-stage builds must add them
+      const tools = (base === "full" || lang === "go") ? 0 : L.tools;
+      return { parts: [["base", b], ["prod deps", L.deps], ["dev deps / modules", L.dev], ["build tools", tools], ["source + caches", L.src + L.cache + L.out]] };
+    }
+    const b = L.base[base] ?? 0;
+    return { parts: [["base", b], ["prod deps", L.deps], ["dev deps / modules", 0], ["build tools", 0], ["built app", L.out + (lang === "py" ? L.src : 0)]] };
+  }
+  const total = s => s.parts.reduce((a, p) => a + p[1], 0);
+  function calc() {
+    const multi = $("ms").checked;
+    const bBtn = [...$("base").querySelectorAll("button")];
+    bBtn.forEach(b => (b.disabled = b.dataset.v === "scratch" && !(langV === "go" && multi)));
+    let base = getBase();
+    if (base === "scratch" && !(langV === "go" && multi)) { bBtn.forEach(b => b.classList.toggle("on", b.dataset.v === "alpine")); base = "alpine"; }
+    const s = sizeOf(langV, base, multi), mb = total(s);
+    const n = +$("nn").value, bw = +$("bw").value;
+    $("nnv").textContent = n; $("bwv").textContent = bw + " MB/s";
+    const opts = ["full", "slim", "alpine", "scratch"].filter(b => LANG[langV].base[b] != null);
+    const best = Math.min(...opts.map(b => total(sizeOf(langV, b, true))));
+    $("isz").textContent = mb.toFixed(0) + " MB";
+    $("ipt").textContent = (mb / bw).toFixed(1) + " s";
+    $("itot").textContent = (mb * n / 1000).toFixed(1) + " GB";
+    $("ibest").textContent = mb <= best + 0.5 ? "this is it ✅" : (mb / Math.max(best, 1)).toFixed(1) + "× bigger";
+    const col = { "base": "--c-sv", "prod deps": "--c-db", "dev deps / modules": "--c-er", "build tools": "--c-er", "source + caches": "--c-lt", "built app": "--c-ca" };
+    Plot.bars($("ich"), { bars: s.parts.map(p => ({ label: p[0], value: +p[1].toFixed(1), color: MX.css(col[p[0]]) })), yMin: 0, yLabel: "MB in the final image" });
+    $("imsg").textContent = !multi && langV === "go" ? `Single-stage Go ships the whole ${LANG.go.tag} toolchain just to run one ${LANG.go.out} MB binary. Tick multi-stage and pick scratch.` :
+      !multi ? "Single stage: dev dependencies, build tools and caches all ship to production. Tick multi-stage to leave them behind." :
+      base === "full" ? "Multi-stage helps, but the full base image is still most of the weight. Try slim or alpine." :
+      `About ${(mb * n / 1000).toFixed(1)} GB moves across the network when ${n} servers start at once; each waits ${(mb / bw).toFixed(1)} s for the image.`;
+  }
+  ["nn", "bw"].forEach(id => ($(id).oninput = calc));
+  $("ms").onchange = calc;
+  calc();
+})();
+</script>
+</body>
+</html>

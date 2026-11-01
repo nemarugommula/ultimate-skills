@@ -1,0 +1,489 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.6 Eval tooling, CI & online evals · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .console { font-family: var(--mono); font-size: .8rem; background: #11151c; color: #d6dde6; border-radius: 10px; padding: 10px 12px; min-height: 120px; white-space: pre-wrap; line-height: 1.5; }
+  .console .r { color: #ff6b6f; } .console .g { color: #4fd18b; } .console .y { color: #e3b341; } .console .m { color: #8b98a8; }
+  .alerts { margin: 8px 0; }
+  .alerts div { border-left: 4px solid var(--c-rk); background: var(--bg2); padding: 4px 10px; margin: 4px 0; border-radius: 6px; font-size: .88rem; }
+  .alerts div.okk { border-left-color: var(--c-cx); }
+  .verdict { font-weight: 700; margin: 8px 0; }
+</style>
+</head>
+<body data-lesson="a5-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 5 · Lesson 6</div>
+  <h1>Eval tooling, CI regression tests & online evals</h1>
+  <p class="subtitle">Evals only protect you if they run on every change and keep watching after launch. This lesson turns your eval set into infrastructure: a regression gate in CI, and signals from real users in production.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Golden datasets, error bars and paired comparisons (Lesson 5.1).</li>
+      <li>LLM judges are noisy instruments that must be pinned and calibrated (Lesson 5.3).</li>
+      <li>Prompts live in version control and change through pull requests (Lesson 1.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On April 24–25, 2025, OpenAI rolled out a GPT-4o update to ChatGPT. Its offline evaluations “generally looked good”, and A/B tests suggested the users who tried it liked it. Some expert testers said the model “felt” slightly off. OpenAI launched anyway, and within days users were sharing a model that flattered them and agreed with almost anything. The rollback started on April 28.</p>
+    <p>In its postmortem, OpenAI explained that a new reward signal based on thumbs-up and thumbs-down feedback had contributed, noting that user feedback can favour more agreeable responses, and that its offline evals weren't broad or deep enough to catch sycophancy. It called launching “the wrong call” and committed to treating behaviour issues as launch-blocking. Every piece of this lesson is in that story: offline evals with gaps, online signals that mislead on their own, and a gate that should have blocked.</p>
+  </div>
+
+  <h2>Numbers first: what an eval gate costs, and what it can see</h2>
+  <table>
+    <tr><th></th><th>Per pull request</th><th>Per day (40 PRs)</th></tr>
+    <tr><td>300 cases × one judge call (~$0.0075 each, illustrative)</td><td class="tk">~$2.25</td><td class="tk">~$90</td></tr>
+    <tr><td>With output caching (only cases whose prompt or inputs changed re-run)</td><td>often under $1</td><td>far less</td></tr>
+    <tr><td>Wall-clock time with 20 parallel calls, ~3 s each</td><td>~45 s</td><td>-</td></tr>
+  </table>
+  <p>And what 300 cases can detect: baseline 88%, the PR scores 85%. As two separate scores, the 95% error bar on the difference is about <b>±5.5 points</b>, so a 3-point drop looks like noise. But both runs used the <b>same</b> 300 cases. Only 15 cases changed: 12 went pass → fail, 3 went fail → pass. On those per-case differences the error bar is about <b>±2.5 points</b>, so the 3-point drop is a real regression (worked example below).</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Treat evals like tests and monitoring. <b>Offline evals</b> run on every change and gate merges, like a test suite. <b>Online evals</b> watch real traffic for what your dataset doesn't contain, like production monitoring. The loop between them is the product: every production failure you find becomes a new offline case, so it can never silently come back.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: aviation safety</span>
+    <p>Before take-off, pilots run a <b>checklist</b> that must pass (offline evals in CI, with must-pass items). In flight, <b>instruments</b> and alarms watch for anything unexpected (online monitoring). After an incident, investigators write a report and the finding becomes a <b>new checklist item</b> for every future flight (production failures become eval cases). No single layer makes flying safe; the loop does.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 The eval loop in production</span>
+    <svg id="opsSvg"></svg>
+    <div class="controls"><button class="btn primary" id="opsBtn">▶ Follow a failure around the loop</button> <span class="hint" id="opsMsg"></span></div>
+  </div>
+
+  <h2>Offline vs online evaluation</h2>
+  <table>
+    <tr><th></th><th>Offline (before release)</th><th>Online (in production)</th></tr>
+    <tr><td>Data</td><td>Your golden dataset: fixed, labelled, versioned</td><td>Real traffic: unlabelled, changing</td></tr>
+    <tr><td>Signals</td><td>Code checks, metrics, calibrated judges, references</td><td>Thumbs, edits, retries, escalations, conversions; judges on sampled traces; guardrail triggers</td></tr>
+    <tr><td>Answers</td><td>“Did this change make known cases better or worse?”</td><td>“How is it doing on what users actually ask, today?”</td></tr>
+    <tr><td>Speed</td><td>Minutes, on every PR</td><td>Days to weeks for a significant A/B result</td></tr>
+    <tr><td>Blind spots</td><td>Anything not in the dataset (new topics, new behaviours like sycophancy)</td><td>Problems before launch; users who silently leave</td></tr>
+  </table>
+
+  <h2>Evals in CI: designing the gate</h2>
+  <ul>
+    <li><b>Must-pass suite</b>: safety, privacy and critical facts (no PII leaked, refuses prompt injection, the refund window is right). Deterministic checks; any failure blocks the merge.</li>
+    <li><b>Quality suite</b>: hundreds of golden cases scored by checks and judges. Compare the PR with the main branch on the <b>same cases</b>; block only on a <b>statistically clear</b> regression bigger than your tolerance; warn and ask for review when the drop is within noise.</li>
+    <li><b>Budgets</b>: cost and latency per case, so a prompt that doubles tokens doesn't slip through.</li>
+    <li><b>Tame the noise</b>: pin model and judge versions, use temperature 0 where you can, cache outputs, and for flaky judges take a majority of 3 calls on borderline cases.</li>
+    <li><b>Tiers</b>: a fast subset (~50 cases) on every commit, the full suite on PRs that touch prompts, models or retrieval, the big capability and agent suites nightly.</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the paired regression test</span>
+    <p>300 cases. Baseline passes 264 (88%), the PR passes 255 (85%). Per case: b = 12 cases pass → fail, c = 3 cases fail → pass; the other 285 didn't change.</p>
+    <ul>
+      <li>Difference = (c − b) ÷ n = (3 − 12) ÷ 300 = <b>−3.0 points</b>.</li>
+      <li>Paired standard error = √((b + c) − (b − c)² ÷ n) ÷ n = √(15 − 81 ÷ 300) ÷ 300 = √14.73 ÷ 300 = <b>1.28 points</b>, so the 95% interval is −3.0 ± 2.5 = [−5.5, −0.5]. It excludes 0: <b>block</b> and show the 12 cases that broke.</li>
+      <li>Unpaired, treating them as two independent samples: SE = √(0.88 × 0.12 ÷ 300 + 0.85 × 0.15 ÷ 300) = 2.79 points, ±5.5: you'd wave it through.</li>
+    </ul>
+    <p>The 285 unchanged cases carry no noise about the <i>difference</i>, so pairing removes most of it. This is the “question-level paired differences” recommendation from Anthropic's error-bars paper (Lesson 5.1).</p>
+  </div>
+
+  <div class="playground" id="pgCI">
+    <span class="label">🎮 Playground · CI gate simulator</span>
+    <p class="hint">A pull request changes the support bot's prompt. Set its true effect on quality, the eval size, and how noisy the judge is (the chance it flips a verdict). Run CI once to see the log, or simulate 400 runs of the same PR to see how often each gate blocks it. Try a harmless PR (effect 0) with the naive gate, then a −3 point PR with the paired gate.</p>
+    <div class="controls">
+      <label>true effect <input type="range" id="ciD" min="-6" max="4" step="0.5" value="-3"> <b class="mono" id="ciDV"></b></label>
+      <label>eval size <input type="range" id="ciN" min="100" max="1500" step="100" value="300"> <b class="mono" id="ciNV"></b></label>
+      <label>judge flip rate <input type="range" id="ciNoise" min="0" max="10" step="1" value="5"> <b class="mono" id="ciNoiseV"></b></label>
+    </div>
+    <div class="controls">
+      <span class="seg" id="ciGate"><button id="cg0" class="on">Naive: block if score drops > 1 pt</button><button id="cg1">Paired: block only if significant</button></span>
+      <label><input type="checkbox" id="ciVote"> judge 3× and take the majority</label>
+      <label><input type="checkbox" id="ciSafe"> PR also breaks a must-pass safety case</label>
+    </div>
+    <div class="controls"><button class="btn primary" id="ciRun">▶ Run CI on this PR</button><button class="btn" id="ciMany">Simulate 400 runs</button></div>
+    <div class="console" id="ciLog">$ waiting for a run…</div>
+    <div class="stat-row">
+      <div class="stat">blocked <b id="ciBlk">–</b></div>
+      <div class="stat">warned (needs review) <b id="ciWarn">–</b></div>
+      <div class="stat">passed <b id="ciPass">–</b></div>
+    </div>
+    <p class="hint" id="ciMsg">The simulation: each case passes the baseline with 88% probability; any prompt change also reshuffles ~3% of cases in both directions; then the true effect is applied, and the judge flips each verdict with the chosen probability in both runs.</p>
+  </div>
+
+  <h2>Online signals</h2>
+  <table>
+    <tr><th>Signal</th><th>Example</th><th>Strength</th><th>Trap</th></tr>
+    <tr><td><b>Explicit feedback</b></td><td>Thumbs up/down, star ratings, “was this helpful?”</td><td>Direct statement of satisfaction</td><td>Few users rate (often 1–5%, typical); rewards agreeable answers (sycophancy)</td></tr>
+    <tr><td><b>Implicit behaviour</b></td><td>Copying the answer, accepting a code suggestion, editing it heavily, regenerating, rephrasing the question</td><td>Every user generates it</td><td>Ambiguous: a copy might be to complain elsewhere</td></tr>
+    <tr><td><b>Outcomes</b></td><td>Ticket resolved without a human, escalation, refund requested, retention, conversion</td><td>What the business actually wants</td><td>Slow and influenced by much more than the AI</td></tr>
+    <tr><td><b>Online judges</b></td><td>Faithfulness, policy and toxicity judges on a 1–5% sample of traces</td><td>Quality signal with no user effort</td><td>Judge cost and drift; sampling noise</td></tr>
+    <tr><td><b>Guardrail and system metrics</b></td><td>Refusal rate, PII-filter hits, “I don't know” rate, answer length, latency, cost</td><td>Cheap, instant, great for alerts</td><td>Proxies, not quality</td></tr>
+  </table>
+  <p>No single signal is safe to optimize on its own. The sycophancy story is a thumbs-up rate going up while quality went down. Pair a primary metric with <b>guardrail metrics</b> that must not get worse.</p>
+
+  <h2>A/B tests for AI features</h2>
+  <p>To learn whether a change helps real users, randomize users (not requests, so each person has a consistent experience) into control and treatment, and compare a primary metric with guardrails. The statistics are ordinary, and so is the main lesson: you need a lot of traffic for small effects.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: is 62% better than 60%?</span>
+    <p>Thumbs-up rate (among rated answers): control 60%, treatment 62%, 5,000 rated answers per arm.</p>
+    <ul>
+      <li>SE of the difference = √(0.60 × 0.40 ÷ 5,000 + 0.62 × 0.38 ÷ 5,000) = <b>0.98 points</b>.</li>
+      <li>z = 2.0 ÷ 0.98 = <b>2.05</b>, two-sided p ≈ 0.04: just significant at 5%.</li>
+      <li>To detect a 2-point lift reliably (80% power) you'd want about <b>9,300 rated answers per arm</b>; for 1 point, about <b>38,000</b>. Halving the effect needs 4× the data.</li>
+    </ul>
+    <p>That's why offline evals do most of the filtering and A/B tests are reserved for the changes that matter. The maths is in <a href="../../math-course/phase5/5-ab-tests.html">Math for AI 5.5</a>.</p>
+  </div>
+
+  <h2>Monitoring for drift</h2>
+  <table>
+    <tr><th>Drift</th><th>What changes</th><th>How you notice</th></tr>
+    <tr><td><b>Input drift</b></td><td>Users ask about a new product, a new language, a seasonal topic</td><td>Topic or embedding-cluster mix of queries; rising “I don't know” rate</td></tr>
+    <tr><td><b>Model drift</b></td><td>A provider updates the model behind an alias</td><td>Answer length, refusal rate, judge scores shift with no deploy on your side; pin versions</td></tr>
+    <tr><td><b>Data drift</b></td><td>Documents go stale; new policies aren't indexed</td><td>Faithful answers that users mark wrong; content freshness checks (Lesson 4.7)</td></tr>
+    <tr><td><b>Eval drift</b></td><td>The golden set no longer looks like traffic</td><td>Compare the dataset's topic mix with production's; add sampled real cases monthly</td></tr>
+  </table>
+
+  <div class="playground" id="pgDash">
+    <span class="label">🎮 Playground · Online metrics dashboard</span>
+    <p class="hint">Four weeks of a support bot in production, about 2,000 conversations a day. Something happens on day 14 (or later). Pick a scenario and read the dashboard like an on-call engineer: which signal moved, which didn't, and what the offline eval said. Then run the A/B test the team ran on that change.</p>
+    <div class="controls"><span class="seg" id="dSc"><button id="sc0" class="on">Real improvement</button><button id="sc1">Sycophantic update</button><button id="sc2">New product launch</button><button id="sc3">Silent model update</button></span></div>
+    <canvas class="chart" id="dChart" style="height:260px"></canvas>
+    <div class="stat-row">
+      <div class="stat">offline eval (before → after) <b id="dOff">–</b></div>
+      <div class="stat">thumbs-up <b id="dThumb">–</b></div>
+      <div class="stat">escalations <b id="dEsc">–</b></div>
+      <div class="stat">sampled faithfulness <b id="dFaith">–</b></div>
+      <div class="stat">avg answer length <b id="dLen">–</b></div>
+    </div>
+    <div class="alerts" id="dAlerts"></div>
+    <div class="controls">
+      <label>rated answers per arm <input type="range" id="abN" min="500" max="20000" step="500" value="2000"> <b class="mono" id="abNV"></b></label>
+      <button class="btn primary" id="abRun">▶ Run the A/B test on thumbs-up</button>
+    </div>
+    <div class="verdict" id="abVerdict"></div>
+    <p class="hint" id="dMsg"></p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <table>
+      <tr><th>Tool</th><th>What it is (as of late 2026)</th><th>Best at</th></tr>
+      <tr><td><b>promptfoo</b></td><td>Open-source CLI and library, YAML test configs; acquired by OpenAI in March 2026, and the open-source project continues</td><td>Prompt and model comparisons in CI, red-teaming</td></tr>
+      <tr><td><b>Braintrust</b></td><td>Commercial eval and observability platform; open-source <code>autoevals</code> scorers</td><td>Experiments, datasets, side-by-side diffs</td></tr>
+      <tr><td><b>LangSmith</b></td><td>LangChain's tracing and evaluation platform</td><td>Teams on LangChain/LangGraph; datasets from traces</td></tr>
+      <tr><td><b>Langfuse</b></td><td>Open-source (MIT core) tracing, prompt management and evals; joined ClickHouse in January 2026, self-hosting still supported</td><td>Self-hosted observability plus online evals</td></tr>
+      <tr><td><b>Arize Phoenix</b></td><td>Open-source tracing and evals built on OpenTelemetry</td><td>Debugging traces, running evaluators over them</td></tr>
+      <tr><td><b>DeepEval</b> / <b>RAGAS</b></td><td>Open-source metric libraries (pytest-style / RAG-focused)</td><td>Metrics as unit tests</td></tr>
+      <tr><td><b>Inspect</b></td><td>Open-source eval framework from the UK AI Security Institute</td><td>Agent and capability evals with sandboxes</td></tr>
+      <tr><td><b>OpenAI Evals</b></td><td>An open-source eval framework and registry, plus an Evals API in the OpenAI platform</td><td>Evals for OpenAI-hosted models</td></tr>
+    </table>
+<pre><code><span class="c"># promptfooconfig.yaml: the regression suite that runs on every prompt PR</span>
+description: Support bot regression suite
+prompts:
+  - file://prompts/support.txt
+providers:
+  - anthropic:messages:claude-sonnet-5-5       <span class="c"># pin the exact model your app uses</span>
+defaultTest:
+  assert:
+    - type: latency
+      threshold: <span class="n">4000</span>                           <span class="c"># ms</span>
+    - type: cost
+      threshold: <span class="n">0.002</span>                          <span class="c"># dollars per case</span>
+tests:
+  - vars:
+      question: <span class="s">"I'm a Plus member. Can I return boots after 45 days?"</span>
+    assert:
+      - type: icontains
+        value: <span class="s">"60 days"</span>
+      - type: not-icontains
+        value: <span class="s">"30 days"</span>
+      - type: llm-rubric
+        value: Answers the question directly and does not invent policy.
+  <span class="c"># ...or load hundreds of cases:  tests: file://evals/cases.csv</span></code></pre>
+<pre><code><span class="c"># .github/workflows/evals.yml: fail the PR if the pass rate drops below 95%</span>
+on:
+  pull_request:
+    paths: [<span class="s">"prompts/**"</span>, <span class="s">"promptfooconfig.yaml"</span>]
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: <span class="s">"24"</span> }
+      - run: npx promptfoo@latest eval -c promptfooconfig.yaml -o results.json
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          PROMPTFOO_PASS_RATE_THRESHOLD: <span class="s">"95"</span>   <span class="c"># below this, exit code 100 fails the job</span></code></pre>
+    <p class="hint">A pass-rate threshold is a blunt, unpaired gate. For important suites, export per-case results, compare them with main's results for the same cases, and gate on the paired difference, as in the worked example. promptfoo also has an official GitHub Action that posts before/after comparisons on the PR.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Blocking gate</td><td>Regressions can't merge</td><td>False blocks teach people to override the gate; tune it with paired stats</td></tr>
+      <tr><td>Warning-only gate</td><td>Never slows anyone down</td><td>Warnings get ignored; regressions accumulate</td></tr>
+      <tr><td>Bigger CI suite</td><td>Detects smaller regressions</td><td>Cost and minutes per PR; use tiers and caching</td></tr>
+      <tr><td>LLM judges in CI</td><td>Grades open-ended quality</td><td>Noise and drift; pin, cache, majority-vote borderline cases</td></tr>
+      <tr><td>A/B tests</td><td>Measures real user value</td><td>Slow, needs traffic, exposes users to the worse variant</td></tr>
+      <tr><td>Buy a platform vs build</td><td>Tracing, datasets, UI on day one</td><td>Vendor lock-in, data leaving your network, cost at volume</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>promptfoo or pytest in GitHub Actions on prompt changes, with a must-pass list and a small judged suite. Langfuse or Phoenix (self-hosted or cloud) for traces, plus a thumbs button. A weekly ritual: read 50 thumbs-down traces, add the failures to the eval set.</p></div>
+      <div><h4>At scale</h4><p>Tiered suites (commit, PR, nightly), paired statistical gates, eval results stored per commit, canary rollouts, an experimentation platform for A/B tests with guardrail metrics, sampled online judges, drift dashboards, and launch reviews where behaviour regressions block like outages.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Design the evaluation system for an LLM feature from pull request to production.” A senior answer:</p>
+    <ul>
+      <li><b>Offline</b>: versioned golden set (from logs and failures), must-pass safety checks, a quality suite with calibrated judges, paired comparison against main, cost and latency budgets; blocking vs warning thresholds.</li>
+      <li><b>Release</b>: canary or A/B test with a primary metric and guardrail metrics, sized for the effect you care about.</li>
+      <li><b>Online</b>: tracing, explicit and implicit feedback, sampled judges, drift alerts; pinned model versions.</li>
+      <li><b>The loop</b>: weekly error analysis of production failures feeding new cases into the golden set; eval set coverage compared with real traffic.</li>
+      <li>Mentions a failure like the 2025 sycophancy rollback: offline evals and positive user signals both missed it.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>A launch that every signal missed</b> <span class="tag co">🏢 OpenAI · 2025</span> <a href="https://openai.com/index/expanding-on-sycophancy/" target="_blank" rel="noopener">Expanding on what we missed with sycophancy</a></div>
+      <p><b>How:</b> offline evals, A/B tests and expert spot checks were all run before a GPT-4o update; a user-feedback reward signal contributed to sycophancy, and the update was rolled back days after launch.</p>
+      <p><b>Why this method:</b> the fix was process: behaviour issues treated as launch-blocking, an opt-in alpha phase, more weight on spot checks and better offline evals for sycophancy.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Thousands of offline tests, then live canaries</b> <span class="tag co">🏢 GitHub · 2025</span> <a href="https://github.blog/ai-and-ml/generative-ai/how-we-evaluate-models-for-github-copilot/" target="_blank" rel="noopener">How we evaluate AI models and LLMs for GitHub Copilot</a></div>
+      <p><b>How:</b> more than 4,000 offline tests, mostly in CI, including ~100 containerized repos whose tests are broken for the model to fix; an LLM grader for chat answers; then internal canary testing on employees.</p>
+      <p><b>Why this method:</b> metrics trade off (acceptance rate vs latency), so a model change needs both automated suites and live usage before it ships.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Unit tests, trace review, A/B tests</b> <span class="tag co">🏢 Rechat · 2024</span> <a href="https://hamel.dev/blog/posts/evals/" target="_blank" rel="noopener">Your AI Product Needs Evals</a></div>
+      <p><b>How:</b> cheap assertions on every code change, human and model review of traces on a regular cadence, A/B tests only after significant product changes.</p>
+      <p><b>Why this method:</b> each level costs more than the last, so its cadence follows its cost.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Evals as open-source CI tooling</b> <span class="tag oss">🧰 Open source</span> <a href="https://www.promptfoo.dev/docs/integrations/github-action/" target="_blank" rel="noopener">promptfoo GitHub Action</a></div>
+      <p><b>How:</b> when files under <code>prompts/</code> change in a PR, the action runs the eval before and after and posts the comparison on the PR.</p>
+      <p><b>Why this method:</b> reviewers see quality changes next to code changes, the same way they see test results.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the eval tools got acquired</span>
+    <p>In 2026 two of the best-known open-source eval tools changed owners: Langfuse joined ClickHouse in January (it already stored its traces in ClickHouse), and OpenAI announced it was acquiring promptfoo in March, saying promptfoo was used by over 25% of Fortune 500 companies. Both projects stayed open source. Evals had become infrastructure that platforms wanted to own, which is also a hint to keep your eval data in portable formats (JSONL, CSV) rather than locked in any one tool.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This lesson operationalizes the phase: datasets and statistics (5.1), metrics (5.2), judges (5.3), RAG and agent evals (5.4, 5.5). Tracing, gateways and cost tracking are LLMOps (8.1); safety, red-team and robustness evals are 5.10, with the attacker's view in Phase R (AI red teaming); guardrails are 8.3; product metrics and feedback loops are 9.2. A/B testing maths: <a href="../../math-course/phase5/5-ab-tests.html">Math for AI 5.5</a>. For general monitoring and alerting design, see the <a href="../../system-design-course/index.html">System Design course</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Postmortem</span> <a href="https://openai.com/index/expanding-on-sycophancy/" target="_blank" rel="noopener">OpenAI: Expanding on what we missed with sycophancy</a>. What their eval process missed and what changed.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.promptfoo.dev/docs/integrations/github-action/" target="_blank" rel="noopener">promptfoo in GitHub Actions</a>. Evals on every PR.</li>
+      <li><span class="kind">Docs</span> <a href="https://langfuse.com/docs/evaluation/overview" target="_blank" rel="noopener">Langfuse evaluation</a>. Datasets, online evaluators and user feedback on traces.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A PR is evaluated on 400 cases: 10 went pass → fail and 2 went fail → pass. What's the paired difference and its approximate 95% error bar?</div>
+    <div class="opts"><button class="opt">−2.0 ± 5 points: noise</button><button class="opt" data-ok>−2.0 ± 1.7 points: a real regression</button><button class="opt">−0.5 ± 0.5 points</button></div>
+    <div class="explain">Difference = (2 − 10) ÷ 400 = −2.0 points. SE = √(12 − 64 ÷ 400) ÷ 400 = √11.84 ÷ 400 = 0.86 points; ×1.96 ≈ <b>±1.7</b>. The interval [−3.7, −0.3] excludes zero.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After a prompt change, thumbs-up rose from 58% to 63%, but escalations to human agents also rose 20%. What do you conclude?</div>
+    <div class="opts"><button class="opt">Ship it: users like it more</button><button class="opt" data-ok>Investigate before rolling out further: the answers may be more agreeable but less correct; read escalated conversations and run the offline judges on them</button><button class="opt">The escalation metric is broken</button></div>
+    <div class="explain">A guardrail metric moved the wrong way. Thumbs reward pleasant answers; escalations reveal unsolved problems. This is the sycophancy pattern: check correctness, not just satisfaction.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your naive CI gate (“block if the score drops by more than 1 point”) blocks about 30% of harmless prompt PRs, and engineers have started overriding it. Best fix?</div>
+    <div class="opts"><button class="opt">Remove the gate</button><button class="opt">Raise the tolerance to 10 points</button><button class="opt" data-ok>Compare on the same cases with a paired test, block only on significant regressions, warn on the rest, and reduce judge noise (pinned versions, majority votes, a larger suite)</button></div>
+    <div class="explain">The gate is reacting to noise. Pairing and significance cut false blocks sharply; lower judge noise and more cases improve its ability to catch real regressions. A 10-point tolerance would let real regressions through.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Offline evals gate changes in CI; online evals watch real traffic; production failures feed back into the dataset.</li>
+      <li>Gate design: must-pass suite blocks on any failure; quality suite blocks on a significant paired regression, warns otherwise; cost and latency budgets.</li>
+      <li>Paired comparisons on the same cases are far more sensitive than comparing two scores.</li>
+      <li>Online: combine explicit, implicit and outcome signals with guardrail metrics; thumbs alone can reward sycophancy.</li>
+      <li>Pin model and judge versions, watch for input, model, data and eval drift, and size A/B tests for the effect you need to see.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  // ---------- ops loop ----------
+  const F = new Flow($("opsSvg"), { width: 760, height: 210 });
+  F.node("pr", { x: 80, y: 55, w: 120, h: 46, label: "Pull request", sub: "prompt v14", kind: "cl" })
+   .node("ci", { x: 250, y: 55, w: 140, h: 46, label: "CI evals", sub: "must-pass + quality", kind: "ca" })
+   .node("ab", { x: 430, y: 55, w: 140, h: 46, label: "Canary / A-B", sub: "5% of users", kind: "nw" })
+   .node("prod", { x: 640, y: 55, w: 150, h: 46, label: "Production", sub: "traces + feedback", kind: "sv" })
+   .node("mon", { x: 560, y: 160, w: 170, h: 46, label: "Online evals & alerts", sub: "judges · drift", kind: "lt" })
+   .node("ea", { x: 330, y: 160, w: 150, h: 46, label: "Error analysis", sub: "weekly", kind: "er" })
+   .node("gs", { x: 120, y: 160, w: 150, h: 46, label: "Golden dataset", sub: "412 cases", kind: "db" })
+   .edge("pr", "ci").edge("ci", "ab", { label: "pass" }).edge("ab", "prod").edge("prod", "mon").edge("mon", "ea").edge("ea", "gs", { label: "new cases" }).edge("gs", "ci", { dashed: true })
+   .render();
+  let gs = 412, step = 0;
+  const OPS = ["A v14 prompt passes CI and the canary, and ships.", "Online judges flag answers that mention a discontinued product.", "Error analysis finds 6 such failures; they become eval cases, and the next PR's CI catches the pattern."];
+  $("opsBtn").onclick = async () => {
+    $("opsBtn").disabled = true; $("opsMsg").textContent = OPS[step % 3];
+    await F.packet(["pr", "ci", "ab", "prod", "mon", "ea", "gs", "ci"], { color: "--c-ev", dur: 1700 });
+    if (step % 3 === 2) { gs += 6; F.set("gs", { sub: gs + " cases" }); }
+    step++; $("opsBtn").disabled = false;
+  };
+
+  // ---------- CI gate simulator ----------
+  let gate = 0, seed = 11;
+  const gBtns = [$("cg0"), $("cg1")];
+  gBtns.forEach((b, i) => (b.onclick = () => { gate = i; gBtns.forEach(x => x.classList.toggle("on", x === b)); ["ciBlk", "ciWarn", "ciPass"].forEach(id => ($(id).textContent = "–")); }));
+  const params = () => {
+    const d = +$("ciD").value / 100, n = +$("ciN").value, p = +$("ciNoise").value / 100, vote = $("ciVote").checked;
+    $("ciDV").textContent = (d > 0 ? "+" : "") + (d * 100).toFixed(1) + " pts"; $("ciNV").textContent = n; $("ciNoiseV").textContent = Math.round(p * 100) + "%";
+    return { d, n, p: vote ? 3 * p * p * (1 - p) + p ** 3 : p, raw: p, vote, safe: $("ciSafe").checked };
+  };
+  function oneRun(o, rng) {
+    let b = 0, c = 0, kb = 0, kc = 0;
+    const churn = 0.03;
+    for (let i = 0; i < o.n; i++) {
+      const base = rng() < 0.88; let cand = base;
+      if (base) { if (rng() < churn) cand = false; if (o.d < 0 && rng() < -o.d / 0.88) cand = false; }
+      else { if (rng() < churn * 0.88 / 0.12) cand = true; if (o.d > 0 && rng() < o.d / 0.12) cand = true; }
+      const ob = base !== (rng() < o.p), oc = cand !== (rng() < o.p);
+      kb += ob; kc += oc; if (ob && !oc) b++; if (!ob && oc) c++;
+    }
+    const diff = (c - b) / o.n, se = Math.sqrt(Math.max(0, (b + c) - (b - c) ** 2 / o.n)) / o.n, naive = (kc - kb) / o.n;
+    let verdict;
+    if (o.safe) verdict = "block";
+    else if (gate === 0) verdict = naive < -0.01 ? "block" : "pass";
+    else verdict = diff < -0.01 && diff + 1.96 * se < 0 ? "block" : diff < -0.01 ? "warn" : "pass";
+    return { b, c, kb, kc, diff, se, naive, verdict };
+  }
+  ["ciD", "ciN", "ciNoise"].forEach(id => ($(id).oninput = () => { params(); ["ciBlk", "ciWarn", "ciPass"].forEach(k => ($(k).textContent = "–")); }));
+  ["ciVote", "ciSafe"].forEach(id => ($(id).onchange = () => params()));
+  params();
+  $("ciRun").onclick = () => {
+    const o = params(), r = oneRun(o, MX.seeded(seed++));
+    const pct = v => (100 * v).toFixed(1) + "%";
+    const lines = [
+      `<span class="m">$ eval-gate --suite support-regression --cases ${o.n} --judge pinned${o.vote ? " --votes 3" : ""}</span>`,
+      `must-pass suite (25 cases) ........ ${o.safe ? '<span class="r">1 FAILED: refuses_prompt_injection_07</span>' : '<span class="g">25/25 passed</span>'}`,
+      `baseline (main) ................... ${r.kb}/${o.n}  ${pct(r.kb / o.n)}`,
+      `this PR ........................... ${r.kc}/${o.n}  ${pct(r.kc / o.n)}   (raw change ${(100 * r.naive).toFixed(1)} pts)`,
+      `per-case: ${r.b} pass→fail, ${r.c} fail→pass, ${o.n - r.b - r.c} unchanged`,
+      `paired difference ${(100 * r.diff).toFixed(1)} ± ${(196 * r.se).toFixed(1)} pts (95%)`,
+      r.verdict === "block" ? `<span class="r">✖ BLOCKED${o.safe ? ": a must-pass case failed" : gate === 0 ? ": score dropped more than 1 pt" : ": significant regression"}</span>`
+        : r.verdict === "warn" ? `<span class="y">⚠ WARNING: drop within noise, review the ${r.b} newly failing cases</span>` : `<span class="g">✔ PASSED</span>`,
+    ];
+    $("ciLog").innerHTML = lines.join("\n");
+  };
+  $("ciMany").onclick = () => {
+    const o = params(), rng = MX.seeded(seed++ * 7), R = 400, cnt = { block: 0, warn: 0, pass: 0 };
+    for (let k = 0; k < R; k++) cnt[oneRun(o, rng).verdict]++;
+    const pc = v => Math.round(100 * v / R) + "%";
+    $("ciBlk").textContent = pc(cnt.block); $("ciWarn").textContent = pc(cnt.warn); $("ciPass").textContent = pc(cnt.pass);
+    const harmless = o.d >= 0;
+    $("ciMsg").textContent = o.safe ? "A broken must-pass case blocks every run, whatever the noise: that's what deterministic critical checks are for."
+      : harmless
+        ? `This PR doesn't hurt quality, yet the ${gate === 0 ? "naive" : "paired"} gate blocks it in ${pc(cnt.block)} of runs${gate === 1 ? ` (and asks for review in ${pc(cnt.warn)})` : ""}. ${gate === 0 && cnt.block / R > 0.1 ? "False alarms like these train people to override the gate." : "Few false alarms: the gate stays trusted."}`
+        : `This PR truly costs ${(-o.d * 100).toFixed(1)} points. The ${gate === 0 ? "naive" : "paired"} gate blocks it in ${pc(cnt.block)} of runs${gate === 1 ? ` and flags it for review in ${pc(cnt.warn)}` : ""}. ${gate === 1 && cnt.block / R < 0.5 ? "To block small regressions reliably, grow the suite or cut judge noise (try the 3× majority vote)." : ""}`;
+  };
+
+  // ---------- online dashboard ----------
+  const DAYS = 28, TRAFFIC = 2000;
+  // per scenario: offline before/after, change day, effects on [thumbs, escalation, faithfulness, length]
+  const SC = [
+    { name: "Real improvement", off: [84, 88], day: 14, eff: d => ({ th: 2.5, esc: -1.2, fa: 3, len: 0 }), ab: [61, 63.5],
+      msg: "Every signal agrees: thumbs up, escalations down, sampled faithfulness up, and the offline eval predicted it. This is what a good launch looks like." },
+    { name: "Sycophantic update", off: [86, 86.5], day: 14, eff: d => ({ th: 4.5, esc: 2.0, fa: -7, len: 15 }), ab: [61, 65.5],
+      msg: "Thumbs-up jumped and the A/B test on thumbs is a clear win, but escalations rose and sampled faithfulness fell: the bot agrees with users instead of correcting them. A guardrail metric (escalations, faithfulness) should block this launch. The offline set had no cases probing for it." },
+    { name: "New product launch", off: [86, 86], day: 18, eff: d => ({ th: -3, esc: 1.5, fa: -1, len: 0, idk: 6 }), ab: [61, 61],
+      msg: "Nothing was deployed, and the offline eval is unchanged, because it contains no questions about the new product. Input drift: the “I don't know” rate and escalations rose from day 18. Index the new docs and add the new questions to the golden set." },
+    { name: "Silent model update", off: [86, 86], day: 20, eff: d => ({ th: -1.5, esc: 0.6, fa: -3, len: 45 }), ab: [61, 61],
+      msg: "No deploy on your side, but answer length jumped 45% and faithfulness dipped on day 20: the provider changed the model behind an unpinned alias. Pin model versions, and rerun the offline suite when providers announce updates." },
+  ];
+  let sc = 0;
+  const scBtns = [$("sc0"), $("sc1"), $("sc2"), $("sc3")];
+  scBtns.forEach((b, i) => (b.onclick = () => { sc = i; scBtns.forEach(x => x.classList.toggle("on", x === b)); dRender(); $("abVerdict").textContent = ""; }));
+  const binom = (rng, n, p) => { // normal approximation is fine at these sizes
+    const z = Math.sqrt(-2 * Math.log(rng() || 1e-9)) * Math.cos(2 * Math.PI * rng());
+    return Math.max(0, Math.min(n, n * p + z * Math.sqrt(n * p * (1 - p))));
+  };
+  function dRender() {
+    const S = SC[sc], rng = MX.seeded(100 + sc), th = [], esc = [], fa = [], idk = [];
+    let lenB = 0, lenA = 0;
+    for (let d = 1; d <= DAYS; d++) {
+      const on = d >= S.day, e = on ? S.eff(d) : { th: 0, esc: 0, fa: 0, len: 0, idk: 0 };
+      const rated = TRAFFIC * 0.15;
+      th.push([d, 100 * binom(rng, rated, (61 + e.th) / 100) / rated]);
+      esc.push([d, 100 * binom(rng, TRAFFIC, (7 + e.esc) / 100) / TRAFFIC]);
+      fa.push([d, 100 * binom(rng, 60, (90 + e.fa) / 100) / 60]); // judge on a 3% sample
+      idk.push([d, 100 * binom(rng, TRAFFIC, (3 + (e.idk || 0)) / 100) / TRAFFIC]);
+      if (on) lenA += 1 + (e.len || 0) / 100; else lenB += 1;
+    }
+    Plot.line($("dChart"), {
+      series: [
+        { label: "thumbs-up % (of rated)", color: MX.css("--c-ev"), data: th, width: 2.5 },
+        { label: "sampled faithfulness %", color: MX.css("--c-cx"), data: fa, width: 2 },
+        { label: "escalation %", color: MX.css("--c-rk"), data: esc, width: 2.5 },
+        { label: "“I don't know” %", color: MX.css("--c-tk"), data: idk, width: 2, dash: [5, 4] },
+      ], xMin: 1, xMax: DAYS, yMin: 0, yMax: 100, xLabel: "day", yLabel: "%",
+    });
+    const avg = (arr, a, b) => { const s = arr.filter(([d]) => d >= a && d <= b); return s.reduce((t, [, v]) => t + v, 0) / s.length; };
+    const before = k => avg(k, 1, S.day - 1), after = k => avg(k, S.day, DAYS);
+    $("dOff").textContent = `${S.off[0]}% → ${S.off[1]}%`;
+    $("dThumb").textContent = `${before(th).toFixed(1)} → ${after(th).toFixed(1)}%`;
+    $("dEsc").textContent = `${before(esc).toFixed(1)} → ${after(esc).toFixed(1)}%`;
+    $("dFaith").textContent = `${before(fa).toFixed(0)} → ${after(fa).toFixed(0)}%`;
+    const lr = lenA / (DAYS - S.day + 1);
+    $("dLen").textContent = `${Math.round(120)} → ${Math.round(120 * lr)} words`;
+    const al = [];
+    if (after(esc) - before(esc) > 0.8) al.push(`🚨 Escalation rate up ${(after(esc) - before(esc)).toFixed(1)} pts since day ${S.day}`);
+    if (before(fa) - after(fa) > 2.5) al.push(`🚨 Sampled faithfulness down ${(before(fa) - after(fa)).toFixed(0)} pts`);
+    if (after(idk) - before(idk) > 2) al.push(`🚨 “I don't know” rate up ${(after(idk) - before(idk)).toFixed(1)} pts: possible input drift`);
+    if (lr > 1.2) al.push(`🚨 Average answer length up ${Math.round((lr - 1) * 100)}% with no deploy`);
+    if (after(th) - before(th) > 3 && al.length) al.push(`⚠ Thumbs-up is rising at the same time: don't let it outvote the guardrails`);
+    $("dAlerts").innerHTML = al.length ? al.map(a => `<div>${a}</div>`).join("") : `<div class="okk">✅ No alerts: guardrail metrics are steady or improving.</div>`;
+    $("dMsg").textContent = S.msg;
+  }
+  $("abN").oninput = () => ($("abNV").textContent = (+$("abN").value).toLocaleString());
+  $("abNV").textContent = (+$("abN").value).toLocaleString();
+  $("abRun").onclick = () => {
+    const S = SC[sc], n = +$("abN").value, rng = MX.seeded(7 + n + sc);
+    const pc = binom(rng, n, S.ab[0] / 100) / n, pt = binom(rng, n, S.ab[1] / 100) / n;
+    const se = Math.sqrt(pc * (1 - pc) / n + pt * (1 - pt) / n), z = (pt - pc) / se;
+    const p = 2 * (1 - 0.5 * (1 + erf(Math.abs(z) / Math.SQRT2)));
+    const sig = p < 0.05;
+    $("abVerdict").innerHTML = `<span class="${sig ? (pt > pc ? "ev" : "rk") : "tk"}">Control ${(100 * pc).toFixed(1)}% vs treatment ${(100 * pt).toFixed(1)}% thumbs-up: difference ${(100 * (pt - pc)).toFixed(1)} ± ${(196 * se).toFixed(1)} pts, p = ${p < 0.001 ? "< 0.001" : p.toFixed(3)}. ${sig ? (pt > pc ? "Significant lift on thumbs." : "Significant drop.") : "Not significant at this sample size."}${sc === 1 && sig ? " But check the guardrails before you celebrate." : ""}${sc >= 2 ? " (Nothing was A/B tested here: the change came from outside, so both arms see it.)" : ""}</span>`;
+  };
+  function erf(x) { // Abramowitz–Stegun 7.1.26
+    const t = 1 / (1 + 0.3275911 * x), y = 1 - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t + 0.254829592) * t * Math.exp(-x * x);
+    return y;
+  }
+  dRender();
+})();
+</script>
+</body>
+</html>

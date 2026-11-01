@@ -1,0 +1,481 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P.3 async/await · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .lgd { display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: .82rem; margin: 6px 0; }
+  .lgd i { display: inline-block; width: 12px; height: 12px; border-radius: 3px; margin-right: 5px; vertical-align: -2px; }
+  .el-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 10px; margin: 10px 0; }
+  .co { border: 2px solid var(--line); border-radius: 10px; padding: 6px 8px; background: var(--bg2); }
+  .co h5 { margin: 0 0 4px; font-size: .9rem; display: flex; justify-content: space-between; gap: 6px; }
+  .co .ln { font-family: var(--mono); font-size: .78rem; padding: 1px 4px; border-radius: 4px; white-space: pre; overflow-x: auto; }
+  .co .ln.cur { background: color-mix(in srgb, var(--c-tl) 30%, transparent); }
+  .co .ln.done { color: var(--muted); }
+  .co.running { border-color: var(--c-tl); }
+  .co.waiting { border-color: var(--c-cx); }
+  .co.blocked { border-color: var(--c-rk); }
+  .co.finished { opacity: .6; }
+  .chip { display: inline-block; font-family: var(--mono); font-size: .8rem; padding: 1px 8px; border-radius: 999px; border: 1px solid var(--line); margin: 0 3px; }
+  .elog { font-family: var(--mono); font-size: .8rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; min-height: 60px; white-space: pre-wrap; max-height: 180px; overflow-y: auto; }
+</style>
+</head>
+<body data-lesson="ap-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase P · Lesson 3</div>
+  <h1>async/await: the event loop, gather, semaphores & async streams</h1>
+  <p class="subtitle">An LLM call spends about a second waiting and a few milliseconds computing. asyncio lets one Python thread wait on hundreds of them at once, if you respect rate limits and never block the loop.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>A <b>generator</b> pauses at <code>yield</code> and resumes later with its state intact (Lesson P.2). Coroutines pause the same way, at <code>await</code>.</li>
+      <li>A typical LLM call takes around a second or more, mostly network and generation time; you can <b>stream</b> the answer token by token (Lesson 0.5).</li>
+      <li>Providers <b>rate-limit</b> you: send too much and you get HTTP <b>429</b>. The SDKs retry 429s and 5xx errors twice by default (Lessons 0.5 and P.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>OpenAI's cookbook ships a script for one of the most common jobs in AI engineering: running a huge batch of API requests. Its docstring sums up the whole problem: send a million requests one by one and the job takes days; send them all in parallel and they blow through the rate limits and fail.</p>
+    <p>Their answer is built on <code>asyncio</code>: make requests concurrently, but throttle them to stay under the limits, and retry the failures. By the end of this lesson you'll be able to write that script yourself, and explain each design choice.</p>
+  </div>
+
+  <h2>Numbers first: your program is mostly waiting</h2>
+  <table>
+    <tr><th>1,000 LLM calls, ~1.2 s each</th><th>Wall time</th><th>Why</th></tr>
+    <tr><td>One after another</td><td class="rk">1,000 × 1.2 s = 20 min</td><td>The CPU works for a few ms per call (building JSON, parsing the reply) and sits idle for the rest.</td></tr>
+    <tr><td>50 in flight at once</td><td class="ev">1,000 ÷ 50 × 1.2 s ≈ 24 s</td><td>While one call waits on the network, the others are waiting too, in parallel.</td></tr>
+    <tr><td>All 1,000 at once</td><td class="rk">fast to send, then a wall of 429s</td><td>Over the provider's limit: most requests are rejected, retried, rejected again.</td></tr>
+    <tr><td>Rate limit of 500 requests per minute</td><td class="tk">≥ 1,000 ÷ 500 = 2 min</td><td>No amount of concurrency beats the limit. The goal is to sit just under it.</td></tr>
+  </table>
+  <p>Plain sentence: <b>LLM calls are I/O-bound</b>: their time is spent waiting on input/output (the network), not computing. The fix for waiting isn't more CPUs; it's not waiting <i>idly</i>. That's concurrency, and in Python the lightest way to get it is <code>asyncio</code>.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A <b>coroutine</b> (<code>async def</code>) is a function that can pause at every <code>await</code>. An <b>event loop</b> runs many of them on <b>one thread</b>: it runs one until it awaits something slow (a network reply, a timer), parks it, runs another, and resumes the first when its reply arrives. Nothing runs in parallel, yet hundreds of calls overlap their waiting. Two rules follow. Bound how many run at once (a <b>semaphore</b>) to respect rate limits, and <b>never block the loop</b>: one synchronous call inside a coroutine freezes every other coroutine.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: one waiter, many tables</span>
+    <p>A good waiter takes table 1's order, hands it to the kitchen, and goes to table 2 instead of standing at the kitchen window. When a dish is ready, the kitchen rings a bell and the waiter brings it over. One waiter, twenty tables, no one waiting on the waiter. Now imagine the waiter stops to read a newspaper for five minutes (a blocking call): every table stalls, though the kitchen keeps cooking. And if the waiter sends 200 orders at once, the kitchen sends half of them back (429). Await is “go serve someone else”; a semaphore is “at most ten open orders”.</p>
+  </div>
+
+  <h2>The vocabulary, in order</h2>
+  <table>
+    <tr><th>Term</th><th>What it is</th><th>Code</th></tr>
+    <tr><td><b>Coroutine function</b></td><td>A function defined with <code>async def</code>. Calling it <b>runs nothing</b>; it returns a coroutine object.</td><td><code>async def ask(q): ...</code></td></tr>
+    <tr><td><b>await</b></td><td>“Run this awaitable; pause me until it's done, and let the loop run others meanwhile.” Only allowed inside <code>async def</code>.</td><td><code>reply = await client.messages.create(...)</code></td></tr>
+    <tr><td><b>Event loop</b></td><td>The scheduler that runs coroutines and watches sockets and timers. One per thread.</td><td><code>asyncio.run(main())</code> starts one</td></tr>
+    <tr><td><b>Task</b></td><td>A coroutine scheduled on the loop to run concurrently.</td><td><code>t = asyncio.create_task(ask(q))</code></td></tr>
+    <tr><td><b>gather</b></td><td>Run several awaitables concurrently; get results in <b>input order</b>.</td><td><code>await asyncio.gather(*coros)</code></td></tr>
+    <tr><td><b>TaskGroup</b> (3.11+)</td><td>Structured concurrency: if one task fails, the others are cancelled and the errors are raised together as an <code>ExceptionGroup</code>.</td><td><code>async with asyncio.TaskGroup() as tg:</code></td></tr>
+  </table>
+  <p>Two gotchas. Forget an <code>await</code> and nothing happens except a <code>RuntimeWarning: coroutine ... was never awaited</code>. And the docs warn that the loop keeps only <b>weak references</b> to tasks: a fire-and-forget <code>create_task(...)</code> whose result you don't store can be garbage-collected mid-flight. Keep a reference (or use a TaskGroup).</p>
+
+  <div class="playground" id="pg-loop">
+    <span class="label">🎮 Playground · Step through the event loop</span>
+    <p class="hint"><code>asyncio.gather(log_usage(), fetch_docs(), ask_llm())</code>. Each click is one turn of the loop: it runs one ready coroutine until its next <code>await</code>, or, if nothing is ready, waits for the next timer or reply. One tick ≈ 1 second. Then switch <code>log_usage</code> to the blocking <code>time.sleep</code> and step again. (A step-by-step model of asyncio's scheduling, simplified.)</p>
+    <div class="controls">
+      log_usage sleeps with <span class="seg" id="elMode"><button data-v="await" class="on">await asyncio.sleep(3)</button><button data-v="block">time.sleep(3)  # blocking!</button></span>
+    </div>
+    <div class="controls"><button class="btn primary" id="el-step">Step ▶</button><button class="btn" id="el-run">Run to the end</button><button class="btn" id="el-reset">Reset</button></div>
+    <div class="stat-row">
+      <div class="stat">clock <b id="elClock">t = 0</b></div>
+      <div class="stat">ready queue <b id="elReady"></b></div>
+      <div class="stat">waiting <b id="elWait"></b></div>
+    </div>
+    <div class="el-grid" id="elCos"></div>
+    <div class="elog" id="elLog"></div>
+    <div class="verdict" id="elMsg"></div>
+  </div>
+  <p>What you should see: with <code>await asyncio.sleep</code>, all three coroutines start at t = 0 and their waits overlap; everything is done at t = 3. With <code>time.sleep</code>, <code>log_usage</code> never gives control back: the clock runs to 3 with nobody else allowed to start, and the LLM reply lands at t = 6. A blocking call doesn't just slow its own coroutine; it stalls all of them.</p>
+
+  <h2>Concurrency limits: semaphores and rate limits</h2>
+  <p>Provider limits are usually measured per minute: Anthropic's docs list requests per minute (RPM), input tokens per minute and output tokens per minute, enforced with a <b>token bucket</b> (capacity refills continuously rather than resetting each minute, so bursts can trip the limit). <code>asyncio.Semaphore(n)</code> doesn't measure rates; it caps how many requests are <b>in flight</b>. The bridge between the two is a one-line formula.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how many in flight? (Little's law)</span>
+    <p>In-flight requests = arrival rate × time each one takes. Your limit is 500 requests per minute and a call takes about 1.2 s.</p>
+    <ul>
+      <li>500 per minute = 500 ÷ 60 ≈ <b>8.3 requests per second</b>.</li>
+      <li>8.3 per second × 1.2 s ≈ <b>10 requests in flight</b>. That's your semaphore size.</li>
+      <li>With <code>Semaphore(50)</code> you'd send ~42 per second for a few seconds, burst past the bucket, and get 429s. With <code>Semaphore(2)</code> you'd only reach ~100 per minute: safe but 5× slower than allowed.</li>
+      <li>Tokens per minute can bind first: 10 calls in flight × 3,000 input tokens each, completing every 1.2 s, is 1.5 million input tokens per minute. Check every limit, not just RPM.</li>
+    </ul>
+  </div>
+
+  <div class="playground" id="pg-timeline">
+    <span class="label">🎮 Playground · 50 LLM calls on a timeline</span>
+    <p class="hint">A <b>simulated</b> provider: calls take 0.8–1.6 s, the rate limit is a token bucket of 20 requests refilling at 10 per second (600 per minute), and the client retries a 429 twice with backoff, like the SDKs do by default. Each row is one call. Try every mode, then add the hidden blocking call.</p>
+    <div class="controls">
+      <span class="seg" id="tlMode"><button data-v="seq">for loop: await one by one</button><button data-v="gather">gather(*all 50)</button><button data-v="sem" class="on">gather + Semaphore(n)</button></span>
+      <label>n <input type="range" id="tlN" min="1" max="50" step="1" value="10"> <b class="mono" id="tlNv"></b></label>
+    </div>
+    <div class="controls">
+      hidden blocking call <span class="seg" id="tlBlock"><button data-v="none" class="on">none</button><button data-v="one">time.sleep(2) in a logging helper (call #10)</button><button data-v="sync">sync SDK client inside async def</button></span>
+      <button class="btn primary" id="tl-run">▶ Run</button>
+    </div>
+    <canvas id="tlCanvas" style="width:100%;height:300px;display:block"></canvas>
+    <div class="lgd"><span><i style="background:var(--c-md)"></i>request in flight</span><span><i style="background:var(--c-rk)"></i>429 response</span><span><i style="background:var(--c-tk)"></i>backoff before retry</span><span><i style="background:color-mix(in srgb, var(--c-rk) 25%, transparent)"></i>event loop blocked</span></div>
+    <div class="verdict" id="tlMsg"></div>
+    <div class="stat-row">
+      <div class="stat">total time <b id="tlTotal">–</b></div>
+      <div class="stat">max in flight <b id="tlMax">–</b></div>
+      <div class="stat">429 responses <b id="tlRl">–</b></div>
+      <div class="stat">calls failed <b id="tlFail">–</b></div>
+    </div>
+  </div>
+  <p>What you should see: the <code>for</code> loop takes about a minute. Unbounded <code>gather</code> sends all 50 in the first instant, empties the bucket, and gets a wave of 429s; some calls fail even after retries. A semaphore of about 10 finishes in a few seconds with no 429s at all. The blocking modes show the trap: one <code>time.sleep</code> freezes every call's progress for 2 s, and a sync client turns your “concurrent” code back into the for loop.</p>
+
+  <h2>Timeouts, cancellation and errors</h2>
+  <ul>
+    <li><b>Always set a deadline.</b> <code>async with asyncio.timeout(30):</code> (3.11+; <code>asyncio.wait_for</code> before that) cancels the work inside and raises <code>TimeoutError</code>. The SDKs also take a <code>timeout</code>: the Anthropic SDK's default is 10 minutes, far longer than most user-facing requests should wait.</li>
+    <li><b>Cancellation is an exception.</b> A cancelled task gets <code>asyncio.CancelledError</code> raised at its current <code>await</code>. It subclasses <code>BaseException</code>, so <code>except Exception</code> won't swallow it, and you shouldn't: the docs warn that <code>TaskGroup</code> and <code>timeout()</code> rely on it. Put cleanup in <code>finally</code>.</li>
+    <li><b>gather vs TaskGroup on failure.</b> By default the first exception in <code>gather</code> propagates, but the other awaitables <b>keep running</b>. <code>return_exceptions=True</code> returns errors in the results list instead, which is ideal for batch jobs (“which of the 1,000 failed?”). <code>TaskGroup</code> cancels the siblings when one fails, which is ideal when the results are only useful together (all three retrievers for one RAG answer).</li>
+  </ul>
+
+  <h2>Async generators: streams that don't block</h2>
+  <p>An <code>async def</code> containing <code>yield</code> is an <b>async generator</b>; you consume it with <code>async for</code>. It's the async version of Lesson P.2's token streams, and what the async SDK clients return when you stream. Because each <code>__anext__</code> is awaited, ten users' streams can be relayed concurrently on one thread. <code>async with</code> is the async context manager (closing connections, releasing semaphores) and async comprehensions work too: <code>[t async for t in stream]</code>.</p>
+
+  <h2>The blocking-call pitfall</h2>
+  <p>The event loop can only switch at <code>await</code>. Anything slow that doesn't await holds it. The docs' advice: run blocking work in a thread with <code>asyncio.to_thread()</code> (3.9+), and use debug mode (<code>asyncio.run(main(), debug=True)</code> or <code>PYTHONASYNCIODEBUG=1</code>), which logs any callback that takes longer than 100 ms.</p>
+  <table>
+    <tr><th>Blocks the loop ❌</th><th>Use instead ✅</th></tr>
+    <tr><td><code>time.sleep(1)</code></td><td><code>await asyncio.sleep(1)</code></td></tr>
+    <tr><td>The sync SDK client: <code>Anthropic()</code>, <code>OpenAI()</code></td><td><code>AsyncAnthropic()</code>, <code>AsyncOpenAI()</code>, with <code>await</code></td></tr>
+    <tr><td><code>requests.get(url)</code></td><td>An async HTTP client: <code>httpx.AsyncClient</code>, or <code>httpx2.AsyncClient</code> (the Pydantic-maintained successor both official SDKs are built on as of 2026), or <code>aiohttp</code></td></tr>
+    <tr><td>Big CPU work: parsing a 300-page PDF, tokenizing a corpus</td><td><code>await asyncio.to_thread(parse, pdf)</code> for libraries that release the GIL, or a process pool for pure-Python CPU work (Lesson P.4)</td></tr>
+    <tr><td>A sync database driver</td><td>Its async driver (asyncpg, async SQLAlchemy), or <code>to_thread</code></td></tr>
+  </table>
+  <p><b>Reuse one HTTP client.</b> A client holds a connection pool (httpx2's defaults: up to 100 connections, 20 kept alive), so creating a new client per request throws away connection reuse. The same goes for SDK clients: create one <code>AsyncAnthropic()</code> at startup and share it.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Standard library:</b> <code>asyncio</code> (<code>run</code>, <code>gather</code>, <code>TaskGroup</code>, <code>Semaphore</code>, <code>timeout</code>, <code>to_thread</code>, <code>Queue</code>). <b>Clients:</b> <code>AsyncAnthropic</code>, <code>AsyncOpenAI</code> (both can also use aiohttp as their transport), httpx / httpx2, aiohttp. <b>Servers:</b> FastAPI runs <code>async def</code> endpoints on the loop and plain <code>def</code> endpoints in a threadpool (Lesson P.6). Runnable on Python 3.11+ (checked on 3.13), with a fake LLM standing in for the network:</p>
+<pre><code><span class="k">import</span> asyncio, random, time
+
+<span class="k">async def</span> fake_llm(prompt: str) -&gt; str:          <span class="c"># stand-in for: await client.messages.create(...)</span>
+    <span class="k">await</span> asyncio.sleep(random.uniform(<span class="n">0.8</span>, <span class="n">1.2</span>))  <span class="c"># waiting on the network; the loop runs others</span>
+    <span class="k">return</span> <span class="s">f"summary of {prompt}"</span>
+
+<span class="k">async def</span> summarize_all(docs: list[str], max_in_flight: int = <span class="n">10</span>) -&gt; list[str]:
+    sem = asyncio.Semaphore(max_in_flight)       <span class="c"># at most 10 requests at once</span>
+    <span class="k">async def</span> one(doc: str) -&gt; str:
+        <span class="k">async with</span> sem:
+            <span class="k">async with</span> asyncio.timeout(<span class="n">30</span>):      <span class="c"># Python 3.11+: cancel if a call hangs</span>
+                <span class="k">return await</span> fake_llm(doc)
+    <span class="k">return await</span> asyncio.gather(*(one(d) <span class="k">for</span> d <span class="k">in</span> docs))   <span class="c"># results in input order</span>
+
+<span class="k">async def</span> stream_tokens(text: str):              <span class="c"># an async generator: async def + yield</span>
+    <span class="k">for</span> word <span class="k">in</span> text.split():
+        <span class="k">await</span> asyncio.sleep(<span class="n">0.01</span>)                <span class="c"># a token arriving from the network</span>
+        <span class="k">yield</span> word + <span class="s">" "</span>
+
+<span class="k">async def</span> main():
+    t = time.perf_counter()
+    out = <span class="k">await</span> summarize_all([<span class="s">f"doc{i}"</span> <span class="k">for</span> i <span class="k">in</span> range(<span class="n">50</span>)])
+    print(len(out), <span class="s">f"{time.perf_counter() - t:.1f}s"</span>)     <span class="c"># 50 calls in ~5 s, not ~50 s</span>
+
+    <span class="k">async with</span> asyncio.TaskGroup() <span class="k">as</span> tg:        <span class="c"># Python 3.11+: if one fails, the rest are cancelled</span>
+        a = tg.create_task(fake_llm(<span class="s">"question A"</span>))
+        b = tg.create_task(fake_llm(<span class="s">"question B"</span>))
+    print(a.result(), <span class="s">"|"</span>, b.result())
+
+    <span class="k">async for</span> tok <span class="k">in</span> stream_tokens(<span class="s">"tokens arrive one at a time"</span>):
+        print(tok, end=<span class="s">""</span>, flush=<span class="k">True</span>)
+    print()
+
+    <span class="c"># a blocking call moved off the loop: both sleeps overlap, ~1.0 s total</span>
+    <span class="k">await</span> asyncio.gather(asyncio.to_thread(time.sleep, <span class="n">1</span>), asyncio.sleep(<span class="n">1</span>))
+
+asyncio.run(main())</code></pre>
+    <p>The same shape with the real async client (from the Anthropic SDK docs; needs an API key, and <code>MODEL</code> is whichever model you use):</p>
+<pre><code><span class="k">from</span> anthropic <span class="k">import</span> AsyncAnthropic
+client = AsyncAnthropic(max_retries=<span class="n">2</span>, timeout=<span class="n">30.0</span>)       <span class="c"># one client, shared; 2 retries is the default</span>
+
+<span class="k">async def</span> ask(q: str) -&gt; str:
+    msg = <span class="k">await</span> client.messages.create(model=MODEL, max_tokens=<span class="n">512</span>,
+                                       messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: q}])
+    <span class="k">return</span> msg.content[<span class="n">0</span>].text
+
+<span class="k">async def</span> stream(q: str):
+    <span class="k">async with</span> client.messages.stream(model=MODEL, max_tokens=<span class="n">1024</span>,
+                                     messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: q}]) <span class="k">as</span> s:
+        <span class="k">async for</span> text <span class="k">in</span> s.text_stream:
+            print(text, end=<span class="s">""</span>, flush=<span class="k">True</span>)</code></pre>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>asyncio</td><td>Thousands of concurrent waits on one thread; cheap tasks; explicit switch points</td><td>“Function colouring”: async spreads up the call stack; one blocking call stalls everything; every library must be async-aware</td></tr>
+      <tr><td>Threads for I/O (P.4)</td><td>Works with sync libraries unchanged</td><td>Heavier per task; switches can happen anywhere, so shared state needs locks</td></tr>
+      <tr><td>Big semaphore</td><td>Higher throughput up to the limit</td><td>429 storms past it; more memory and open sockets</td></tr>
+      <tr><td><code>gather(return_exceptions=True)</code></td><td>Batch jobs survive individual failures</td><td>You must check every result for exceptions</td></tr>
+      <tr><td><code>TaskGroup</code></td><td>No orphaned tasks; errors never silently lost</td><td>One failure cancels the whole group (sometimes not what you want)</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>FastAPI with <code>async def</code> endpoints, one shared <code>AsyncAnthropic</code>/<code>AsyncOpenAI</code> client, a module-level semaphore per provider sized with Little's law, timeouts on every call, the SDK's retries, and <code>asyncio.gather</code> for parallel retrieval + generation steps. Turn on asyncio debug mode in development to catch blocking calls.</p></div>
+      <div><h4>At scale</h4><p>Rate limiting moves out of the process: a shared limiter (often Redis-backed) or an LLM gateway that knows the org-wide RPM and token budgets (Lesson 8.1); priority queues so interactive traffic beats batch jobs; offline work goes to provider batch APIs; and loop-lag metrics (how late callbacks run) are on the dashboard next to p95 latency.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <ul>
+      <li>“You need to summarize 10,000 documents with an LLM. Write it.” Async client, <code>Semaphore</code> sized from the rate limit (Little's law), timeout per call, retries with backoff on 429/5xx, <code>gather(return_exceptions=True)</code> or a worker pool over an <code>asyncio.Queue</code>, results written incrementally.</li>
+      <li>“Is asyncio parallel?” No: one thread, cooperative switching at <code>await</code>. It overlaps waiting, not computation; for CPU work use processes (P.4).</li>
+      <li>“Our async API got slow under load and CPU is at 5%. Why?” Something blocks the loop: a sync client, <code>requests</code>, <code>time.sleep</code>, or heavy parsing. Find it with debug mode or loop-lag metrics; fix with async libraries or <code>to_thread</code>.</li>
+      <li>“gather or TaskGroup?” TaskGroup when results are all-or-nothing and you want siblings cancelled; gather with <code>return_exceptions=True</code> for best-effort batches.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Parallel requests under rate limits</b> <span class="tag co">🏢 OpenAI</span> <a href="https://github.com/openai/openai-cookbook/blob/main/examples/api_request_parallel_processor.py" target="_blank" rel="noopener">api_request_parallel_processor.py</a></div>
+      <p><b>How:</b> streams requests from a file, makes them concurrently with asyncio and aiohttp, throttles both requests and tokens per minute, and retries failures.</p>
+      <p><b>Why this method:</b> sequential takes days; unthrottled parallel fails. Concurrency capped just under the limits gets the maximum safe throughput.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Token-bucket rate limits</b> <span class="tag co">🏢 Anthropic · 2026</span> <a href="https://platform.claude.com/docs/en/api/rate-limits" target="_blank" rel="noopener">Rate limits</a></div>
+      <p><b>How:</b> limits are measured in requests, input tokens and output tokens per minute, enforced with a token bucket; going over returns a 429 that says which limit was hit, often with a <code>retry-after</code> header saying how many seconds to wait.</p>
+      <p><b>Why this method:</b> continuous refill smooths load, but means short bursts can trip the limit: exactly why client-side concurrency caps matter.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>async def vs def in a web framework</b> <span class="tag oss">🧰 Open source</span> <a href="https://fastapi.tiangolo.com/async/" target="_blank" rel="noopener">FastAPI: Concurrency and async/await</a></div>
+      <p><b>How:</b> <code>async def</code> endpoints run on the event loop; plain <code>def</code> endpoints run in an external threadpool so they don't block the server.</p>
+      <p><b>Why this method:</b> lets you mix async LLM clients with sync libraries safely, as long as you never call blocking code from inside an <code>async def</code>.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Catching blocking calls</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.python.org/3/library/asyncio-dev.html" target="_blank" rel="noopener">Developing with asyncio</a></div>
+      <p><b>How:</b> debug mode logs callbacks slower than 100 ms (tunable via <code>loop.slow_callback_duration</code>), un-awaited coroutines and calls from the wrong thread.</p>
+      <p><b>Why this method:</b> a blocking call is silent in production; debug mode turns it into a log line with a traceback.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the tulip and the keywords</span>
+    <p>asyncio started as Guido van Rossum's PEP 3156 in December 2012; its discussion list was <code>python-tulip</code>, after the project's code name, Tulip. The <code>async</code> and <code>await</code> keywords came later, in Python 3.5, from Yury Selivanov's PEP 492. Before that, coroutines were written as generators with <code>yield from</code>, which is why Lesson P.2's pausing functions feel so familiar here.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>P.2's generators become async generators here; P.4 covers threads and processes for the work asyncio can't do (CPU-bound) and the GIL behind <code>to_thread</code>; P.6 builds FastAPI streaming endpoints on this. Elsewhere: parallel and fan-out workflows (6.3), batch embedding at scale (4.8), and cutting latency with concurrency and caching (8.2). The algorithms behind token buckets are in the System Design course: <a href="../../system-design-course/phase1/5-rate-limiting.html">rate limiting</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/library/asyncio-task.html" target="_blank" rel="noopener">Coroutines and tasks</a>. TaskGroup, gather, timeouts, cancellation and to_thread, with examples.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/library/asyncio-dev.html" target="_blank" rel="noopener">Developing with asyncio</a>. Debug mode and the common mistakes.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/openai/openai-cookbook/blob/main/examples/api_request_parallel_processor.py" target="_blank" rel="noopener">OpenAI cookbook: parallel processor</a>. A complete, real throttled batch runner to read end to end.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Your limit is 600 requests per minute and calls take about 2 s. Roughly what semaphore size keeps you near the limit without going over?</div>
+    <div class="opts"><button class="opt">5</button><button class="opt" data-ok>20</button><button class="opt">600</button></div>
+    <div class="explain">Little's law: 600 per minute = 10 per second; 10 per second × 2 s = <b>20</b> in flight. 5 would cap you at 150 per minute; 600 would burst straight into 429s. Leave a little headroom, and check token-per-minute limits too.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A FastAPI <code>async def /chat</code> endpoint calls <code>OpenAI().chat.completions.create(...)</code> (the sync client). Under 20 concurrent users, latency grows linearly and CPU sits at 3%. What's happening?</div>
+    <div class="opts"><button class="opt">The model is overloaded</button><button class="opt" data-ok>The sync call blocks the event loop, so requests are served one at a time; use <code>AsyncOpenAI</code> with <code>await</code> (or make the endpoint a plain <code>def</code> so it runs in the threadpool)</button><button class="opt">FastAPI needs more worker processes for I/O</button></div>
+    <div class="explain">Inside <code>async def</code>, a blocking call holds the only thread the loop has. Nothing else, not even other users' requests, can run until it returns. Low CPU plus linear latency growth is the classic signature.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A RAG answer needs three parallel calls (vector search, keyword search, a reranker warm-up). If any fails, the answer is useless and the others should stop. Which tool fits best?</div>
+    <div class="opts"><button class="opt" data-ok><code>asyncio.TaskGroup</code></button><button class="opt"><code>asyncio.gather(..., return_exceptions=True)</code></button><button class="opt">A <code>for</code> loop with <code>await</code></button></div>
+    <div class="explain">TaskGroup cancels the remaining tasks as soon as one fails and raises the errors together, so no orphaned work keeps burning tokens. <code>return_exceptions=True</code> suits best-effort batches; the for loop gives up the concurrency entirely.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>LLM calls are I/O-bound: asyncio overlaps their waiting on one thread. <code>async def</code> + <code>await</code> + <code>asyncio.run</code>.</li>
+      <li><code>gather</code> for batches (results in order, <code>return_exceptions=True</code>), <code>TaskGroup</code> (3.11+) for all-or-nothing work.</li>
+      <li>Cap concurrency with a <code>Semaphore</code> sized by Little's law (rate × latency); set timeouts; never swallow <code>CancelledError</code>.</li>
+      <li>Never block the loop: async clients, <code>asyncio.sleep</code>, <code>to_thread</code> for blocking work, debug mode to find offenders.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const segInit = (gid, cb) => {
+    const bs = [...$(gid).querySelectorAll("button")];
+    bs.forEach(b => { b.id = gid + "-" + b.dataset.v; b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }; });
+  };
+
+  /* ---------- Playground 1: event loop stepper ---------- */
+  const COS = {
+    log_usage: { lines: ["async def log_usage():", "    print('C: start')", "    await asyncio.sleep(3)", "    print('C: logged')"], wait: 3 },
+    fetch_docs: { lines: ["async def fetch_docs():", "    print('A: start')", "    docs = await db.query(q)   # 2 s", "    print('A: got docs')"], wait: 2 },
+    ask_llm: { lines: ["async def ask_llm():", "    print('B: start')", "    reply = await client.messages.create(...)   # 3 s", "    print('B: got reply')"], wait: 3 },
+  };
+  const ORDER = ["log_usage", "fetch_docs", "ask_llm"];
+  let elMode = "await", S;
+  segInit("elMode", v => { elMode = v; elReset(); });
+  function elReset() {
+    S = { t: 0, ready: [...ORDER], waiting: {}, st: {}, pc: {}, log: [], done: 0, blockedNow: null };
+    ORDER.forEach(n => { S.st[n] = "ready"; S.pc[n] = 1; });
+    COS.log_usage.lines[2] = elMode === "block" ? "    time.sleep(3)   # blocks the loop!" : "    await asyncio.sleep(3)";
+    S.log.push("t=0  gather() schedules 3 tasks: ready = [log_usage, fetch_docs, ask_llm]");
+    $("elMsg").innerHTML = "";
+    elRender();
+  }
+  function elStep() {
+    if (S.done === 3) return false;
+    S.blockedNow = null;
+    if (S.ready.length) {
+      const n = S.ready.shift();
+      S.st[n] = "running";
+      if (S.pc[n] === 1) {
+        const out = n === "log_usage" ? "C" : n === "fetch_docs" ? "A" : "B";
+        S.log.push(`t=${S.t}  run ${n}: prints '${out}: start'`);
+        if (n === "log_usage" && elMode === "block") {
+          // time.sleep: runs to completion without yielding; the clock advances while nobody else can run
+          S.t += 3; S.blockedNow = n;
+          S.log.push(`t=${S.t}  ${n} was stuck in time.sleep(3) the whole time: the loop could run nothing else`);
+          // replies that arrived during the block are only noticed now
+          S.log.push(`t=${S.t}  ${n} prints 'C: logged' and finishes`);
+          S.pc[n] = 4; S.st[n] = "finished"; S.done++;
+          return true;
+        }
+        S.pc[n] = 2;
+        S.waiting[n] = S.t + COS[n].wait; S.st[n] = "waiting";
+        S.log.push(`        ${n} hits await → parked until t=${S.waiting[n]}`);
+      } else {
+        S.pc[n] = 3;
+        const msg = COS[n].lines[3].trim().replace("print(", "prints ").replace(")", "");
+        S.log.push(`t=${S.t}  resume ${n}: ${msg} and finishes`);
+        S.pc[n] = 4; S.st[n] = "finished"; S.done++;
+      }
+      return true;
+    }
+    // nothing ready: sleep until the next timer / reply
+    const next = Math.min(...Object.values(S.waiting));
+    S.t = Math.max(S.t, next);
+    Object.entries(S.waiting).forEach(([n, w]) => { if (w <= S.t) { delete S.waiting[n]; S.ready.push(n); S.st[n] = "ready"; S.pc[n] = 3; } });
+    S.log.push(`t=${S.t}  loop idle → wakes up: ready = [${S.ready.join(", ")}]`);
+    return true;
+  }
+  function elRender() {
+    $("elClock").textContent = `t = ${S.t}`;
+    $("elReady").innerHTML = S.ready.length ? S.ready.map(n => `<span class="chip">${n}</span>`).join("") : "—";
+    const w = Object.entries(S.waiting);
+    $("elWait").innerHTML = w.length ? w.map(([n, t]) => `<span class="chip">${n} → t=${t}</span>`).join("") : "—";
+    $("elCos").innerHTML = ORDER.map(n => {
+      const c = COS[n], st = S.blockedNow === n ? "blocked" : S.st[n];
+      return `<div class="co ${st}"><h5><span>${n}</span><span class="muted">${st}</span></h5>` +
+        c.lines.map((l, i) => `<div class="ln${i === S.pc[n] - (st === "finished" ? 99 : 0) ? " cur" : i < S.pc[n] ? " done" : ""}">${l.replace(/</g, "&lt;")}</div>`).join("") + "</div>";
+    }).join("");
+    $("elLog").textContent = S.log.join("\n");
+    $("elLog").scrollTop = 1e6;
+    if (S.done === 3) {
+      $("elMsg").innerHTML = S.t <= 3
+        ? `<span class="ev">All done at t = ${S.t}: the three waits overlapped on one thread.</span>`
+        : `<span class="rk">All done at t = ${S.t}, not 3: the blocking sleep stopped fetch_docs and ask_llm from even starting their requests.</span>`;
+    }
+  }
+  $("el-step").onclick = () => { elStep(); elRender(); };
+  $("el-run").onclick = () => { let g = 0; while (elStep() && g++ < 50); elRender(); };
+  $("el-reset").onclick = elReset;
+  elReset();
+
+  /* ---------- Playground 2: timeline of 50 calls (discrete-event simulation) ---------- */
+  let tlMode = "sem", tlBlock = "none";
+  segInit("tlMode", v => { tlMode = v; tlRun(); });
+  segInit("tlBlock", v => { tlBlock = v; tlRun(); });
+  $("tlN").oninput = () => { $("tlNv").textContent = $("tlN").value; tlMode === "sem" && tlRun(); };
+  $("tlNv").textContent = $("tlN").value;
+  const N = 50, CAP = 20, REFILL = 10, LOOP = 0.002, MAXTRY = 3, R429 = 0.15;
+  function simulate(mode, block, n) {
+    const rng = MX.seeded(11), lat = Array.from({ length: N }, () => 0.8 + 0.8 * rng());
+    const limit = mode === "seq" ? 1 : mode === "gather" ? N : n;
+    let tokens = CAP, tb = 0, loopFree = 0, inflight = 0, maxIn = 0, rl = 0, failed = 0, finished = 0, nextTask = 0, endT = 0;
+    const segs = [], blocks = [], ev = [];
+    const push = (t, type, i, a) => { ev.push({ t, type, i, a }); };
+    const take = t => { tokens = Math.min(CAP, tokens + (t - tb) * REFILL); tb = t; if (tokens >= 1) { tokens -= 1; return true; } return false; };
+    const startNext = t => { while (inflight < limit && nextTask < N) { inflight++; maxIn = Math.max(maxIn, inflight); push(t, "send", nextTask++, 1); } };
+    startNext(0);
+    let guard = 0;
+    while (ev.length && guard++ < 5000) {
+      ev.sort((x, y) => x.t - y.t || x.i - y.i);
+      const e = ev.shift();
+      const te = Math.max(e.t, loopFree);
+      loopFree = te + LOOP;
+      if (e.type === "send") {
+        const ok = take(te);
+        const d = ok ? lat[e.i] : R429;
+        segs.push({ i: e.i, a: te, b: te + d, k: ok ? "fly" : "429" });
+        if (block === "sync") { loopFree = te + d; blocks.push([te, te + d]); }
+        push(te + d, ok ? "done" : "rl", e.i, e.a);
+      } else if (e.type === "rl") {
+        rl++;
+        if (e.a < MAXTRY) {
+          const wait = 0.5 * 2 ** (e.a - 1) * (0.75 + 0.5 * rng());
+          segs.push({ i: e.i, a: te, b: te + wait, k: "wait" });
+          push(te + wait, "send", e.i, e.a + 1);
+        } else { failed++; finished++; inflight--; endT = Math.max(endT, te); startNext(loopFree); }
+      } else if (e.type === "done") {
+        finished++; inflight--; endT = Math.max(endT, te);
+        if (block === "one" && e.i === 9) { blocks.push([te, te + 2]); loopFree = te + 2; }
+        startNext(loopFree);
+      }
+    }
+    return { segs, blocks, total: Math.max(endT, loopFree - LOOP), maxIn: block === "sync" ? 1 : maxIn, rl, failed };
+  }
+  function draw(r) {
+    const cv = $("tlCanvas"), dpr = window.devicePixelRatio || 1, W = cv.clientWidth || 700, H = cv.clientHeight || 300;
+    cv.width = W * dpr; cv.height = H * dpr;
+    const g = cv.getContext("2d"); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    const L = 34, B = 22, T = 6, rowH = (H - B - T) / N, tMax = Math.max(r.total, 1) * 1.02;
+    const X = t => L + (W - L - 8) * t / tMax;
+    g.fillStyle = MX.css("--muted"); g.font = "11px " + MX.css("--font");
+    r.blocks.forEach(([a, b]) => { g.fillStyle = "rgba(225,80,80,0.18)"; g.fillRect(X(a), T, Math.max(1, X(b) - X(a)), N * rowH); });
+    const col = { fly: MX.css("--c-md"), "429": MX.css("--c-rk"), wait: MX.css("--c-tk") };
+    r.segs.forEach(s => { g.fillStyle = col[s.k]; g.fillRect(X(s.a), T + s.i * rowH + 0.5, Math.max(1.5, X(s.b) - X(s.a)), Math.max(1, rowH - 1)); });
+    g.strokeStyle = MX.css("--line"); g.beginPath(); g.moveTo(L, T + N * rowH + 2); g.lineTo(W - 8, T + N * rowH + 2); g.stroke();
+    g.fillStyle = MX.css("--muted"); g.textAlign = "center";
+    const step = tMax > 40 ? 10 : tMax > 15 ? 5 : tMax > 6 ? 2 : 1;
+    for (let t = 0; t <= tMax; t += step) g.fillText(t + " s", X(t), H - 6);
+    g.textAlign = "right"; g.fillText("#1", L - 4, T + rowH + 2); g.fillText("#50", L - 4, T + N * rowH);
+  }
+  function tlRun() {
+    const n = +$("tlN").value, r = simulate(tlMode, tlBlock, n);
+    draw(r);
+    $("tlTotal").textContent = r.total.toFixed(1) + " s";
+    $("tlMax").textContent = r.maxIn;
+    $("tlRl").textContent = r.rl;
+    $("tlFail").textContent = r.failed;
+    let m;
+    if (tlBlock === "sync") m = `<span class="rk">The sync client blocks the loop for each whole request, so gather + semaphore runs one call at a time: ${r.total.toFixed(0)} s, same as a for loop.</span>`;
+    else if (tlBlock === "one") m = `<span class="rk">One time.sleep(2) froze every in-flight call's progress (red band): replies arrived but nobody could handle them. Use await asyncio.sleep, or asyncio.to_thread for blocking helpers.</span>`;
+    else if (tlMode === "seq") m = `<span class="rk">One at a time: ${r.total.toFixed(0)} s, almost all of it spent waiting.</span>`;
+    else if (r.rl > 0) m = `<span class="rk">${r.rl} responses were 429s${r.failed ? ` and ${r.failed} calls failed after 3 attempts` : ""}. Too many requests in flight for a 600/min bucket.</span>`;
+    else m = `<span class="ev">${r.total.toFixed(1)} s with no 429s: concurrency capped at ${r.maxIn}, just under the rate limit.</span>`;
+    $("tlMsg").innerHTML = m;
+  }
+  $("tl-run").onclick = tlRun;
+  window.addEventListener("resize", tlRun);
+  tlRun();
+})();
+</script>
+</body>
+</html>

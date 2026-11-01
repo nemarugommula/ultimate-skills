@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.2 Deploying safely · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .ugrid { display: grid; grid-template-columns: repeat(20, 1fr); gap: 4px; max-width: 520px; margin: 10px auto; }
+  .ugrid i { aspect-ratio: 1; border-radius: 4px; background: var(--panel); border: 1px solid var(--line); display: block; }
+  .ugrid i.on { background: var(--c-ca); border-color: var(--c-ca); }
+  .ugrid i.emp { outline: 2px solid var(--c-sv); outline-offset: -2px; }
+  .ugrid i.flip { box-shadow: 0 0 0 2px var(--c-er); }
+</style>
+</head>
+<body data-lesson="s6-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 2</div>
+  <h1>Deploying safely: rolling, blue-green, canary, feature flags</h1>
+  <p class="subtitle">Most outages start with a change. Safe deployment means every release reaches a few users first, is watched by a robot, and can be undone in a minute, so a bad change hurts hundreds of people instead of millions.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>A pipeline</b> builds one artifact per commit and promotes it (Lesson 6.1).</li>
+      <li><b>Load balancers</b> decide which server gets each request, and can split traffic by weight (Lesson 1.2).</li>
+      <li><b>Error rate</b> and <b>SLOs</b> (service level objectives: the reliability target, like 99.9% of requests succeed) (Lesson 0.5).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On <b>Friday, July 19, 2024, at 04:09 UTC</b>, CrowdStrike pushed a content configuration update to its Falcon sensor for Windows. A bug in their content validator let a problematic file through, and Windows machines that loaded it crashed with a blue screen. The update was reverted at <b>05:27 UTC</b>, 78 minutes later. Microsoft estimated <b>8.5 million Windows devices</b> were affected.</p>
+    <p>In its own review, the first fix CrowdStrike listed for this kind of content was a <b>staggered deployment</b>: “gradually deployed to larger portions of the sensor base, starting with a canary deployment.” That's this lesson.</p>
+  </div>
+
+  <h2>Numbers first: big bang vs canary</h2>
+  <p>Your service handles <b>1,000 requests per second</b>. A new release has a bug that makes <b>20% of requests fail</b>. (Google's SRE workbook uses this same 20% example.)</p>
+  <table>
+    <tr><th></th><th>Big bang: 100% at once</th><th>Canary: 1% first, with automated checks</th></tr>
+    <tr><td>Traffic on the bad version</td><td class="er">100%</td><td class="ca">1%</td></tr>
+    <tr><td>Time until it's undone</td><td>humans notice in ~10 min + ~5 min to redeploy = 15 min</td><td>robot notices in ~5 min + ~1 min to shift traffic back = 6 min</td></tr>
+    <tr><td>Failed requests</td><td class="er">15 × 60 × 1,000 × 20% = <b>180,000</b></td><td class="db">6 × 60 × 1,000 × 1% × 20% = <b>720</b></td></tr>
+  </table>
+  <p>Same bug, <b>250× less damage</b>. You can't make releases bug-free. You can make each bug small.</p>
+  <div class="eq">
+    damage ≈ <span class="cl">traffic</span> × <span class="sv">share on new version</span> × <span class="er">extra error rate</span> × <span class="lt">time to undo</span>
+    <span class="say">“The harm a bad release does is the traffic it sees, times how bad it is, times how long it stays.” Safe deployment attacks the share and the time; testing attacks the error rate.</span>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Separate deploy from release, and make every step reversible.</b> Deploying puts new code on servers. Releasing lets users reach it. Rollouts limit how many users a new version reaches; feature flags decide which users see a feature; automated analysis decides whether to continue or roll back.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the canary in the coal mine</span>
+    <p>The name is literal. Miners carried canaries underground because the small birds react to poisonous gas before people do. A canary release sends a small slice of real traffic to the new version first. If that slice gets sick, you pull back before the rest of your users go in.</p>
+  </div>
+
+  <h2>The deployment strategies</h2>
+  <table>
+    <tr><th>Strategy</th><th>How it works</th><th>Rollback</th><th>Cost / catch</th></tr>
+    <tr><td><b>Recreate</b></td><td>Stop all old servers, start all new ones</td><td>Redeploy the old version (minutes)</td><td class="er">Downtime during the switch. Fine for internal tools.</td></tr>
+    <tr><td><b>Rolling</b></td><td>Replace servers a few at a time. Kubernetes' default: by default up to 25% extra pods (<code>maxSurge</code>) and up to 25% unavailable (<code>maxUnavailable</code>)</td><td><code>kubectl rollout undo</code> (minutes)</td><td>No downtime, but by default nothing checks errors: a bad version still reaches everyone</td></tr>
+    <tr><td><b>Blue-green</b></td><td>Run a full second copy (green) with the new version; flip the load balancer from blue to green</td><td class="ca">Flip back (seconds)</td><td>Double the servers during the deploy; database must suit both versions</td></tr>
+    <tr><td><b>Canary</b></td><td>Send 1% → 5% → 25% → 100% of traffic to the new version, checking metrics at each step</td><td class="ca">Shift traffic back (seconds to a minute)</td><td>Needs good metrics and traffic splitting; slower to reach 100%</td></tr>
+    <tr><td><b>Dark launch / shadow</b></td><td>Copy real requests to the new version but throw away its answers</td><td>Nothing to undo: users never saw it</td><td>Great for load and correctness; careful with writes (don't charge twice!)</td></tr>
+    <tr><td><b>Feature flags</b></td><td>New code ships turned off; a flag turns it on for chosen users</td><td class="ca">Flip the flag (seconds, no deploy)</td><td>Flags pile up as tech debt; must be cleaned up</td></tr>
+  </table>
+
+  <h3>What “automated canary analysis” checks</h3>
+  <p>The robot compares the canary against a <b>baseline</b>: servers running the <i>old</i> version that receive the same small slice of traffic and started at the same time. Comparing to a fresh baseline (not the big, long-running production fleet) removes differences like warm caches and uptime.</p>
+  <ul>
+    <li><b>Metrics:</b> error rate, latency percentiles (p99 = the time 99% of requests beat, Lesson 6.3), CPU, memory, crashes.</li>
+    <li><b>Judgment:</b> “is the canary significantly worse?” Netflix's open-source tool Kayenta uses a statistical test (Mann-Whitney U) for each metric and then combines them into a score.</li>
+    <li><b>Decision:</b> continue to the next step, or roll back automatically, with no human in the loop.</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: why the canary needs a few minutes</span>
+    <p>At 1% of 1,000 requests/s, the canary sees <b>10 requests/s = 600 per minute</b>. The normal error rate is 0.1%, so in one minute you expect <b>0.6 errors</b>. Whether you see 0, 1 or 2 is luck.</p>
+    <ul>
+      <li>Watch for <b>5 minutes</b>: 3,000 requests, about 3 errors expected normally. A 20%-broken canary shows about <b>600</b>. Obvious.</li>
+      <li>A subtle bug adding 0.2% errors shows about 6 extra errors (9 instead of 3). Detectable, but noise can fool you.</li>
+      <li>Set the rollback threshold too low and random noise rolls back good releases. Too high and subtle bugs sail through to 100%.</li>
+    </ul>
+    <p>Bigger slices or longer windows give clearer answers but expose more users. That's the tuning problem in the simulator.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Ship a bad release</span>
+    <p class="hint">1,000 requests per second, normal error rate 0.1%. Pick how broken the new version is (0% = a good release), a strategy, and whether a robot watches. Humans notice when overall errors stay above 0.5% for 10 minutes, then need 5 minutes to redeploy. The robot compares new vs old over a 5-minute window and shifts traffic back in 1 minute.</p>
+    <svg id="cn-fl"></svg>
+    <div class="controls">
+      <label>release extra error rate <input type="range" id="cn-e" min="0" max="6" step="1" value="5"> <b class="mono" id="cn-ev"></b></label>
+      <span class="seg" id="cn-s"><button id="cn-s-big" data-v="big">Big bang</button><button id="cn-s-roll" data-v="roll">Rolling</button><button id="cn-s-can" data-v="can" class="on">Canary</button></span>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="cn-auto" checked> automated analysis + auto-rollback</label>
+      <label>rollback if new is worse by <input type="range" id="cn-th" min="0" max="6" step="1" value="2"> <b class="mono" id="cn-thv"></b></label>
+      <label>canary step length <input type="range" id="cn-h" min="2" max="15" step="1" value="6"> <b class="mono" id="cn-hv"></b></label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="cn-run">▶ Deploy</button>
+      <button class="btn" id="cn-replay">Replay minute by minute</button>
+      <button class="btn" id="cn-seed">New random luck</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">failed requests caused <b id="cn-bad">–</b></div>
+      <div class="stat">vs big bang, no robot <b id="cn-vs">–</b></div>
+      <div class="stat">peak traffic on new version <b id="cn-peak">–</b></div>
+      <div class="stat">outcome <b id="cn-out">–</b></div>
+    </div>
+    <canvas class="chart" id="cn-c1" style="height:160px"></canvas>
+    <canvas class="chart" id="cn-c2" style="height:160px"></canvas>
+    <p class="hint" id="cn-msg"></p>
+  </div>
+  <p>Things to try: a 20% bug with Big bang (no robot), then Canary. Then set the error to <b>0%</b> (a perfectly good release) and the threshold to <b>0.05%</b>, and press “New random luck” a few times: sometimes the robot panics and rolls back a good release. Now try a subtle <b>0.5%</b> bug with a <b>5%</b> threshold: it slips to 100% and only humans catch it, much later.</p>
+
+  <h2>Feature flags: deploy dark, release by percentage</h2>
+  <p>A <b>feature flag</b> is an <code>if</code> statement whose answer comes from a config service, not the code: <code>if flags.on("new-checkout", user)</code>. The code ships to everyone, turned off. Then you release it to 1% of users, then 10%, then everyone, with no deploy at all. If it misbehaves, a <b>kill switch</b> turns it off in seconds.</p>
+  <p>One subtle requirement: a user must get the <b>same answer every time</b>, or the checkout page changes between clicks. So flag systems don't flip a coin per request. They hash the user's ID into a number from 0 to 99 and turn the feature on if it's below the percentage. Unleash, for example, uses a normalized MurmurHash of the user's ID. Raising the percentage from 10 to 20 keeps the first 10% in and adds 10% more.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Roll out a feature flag</span>
+    <p class="hint">200 users. Teal = seeing the new checkout. Orange outline = employees (a targeting rule can turn the feature on for them first). Move the percentage, then press <b>Everyone reloads</b>: red rings show users whose experience changed. Compare hashing the user ID with flipping a coin per request.</p>
+    <div class="controls">
+      <label>rollout <input type="range" id="ff-pct" min="0" max="100" step="5" value="10"> <b class="mono" id="ff-pv"></b></label>
+      <span class="seg" id="ff-b"><button id="ff-b-hash" data-v="hash" class="on">hash(user ID)</button><button id="ff-b-rand" data-v="rand">coin flip per request</button></span>
+      <label><input type="checkbox" id="ff-emp"> always on for employees</label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="ff-reload">↻ Everyone reloads</button>
+      <button class="btn" id="ff-kill">🛑 Kill switch</button>
+    </div>
+    <div class="ugrid" id="ff-g"></div>
+    <div class="stat-row">
+      <div class="stat">users with the feature <b id="ff-on">–</b></div>
+      <div class="stat">experience flipped on last reload <b id="ff-flip">–</b></div>
+      <div class="stat">time to turn off <b id="ff-off">–</b></div>
+    </div>
+    <p class="hint" id="ff-msg"></p>
+  </div>
+
+  <h2>The hard part: the database doesn't roll back</h2>
+  <p>During a rolling or canary deploy, <b>old and new code run at the same time</b>, against the <b>same database</b>. And if you roll back, old code meets whatever the new code wrote. So every schema change must work with both versions. The pattern is called <b>expand and contract</b> (Martin Fowler calls it “parallel change”): expand, migrate, contract.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: renaming a column safely</span>
+    <p>You want to rename <code>users.name</code> to <code>users.full_name</code>. Doing it in one step breaks every old server still running. Instead, four deploys:</p>
+    <ol>
+      <li><b>Expand:</b> add the new column <code>full_name</code> (nullable). Old code ignores it. Safe.</li>
+      <li><b>Dual-write:</b> new code writes both <code>name</code> and <code>full_name</code>, still reads <code>name</code>. Backfill old rows in small batches.</li>
+      <li><b>Switch reads:</b> code reads <code>full_name</code>. Rolling back to step 2 is still safe, because both columns are kept in sync.</li>
+      <li><b>Contract:</b> once nothing reads <code>name</code> (days later), stop writing it and drop it.</li>
+    </ol>
+    <p>Each step is boring and reversible. That's the point.</p>
+  </div>
+
+  <div class="box incident">
+    <span class="label">🔥 Real outage · Cloudflare, July 2, 2019</span>
+    <p>Cloudflare deployed a new rule to its web application firewall (WAF). The rule contained a regular expression that backtracked enormously and exhausted the CPUs serving HTTP and HTTPS traffic on its network worldwide. The service went down for <b>27 minutes</b>.</p>
+    <p>Cloudflare's postmortem lists what went wrong, including that its procedure “allowed a non-emergency rule change to go globally into production without a staged rollout,” and that the rollback plan took too long. One fix: staged rollouts of rules, like Cloudflare's other software, while keeping the ability to deploy globally in an emergency.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Progressive delivery on Kubernetes: <b>Argo Rollouts</b>, <b>Flagger</b>; multi-cloud: <b>Spinnaker</b> with <b>Kayenta</b> for canary analysis; managed: <b>AWS CodeDeploy</b>, Google Cloud Deploy. Feature flags: <b>LaunchDarkly</b>, <b>Unleash</b>, <b>Flagsmith</b>, <b>Statsig</b>, and the vendor-neutral <b>OpenFeature</b> API. An Argo Rollouts canary that pauses at each step and lets a Prometheus query decide whether to continue:</p>
+<pre><code><span class="k">apiVersion:</span> argoproj.io/v1alpha1
+<span class="k">kind:</span> Rollout
+<span class="k">metadata:</span> { <span class="k">name:</span> shop }
+<span class="k">spec:</span>
+  <span class="k">replicas:</span> <span class="n">20</span>
+  <span class="k">strategy:</span>
+    <span class="k">canary:</span>
+      <span class="k">steps:</span>
+        - <span class="k">setWeight:</span> <span class="n">5</span>                    <span class="c"># 5% of traffic to the new version</span>
+        - <span class="k">pause:</span> { <span class="k">duration:</span> 10m }
+        - <span class="k">analysis:</span>                       <span class="c"># robot judges the canary</span>
+            <span class="k">templates:</span> [ { <span class="k">templateName:</span> success-rate } ]
+        - <span class="k">setWeight:</span> <span class="n">25</span>
+        - <span class="k">pause:</span> { <span class="k">duration:</span> 10m }
+        - <span class="k">setWeight:</span> <span class="n">50</span>
+        - <span class="k">pause:</span> { <span class="k">duration:</span> 10m }       <span class="c"># then 100%</span>
+  <span class="c"># ... selector and pod template as in a normal Deployment</span>
+---
+<span class="k">apiVersion:</span> argoproj.io/v1alpha1
+<span class="k">kind:</span> AnalysisTemplate
+<span class="k">metadata:</span> { <span class="k">name:</span> success-rate }
+<span class="k">spec:</span>
+  <span class="k">metrics:</span>
+    - <span class="k">name:</span> success-rate
+      <span class="k">interval:</span> 1m
+      <span class="k">failureLimit:</span> <span class="n">2</span>                    <span class="c"># 3 bad measurements = abort and roll back</span>
+      <span class="k">successCondition:</span> result[0] >= <span class="n">0.99</span>
+      <span class="k">provider:</span>
+        <span class="k">prometheus:</span>
+          <span class="k">address:</span> http://prometheus:9090
+          <span class="k">query:</span> |
+            sum(rate(http_requests_total{app="shop",status!~"5.."}[5m]))
+            / sum(rate(http_requests_total{app="shop"}[5m]))</code></pre>
+    <p class="hint">Plain Kubernetes rollback, no extra tools: <code>kubectl rollout status deployment/shop</code> watches a rollout; <code>kubectl rollout undo deployment/shop</code> goes back to the previous version. (PromQL, the query language in that template, is taught in Lesson 6.3.)</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Strategy</th><th>✅ Use when</th><th>❌ Avoid when</th></tr>
+      <tr><td>Rolling (default)</td><td>Small team, low traffic, good tests; free in Kubernetes</td><td>A bad release would be very costly: nothing stops it from reaching 100%</td></tr>
+      <tr><td>Blue-green</td><td>You need instant rollback, or a clean cutover (e.g. a big runtime upgrade)</td><td>Doubling the fleet is expensive, or old and new can't share the database</td></tr>
+      <tr><td>Canary + analysis</td><td>High traffic (enough data for statistics) and a costly blast radius</td><td>Very low traffic: 1% of 10 requests a minute tells you nothing; use longer steps or dark launches</td></tr>
+      <tr><td>Feature flags</td><td>Releasing features gradually, A/B tests, kill switches for risky paths</td><td>You never clean them up: hundreds of stale flags make code paths impossible to reason about</td></tr>
+    </table>
+    <p>Rollback vs <b>roll forward</b>: rolling back is almost always faster and safer during an incident. Roll forward (ship a fix) only when rollback is impossible, such as after a one-way data migration, which is why you avoid one-way migrations.</p>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Rolling deploys from the platform you're on, a one-command rollback you've actually practiced, and a feature-flag library (even a simple config table) for anything risky. Every migration expand-then-contract from day one. Deploy during working hours, not Friday night.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Progressive delivery everywhere: canaries with automated analysis, then region by region (one region or zone first, the rest later), with configuration changes treated exactly like code. Flag platforms with audit logs and owners. Release “bake time” between stages, and automatic rollback tied to SLO burn (Lesson 6.4).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>When an interviewer asks “how do you roll this out?”, a senior answer covers:</p>
+    <ul>
+      <li>A <b>staged rollout</b> (canary or region by region) with the <b>metrics</b> that gate each step and an <b>automatic rollback</b>.</li>
+      <li><b>Feature flags</b> to separate deploy from release, and a kill switch for the risky path.</li>
+      <li><b>Backward-compatible</b> APIs and schemas (expand and contract), because old and new versions run together.</li>
+      <li>Treating <b>config changes</b> like code changes. Both the CrowdStrike and Cloudflare outages were pushes of content or rules, not app binaries.</li>
+    </ul>
+    <p class="hint">Follow-ups: “Your service gets 20 requests a minute. Does a 1% canary work?” (No: too little data. Use longer steps, a bigger slice, or synthetic traffic.) “How do you roll back a database migration?” (You design it so you don't have to.)</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Canarying as a discipline</b> <span class="tag co">🏢 Google · SRE workbook</span> <a href="https://sre.google/workbook/canarying-releases/" target="_blank" rel="noopener">Canarying Releases</a></div>
+      <p><b>How:</b> Google defines canarying as a partial and time-limited deployment of a change, plus its evaluation. The part that gets the change is “the canary,” the rest is “the control,” and the result decides whether the rollout proceeds.</p>
+      <p><b>Why this method:</b> the canary only risks a small fragment of the error budget. The chapter's example: a release that fails 20% of requests is far less harmful on a 5% canary population than deployed globally.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Automated canary analysis</b> <span class="tag co">🏢 Netflix + Google · 2018</span> <a href="https://netflixtechblog.com/automated-canary-analysis-at-netflix-with-kayenta-3260bc7acc69" target="_blank" rel="noopener">Automated Canary Analysis at Netflix with Kayenta</a></div>
+      <p><b>How:</b> alongside production, Netflix creates a baseline cluster (old version) and a canary cluster (new version), typically about 3 instances each, each getting a small slice of traffic. Kayenta compares their metrics using confidence intervals from the Mann-Whitney U test and computes a score.</p>
+      <p><b>Why this method:</b> comparing against a fresh baseline instead of the long-running production fleet isolates the effect of the change itself. Kayenta is tightly integrated with Spinnaker, Netflix's delivery platform, which then decides to continue or roll back.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A content push that skipped the canary</b> <span class="tag co">🏢 CrowdStrike · 2024</span> <a href="https://www.crowdstrike.com/en-us/blog/falcon-content-update-preliminary-post-incident-report/" target="_blank" rel="noopener">Preliminary Post Incident Review</a></div>
+      <p><b>How:</b> a bug in the content validator let a Template Instance with problematic content pass; when sensors loaded Channel File 291 it caused an out-of-bounds memory read and Windows crashes. The fix list includes a staggered rollout starting with a canary, better monitoring during rollout, and more customer control over when updates arrive.</p>
+      <p><b>Why this method:</b> even well-tested content can be wrong; a staged rollout turns “every machine at once” into “a few machines, then stop.”</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Rolling updates by default</b> <span class="tag oss">🧰 Open source · Kubernetes</span> <a href="https://kubernetes.io/docs/concepts/workloads/controllers/deployment/" target="_blank" rel="noopener">Kubernetes Deployments</a></div>
+      <p><b>How:</b> <code>RollingUpdate</code> is the default strategy, with <code>maxSurge</code> and <code>maxUnavailable</code> both defaulting to 25%; <code>Recreate</code> kills all old pods first. <code>kubectl rollout undo</code> returns to the previous revision.</p>
+      <p><b>Why this method:</b> zero-downtime replacement with no extra infrastructure; for metric-gated canaries you add a tool like Argo Rollouts on top.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Sticky percentage rollouts</b> <span class="tag oss">🧰 Open source · Unleash</span> <a href="https://docs.getunleash.io/reference/activation-strategies" target="_blank" rel="noopener">Unleash activation strategies</a></div>
+      <p><b>How:</b> a gradual rollout's percentage uses a normalized MurmurHash of the user's unique ID; “stickiness” keeps each user's answer stable across sessions, and targeting constraints limit who is eligible.</p>
+      <p><b>Why this method:</b> hashing gives a random-looking but repeatable split, so users don't flicker between versions and raising the percentage only adds users.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the 78 minutes</span>
+    <p>CrowdStrike's bad update was live from 04:09 to 05:27 UTC, and its review says Mac and Linux hosts were not affected. Yet those 78 minutes reached about 8.5 million Windows machines, which Microsoft noted was less than one percent of all Windows machines. Huge reach, tiny window: a perfect picture of why <b>how many</b> receive a change matters as much as <b>how long</b> it stays.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This is the last stage of the pipeline from Lesson 6.1. The metrics that judge a canary come from Lesson 6.3 (observability), and the automatic rollback trigger is often an SLO burn-rate alert (Lesson 6.4). Backward-compatible changes connect to API versioning (Lesson 4.5). Lesson 8.4 adds error budgets: when the budget runs out, risky rollouts pause. In AI products, the same tools roll out a new model to 1% of users and compare quality and cost metrics before going wider.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Book</span> <a href="https://sre.google/workbook/canarying-releases/" target="_blank" rel="noopener">SRE workbook: Canarying Releases</a>. How to pick canary size, duration and metrics.</li>
+      <li><span class="kind">Blog</span> <a href="https://martinfowler.com/bliki/ParallelChange.html" target="_blank" rel="noopener">Martin Fowler: Parallel Change</a>. Expand, migrate, contract, explained with a small example.</li>
+      <li><span class="kind">Docs</span> <a href="https://argo-rollouts.readthedocs.io/en/stable/features/canary/" target="_blank" rel="noopener">Argo Rollouts: canary</a>. The real YAML for weighted steps, pauses and analysis.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 2,000 requests/s. A bad release fails 10% of requests. A 2% canary catches it after 5 minutes and shifts traffic back in 1 minute. About how many requests failed?</div>
+    <div class="opts"><button class="opt" data-ok>About 1,440</button><button class="opt">About 72,000</button><button class="opt">About 14,400</button></div>
+    <div class="explain">6 minutes × 60 s × 2,000 req/s × 2% × 10% = 1,440. The same bug at 100% for the same 6 minutes would fail 72,000. Shrinking the share on the new version is the lever.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. You need to rename a database column, and you deploy with rolling updates. What's the safe plan?</div>
+    <div class="opts"><button class="opt">Rename the column and deploy the new code in the same release</button><button class="opt" data-ok>Add the new column, write both, switch reads, and drop the old column in a later release</button><button class="opt">Use blue-green so the rename happens instantly</button></div>
+    <div class="explain">During the rollout, old and new code share one database, and a rollback brings old code back. Expand and contract keeps every step compatible with both versions. Blue-green doesn't help: both colors still share the database.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your flag system turns a feature on with <code>random() &lt; 0.1</code> on every request. What goes wrong?</div>
+    <div class="opts"><button class="opt">Nothing: about 10% of users see it</button><button class="opt" data-ok>The same user flips between old and new on every page load</button><button class="opt">The feature reaches 100% of users over time but never more</button></div>
+    <div class="explain">10% of requests isn't 10% of users. A user loading 10 pages sees the feature about once, at random. Hashing the user ID into a bucket from 0 to 99 gives each user one stable answer.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Damage ≈ traffic × share on new version × error rate × time to undo. Rollouts shrink the share; robots shrink the time.</li>
+      <li>Strategies: recreate (downtime), rolling (default), blue-green (instant flip), canary (small slice + analysis), dark launch, feature flags.</li>
+      <li>Canary analysis compares against a fresh baseline; thresholds trade false rollbacks against missed bugs.</li>
+      <li>Feature flags separate deploy from release; hash the user ID so each user gets a stable answer.</li>
+      <li>Old and new code share the database: use expand and contract, and treat config pushes like code.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const pct = v => (v * 100 >= 1 ? +(v * 100).toFixed(1) : +(v * 100).toFixed(2)) + "%";
+
+  // ---------- canary simulator ----------
+  const F = new Flow($("cn-fl"), { width: 720, height: 170 });
+  F.node("u", { x: 80, y: 85, label: "👤 Users", sub: "1,000 req/s", kind: "cl" })
+   .node("lb", { x: 270, y: 85, label: "Load balancer", sub: "weights", kind: "nw" })
+   .node("v1", { x: 500, y: 40, label: "v1 (stable)", sub: "100%", kind: "sv" })
+   .node("v2", { x: 500, y: 130, label: "v2 (new)", sub: "0%", kind: "sv" })
+   .node("rb", { x: 650, y: 130, w: 100, label: "🤖 Analysis", sub: "watching", kind: "lt" })
+   .edge("u", "lb").edge("lb", "v1").edge("lb", "v2").edge("v2", "rb", { dashed: true, noArrow: true }).render();
+
+  const ES = [0, 0.002, 0.005, 0.01, 0.05, 0.2, 0.5], THS = [0.0005, 0.001, 0.002, 0.005, 0.01, 0.02, 0.05];
+  const RPM = 60000, BASE = 0.001, T = 60, WIN = 5;
+  let seed = 1, last = null;
+  const getS = seg("cn-s", () => canary());
+  function schedule(kind, H) {
+    if (kind === "big") return () => 1;
+    if (kind === "roll") return t => Math.min(1, 0.25 * (Math.floor(t / 3) + 1));
+    const st = [0.01, 0.05, 0.25, 0.5];
+    return t => (t < H * st.length ? st[Math.floor(t / H)] : 1);
+  }
+  function simulate(e, kind, auto, th, H, sd) {
+    const rng = MX.seeded(sd), f0 = schedule(kind, H);
+    const gauss = () => Math.sqrt(-2 * Math.log(rng() + 1e-12)) * Math.cos(2 * Math.PI * rng());
+    const draw = (n, p) => Math.max(0, Math.round(n * p + Math.sqrt(n * p * (1 - p)) * gauss()));
+    const frac = [], badPerMin = [], hist = [];
+    let rollbackAt = null, offAt = null, humanClock = 0, bad = 0, detectedBy = null, peak = 0;
+    for (let t = 0; t < T; t++) {
+      let f = offAt !== null && t >= offAt ? 0 : f0(t);
+      frac.push(f); peak = Math.max(peak, f);
+      const nNew = RPM * f, nOld = RPM - nNew;
+      const extra = nNew * e; bad += extra; badPerMin.push(extra);
+      hist.push({ nNew, eNew: draw(nNew, BASE + e), nOld, eOld: draw(nOld, BASE) });
+      if (offAt !== null) continue;
+      // robot: compare last WIN minutes of new vs old (or vs the pre-deploy baseline if all traffic is new)
+      if (auto && t >= WIN - 1 && rollbackAt === null) {
+        const w = hist.slice(-WIN), nN = w.reduce((a, h) => a + h.nNew, 0), eN = w.reduce((a, h) => a + h.eNew, 0);
+        const nO = w.reduce((a, h) => a + h.nOld, 0), eO = w.reduce((a, h) => a + h.eOld, 0);
+        const oldRate = nO > 1000 ? eO / nO : BASE;
+        if (nN > 0 && eN / nN - oldRate > th) { rollbackAt = t; detectedBy = "robot"; offAt = t + 2; }
+      }
+      // humans: overall error rate above 0.5% for 10 straight minutes, then 5 minutes to redeploy
+      if (rollbackAt === null) {
+        humanClock = (f * e + BASE) > 0.005 ? humanClock + 1 : 0;
+        if (humanClock >= 10) { rollbackAt = t; detectedBy = "humans"; offAt = t + 6; }
+      }
+    }
+    return { frac, badPerMin, bad, rollbackAt, detectedBy, peak };
+  }
+  function canary() {
+    const e = ES[+$("cn-e").value], kind = getS(), auto = $("cn-auto").checked, th = THS[+$("cn-th").value], H = +$("cn-h").value;
+    $("cn-ev").textContent = e ? pct(e) : "0% (good release)"; $("cn-thv").textContent = pct(th); $("cn-hv").textContent = H + " min";
+    const r = simulate(e, kind, auto, th, H, seed), ref = simulate(e, "big", false, th, H, seed);
+    last = r;
+    $("cn-bad").textContent = Math.round(r.bad).toLocaleString();
+    $("cn-vs").textContent = e === 0 ? "–" : ref.bad > 0 ? (r.bad >= ref.bad * 0.999 ? "same" : Math.round(ref.bad / Math.max(1, r.bad)).toLocaleString() + "× fewer") : "–";
+    $("cn-peak").textContent = pct(r.peak);
+    let out;
+    if (r.rollbackAt === null) out = e === 0 ? "✅ shipped" : "❌ shipped to 100%";
+    else out = (e === 0 ? "⚠️ false rollback" : "↩ rolled back") + ` at min ${r.rollbackAt} (${r.detectedBy})`;
+    $("cn-out").textContent = out;
+    Plot.line($("cn-c1"), { series: [{ label: "% of traffic on v2", color: MX.css("--c-sv"), data: r.frac.map((f, t) => [t, 100 * f]), fill: true }], xLabel: "minutes after deploy", yMin: 0, yMax: 100 });
+    Plot.line($("cn-c2"), { series: [{ label: "failed requests per minute caused by v2", color: MX.css("--c-er"), data: r.badPerMin.map((b, t) => [t, b]), fill: true }], xLabel: "minutes after deploy", yMin: 0, yMax: Math.max(10, ...r.badPerMin) * 1.1 });
+    $("cn-msg").textContent = e === 0 && r.rollbackAt !== null ? "A good release was rolled back by random noise. A threshold this tight sees ghosts: raise it or watch longer." :
+      e === 0 ? "A good release went all the way. The careful rollout cost only time." :
+      r.rollbackAt === null ? "The bug was too small for the threshold and never pushed overall errors past what humans notice. It's now live for everyone." :
+      r.detectedBy === "humans" ? "Humans caught it, but only after it reached a lot of traffic. A robot watching the canary would have stopped it earlier." :
+      "The robot caught it while only a small slice of traffic was exposed.";
+    paintFlow(r.frac[T - 1], e);
+  }
+  function paintFlow(f, e) {
+    F.set("v1", { sub: pct(1 - f) + " of traffic", load: 1 - f }).set("v2", { sub: pct(f) + ", errors " + pct(f ? BASE + e : 0), load: f, hot: f > 0 && e >= 0.01 })
+     .edgeStyle("lb", "v2", { width: 1 + 6 * f, color: e >= 0.01 && f > 0 ? "--c-er" : "--line" }).edgeStyle("lb", "v1", { width: 1 + 6 * (1 - f) });
+    const ev2 = F.edges.find(x => x.b === "v2" && x.a === "lb"); if (ev2 && ev2.line) ev2.line.style.stroke = MX.css(e >= 0.01 && f > 0 ? "--c-er" : "--line"); // inline style beats the stylesheet's edge color
+  }
+  let playing = false;
+  $("cn-replay").onclick = async () => {
+    if (playing || !last) return; playing = true;
+    const e = ES[+$("cn-e").value];
+    for (let t = 0; t < T; t++) {
+      paintFlow(last.frac[t], e);
+      F.set("rb", { sub: last.rollbackAt !== null && t >= last.rollbackAt ? "rollback! min " + last.rollbackAt : "min " + t });
+      F.set("lb", { sub: "minute " + t });
+      if (t % 6 === 0) F.packet(["u", "lb", last.frac[t] > 0 && Math.random() < Math.max(0.3, last.frac[t]) ? "v2" : "v1"], { color: "--c-cl", dur: 300 });
+      await new Promise(r => setTimeout(r, 60));
+    }
+    F.set("rb", { sub: "watching" }).set("lb", { sub: "weights" });
+    playing = false;
+  };
+  ["cn-e", "cn-th", "cn-h"].forEach(id => ($(id).oninput = canary));
+  $("cn-auto").onchange = canary;
+  $("cn-run").onclick = canary;
+  $("cn-seed").onclick = () => { seed = (seed * 48271) % 2147483647; canary(); };
+  canary();
+
+  // ---------- feature flags ----------
+  const N = 200, EMP = new Set([3, 27, 58, 91, 144, 177]);
+  const fnv = s => { let h = 2166136261; for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); } return (h >>> 0) % 100; };
+  const bucket = [...Array(N)].map((_, i) => fnv("new-checkout:user-" + i));
+  const cells = [...Array(N)].map((_, i) => { const c = document.createElement("i"); if (EMP.has(i)) c.classList.add("emp"); c.title = "user " + i; $("ff-g").appendChild(c); return c; });
+  let shown = null, killed = false, flips = 0;
+  const getB = seg("ff-b", () => ffEval(true));
+  function decide(i, p) {
+    if (killed) return false;
+    if ($("ff-emp").checked && EMP.has(i)) return true;
+    return getB() === "hash" ? bucket[i] < p : Math.random() * 100 < p;
+  }
+  function ffEval(reload) {
+    const p = +$("ff-pct").value; $("ff-pv").textContent = p + "%";
+    const now = [...Array(N)].map((_, i) => decide(i, p));
+    flips = shown && reload ? now.filter((v, i) => v !== shown[i]).length : 0;
+    cells.forEach((c, i) => { c.classList.toggle("on", now[i]); c.classList.toggle("flip", !!(shown && reload && now[i] !== shown[i])); });
+    shown = now;
+    $("ff-on").textContent = now.filter(Boolean).length + " / " + N;
+    $("ff-flip").textContent = reload ? flips : "–";
+    $("ff-off").textContent = killed ? "seconds (flag off)" : "seconds, no deploy";
+    $("ff-msg").textContent = killed ? "Kill switch on: the feature is off for everyone, and the code is still deployed. Move the slider to turn it back on." :
+      getB() === "rand" && reload && flips ? `${flips} users saw their checkout page change between two loads. Per-request coin flips are 10% of requests, not 10% of users.` :
+      getB() === "hash" && reload ? "With hashing, a reload changes nothing unless the percentage changed. Raising the percentage only adds users; nobody who had it loses it." :
+      "Each user's ID is hashed to a bucket from 0 to 99; the feature is on if the bucket is below the rollout percentage.";
+  }
+  $("ff-pct").oninput = () => { killed = false; ffEval(true); };
+  $("ff-emp").onchange = () => ffEval(true);
+  $("ff-reload").onclick = () => ffEval(true);
+  $("ff-kill").onclick = () => { killed = true; ffEval(true); };
+  ffEval(false);
+})();
+</script>
+</body>
+</html>

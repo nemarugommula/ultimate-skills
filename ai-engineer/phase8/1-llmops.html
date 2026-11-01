@@ -1,0 +1,472 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.1 LLMOps · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .wf { display: grid; gap: 4px; margin: 10px 0; }
+  .sp { display: grid; grid-template-columns: minmax(150px, 230px) 1fr 160px; gap: 8px; align-items: center; font-size: .85rem; cursor: pointer; border-radius: 6px; padding: 2px 4px; }
+  .sp:hover, .sp.sel { background: var(--bg2); }
+  .sp .nm { font-family: var(--mono); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .sp .track { position: relative; height: 16px; background: var(--panel); border-radius: 4px; }
+  .sp .bar { position: absolute; top: 2px; height: 12px; border-radius: 3px; }
+  .sp .meta { font-family: var(--mono); font-size: .78rem; color: var(--muted); text-align: right; white-space: nowrap; }
+  .sp.hotL .nm::after { content: " 🐢"; } .sp.hotC .nm::after { content: " 💸"; } .sp.hotL.hotC .nm::after { content: " 🐢💸"; }
+  .attrs { font-family: var(--mono); font-size: .8rem; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; white-space: pre-wrap; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  @media (max-width: 640px) { .sp { grid-template-columns: 120px 1fr; } .sp .meta { grid-column: 1 / -1; text-align: left; } }
+</style>
+</head>
+<body data-lesson="a8-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8 · Lesson 1</div>
+  <h1>LLMOps: tracing, gateways, fallbacks &amp; cost tracking</h1>
+  <p class="subtitle">Your LLM feature works on your laptop. In production a model provider is a dependency that goes down, slows down, changes behaviour without warning and bills you per token. LLMOps is how you see all of that and survive it.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Tokens</b> are what you pay for: input tokens (the prompt) and output tokens (the answer), priced per million (Lesson 0.3).</li>
+      <li>A <b>RAG</b> request retrieves document chunks and puts them in the prompt (Lesson 3.6); an <b>agent</b> loops model call → tool call → model call (Lesson 6.1).</li>
+      <li><b>p95 latency</b> = the time 95% of requests finish under. Averages hide the slow tail.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In August and early September 2025, some Claude users noticed answers getting worse. Nothing was “down”: requests succeeded, just with lower-quality output. Anthropic's postmortem traced it to <b>three separate infrastructure bugs</b>: a context-window routing error, an output-corruption misconfiguration on some TPU servers, and a compiler bug in approximate top-k sampling. At the worst hour, on August 31, <b>16% of Sonnet 4 requests</b> were affected.</p>
+    <p>If you were building on that model, your error-rate dashboard stayed green the whole time. Only tracing real requests and scoring their quality would have shown you something was wrong. That gap is what this lesson closes.</p>
+  </div>
+
+  <h2>Numbers first: what one request really costs</h2>
+  <p>A support assistant answers “Where is my order #1042?” It uses RAG plus one tool call. Here is what happens under the hood, at illustrative prices of <b>$3 per million input tokens</b> and <b>$15 per million output tokens</b>:</p>
+  <table>
+    <tr><th>Step</th><th>Time</th><th>Tokens</th><th>Cost</th></tr>
+    <tr><td>Input safety check, embed query, vector search, rerank</td><td class="tk">420 ms</td><td>small</td><td>≈ $0</td></tr>
+    <tr><td class="md">LLM call 1: decide to call the order tool</td><td class="tk">900 ms</td><td>3,200 in / 40 out</td><td>$0.0102</td></tr>
+    <tr><td class="tl">Tool: order-status API</td><td class="tk">380 ms</td><td>–</td><td>–</td></tr>
+    <tr><td class="md">LLM call 2: write the answer</td><td class="tk">1,250 ms</td><td>3,600 in / 180 out</td><td>$0.0135</td></tr>
+    <tr><td>Output check</td><td class="tk">100 ms</td><td>–</td><td>≈ $0</td></tr>
+    <tr><td><b>Total</b></td><td class="tk"><b>3.05 s</b></td><td>6,800 in / 220 out</td><td><b>≈ $0.024</b></td></tr>
+    <tr><td>At 100,000 requests a day</td><td></td><td>680 million tokens</td><td class="rk"><b>≈ $2,400 a day</b></td></tr>
+  </table>
+  <p class="muted">Prices are illustrative round numbers; real ones vary by model and change often (check your provider's pricing page). Times are typical, not measured.</p>
+  <p>Three things jump out. One user question became <b>two model calls</b> and seven steps. <b>Input tokens dominate</b> the bill (6,800 vs 220). And without a record of each step, you couldn't tell which one to fix when the bill or the latency doubles.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Treat every model call like a call to a flaky, expensive, ever-changing third-party API. <b>Trace</b> each request step by step (time, tokens, cost, inputs and outputs), put a <b>gateway</b> between your code and the providers (timeouts, retries, fallbacks, budgets), and <b>pin and version</b> everything that changes behaviour: model, prompt, retrieval settings.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the flight recorder and the air-traffic controller</span>
+    <p>A trace is a <b>flight recorder</b> for one request: every step, how long it took, what went in and what came out, so after a bad answer you can replay exactly what happened. A gateway is <b>air-traffic control</b>: every flight goes through it, it knows which runways (providers) are open, diverts traffic when one closes, and stops anyone from taking off without a flight plan (a budget).</p>
+  </div>
+
+  <h2>Tracing: spans, traces and the GenAI conventions</h2>
+  <p>A <b>trace</b> is the record of one request. It is made of <b>spans</b>: timed steps, nested in a tree (the request span contains the retrieval span, the model-call spans, the tool spans). This is standard distributed tracing from web services, with LLM-specific fields added: model name, input and output tokens, the prompt and the completion.</p>
+  <p><b>OpenTelemetry</b> (OTel), the open standard for traces, metrics and logs, has <b>GenAI semantic conventions</b>: agreed attribute names so every tool records the same thing the same way. For example <code>gen_ai.operation.name</code> (chat, <code>execute_tool</code>, <code>invoke_agent</code>…), <code>gen_ai.provider.name</code>, <code>gen_ai.request.model</code>, <code>gen_ai.response.model</code>, <code>gen_ai.usage.input_tokens</code> and <code>gen_ai.usage.output_tokens</code>. As of late 2026 these conventions are still marked <b>Development</b> (not yet stable) and live in their own repository, so attribute names can still change: an older name, <code>gen_ai.system</code>, has already been replaced by <code>gen_ai.provider.name</code>.</p>
+  <table>
+    <tr><th>What to record on every model span</th><th>Why</th></tr>
+    <tr><td>Requested <b>and</b> returned model name</td><td>An alias like “latest” can silently point to a new model; the response tells you which one actually answered.</td></tr>
+    <tr><td>Input, output and cached tokens; computed cost</td><td>Cost per user, per feature, per tenant. Spot the step that blew up.</td></tr>
+    <tr><td>Latency, and time to first token (TTFT) for streaming</td><td>TTFT is what a user feels in a chat UI; total time matters for pipelines.</td></tr>
+    <tr><td>Prompt version, retrieval config, tool calls and arguments</td><td>Reproduce a bad answer; compare versions.</td></tr>
+    <tr><td>User/tenant ID (hashed), feature name, session ID</td><td>Group traces into conversations and bills.</td></tr>
+    <tr><td>Prompt and completion text (<b>redacted</b>, sampled, access-controlled)</td><td>You need them to debug, but they contain customer data: PII (personally identifiable information) such as emails, phone numbers and addresses. See Lesson 8.3.</td></tr>
+  </table>
+
+  <div class="playground" id="pg-trace">
+    <span class="label">🎮 Playground · Trace explorer: find the slow, expensive step</span>
+    <p class="hint">A recorded trace of the order-status request above. Each row is a span: the bar shows when it ran inside the request, the right column shows time and cost. Click a span to see its attributes. Pick an incident, find the culprit (🐢 = slowest span, 💸 = most expensive span), then press <b>Apply the fix</b>.</p>
+    <div class="controls">
+      <span class="seg" id="sc"><button data-v="normal" class="on" id="sc-normal">Normal day</button><button data-v="slowtool" id="sc-slow">“The bot is slow”</button><button data-v="bloat" id="sc-bloat">“The bill jumped”</button><button data-v="loop" id="sc-loop">“This user is expensive”</button></span>
+      <button class="btn" id="fix">🔧 Apply the fix</button>
+    </div>
+    <div class="wf" id="wf"></div>
+    <div class="stat-row">
+      <div class="stat">request latency <b id="tLat">–</b></div>
+      <div class="stat">model calls <b id="tCalls">–</b></div>
+      <div class="stat">tokens in / out <b id="tTok">–</b></div>
+      <div class="stat">cost per request <b id="tCost">–</b></div>
+      <div class="stat">at 100k requests/day <b id="tDay">–</b></div>
+    </div>
+    <div class="verdict" id="tMsg"></div>
+    <div class="attrs" id="attrs">Click a span to see its attributes.</div>
+    <p class="hint">A scripted trace (no real model calls). Real tracing tools draw exactly this waterfall from the spans your code emits.</p>
+  </div>
+  <p>What you should see: the slow-bot incident isn't the model at all, it's a tool waiting 6 seconds on a struggling API. The jumped bill is <b>retrieval</b> stuffing 20 chunks into both model calls (fix: rerank down to 5). The expensive user is hitting an <b>agent loop</b> calling the same tool with the same arguments again and again; the fix is a step limit plus duplicate-call detection (Lesson 6.6). None of those show up in an error-rate graph.</p>
+
+  <h2>Cost tracking: attribute every token</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: who is spending the money?</span>
+    <p>Your monthly bill is <b>$72,000</b>. Tag every span with a <code>feature</code> and a hashed <code>user_id</code>, then group:</p>
+    <ul>
+      <li>Chat assistant: 2.4 M requests × $0.024 = <b>$57,600</b> (80%).</li>
+      <li>Nightly document summaries: 60,000 docs × $0.18 = <b>$10,800</b> (15%). Not interactive, so a batch API at half price (Lesson 8.2) saves <b>$5,400</b> a month.</li>
+      <li>“Other”: <b>$3,600</b>. Drill in: one integration test hitting production in a retry loop.</li>
+    </ul>
+    <p>Then set <b>budgets</b>: a per-user daily cap (say $2) and a per-feature monthly cap with an alert at 80%. Without tags you only know the total, and the total never tells you what to fix.</p>
+  </div>
+
+  <h2>Gateways: one front door for every model</h2>
+  <p>An <b>LLM gateway</b> is a proxy or library that sits between your code and the model providers and gives every call one interface. What it handles for you:</p>
+  <table>
+    <tr><th>Feature</th><th>What it does</th><th>Typical setting</th></tr>
+    <tr><td><b>Timeouts</b></td><td>Give up on a call that hangs. SDK defaults can be minutes long.</td><td>A few seconds to TTFT for chat; longer for big batch jobs</td></tr>
+    <tr><td><b>Retries with backoff</b></td><td>Retry rate-limit errors (HTTP 429) and server errors (5xx), waiting longer each time, with random jitter.</td><td>1–2 retries; never retry forever</td></tr>
+    <tr><td><b>Fallbacks</b></td><td>When a model or provider fails, send the call to another (a different region, provider or model).</td><td>Primary → same model elsewhere → a different model</td></tr>
+    <tr><td><b>Circuit breaker</b></td><td>After many failures, stop trying the broken provider for a while and go straight to the fallback.</td><td>Open at &gt; 50% errors over a few seconds; retry after a cool-down</td></tr>
+    <tr><td><b>Rate limits and budgets</b></td><td>Cap requests and spend per key, user or team, before the provider's limit or your CFO's does.</td><td>Per user, per feature, per environment</td></tr>
+    <tr><td><b>Keys, logging, caching</b></td><td>Keep provider keys in one place; log every call; cache repeats (Lesson 8.2).</td><td>Virtual keys per team</td></tr>
+  </table>
+
+  <div class="playground" id="pg-gw">
+    <span class="label">🎮 Playground · Gateway failover simulator</span>
+    <p class="hint">600 requests over one minute (10 per second). Between second 20 and 40 the primary provider has an incident: a share of calls fail fast, and some <b>hang</b>. A request counts as a success only if it gets an answer within the user's 30-second patience. Start with <b>Naive</b>, then try each preset, then tune it yourself.</p>
+    <div class="controls">
+      <button class="btn" id="gw-naive">Naive (no timeout, no retry)</button>
+      <button class="btn" id="gw-retry">Retry ×3</button>
+      <button class="btn" id="gw-fb">Timeout + fallback</button>
+      <button class="btn primary" id="gw-cb">+ circuit breaker</button>
+    </div>
+    <div class="controls">
+      <label>outage error rate <input type="range" id="gErr" min="0" max="100" step="5" value="70"> <b class="mono" id="gErrV"></b></label>
+      <label>hanging calls <input type="range" id="gHang" min="0" max="60" step="5" value="30"> <b class="mono" id="gHangV"></b></label>
+    </div>
+    <div class="controls">
+      <label>timeout <input type="range" id="gTo" min="0" max="30" step="1" value="0"> <b class="mono" id="gToV"></b></label>
+      <label>retries <input type="range" id="gRe" min="0" max="3" step="1" value="0"> <b class="mono" id="gReV"></b></label>
+      <label><input type="checkbox" id="gFb"> fallback provider</label>
+      <label><input type="checkbox" id="gCb"> circuit breaker</label>
+    </div>
+    <svg id="gwflow" style="width:100%;max-height:180px"></svg>
+    <canvas class="chart" id="gwc" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">successful answers <b id="gS">–</b></div>
+      <div class="stat">p95 latency <b id="gP">–</b></div>
+      <div class="stat">calls to primary <b id="gPc">–</b></div>
+      <div class="stat">calls to fallback <b id="gSc">–</b></div>
+      <div class="stat">relative cost <b id="gC">–</b></div>
+    </div>
+    <p class="hint" id="gMsg"></p>
+    <p class="hint">A seeded simulation with typical numbers (primary median 1.2 s, fallback median 1.6 s and 1.5× the price), not measurements of any real provider.</p>
+  </div>
+  <p>What you should see: with no timeout, hanging calls eat the user's whole patience. Retries alone push p95 latency up and send <b>more</b> traffic to the provider that is already struggling (a retry storm). A short timeout plus a fallback rescues almost every request for a little more money, and a circuit breaker stops hammering the broken provider at all.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the worst case of “timeout + retries”</span>
+    <p>Timeout 10 s, 3 retries, backoff 0.5 s, 1 s, 2 s. If every attempt hangs: 4 × 10 + 0.5 + 1 + 2 = <b>43.5 s</b> before the user sees an error. Your latency budget is the sum of every attempt, so keep timeouts short, retries few, and move to a fallback quickly. Same logic for an agent: 8 steps × a 10 s timeout = 80 s worst case.</p>
+  </div>
+
+  <h2>Versioning and the incidents you will actually have</h2>
+  <p>Pin a <b>dated model snapshot</b> (not a moving alias) in production, version prompts like code (Lesson 1.5), and record both on every trace. Then a change in behaviour always has a cause you can find, and a rollback is a config change.</p>
+  <table>
+    <tr><th>Incident</th><th>What you see</th><th>First response</th></tr>
+    <tr><td class="rk">Provider outage</td><td>5xx errors, timeouts, one region or the whole provider</td><td>Gateway fails over; circuit breaker; status page check</td></tr>
+    <tr><td class="rk">Rate limited</td><td>HTTP 429 at peak</td><td>Backoff with jitter, queue, raise limits, spread across keys/regions</td></tr>
+    <tr><td class="rk">Silent quality change</td><td>No errors; thumbs-down, complaints, eval scores drift</td><td>Online evals on sampled traffic (Lesson 5.6); pin snapshots; compare by model version</td></tr>
+    <tr><td class="rk">Prompt or retrieval regression</td><td>Quality drops right after your deploy</td><td>Roll back the prompt version; add the case to the CI eval set</td></tr>
+    <tr><td class="rk">Cost spike</td><td>Bill or tokens per request jump</td><td>Group by feature/user; cap agent steps; per-user budgets</td></tr>
+    <tr><td class="rk">PII in logs</td><td>Customer data in traces visible to the whole company</td><td>Redact before logging, restrict access, set retention (Lesson 8.3)</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Tracing and LLM observability:</b> Langfuse (core is MIT-licensed open source, self-hostable), LangSmith (from the LangChain team, hosted), Arize Phoenix (source-available under the Elastic License 2.0), Helicone (Apache-2.0, integrates by changing the base URL to its gateway), plus your existing OpenTelemetry stack. <b>Gateways:</b> LiteLLM (open-source SDK and proxy), Portkey (MIT gateway), Cloudflare AI Gateway (managed; caching, rate limiting, fallbacks).</p>
+<pre><code><span class="c"># 1) Trace every call: Langfuse decorator + drop-in OpenAI client</span>
+<span class="k">from</span> langfuse <span class="k">import</span> observe, get_client
+<span class="k">from</span> langfuse.openai <span class="k">import</span> openai   <span class="c"># same API, every call becomes a span</span>
+
+<span class="k">@observe</span>()                              <span class="c"># the function becomes the parent span</span>
+<span class="k">def</span> answer(question: str) -> str:
+    docs = retrieve(question)              <span class="c"># decorate retrieve() too for its own span</span>
+    resp = openai.chat.completions.create(
+        model=MODEL,                       <span class="c"># a pinned, dated snapshot from your provider</span>
+        messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: build_prompt(question, docs)}],
+    )
+    <span class="k">return</span> resp.choices[<span class="n">0</span>].message.content
+
+answer(<span class="s">"Where is my order #1042?"</span>)
+get_client().flush()                       <span class="c"># send buffered spans before a script exits</span>
+
+<span class="c"># 2) Timeouts, retries and a fallback model in one place: LiteLLM Router</span>
+<span class="k">from</span> litellm <span class="k">import</span> Router
+
+router = Router(
+    model_list=[
+        {<span class="s">"model_name"</span>: <span class="s">"chat-primary"</span>,  <span class="s">"litellm_params"</span>: {<span class="s">"model"</span>: <span class="s">"openai/"</span> + OPENAI_MODEL}},
+        {<span class="s">"model_name"</span>: <span class="s">"chat-fallback"</span>, <span class="s">"litellm_params"</span>: {<span class="s">"model"</span>: <span class="s">"anthropic/"</span> + CLAUDE_MODEL}},
+    ],
+    fallbacks=[{<span class="s">"chat-primary"</span>: [<span class="s">"chat-fallback"</span>]}],
+    num_retries=<span class="n">1</span>,
+    timeout=<span class="n">20</span>,                             <span class="c"># seconds per attempt</span>
+)
+resp = router.completion(model=<span class="s">"chat-primary"</span>,
+                         messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">"hi"</span>}])</code></pre>
+    <p class="hint">Langfuse reads <code>LANGFUSE_PUBLIC_KEY</code>, <code>LANGFUSE_SECRET_KEY</code> and <code>LANGFUSE_BASE_URL</code> from the environment. Fill the model constants from each provider's models page. If you emit raw OpenTelemetry instead, use the GenAI attribute names above and check the conventions repo for changes.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Log full prompts and outputs</td><td>Debug any bad answer exactly</td><td>Customer data in your logs: privacy, storage cost, access control</td></tr>
+      <tr><td>Sample or redact traces</td><td>Lower cost and risk</td><td>The one trace you need may be missing or masked</td></tr>
+      <tr><td>Hosted observability (SaaS)</td><td>Running in an hour</td><td>Your prompts leave your network; vendor pricing per trace</td></tr>
+      <tr><td>Self-hosted / plain OTel</td><td>Data stays inside; one stack for everything</td><td>You run and upgrade it; fewer LLM-specific views</td></tr>
+      <tr><td>Fallback to a different model</td><td>Survive a provider outage</td><td>Different behaviour: prompts must be tested on both; another bill</td></tr>
+      <tr><td>Gateway as a separate proxy</td><td>Central keys, budgets and logs for every team</td><td>One more hop (a few ms) and a critical service to keep up</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Wrap the model client in a tracing decorator (Langfuse or similar), tag every call with feature and user, set an explicit timeout and one retry, pin the model version, and put a hard monthly spend limit in the provider console. A fallback model can wait until you have customers who notice outages.</p></div>
+      <div><h4>At scale</h4><p>A central gateway every team must use: virtual keys, per-team budgets, multi-provider and multi-region failover, PII redaction before logs, OTel traces flowing into the company's observability stack, online evals on sampled traffic, and on-call runbooks for “provider down” and “quality dropped”.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your LLM feature is live. How do you operate it?” A senior answer:</p>
+    <ul>
+      <li>Traces with spans per step (retrieval, each model call, each tool), with tokens, cost, latency, model and prompt versions.</li>
+      <li>Dashboards on <b>cost per request and per feature</b>, p95 latency and TTFT, error and 429 rates, and a <b>quality</b> signal (online evals, user feedback), because quality can fail silently.</li>
+      <li>A gateway with short timeouts, bounded retries, fallbacks and a circuit breaker; budgets per user.</li>
+      <li>Pinned model snapshots and versioned prompts, so every change is deliberate and reversible.</li>
+      <li>Privacy: redaction, sampling, retention and access control on logged prompts.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Quality bugs with no errors</b> <span class="tag co">🏢 Anthropic · 2025</span> <a href="https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues" target="_blank" rel="noopener">A postmortem of three recent issues</a></div>
+      <p><b>How:</b> three overlapping infrastructure bugs (request routing, a server misconfiguration, a compiler issue in sampling) degraded some responses for weeks; up to 16% of Sonnet 4 requests at the worst hour.</p>
+      <p><b>Why this method:</b> the postmortem is a case study in why you monitor <b>quality</b>, not just availability, and keep enough trace data to tell “the model got worse” from “my prompt got worse”.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The same model name, different behaviour</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2307.09009" target="_blank" rel="noopener">How is ChatGPT's behavior changing over time?</a></div>
+      <p><b>How:</b> Stanford and Berkeley researchers ran the same tasks against the March and June 2023 versions of GPT-4 and GPT-3.5.</p>
+      <p><b>Why this method:</b> behaviour shifted a lot between versions (GPT-4's accuracy at identifying prime numbers fell from 84% to 51%), so pin versions and re-run your evals before you move.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One vocabulary for LLM telemetry</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/open-telemetry/semantic-conventions-genai" target="_blank" rel="noopener">OpenTelemetry GenAI semantic conventions</a></div>
+      <p><b>How:</b> standard span and attribute names for model calls, tool executions and agent invocations (<code>gen_ai.usage.input_tokens</code>, <code>execute_tool</code>, <code>invoke_agent</code>…).</p>
+      <p><b>Why this method:</b> instrument once and send traces to any backend; LLM spans sit in the same trace as your HTTP and database spans.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Failover at the edge</b> <span class="tag co">🏢 Cloudflare</span> <a href="https://developers.cloudflare.com/ai-gateway/configuration/fallbacks/" target="_blank" rel="noopener">AI Gateway: fallbacks</a></div>
+      <p><b>How:</b> a managed gateway in front of many model providers, with configured fallback models or providers, plus caching and rate limiting.</p>
+      <p><b>Why this method:</b> teams get failover, logging and limits without running their own proxy.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the convention that keeps moving</span>
+    <p>The OpenTelemetry GenAI conventions have changed enough that they now live in a repository of their own, and are still marked “Development”. Even the attribute for “which provider” was renamed (<code>gen_ai.system</code> → <code>gen_ai.provider.name</code>). In this field even the monitoring vocabulary needs a version pin.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Traces feed online evals (Lesson 5.6), prompt versions come from Lesson 1.5, and agent step limits come from Lesson 6.6. Lesson 8.2 uses the cost data from your traces to decide what to cache, route and batch; Lesson 8.3 covers redacting the PII in them. The general versions of these ideas are in the System Design course: <a href="../../system-design-course/phase6/3-observability.html">observability</a> and <a href="../../system-design-course/phase6/4-incidents.html">incidents</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Spec</span> <a href="https://github.com/open-telemetry/semantic-conventions-genai" target="_blank" rel="noopener">OpenTelemetry GenAI semantic conventions</a>. The attribute names, span kinds and agent spans.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.litellm.ai/docs/routing" target="_blank" rel="noopener">LiteLLM Router</a>. Retries, fallbacks, timeouts and load balancing across providers.</li>
+      <li><span class="kind">Postmortem</span> <a href="https://www.anthropic.com/engineering/a-postmortem-of-three-recent-issues" target="_blank" rel="noopener">Anthropic: three recent issues</a>. A rare, detailed look at how LLM quality bugs happen and get found.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Each request makes two model calls of 4,000 input and 200 output tokens each. At $3 / $15 per million tokens and 50,000 requests a day, what's the daily bill?</div>
+    <div class="opts"><button class="opt">About $150</button><button class="opt" data-ok>About $1,500</button><button class="opt">About $15,000</button></div>
+    <div class="explain">Per call: 4,000 × $3/M = $0.012, plus 200 × $15/M = $0.003, so $0.015. Two calls make $0.03 per request, and × 50,000 = <b>$1,500 a day</b>. Note that input is 80% of it.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Error rate and latency are normal, but over two weeks thumbs-down feedback doubles. You changed nothing. What's the best first move?</div>
+    <div class="opts"><button class="opt">Add retries and a fallback provider</button><button class="opt" data-ok>Check traces for which model version actually answered, and run your eval set against sampled recent traffic</button><button class="opt">Raise the temperature to make answers more varied</button></div>
+    <div class="explain">A quality drop with no errors points to a changed model (a moving alias, or a provider-side issue) or changed inputs. Traces that record the returned model name and online evals tell you which. Fallbacks fix outages, not quality.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A gateway is set to a 15 s timeout and 2 retries with 1 s and 2 s backoff, no fallback. During an outage where every call hangs, how long does the user wait for an error?</div>
+    <div class="opts"><button class="opt">15 s</button><button class="opt">30 s</button><button class="opt" data-ok>48 s</button></div>
+    <div class="explain">Three attempts × 15 s + 1 s + 2 s of backoff = <b>48 s</b>. That's why you combine short timeouts with a fallback or a circuit breaker, instead of retrying a provider that is clearly down.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Trace every request as spans (retrieval, each model call, each tool) with tokens, cost, latency, model and prompt versions; use the OpenTelemetry GenAI attribute names.</li>
+      <li>Tag spans by feature and user so cost is attributable; set budgets and alerts.</li>
+      <li>Put a gateway in front of providers: short timeouts, few retries with backoff, fallbacks, a circuit breaker, rate limits.</li>
+      <li>Quality can fail silently: pin model snapshots, version prompts, run online evals. Redact PII before it reaches your logs.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const PIN = 3, POUT = 15; // illustrative $ per million tokens
+  const col = { gen: "--c-md", tool: "--c-tl", ret: "--c-cx", guard: "--c-ev", root: "--c-in" };
+  // span: [name, kind, start ms, duration ms, input tokens, output tokens, depth, extra attrs]
+  const S = (name, kind, st, d, i = 0, o = 0, dep = 1, x = {}) => ({ name, kind, st, d, i, o, dep, x });
+  function trace(sc, fixed) {
+    const out = [];
+    let t = 0;
+    const add = (name, kind, d, i, o, x) => { out.push(S(name, kind, t, d, i, o, 1, x)); t += d; };
+    add("guardrail.input", "guard", 120, 0, 0, { check: "moderation" });
+    add("embeddings query", "ret", 80, 12, 0, { "gen_ai.operation.name": "embeddings" });
+    add("vector_search", "ret", 60, 0, 0, { "db.system": "pgvector", top_k: sc === "bloat" && !fixed ? 40 : 20 });
+    add("rerank", "ret", 160, 0, 0, { kept: sc === "bloat" && !fixed ? 20 : 5 });
+    const ctx = sc === "bloat" && !fixed ? 12800 : 0;
+    const loops = sc === "loop" && !fixed ? 7 : 1;
+    for (let k = 0; k < loops; k++) {
+      add("chat plan" + (loops > 1 ? " #" + (k + 1) : ""), "gen", 900 + (sc === "bloat" && !fixed ? 1500 : 0) + k * 120, 3200 + ctx + k * 900, 40,
+        { "gen_ai.operation.name": "chat", "tool_call": "get_order_status(order_id=1042)" });
+      const slow = sc === "slowtool" && !fixed;
+      add("execute_tool get_order_status", "tool", slow ? 6200 : (sc === "slowtool" ? 40 : 380), 0, 0,
+        { "gen_ai.operation.name": "execute_tool", "http.status": slow ? "200 after 6.2 s (orders API overloaded)" : "200", cache: sc === "slowtool" && fixed ? "hit (60 s TTL)" : "miss" });
+    }
+    if (sc === "loop" && fixed) out.push(S("guard: max_steps=4, duplicate tool call blocked", "guard", t, 10, 0, 0, 1, { note: "identical (tool, args) twice in a row → stop and answer" }));
+    add("chat answer", "gen", 1250 + (sc === "bloat" && !fixed ? 1600 : 0), 3600 + ctx + (loops - 1) * 900, 180, { "gen_ai.operation.name": "chat", finish_reason: "stop" });
+    add("guardrail.output", "guard", 100, 0, 0, { check: "PII + link allow-list" });
+    out.unshift(S("POST /support/answer", "root", 0, t, 0, 0, 0, { feature: "support_chat", "user.id": "u_9f3a… (hashed)", "prompt.version": "support-v14" }));
+    out.forEach(s => (s.cost = (s.i * PIN + s.o * POUT) / 1e6));
+    return out;
+  }
+  let sc = "normal", fixed = false, sel = 0;
+  const MSG = {
+    normal: ["A healthy trace: two model calls dominate cost and most of the time.", ""],
+    slowtool: ["🐢 The tool span takes 6.2 s of a 9 s request. The model is fine; the orders API is overloaded.", "Fixed: a 2 s timeout on the tool plus a 60-second cache of order status. The request is back near 3 s."],
+    bloat: ["💸 Retrieval now keeps 20 chunks (≈12,800 extra tokens) and sends them to <b>both</b> model calls, so input tokens and latency balloon.", "Fixed: rerank down to the 5 best chunks. Cost per request back to ≈ 2.4 cents, and answers didn't need the extra chunks."],
+    loop: ["💸 The agent calls the same tool with the same arguments 7 times, and each call re-sends a growing context. One request now costs as much as RATIO normal ones.", "Fixed: a step limit and duplicate-call detection end the loop after the first result (Lesson 6.6)."],
+  };
+  function render() {
+    const tr = trace(sc, fixed), root = tr[0], kids = tr.slice(1);
+    const slow = kids.reduce((b, s) => (s.d > b.d ? s : b)), dear = kids.reduce((b, s) => (s.cost > b.cost ? s : b));
+    $("wf").innerHTML = tr.map((s, i) => `<div class="sp${i === sel ? " sel" : ""}${s === slow ? " hotL" : ""}${s === dear && s.cost > 0 ? " hotC" : ""}" id="span-${i}" data-i="${i}">
+      <span class="nm" style="padding-left:${s.dep * 14}px">${s.name}</span>
+      <span class="track"><span class="bar" style="left:${100 * s.st / root.d}%;width:${Math.max(0.6, 100 * s.d / root.d)}%;background:${MX.css(col[s.kind])}"></span></span>
+      <span class="meta">${s.d.toLocaleString()} ms${s.cost >= 1e-4 ? " · $" + s.cost.toFixed(4) : ""}</span></div>`).join("");
+    $("wf").querySelectorAll(".sp").forEach(r => (r.onclick = () => { sel = +r.dataset.i; render(); }));
+    const s = tr[sel] || root;
+    const a = Object.assign({ "span.name": s.name, "duration_ms": s.d },
+      s.kind === "gen" ? { "gen_ai.provider.name": "example-provider", "gen_ai.request.model": "large-model-2026-05-01", "gen_ai.response.model": "large-model-2026-05-01", "gen_ai.usage.input_tokens": s.i, "gen_ai.usage.output_tokens": s.o, "cost_usd": +s.cost.toFixed(5) } : {}, s.x);
+    $("attrs").textContent = Object.entries(a).map(([k, v]) => `${k} = ${v}`).join("\n");
+    const tin = MX.sum(kids.map(k => k.i)), tout = MX.sum(kids.map(k => k.o)), cost = MX.sum(kids.map(k => k.cost));
+    $("tLat").textContent = (root.d / 1000).toFixed(2) + " s";
+    $("tCalls").textContent = kids.filter(k => k.kind === "gen").length;
+    $("tTok").textContent = tin.toLocaleString() + " / " + tout;
+    $("tCost").textContent = "$" + cost.toFixed(4);
+    $("tDay").textContent = "$" + Math.round(cost * 1e5).toLocaleString();
+    $("tMsg").innerHTML = fixed ? `<span class="ev">✅ ${MSG[sc][1] || "Nothing to fix on a normal day."}</span>` : sc === "normal" ? MSG.normal[0] : `<span class="rk">${MSG[sc][0].replace("RATIO", (cost / 0.0237).toFixed(1))}</span>`;
+    $("fix").textContent = fixed ? "↩ Undo the fix" : "🔧 Apply the fix";
+  }
+  const segBtns = [...$("sc").querySelectorAll("button")];
+  segBtns.forEach(b => (b.onclick = () => { segBtns.forEach(x => x.classList.toggle("on", x === b)); sc = b.dataset.v; fixed = false; sel = 0; render(); }));
+  $("fix").onclick = () => { fixed = !fixed; render(); };
+  render();
+
+  // ---------- gateway simulator ----------
+  const F = new Flow($("gwflow"), { width: 720, height: 170 });
+  F.node("app", { x: 80, y: 85, w: 110, h: 46, label: "Your app", kind: "cl" })
+   .node("gw", { x: 300, y: 85, w: 130, h: 50, label: "Gateway", sub: "timeout · retry", kind: "sv" })
+   .node("p", { x: 560, y: 40, w: 150, h: 46, label: "Primary provider", sub: "", kind: "nw" })
+   .node("s", { x: 560, y: 130, w: 150, h: 46, label: "Fallback provider", sub: "", kind: "nw" })
+   .edge("app", "gw").edge("gw", "p").edge("gw", "s", { dashed: true }).render();
+  function seeded(seed) { return MX.seeded(seed); }
+  function sim(o) {
+    const r = seeded(7), N = 600, rows = [], recent = [];
+    let cbUntil = -1, pCalls = 0, sCalls = 0;
+    const lat = med => med * Math.exp(0.35 * Math.sqrt(-2 * Math.log(r() || 1e-9)) * Math.cos(2 * Math.PI * r()));
+    for (let i = 0; i < N; i++) {
+      const t = i / 10, out = t >= 20 && t < 40;
+      let el = 0, cost = 0, ok = false;
+      const tryPrimary = () => {
+        pCalls++;
+        const fail = out && r() < o.err, hang = out && !fail && r() < o.hang;
+        let d = hang ? 60 : lat(1.2);
+        if (fail) d = 0.3 + r() * 0.4;
+        const T = o.timeout || 600;
+        if (d > T) return { ok: false, d: T };
+        if (!fail) cost += 1;
+        return { ok: !fail, d };
+      };
+      if (!(o.cb && t < cbUntil)) {
+        for (let a = 0; a <= o.retries; a++) {
+          const res = tryPrimary(); el += res.d; recent.push([t, res.ok]);
+          if (res.ok) { ok = true; break; }
+          if (a < o.retries) el += 0.5 * 2 ** a;
+        }
+      }
+      if (!ok && o.fallback) { sCalls++; el += lat(1.6); cost += 1.5; ok = r() > 0.01; }
+      while (recent.length && recent[0][0] < t - 5) recent.shift();
+      if (o.cb && recent.length >= 10 && t >= cbUntil) {
+        const e = recent.filter(x => !x[1]).length / recent.length;
+        if (e > 0.5) cbUntil = t + 10;
+      }
+      rows.push({ t, ok: ok && el <= 30, el: Math.min(el, 60), cost });
+    }
+    const lats = rows.map(x => x.el).sort((a, b) => a - b);
+    return { rows, succ: 100 * rows.filter(x => x.ok).length / N, p95: lats[Math.floor(0.95 * N)], cost: MX.sum(rows.map(x => x.cost)) / N, pCalls, sCalls };
+  }
+  const PRE = {
+    "gw-naive": { to: 0, re: 0, fb: false, cb: false },
+    "gw-retry": { to: 0, re: 3, fb: false, cb: false },
+    "gw-fb": { to: 5, re: 1, fb: true, cb: false },
+    "gw-cb": { to: 5, re: 1, fb: true, cb: true },
+  };
+  Object.entries(PRE).forEach(([id, p]) => ($(id).onclick = () => { $("gTo").value = p.to; $("gRe").value = p.re; $("gFb").checked = p.fb; $("gCb").checked = p.cb; run(); }));
+  function run() {
+    const o = { err: +$("gErr").value / 100, hang: +$("gHang").value / 100, timeout: +$("gTo").value, retries: +$("gRe").value, fallback: $("gFb").checked, cb: $("gCb").checked };
+    $("gErrV").textContent = Math.round(o.err * 100) + "%"; $("gHangV").textContent = Math.round(o.hang * 100) + "%";
+    $("gToV").textContent = o.timeout ? o.timeout + " s" : "none"; $("gReV").textContent = o.retries;
+    const R = sim(o);
+    const succ = [], p95 = [];
+    for (let b = 0; b < 60; b += 2) {
+      const rs = R.rows.filter(x => x.t >= b && x.t < b + 2);
+      succ.push([b + 1, 100 * rs.filter(x => x.ok).length / rs.length]);
+      const l = rs.map(x => x.el).sort((a, c) => a - c); p95.push([b + 1, Math.min(100, 100 * l[Math.floor(0.95 * l.length)] / 30)]);
+    }
+    Plot.line($("gwc"), {
+      series: [
+        { label: "successful answers %", color: MX.css("--c-ev"), data: succ, width: 3 },
+        { label: "p95 latency (% of the 30 s patience)", color: MX.css("--c-tk"), data: p95, dash: [6, 4] },
+      ], xLabel: "seconds (primary incident from 20 to 40)", yMin: 0, yMax: 100,
+    });
+    $("gS").textContent = R.succ.toFixed(1) + "%";
+    $("gP").textContent = R.p95.toFixed(1) + " s";
+    $("gPc").textContent = R.pCalls;
+    $("gSc").textContent = R.sCalls;
+    $("gC").textContent = R.cost.toFixed(2) + "×";
+    F.set("p", { sub: `${R.pCalls} calls`, down: o.err > 0.5, load: Math.min(1, R.pCalls / 1000) });
+    F.set("s", { sub: o.fallback ? `${R.sCalls} calls` : "not configured", load: Math.min(1, R.sCalls / 400) });
+    F.set("gw", { sub: `${o.timeout ? o.timeout + " s" : "no"} timeout · ${o.retries} retr${o.retries === 1 ? "y" : "ies"}`, hot: o.cb });
+    F.edgeStyle("gw", "s", { dashed: !o.fallback, color: o.fallback ? "--c-ev" : null });
+    $("gMsg").textContent = R.succ > 99 ? `Users barely notice the outage: ${R.succ.toFixed(1)}% answered, p95 ${R.p95.toFixed(1)} s.${o.cb ? " The breaker also cut calls to the broken provider." : ""}`
+      : o.retries > 0 && !o.fallback ? `Retries sent ${R.pCalls} calls (for 600 requests) to a provider that is already failing, and stretched p95 to ${R.p95.toFixed(1)} s. Retrying helps blips, not outages.`
+      : `${(100 - R.succ).toFixed(1)}% of users got an error or gave up. Add a timeout and a fallback.`;
+  }
+  ["gErr", "gHang", "gTo", "gRe"].forEach(id => ($(id).oninput = run));
+  ["gFb", "gCb"].forEach(id => ($(id).onchange = run));
+  $("gw-naive").onclick();
+})();
+</script>
+</body>
+</html>

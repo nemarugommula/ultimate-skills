@@ -1,0 +1,389 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>5.5 Evaluating agents · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .traj { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .traj ol { margin: 4px 0; padding-left: 22px; font-family: var(--mono); font-size: .82rem; }
+  .traj li { margin: 3px 0; }
+  .traj li.ok { color: var(--good); }
+  .traj li.extra { color: var(--c-tk); }
+  .traj li.bad { color: var(--bad); }
+  .tbtns { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .tbtns button { font-family: var(--mono); font-size: .78rem; }
+  table.gt td, table.gt th { font-size: .86rem; padding: 4px 6px; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  @media (max-width: 640px) { .traj { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-lesson="a5-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 5 · Lesson 5</div>
+  <h1>Evaluating agents: trajectories, tool calls & benchmarks</h1>
+  <p class="subtitle">An agent doesn't produce one answer; it takes a dozen actions in a world. Grade where it ended up, how it got there, what it cost, and whether it does it every time.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>An <b>agent</b> is an LLM in a loop: it picks a tool (search, an API, a shell), sees the result, and decides the next step until the task is done. Phase 6 builds them (Lesson 6.1); here we learn to grade them.</li>
+      <li><b>Tool calls</b> are structured requests like <code>issue_refund(order_id=1234, amount=89)</code> (Lesson 1.3).</li>
+      <li><b>pass@k</b> = chance at least one of k attempts succeeds (Lesson 5.2); LLM judges grade open-ended output (5.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2024, Sierra built τ-bench (“tau-bench”): customer-service agents talk to a simulated user and use real-looking APIs for a retail shop or an airline, and succeed only if the database ends up in the right state. A GPT-4o function-calling agent solved <b>61%</b> of retail tasks on a single try.</p>
+    <p>Then they ran each task 8 times. The share of tasks it solved <b>all 8 times</b> fell to about <b>25%</b>. A support agent that handles your refund correctly on Monday and wrongly on Tuesday isn't a 61% agent. The authors introduced a metric for exactly this, <b>pass^k</b>, and it's now a standard way to report agent reliability.</p>
+  </div>
+
+  <h2>Numbers first: why agents are harder to evaluate</h2>
+  <table>
+    <tr><th></th><th>Single LLM call</th><th>Agent, 15 steps</th></tr>
+    <tr><td>Chance everything goes right at 95% per step</td><td>95%</td><td class="rk">0.95<sup>15</sup> = 46% (and 0.95<sup>20</sup> = 36%)</td></tr>
+    <tr><td>Input tokens (context grows from 1,500 to 8,500 per step)</td><td>1,500</td><td class="tk">75,000</td></tr>
+    <tr><td>Cost per attempt at $3 / $15 per million tokens (illustrative, 300 output tokens per step)</td><td>~$0.009</td><td class="tk">~$0.29</td></tr>
+    <tr><td>Cost per <b>successful</b> task at 60% success</td><td>-</td><td class="tk">~$0.49</td></tr>
+    <tr><td>Things that can be wrong</td><td>The answer</td><td>Every tool choice, every argument, the order, side effects, the final state, the final message</td></tr>
+  </table>
+  <p>Errors compound, outputs vary run to run, and the agent changes the world as it goes. So you can't grade an agent by reading its last message: “Your refund has been issued!” is worthless if no refund exists in the database.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Grade agents in layers. <b>Outcome first</b>: inspect the final state of a sandboxed environment (the database row exists, the tests pass). <b>Then the path</b>: right tools, right arguments, required steps in the right order, nothing forbidden. <b>Then efficiency and reliability</b>: steps, tokens and dollars per success, and pass^k across repeated trials. Each layer catches failures the others miss.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the driving test</span>
+    <p>The examiner checks that you <b>arrived at the destination</b> (outcome). They also watch <b>how you drove</b>: a red light run on the way fails you even if you arrived (trajectory). They notice if you took 40 minutes for a 10-minute route (efficiency). And a licence means you can do it <b>every time</b>, not once in three tries (pass^k). An agent eval is a driving test, run hundreds of times.</p>
+  </div>
+
+  <h2>What to grade</h2>
+  <table>
+    <tr><th>Layer</th><th>Question</th><th>How</th><th>Catches</th></tr>
+    <tr><td class="ev"><b>Outcome / final state</b></td><td>Is the world in the right state at the end?</td><td>Code checks on the environment: DB rows, files, test suite, API mocks' recorded calls. τ-bench compares the final database to an annotated goal state.</td><td>Claimed-but-not-done; wrong side effects.</td></tr>
+    <tr><td class="tl"><b>Trajectory</b></td><td>Did it take acceptable steps?</td><td>Compare the tool-call sequence to an expected one: strict, in-order (extras allowed), unordered, or rules (“check policy before refund”, “never delete”).</td><td>Lucky successes, policy violations, unsafe actions.</td></tr>
+    <tr><td class="tl"><b>Tool-call accuracy</b></td><td>Right tool, right arguments?</td><td>Per-call: name match, schema-valid arguments, argument values exact (IDs, amounts). Precision/recall of calls.</td><td>Hallucinated IDs, wrong amounts, malformed calls.</td></tr>
+    <tr><td class="md"><b>Transcript quality</b></td><td>Was the conversation good?</td><td>LLM judge with a rubric: asked for missing info, explained clearly, followed tone rules (5.3).</td><td>Rude, confusing or over-long interactions.</td></tr>
+    <tr><td class="tk"><b>Efficiency</b></td><td>What did it cost?</td><td>Steps, tool calls, tokens, latency, dollars per <i>successful</i> task.</td><td>Loops, redundant calls, runaway cost.</td></tr>
+    <tr><td class="ev"><b>Reliability</b></td><td>Does it succeed every time?</td><td>Run each task k times: pass@k (any success) and pass^k (all succeed).</td><td>Flaky agents that look good on one run.</td></tr>
+  </table>
+  <p>Anthropic's agent-eval guidance adds a caution: don't over-specify the path. Capable models find valid routes you didn't anticipate; in one case a model “failed” a τ²-bench task by finding a policy loophole that was actually better for the user. Grade required steps and forbidden actions, not the exact sequence, unless the sequence itself is the requirement.</p>
+
+  <div class="playground" id="pgTraj">
+    <span class="label">🎮 Playground · Trajectory grader</span>
+    <p class="hint">Task: “My order #1234 arrived damaged, I want a refund.” Policy: look up the order, check the damaged-item policy <i>before</i> refunding, refund the $89 once, then tell the customer. Pick an agent run, or build your own from the tool buttons, and compare how each grader scores it. The environment check looks only at the final database.</p>
+    <div class="controls"><span class="seg" id="tPre"><button id="tp0" class="on">Textbook</button><button id="tp1">Detour</button><button id="tp2">Wrong order</button><button id="tp3">Skipped policy</button><button id="tp4">Double refund</button><button id="tp5">Escalated</button></span></div>
+    <div class="tbtns" id="tBtns"></div>
+    <div class="traj">
+      <div><b>Expected (reference)</b><ol id="tExp"></ol></div>
+      <div><b>Agent's trajectory</b><ol id="tAct"></ol></div>
+    </div>
+    <div style="overflow-x:auto"><table class="gt" id="tGrades"></table></div>
+    <div class="verdict" id="tVerdict"></div>
+  </div>
+
+  <h2>Reliability: pass@k vs pass^k</h2>
+  <p>Run each task n times and count the c successes. Two questions, two metrics, both with unbiased estimators:</p>
+  <div class="calc">pass@k = 1 − C(n − c, k) ÷ C(n, k) &nbsp; (at least one of k succeeds) &nbsp;&nbsp;|&nbsp;&nbsp; pass^k = C(c, k) ÷ C(n, k) &nbsp; (all k succeed)</div>
+  <p>pass@k rises with k: more shots on goal. Useful when a cheap verifier can pick the winner (code with tests). pass^k falls with k: it's the reliability a user experiences when they come back again and again. For customer-facing agents, pass^k is the honest number.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: 8 trials, 6 successes</span>
+    <ul>
+      <li>pass^3 = C(6, 3) ÷ C(8, 3) = 20 ÷ 56 = <b>0.36</b>. pass@3 = 1 − C(2, 3) ÷ C(8, 3) = 1 − 0 = <b>1.0</b> (you can't pick 3 failures from 2).</li>
+      <li>If every trial were an independent 75% coin, pass^3 would be 0.75³ ≈ <b>0.42</b> (Anthropic's example).</li>
+      <li>Why τ-bench fell from 61% to about 25% at k = 8, not to 0.61<sup>8</sup> ≈ 2%: tasks differ. Some tasks the agent always solves; others it solves now and then. pass^k separates <b>consistently solved</b> tasks from <b>sometimes solved</b> ones, which one average hides.</li>
+    </ul>
+  </div>
+
+  <div class="playground" id="pgPass">
+    <span class="label">🎮 Playground · pass@k vs pass^k</span>
+    <p class="hint">Two agents with the <b>same</b> average success (pass@1 = 70%) on 100 tasks, 8 trials each. Slide the consistency: at 0, every task is an independent 70% coin flip (a flaky agent); at 1, 70% of tasks always succeed and 30% always fail (a consistent agent). Watch the curves split.</p>
+    <div class="controls">
+      <label>consistency <input type="range" id="pcC" min="0" max="1" step="0.05" value="0"> <b class="mono" id="pcCV"></b></label>
+      <label>average success <input type="range" id="pcP" min="0.3" max="0.95" step="0.05" value="0.7"> <b class="mono" id="pcPV"></b></label>
+      <button class="btn primary" id="pcRun">🎲 Re-run 800 trials</button>
+      <button class="btn small" id="pcFlaky">Flaky agent</button><button class="btn small" id="pcCons">Consistent agent</button>
+    </div>
+    <canvas class="chart" id="pcChart" style="height:240px"></canvas>
+    <div class="stat-row">
+      <div class="stat">pass@1 <b id="pc1">–</b></div>
+      <div class="stat">pass@8 <b id="pcAt8">–</b></div>
+      <div class="stat">pass^8 <b id="pcHat8">–</b></div>
+      <div class="stat">tasks solved 8/8 <b id="pcAll">–</b></div>
+    </div>
+    <p class="hint" id="pcMsg"></p>
+  </div>
+
+  <h2>Sandboxes: where agent evals run</h2>
+  <p>Agent evals need an <b>environment</b> that is realistic, isolated and reset for every trial: a container with the repo checked out (SWE-bench), a seeded database behind mock APIs (τ-bench), self-hosted websites (WebArena), or a simulated user played by another LLM. Never run eval agents against production systems or real customer accounts. Reset state between trials, or one run's leftovers will pass or fail the next. Record the full transcript (every message, tool call and result): it's how you debug failures and catch graders that are wrong.</p>
+
+  <h2>Benchmarks you'll hear about</h2>
+  <table>
+    <tr><th>Benchmark</th><th>Tasks</th><th>Graded by</th><th>Notes (as of 2026)</th></tr>
+    <tr><td><b>SWE-bench</b> (2023)</td><td>2,294 real GitHub issues from 12 Python repos</td><td>The repo's own tests after the agent's patch</td><td>The original; some tasks turned out underspecified or unfairly tested.</td></tr>
+    <tr><td><b>SWE-bench Verified</b> (OpenAI, 2024)</td><td>500 tasks checked by 93 software developers</td><td>Same tests</td><td>68.3% of 1,699 screened samples were filtered out. Anthropic reports frontier models now above 80%: near saturation.</td></tr>
+    <tr><td><b>SWE-bench Pro</b> (Scale AI, 2025)</td><td>1,865 problems from 41 repos</td><td>Tests; public, held-out and commercial splits</td><td>Long-horizon, enterprise-style tasks; held-out sets limit contamination.</td></tr>
+    <tr><td><b>τ-bench</b> / <b>τ²-bench</b> (Sierra, 2024–25)</td><td>Retail (115) and airline (50) conversations; τ² adds a telecom domain where the user also acts</td><td>Final database state vs goal; pass^k</td><td>Tests policy-following with a simulated user.</td></tr>
+    <tr><td><b>GAIA</b> (Meta, Hugging Face et al., 2023)</td><td>466 real-world questions needing browsing, files, tools</td><td>Exact answer match</td><td>Humans 92% vs GPT-4 with plugins 15% at release; answers for 300 held back for a leaderboard.</td></tr>
+    <tr><td><b>WebArena</b> (CMU, 2023)</td><td>812 tasks on self-hosted shopping, forum, GitLab and CMS sites</td><td>Functional checks of the end state</td><td>Best GPT-4 agent 14.41% vs humans 78.24% at release.</td></tr>
+    <tr><td><b>Terminal-Bench 2.0</b> (2026)</td><td>89 hard command-line tasks</td><td>Tests per task in a unique environment</td><td>Frontier agents scored under 65% at publication.</td></tr>
+  </table>
+  <p class="muted">Public scores depend heavily on the scaffold (prompts, tools, retries) around the model, and leak into training data over time. Use benchmarks to shortlist models; use your own task eval to decide.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Inspect</b> (UK AI Security Institute: agents, Docker sandboxes, epochs for repeated trials), <b>LangSmith</b> with LangChain's open-source <b>agentevals</b> (trajectory match: strict, unordered, subset, superset; or an LLM judge on the trajectory), <b>promptfoo</b> (<code>trajectory:tool-sequence</code>, <code>trajectory:tool-used</code>, <code>tool-call-f1</code> assertions), <b>Braintrust</b>, <b>Langfuse</b> and <b>Arize Phoenix</b> for scoring traced agent runs, and the benchmarks' own harnesses (SWE-bench, τ-bench).</p>
+<pre><code><span class="c"># Inspect: grade the final state in a sandbox, 5 trials per task.  Run: inspect eval fix_bug.py --model &lt;provider/model&gt;</span>
+<span class="k">from</span> inspect_ai <span class="k">import</span> Task, task
+<span class="k">from</span> inspect_ai.agent <span class="k">import</span> react
+<span class="k">from</span> inspect_ai.dataset <span class="k">import</span> Sample
+<span class="k">from</span> inspect_ai.scorer <span class="k">import</span> CORRECT, INCORRECT, Score, Target, accuracy, scorer, stderr
+<span class="k">from</span> inspect_ai.solver <span class="k">import</span> TaskState
+<span class="k">from</span> inspect_ai.tool <span class="k">import</span> bash, text_editor
+<span class="k">from</span> inspect_ai.util <span class="k">import</span> sandbox
+
+<span class="k">@scorer</span>(metrics=[accuracy(), stderr()])
+<span class="k">def</span> tests_pass():
+    <span class="k">async def</span> score(state: TaskState, target: Target) -> Score:
+        result = <span class="k">await</span> sandbox().exec([<span class="s">"pytest"</span>, <span class="s">"-q"</span>, <span class="s">"tests/"</span>])   <span class="c"># outcome, not the agent's claim</span>
+        <span class="k">return</span> Score(value=CORRECT <span class="k">if</span> result.success <span class="k">else</span> INCORRECT, explanation=result.stdout[-500:])
+    <span class="k">return</span> score
+
+<span class="k">@task</span>
+<span class="k">def</span> fix_bug():
+    <span class="k">return</span> Task(
+        dataset=[Sample(input=<span class="s">"tests/test_dates.py fails. Fix the bug without editing the tests."</span>)],
+        solver=react(tools=[bash(), text_editor()]),
+        scorer=tests_pass(),
+        sandbox=<span class="s">"docker"</span>,     <span class="c"># isolated container per sample</span>
+        epochs=<span class="n">5</span>,             <span class="c"># repeated trials: compute pass@k and pass^k from the 5 results</span>
+    )</code></pre>
+<pre><code><span class="c"># agentevals: compare tool calls with a reference trajectory (OpenAI-style messages)</span>
+<span class="k">from</span> agentevals.trajectory.match <span class="k">import</span> create_trajectory_match_evaluator
+
+evaluator = create_trajectory_match_evaluator(trajectory_match_mode=<span class="s">"superset"</span>)  <span class="c"># required calls present, extras allowed</span>
+print(evaluator(outputs=agent_messages, reference_outputs=reference_messages))</code></pre>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Outcome-only grading</td><td>Allows creative valid paths; simple</td><td>Misses unsafe or lucky paths; needs a checkable end state</td></tr>
+      <tr><td>Strict trajectory match</td><td>Precise, easy to debug</td><td>Fails valid alternatives; brittle as the agent improves</td></tr>
+      <tr><td>Rule-based trajectory checks</td><td>Encodes what actually matters (order, forbidden calls)</td><td>Rules to write and maintain</td></tr>
+      <tr><td>LLM-judged transcripts</td><td>Grades conversation quality and reasoning</td><td>Cost on long transcripts; judge calibration</td></tr>
+      <tr><td>More trials per task (k)</td><td>Measures reliability; tighter estimates</td><td>k× the cost and time</td></tr>
+      <tr><td>Public benchmarks</td><td>Free, comparable across labs</td><td>Scaffold-dependent, contaminated, saturating; not your task</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>20–50 tasks from real failures, each with a seeded sandbox and a code check on the final state, plus two or three rules (required steps, forbidden calls). Run each task 3–5 times and report pass^k and cost per success, not just one pass rate. Read the transcripts of every failure.</p></div>
+      <div><h4>At scale</h4><p>Hundreds of environment-backed tasks per product, simulated users, nightly runs with many trials, trajectory and safety graders, cost and latency budgets as gates, and a regular audit of graders themselves, because a grading bug can hide or invent a regression.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“How would you evaluate a customer-support agent that can issue refunds?” A senior answer:</p>
+    <ul>
+      <li>A <b>sandboxed environment</b> (seeded DB, mocked payment API, simulated customer) reset per trial; never production.</li>
+      <li><b>Outcome checks</b> on the final state (exactly one refund, right order, right amount), plus <b>trajectory rules</b> (policy checked before refund, no refunds above a limit without approval).</li>
+      <li><b>Repeated trials</b> and pass^k, because customers need consistency; cost and steps per successful task.</li>
+      <li>An <b>LLM judge</b> for the conversation, calibrated on human labels; transcript review of failures to find categories.</li>
+      <li>Public benchmarks (τ-bench) to shortlist models, the private eval to decide.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Reliability over repeated trials</b> <span class="tag co">🏢 Sierra · 2024</span> <a href="https://arxiv.org/abs/2406.12045" target="_blank" rel="noopener">τ-bench: Tool-Agent-User Interaction</a></div>
+      <p><b>How:</b> a language-model user simulator talks to the agent, which uses domain APIs under written policies; success = final database state matches the annotated goal; pass^k over i.i.d. trials.</p>
+      <p><b>Why this method:</b> database-state checks allow many valid conversations while staying objective; pass^k exposed that a 61% agent solved only about 25% of retail tasks in all 8 tries.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Auditing a benchmark's own tasks</b> <span class="tag co">🏢 OpenAI · 2024</span> <a href="https://openai.com/index/introducing-swe-bench-verified/" target="_blank" rel="noopener">Introducing SWE-bench Verified</a></div>
+      <p><b>How:</b> 93 developers screened 1,699 SWE-bench samples for underspecified issues and unfair tests; 500 clean tasks became Verified.</p>
+      <p><b>Why this method:</b> bad tasks made models look worse than they were: GPT-4o resolved 33.2% on Verified vs 16% on the original.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Outcomes, transcripts and grader bugs</b> <span class="tag co">🏢 Anthropic · 2026</span> <a href="https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents" target="_blank" rel="noopener">Demystifying evals for AI agents</a></div>
+      <p><b>How:</b> defines tasks, trials, graders, transcripts and outcomes; combines code-based, model-based and human graders; reports pass@k and pass^k.</p>
+      <p><b>Why this method:</b> agents act over many turns and can find valid paths a fixed script would reject; grading the outcome and reading transcripts keeps the eval honest.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Realistic web environments</b> <span class="tag res">🧪 CMU · 2023</span> <a href="https://arxiv.org/abs/2307.13854" target="_blank" rel="noopener">WebArena</a></div>
+      <p><b>How:</b> fully working, self-hosted websites (e-commerce, forum, GitLab, CMS) in Docker; 812 long-horizon tasks checked for functional correctness.</p>
+      <p><b>Why this method:</b> reproducible environments make agent results comparable; the 14% vs 78% human gap showed how far agents were from reliable web work.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the eval was the bug</span>
+    <p>Anthropic reports that Claude Opus 4.5 initially scored <b>42%</b> on CORE-Bench. A researcher then found grading problems: rigid matching that rejected “96.12” when expecting “96.124991…”, ambiguous task specs, and tasks that couldn't be reproduced exactly. After fixing them and using a less constrained scaffold, the score was <b>95%</b>. Before you trust a low agent score, read the failed transcripts: some “failures” are the grader's.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This lesson grades what Phase 6 builds: the agent loop (6.1), tools and MCP (6.2), workflows (6.3), memory (6.4), multi-agent systems (6.5), guardrails and sandboxes (6.6), and architectures like planner–executor and reflection (6.7); Lesson 6.8 shows unit-testing tools and integration-testing whole agent flows when you build one from scratch. pass@k is from 5.2, transcript judges from 5.3, agentic RAG from 4.4. Lesson 5.6 runs these evals in CI and watches agents in production. The probability behind pass^k is in <a href="../../math-course/phase4/1-probability.html">Math for AI: probability</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Guide</span> <a href="https://www.anthropic.com/engineering/demystifying-evals-for-ai-agents" target="_blank" rel="noopener">Anthropic: Demystifying evals for AI agents</a>. Graders, trials, pass^k, and a roadmap.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2406.12045" target="_blank" rel="noopener">τ-bench</a>. Simulated users, policy-following and pass^k.</li>
+      <li><span class="kind">Docs</span> <a href="https://inspect.aisi.org.uk/" target="_blank" rel="noopener">Inspect</a>. Agents, sandboxes and scorers in one open-source framework.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Each task runs 10 times; one task succeeded 8 times. What's its pass^2?</div>
+    <div class="opts"><button class="opt">0.80</button><button class="opt" data-ok>0.62</button><button class="opt">0.98</button></div>
+    <div class="explain">pass^2 = C(8, 2) ÷ C(10, 2) = 28 ÷ 45 = <b>0.62</b>: the chance two randomly chosen trials both succeeded. (0.8² = 0.64 is the with-replacement approximation; 0.98 is pass@2.)</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your agent's final message says “Refund issued!” in 95% of runs, but users keep complaining. What should the eval check first?</div>
+    <div class="opts"><button class="opt">An LLM judge rating the final message's helpfulness</button><button class="opt" data-ok>The final state of the environment: does exactly one refund for the right order and amount exist?</button><button class="opt">The number of steps per run</button></div>
+    <div class="explain">Agents can claim success without achieving it. Outcome checks on the environment (the database, the payment mock's recorded calls) are the ground truth; the message is just text.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A new prompt version raises pass@1 from 70% to 74%, but pass^5 drops from 52% to 38%. For a customer-facing agent, ship it?</div>
+    <div class="opts"><button class="opt">Yes, pass@1 improved</button><button class="opt" data-ok>No, not yet: it's less consistent. Find which tasks became flaky and why, then re-evaluate</button><button class="opt">Yes, if it's cheaper</button></div>
+    <div class="explain">Customers repeat tasks; consistency is what they experience. A drop in pass^5 means more tasks now succeed only sometimes. Read those transcripts before shipping (and check error bars on both numbers).</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Grade the outcome in a sandbox first (final state), then the trajectory (required steps, forbidden actions, arguments).</li>
+      <li>Don't over-specify the path: rules and in-order matches beat strict sequence equality.</li>
+      <li>Report reliability: pass@k = 1 − C(n−c, k)/C(n, k) rises with k; pass^k = C(c, k)/C(n, k) falls, and is what users feel.</li>
+      <li>Track steps, tokens and cost per <i>successful</i> task.</li>
+      <li>Benchmarks (SWE-bench Verified/Pro, τ-bench, GAIA, WebArena, Terminal-Bench) shortlist models; your own task eval decides. Read transcripts: graders have bugs too.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  // ---------- trajectory grader ----------
+  const TOOLS = [
+    ["lookup_order", "1234"], ["lookup_order", "1243"], ["search_faq", "damaged"], ["check_policy", "damaged_item"],
+    ["issue_refund", "1234, 89"], ["issue_refund", "1243, 89"], ["send_message", "customer"], ["escalate_to_human", "ticket"],
+  ];
+  const sig = t => `${t[0]}(${t[1]})`;
+  const EXP = [TOOLS[0], TOOLS[3], TOOLS[4], TOOLS[6]];
+  const PRESETS = [
+    [0, 3, 4, 6], [0, 2, 0, 3, 4, 6], [1, 3, 5, 6], [0, 4, 6], [0, 3, 4, 4, 6], [0, 3, 7],
+  ];
+  let traj = PRESETS[0].map(i => TOOLS[i]);
+  $("tBtns").innerHTML = TOOLS.map((t, i) => `<button class="btn small" id="tAdd${i}">+ ${sig(t)}</button>`).join("") + `<button class="btn small" id="tUndo">↶ undo</button><button class="btn small" id="tClear">✕ clear</button>`;
+  TOOLS.forEach((t, i) => ($("tAdd" + i).onclick = () => { if (traj.length < 12) traj.push(t); preOff(); grade(); }));
+  $("tUndo").onclick = () => { traj.pop(); preOff(); grade(); };
+  $("tClear").onclick = () => { traj = []; preOff(); grade(); };
+  const preBtns = [...$("tPre").querySelectorAll("button")];
+  const preOff = () => preBtns.forEach(b => b.classList.remove("on"));
+  preBtns.forEach((b, i) => (b.onclick = () => { preBtns.forEach(x => x.classList.toggle("on", x === b)); traj = PRESETS[i].map(k => TOOLS[k]); grade(); }));
+  function lcsLen(a, b) { const d = Array.from({ length: a.length + 1 }, () => new Array(b.length + 1).fill(0)); for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i][j] = a[i - 1] === b[j - 1] ? d[i - 1][j - 1] + 1 : Math.max(d[i - 1][j], d[i][j - 1]); return d[a.length][b.length]; }
+  function grade() {
+    const A = traj.map(sig), E = EXP.map(sig);
+    // simulate the environment: replay the calls against a tiny database
+    const db = { refunds: [], messaged: false, escalated: false };
+    traj.forEach(([n, a]) => { if (n === "issue_refund") db.refunds.push(a); if (n === "send_message") db.messaged = true; if (n === "escalate_to_human") db.escalated = true; });
+    const outcome = db.refunds.length === 1 && db.refunds[0] === "1234, 89" && db.messaged;
+    const strict = A.length === E.length && A.every((s, i) => s === E[i]);
+    const inOrder = lcsLen(A, E) / E.length;
+    const cnt = new Map(); E.forEach(s => cnt.set(s, (cnt.get(s) || 0) + 1));
+    let tp = 0; A.forEach(s => { const k = cnt.get(s) || 0; if (k) { tp++; cnt.set(s, k - 1); } });
+    const prec = A.length ? tp / A.length : 0, rec = tp / E.length, f1 = prec + rec ? 2 * prec * rec / (prec + rec) : 0;
+    const iPol = A.indexOf("check_policy(damaged_item)"), iRef = A.findIndex(s => s.startsWith("issue_refund"));
+    const viol = [];
+    if (iRef >= 0 && (iPol < 0 || iPol > iRef)) viol.push("refund before policy check");
+    if (db.refunds.length > 1) viol.push(`${db.refunds.length} refunds issued`);
+    if (db.refunds.some(r => r.startsWith("1243"))) viol.push("refunded the wrong order");
+    // efficiency: context grows each step (1,500 + 500 × step input tokens, 300 output)
+    const tokIn = m => { let t = 0; for (let i = 0; i < m; i++) t += 1500 + 500 * i; return t; };
+    const costOf = m => tokIn(m) * 3e-6 + m * 300 * 15e-6;
+    const tin = tokIn(A.length), cost = costOf(A.length);
+    $("tExp").innerHTML = E.map(s => `<li class="${A.includes(s) ? "ok" : "bad"}">${s}</li>`).join("");
+    const used = new Map(); E.forEach(s => used.set(s, (used.get(s) || 0) + 1));
+    $("tAct").innerHTML = A.map(s => { const k = used.get(s) || 0; if (k) { used.set(s, k - 1); return `<li class="ok">${s}</li>`; } return `<li class="${/1243|escalate/.test(s) || s.startsWith("issue_refund") ? "bad" : "extra"}">${s}</li>`; }).join("") || "<li class=\"muted\">(empty: add tool calls)</li>";
+    const row = (n, v, good, note) => `<tr><td>${n}</td><td class="${good ? "ev" : "rk"}"><b>${v}</b></td><td class="muted">${note}</td></tr>`;
+    $("tGrades").innerHTML = `<tr><th>Grader</th><th>Score</th><th>What it looks at</th></tr>` +
+      row("Outcome (final DB state)", outcome ? "PASS" : "FAIL", outcome, `refunds: [${db.refunds.join(" | ") || "none"}], customer messaged: ${db.messaged ? "yes" : "no"}`) +
+      row("Strict trajectory match", strict ? "1" : "0", strict, "same calls, same order, nothing extra") +
+      row("In-order match (partial credit)", inOrder.toFixed(2), inOrder === 1, "expected calls found in order; extras allowed") +
+      row("Tool-call F1 (unordered)", f1.toFixed(2), f1 >= 0.99, `precision ${prec.toFixed(2)}, recall ${rec.toFixed(2)}`) +
+      row("Policy & safety rules", viol.length ? viol.join("; ") : "none violated", !viol.length, "policy before refund · one refund · right order") +
+      row("Step efficiency", `${A.length} steps (${A.length ? Math.min(1, E.length / A.length).toFixed(2) : "0"})`, A.length <= E.length, "expected steps ÷ actual steps") +
+      row("Cost of this run", `$${cost.toFixed(3)}`, cost <= costOf(E.length) + 1e-9, `${tin.toLocaleString()} input tokens (expected run: $${costOf(E.length).toFixed(3)}); illustrative prices`);
+    let v;
+    if (!A.length) v = `<span class="muted">Add tool calls to build a trajectory.</span>`;
+    else if (outcome && strict) v = `<span class="ev">Perfect run: every grader agrees.</span>`;
+    else if (outcome && viol.length) v = `<span class="rk">The outcome check passes, but the agent broke policy (${viol.join("; ")}). Outcome-only grading would ship this.</span>`;
+    else if (outcome) v = `<span class="tk">Right outcome via a different path: strict matching says 0, the outcome and in-order graders say it's fine. This is why you shouldn't grade only exact sequences.</span>`;
+    else if (viol.length) v = `<span class="rk">Outcome FAIL with real damage (${viol.join("; ")}). A tool-call F1 of ${f1.toFixed(2)} would hide how bad this is: one wrong argument is a different customer's money.</span>`;
+    else if (db.escalated) v = `<span class="tk">Outcome FAIL, but safe: it handed off instead of acting. Whether that counts as success is a product decision: write it into the grader explicitly.</span>`;
+    else v = `<span class="rk">Outcome FAIL: the task isn't done in the environment, whatever the final message said.</span>`;
+    $("tVerdict").innerHTML = v;
+  }
+  grade();
+
+  // ---------- pass@k vs pass^k ----------
+  const comb = (n, k) => { if (k < 0 || k > n) return 0; let r = 1; for (let i = 1; i <= k; i++) r = r * (n - k + i) / i; return r; };
+  let pcSeed = 1;
+  function pcRun() {
+    const cons = +$("pcC").value, p = +$("pcP").value, T = 100, n = 8, rng = MX.seeded(pcSeed);
+    $("pcCV").textContent = cons.toFixed(2); $("pcPV").textContent = Math.round(p * 100) + "%";
+    // each task: with prob cons, a deterministic task (always solved with prob p, else never); otherwise a p-coin every trial
+    const counts = [];
+    for (let t = 0; t < T; t++) {
+      const det = rng() < cons, solved = ((t * 37) % 100) < Math.round(p * 100); // exactly p of tasks are “solvable”
+      let c = 0; for (let i = 0; i < n; i++) c += det ? (solved ? 1 : 0) : (rng() < p ? 1 : 0);
+      counts.push(c);
+    }
+    const ks = [1, 2, 3, 4, 5, 6, 7, 8];
+    const at = ks.map(k => counts.reduce((s, c) => s + (n - c < k ? 1 : 1 - comb(n - c, k) / comb(n, k)), 0) / T);
+    const hat = ks.map(k => counts.reduce((s, c) => s + comb(c, k) / comb(n, k), 0) / T);
+    Plot.line($("pcChart"), {
+      series: [
+        { label: "pass@k (any of k succeeds)", color: MX.css("--c-ev"), data: ks.map((k, i) => [k, 100 * at[i]]), width: 3, dots: true },
+        { label: "pass^k (all k succeed)", color: MX.css("--c-rk"), data: ks.map((k, i) => [k, 100 * hat[i]]), width: 3, dots: true },
+        { label: "independent-coin pass^k = p^k", color: MX.css("--muted"), data: ks.map(k => [k, 100 * Math.pow(p, k)]), dash: [5, 4] },
+      ], xMin: 1, xMax: 8, yMin: 0, yMax: 100, xLabel: "k (trials)", yLabel: "% of tasks",
+    });
+    $("pc1").textContent = (100 * at[0]).toFixed(0) + "%";
+    $("pcAt8").textContent = (100 * at[7]).toFixed(0) + "%";
+    $("pcHat8").textContent = (100 * hat[7]).toFixed(0) + "%";
+    $("pcAll").textContent = counts.filter(c => c === n).length;
+    $("pcMsg").textContent = cons < 0.2
+      ? `Flaky agent: pass@1 ≈ ${(100 * at[0]).toFixed(0)}%, but only ${counts.filter(c => c === n).length} of 100 tasks succeeded in all 8 trials. pass@8 looks great (${(100 * at[7]).toFixed(0)}%) because almost every task works sometimes. Users would see it fail often.`
+      : cons > 0.8
+        ? `Consistent agent: same pass@1, but pass^8 stays at ${(100 * hat[7]).toFixed(0)}%. It fails the same tasks every time, which is easier to debug, route around, or hand to a human.`
+        : `Partly consistent: pass^8 = ${(100 * hat[7]).toFixed(0)}%. The gap between the red curve and the grey dashed one is the tasks the agent solves every time.`;
+  }
+  ["pcC", "pcP"].forEach(id => ($(id).oninput = pcRun));
+  $("pcRun").onclick = () => { pcSeed++; pcRun(); };
+  $("pcFlaky").onclick = () => { $("pcC").value = 0; pcRun(); };
+  $("pcCons").onclick = () => { $("pcC").value = 1; pcRun(); };
+  pcRun();
+})();
+</script>
+</body>
+</html>

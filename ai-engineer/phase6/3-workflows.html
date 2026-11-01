@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.3 Workflow patterns: chaining, routing, parallel, orchestrator-workers · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .draft { font-family: var(--mono); font-size: .85rem; border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bg2); margin: 6px 0; }
+</style>
+</head>
+<body data-lesson="a6-3" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 3</div>
+  <h1>Workflow patterns: chaining, routing, parallel, orchestrator-workers</h1>
+  <p class="subtitle">Most “agent” products in production are workflows: a few LLM calls wired together by your code. Five patterns cover nearly all of them, and each has a price in latency and tokens you can compute before you build.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Workflow vs agent</b>: in a workflow your code fixes the steps; in an agent the model picks them (Lesson 6.1).</li>
+      <li><b>Latency and tokens</b>: each LLM call takes seconds and costs tokens in and out (Lesson 0.3).</li>
+      <li><b>LLM-as-judge</b>: using a model to score another model's output against a rubric, and its biases (Lesson 5.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>After working with dozens of teams building agents, Anthropic reported something unglamorous: the most successful implementations <b>weren't using complex frameworks or specialized libraries</b>. They were built from <b>simple, composable patterns</b>.</p>
+    <p>Their December 2024 guide named five: <b>prompt chaining, routing, parallelization, orchestrator–workers and evaluator–optimizer</b>. Learn these five shapes and you can read (and price) almost any LLM system diagram you'll meet.</p>
+  </div>
+
+  <h2>Numbers first: same work, very different clocks</h2>
+  <p>Review a pull request for four things: security, performance, readability and tests. Each focused review is one LLM call of about 3 s and 1,500 tokens; merging the four reviews takes one more call of 1.5 s and 2,500 tokens.</p>
+  <table>
+    <tr><th>Design</th><th>Calls</th><th>Tokens</th><th>Wall-clock</th></tr>
+    <tr><td>One big call (“review for all four”)</td><td>1</td><td class="tk">≈2,500</td><td>≈4 s</td></tr>
+    <tr><td>Four focused calls, one after another, then merge</td><td>5</td><td class="tk">4 × 1,500 + 2,500 = 8,500</td><td class="rk">4 × 3 + 1.5 = 13.5 s</td></tr>
+    <tr><td>Four focused calls <b>in parallel</b>, then merge</td><td>5</td><td class="tk">8,500</td><td class="ev">3 + 1.5 = 4.5 s</td></tr>
+    <tr><td>Same as above, but 3 votes per aspect</td><td>13</td><td class="tk">12 × 1,500 + 2,500 = 20,500</td><td>4.5 s</td></tr>
+  </table>
+  <p class="muted">Typical, illustrative numbers. Real latency depends on output length, model and load.</p>
+  <p>Two rules fall out. <b>Tokens add up across every call</b>, whatever the shape. <b>Latency is the longest path</b> through the graph (the <b>critical path</b>), so independent calls should run in parallel. Focused calls usually give better quality than one call juggling four jobs, which is why you pay the extra tokens.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A workflow is a small graph of LLM calls and plain code. <b>Cost = sum over all calls. Latency = the critical path.</b> Pick the pattern that matches the task's shape: a fixed sequence → chain; distinct input types → route; independent parts → parallel; parts you can't know in advance → orchestrator–workers; quality you can check → evaluator–optimizer.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a restaurant kitchen</span>
+    <p>An order moves from prep to cook to plating: a <b>chain</b>, with the head chef tasting at each pass (a <b>gate</b>). The host sends vegetarians to one menu and kids to another: <b>routing</b>. Starters, mains and desserts are cooked at once by different stations: <b>parallel sectioning</b>. Three cooks taste a new sauce and the majority wins: <b>voting</b>. For a wedding, the head chef first decides which dishes and stations are needed, then hands out the work: <b>orchestrator–workers</b>. And a dish goes back to the stove until the chef approves it: <b>evaluator–optimizer</b>.</p>
+  </div>
+
+  <h2>The five patterns</h2>
+  <table>
+    <tr><th>Pattern</th><th>Shape</th><th>Use when</th><th>Latency</th><th>Tokens</th></tr>
+    <tr><td><b>Prompt chaining</b> (+ gates)</td><td>A → check → B → C</td><td>The task splits into fixed steps; a programmatic check between steps catches errors early</td><td>Sum of steps</td><td>Sum of steps</td></tr>
+    <tr><td><b>Routing</b></td><td>classify → one of N handlers</td><td>Distinct input types need different prompts, tools or models (easy questions to a small, cheap model)</td><td>Classifier + 1 handler</td><td>Often <i>lower</i> than one big prompt</td></tr>
+    <tr><td><b>Parallelization: sectioning</b></td><td>N different subtasks at once → merge</td><td>Independent parts; or separate the guardrail check from the answer</td><td>Slowest branch + merge</td><td>Sum of branches (each re-reads shared input)</td></tr>
+    <tr><td><b>Parallelization: voting</b></td><td>N copies of the same task → aggregate</td><td>High-stakes yes/no, or when diverse attempts help (self-consistency)</td><td>Slowest copy</td><td>N ×</td></tr>
+    <tr><td><b>Orchestrator–workers</b></td><td>planner decides subtasks → workers → synthesizer</td><td>You can't predict the subtasks (which files to change, which sources to search)</td><td>Plan + slowest worker + synthesis</td><td>High and variable</td></tr>
+    <tr><td><b>Evaluator–optimizer</b></td><td>generate → evaluate → revise, looped</td><td>Clear evaluation criteria and iteration measurably helps (translation, writing to a rubric, code that must pass tests)</td><td>Rounds × (gen + eval)</td><td>Rounds × (gen + eval), growing</td></tr>
+  </table>
+  <p>The difference between orchestrator–workers and sectioning: in sectioning <b>you</b> wrote the list of subtasks; in orchestrator–workers <b>the model</b> writes it at run time. That's the step towards an agent (Lesson 6.1), and towards multi-agent systems (Lesson 6.5).</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Pattern simulator</span>
+    <p class="hint">Pick a task and a pattern. You'll see the call graph, then press <b>Run</b> to watch the calls (parallel branches fire together). Durations and token counts are illustrative; the “fit” verdict is a rule of thumb, the reasoning a senior engineer would give. No real model is called.</p>
+    <div class="controls"><label>task <select id="pTask" class="btn small"></select></label></div>
+    <div class="controls"><span class="seg" id="pPat"><button data-v="single" class="on">Single call</button><button data-v="chain">Chain + gate</button><button data-v="route">Routing</button><button data-v="section">Sectioning</button><button data-v="vote">Voting</button><button data-v="orch">Orchestrator–workers</button><button data-v="evalopt">Evaluator–optimizer</button></span></div>
+    <div class="controls">
+      <label>branches / workers / rounds <input type="range" id="pN" min="2" max="6" step="1" value="4"> <b class="mono" id="pNv"></b></label>
+      <label><input type="checkbox" id="pPar" checked> run independent calls in parallel</label>
+      <button class="btn primary" id="pRun">▶ Run</button>
+    </div>
+    <svg id="pFlow" aria-label="Workflow call graph"></svg>
+    <div class="verdict" id="pFit"></div>
+    <div class="stat-row">
+      <div class="stat">LLM calls <b id="pCalls">–</b></div>
+      <div class="stat">tokens <b id="pTok">–</b></div>
+      <div class="stat">wall-clock <b id="pLat">–</b></div>
+      <div class="stat">if run one by one <b id="pSer">–</b></div>
+    </div>
+  </div>
+  <p>What you should see: on the translation task, sectioning with parallel calls is about as fast as a single call while each language gets a focused prompt; untick “parallel” and the same graph takes several times longer. Routing is the only pattern that is often <b>cheaper</b> than a single call, because the classifier is small and each handler's prompt is short. Orchestrator–workers is powerful but the most expensive: use it only when you truly can't list the subtasks in advance.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: pricing an orchestrator–workers run</span>
+    <p>A research feature: the orchestrator reads the question and plans (2 s, 1,500 tokens), spawns 5 searchers (each 6 s, 4,000 tokens, they read web pages), then a synthesizer writes the report from all findings (5 s, 6,000 tokens).</p>
+    <ul>
+      <li>Tokens: 1,500 + 5 × 4,000 + 6,000 = <b>27,500</b>.</li>
+      <li>Wall-clock in parallel: 2 + 6 + 5 = <b>13 s</b>. One by one: 2 + 30 + 5 = <b>37 s</b>.</li>
+      <li>If the orchestrator decides it needs 12 searchers for a broad question: 1,500 + 48,000 + 6,000 = 55,500 tokens, but still 13 s in parallel (if your rate limits allow 12 concurrent calls).</li>
+    </ul>
+    <p>That's the trade: parallelism keeps <b>latency</b> flat while <b>cost</b> scales with however many workers the model decides to spawn. Cap the worker count, and give each worker a clear, bounded task.</p>
+  </div>
+
+  <h2>Evaluator–optimizer: when “try again” works</h2>
+  <p>One call writes, another critiques against criteria, and the first revises, until the critic is satisfied or you hit a round limit. It works when the criteria are clear and checkable. Its two failure modes: a <b>threshold the generator can never reach</b> (you pay for every round) and a <b>noisy judge</b> that passes a mediocre draft on a lucky score.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Evaluator–optimizer loop</span>
+    <p class="hint">Task: a product tagline under 60 characters that says the jacket is waterproof and lightweight. The generator and the judge are <b>scripted stand-ins</b>: the drafts are pre-written, true quality improves with diminishing returns towards a ceiling of 0.9, and the judge's score is the true quality plus random noise. Push the threshold above 0.9, then crank the judge noise and try a few seeds.</p>
+    <div class="controls">
+      <label>pass threshold <input type="range" id="eTh" min="0.5" max="0.98" step="0.01" value="0.8"> <b class="mono" id="eThv"></b></label>
+      <label>max rounds <input type="range" id="eMax" min="1" max="8" step="1" value="6"> <b class="mono" id="eMaxv"></b></label>
+      <label>judge noise <input type="range" id="eNoise" min="0" max="0.3" step="0.01" value="0.05"> <b class="mono" id="eNoisev"></b></label>
+    </div>
+    <div class="controls"><button class="btn primary" id="eRun">▶ Run the loop</button><button class="btn" id="eSeed">🎲 New judge seed</button> <span class="muted">seed <b class="mono" id="eSeedv"></b></span></div>
+    <canvas class="chart" id="eChart" style="height:220px"></canvas>
+    <div class="verdict" id="eVerdict"></div>
+    <div class="draft" id="eDraft"></div>
+    <div class="stat-row">
+      <div class="stat">rounds <b id="eRounds">–</b></div>
+      <div class="stat">true quality of the shipped draft <b id="eQ">–</b></div>
+      <div class="stat">tokens <b id="eTok">–</b></div>
+      <div class="stat">latency <b id="eLat">–</b></div>
+    </div>
+  </div>
+  <p>What you should see: with the default threshold the loop stops after a few rounds with a good draft. Above 0.9, it runs to the round limit every time, burning tokens on tiny gains. With a noisy judge, some seeds stop at round 1 or 2 on a lucky score while the true quality is still poor. Fixes: set thresholds from measured judge scores on known-good outputs, make the critique <b>specific</b> (a checklist, tests, a length check in code), and always cap rounds. Lesson 5.3 covers calibrating the judge.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Plain code is enough for most workflows: <code>asyncio.gather</code> for sectioning and voting, an <code>if</code> for routing and gates, a <code>for</code> loop with a cap for evaluator–optimizer. Graph frameworks such as <b>LangGraph</b> (1.x as of 2026) help when you want the graph explicit, with state, checkpoints, streaming and human approval steps. Durable-execution engines (Temporal, cloud step functions) suit long workflows that must survive restarts.</p>
+<pre><code><span class="c"># Sectioning in plain Python: four focused reviews in parallel, then merge</span>
+<span class="k">import</span> asyncio, anthropic
+client = anthropic.AsyncAnthropic()
+
+<span class="k">async def</span> ask(prompt: str) -> str:
+    r = <span class="k">await</span> client.messages.create(model=<span class="s">"claude-haiku-5-5"</span>, max_tokens=<span class="n">800</span>,
+                                    messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: prompt}])
+    <span class="k">return</span> r.content[<span class="n">0</span>].text
+
+<span class="k">async def</span> review(diff: str) -> str:
+    aspects = [<span class="s">"security"</span>, <span class="s">"performance"</span>, <span class="s">"readability"</span>, <span class="s">"tests"</span>]
+    parts = <span class="k">await</span> asyncio.gather(*[ask(<span class="s">f"Review this diff ONLY for {a}:\n{diff}"</span>) <span class="k">for</span> a <span class="k">in</span> aspects])
+    <span class="k">return await</span> ask(<span class="s">"Merge these reviews, remove duplicates, rank by severity:\n\n"</span> + <span class="s">"\n\n"</span>.join(parts))</code></pre>
+<pre><code><span class="c"># Evaluator–optimizer as a LangGraph graph with a conditional edge and a round cap</span>
+<span class="k">from</span> typing <span class="k">import</span> TypedDict
+<span class="k">from</span> langgraph.graph <span class="k">import</span> StateGraph, START, END
+
+<span class="k">class</span> State(TypedDict):
+    task: str
+    draft: str
+    feedback: str
+    score: float
+    rounds: int
+
+<span class="k">def</span> generate(s: State) -> dict:
+    draft = llm(<span class="s">f"{s['task']}\nPrevious draft: {s['draft']}\nFix this feedback: {s['feedback']}"</span>)
+    <span class="k">return</span> {<span class="s">"draft"</span>: draft, <span class="s">"rounds"</span>: s[<span class="s">"rounds"</span>] + <span class="n">1</span>}
+
+<span class="k">def</span> evaluate(s: State) -> dict:
+    score, feedback = judge(s[<span class="s">"draft"</span>])        <span class="c"># rubric + checks in code (length, required words)</span>
+    <span class="k">return</span> {<span class="s">"score"</span>: score, <span class="s">"feedback"</span>: feedback}
+
+<span class="k">def</span> route(s: State) -> str:
+    <span class="k">return</span> <span class="s">"done"</span> <span class="k">if</span> s[<span class="s">"score"</span>] >= <span class="n">0.8</span> <span class="k">or</span> s[<span class="s">"rounds"</span>] >= <span class="n">4</span> <span class="k">else</span> <span class="s">"revise"</span>
+
+graph = (StateGraph(State)
+         .add_node(<span class="s">"generate"</span>, generate)
+         .add_node(<span class="s">"evaluate"</span>, evaluate)
+         .add_edge(START, <span class="s">"generate"</span>)
+         .add_edge(<span class="s">"generate"</span>, <span class="s">"evaluate"</span>)
+         .add_conditional_edges(<span class="s">"evaluate"</span>, route, {<span class="s">"revise"</span>: <span class="s">"generate"</span>, <span class="s">"done"</span>: END})
+         .compile())
+out = graph.invoke({<span class="s">"task"</span>: <span class="s">"Tagline < 60 chars: waterproof + lightweight"</span>,
+                    <span class="s">"draft"</span>: <span class="s">""</span>, <span class="s">"feedback"</span>: <span class="s">""</span>, <span class="s">"score"</span>: <span class="n">0.0</span>, <span class="s">"rounds"</span>: <span class="n">0</span>})</code></pre>
+    <p class="hint"><code>llm()</code> and <code>judge()</code> are your own helpers (one model call each). Node functions return only the state keys they update.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Splitting one call into a chain</td><td>Each step easier; checkable in between; mix models per step</td><td>Latency adds up; errors in early steps propagate</td></tr>
+      <tr><td>Routing</td><td>Specialised prompts; cheap models for easy inputs</td><td>A misroute sends the input down the wrong path: measure the classifier</td></tr>
+      <tr><td>Parallel calls</td><td>Latency of the slowest branch, not the sum</td><td>More tokens (shared input re-read); rate limits; a merge step that can lose detail</td></tr>
+      <tr><td>Voting</td><td>Fewer one-off errors on high-stakes decisions</td><td>N× cost; useless if all copies share the same blind spot</td></tr>
+      <tr><td>Orchestrator–workers</td><td>Handles unpredictable subtasks</td><td>Variable, often high cost; harder to test; the planner can over-spawn</td></tr>
+      <tr><td>Evaluator–optimizer</td><td>Better outputs when criteria are clear</td><td>Rounds × cost; noisy or biased judges stop early or never</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Plain Python: a 2–3 step chain with a code check between steps, or a router in front of 2–3 prompts. Parallelize with <code>asyncio.gather</code>. Log every call's latency and tokens so you can see the critical path. Add a framework only when the graph gets hard to read.</p></div>
+      <div><h4>At scale</h4><p>Workflows as versioned graphs (LangGraph or a durable-execution engine) with retries per node, per-node model choice (small models for routing and checks), concurrency limits per provider, cost dashboards per node, and evals per step as well as end to end (Lesson 5.6).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Design the LLM part of a support-ticket system.” A senior answer:</p>
+    <ul>
+      <li>Starts with the <b>simplest pattern</b>: a router (billing / technical / refund / other) with a small model, then a focused prompt or workflow per route.</li>
+      <li>Adds <b>gates</b> in code (schema validation, required fields) and <b>parallel</b> checks (a guardrail call alongside the answer call).</li>
+      <li>Prices it: calls per ticket, tokens per call, <b>critical-path latency</b> vs the SLO.</li>
+      <li>Reserves an <b>agent</b> or orchestrator only for the long tail where steps can't be predicted, with caps, and says how each step is evaluated.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The five patterns, named</b> <span class="tag co">🏢 Anthropic · 2024</span> <a href="https://www.anthropic.com/research/building-effective-agents" target="_blank" rel="noopener">Building effective agents</a></div>
+      <p><b>How:</b> catalogues prompt chaining, routing, parallelization (sectioning and voting), orchestrator–workers and evaluator–optimizer, each with when-to-use examples.</p>
+      <p><b>Why this method:</b> composable patterns in plain code were what worked across many customer deployments; frameworks can hide the prompts and make debugging harder.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Orchestrator–workers for research</b> <span class="tag co">🏢 Anthropic · 2025</span> <a href="https://www.anthropic.com/engineering/multi-agent-research-system" target="_blank" rel="noopener">How we built our multi-agent research system</a></div>
+      <p><b>How:</b> a lead agent plans the research and spawns subagents that search in parallel, each with its own context, then synthesizes their findings.</p>
+      <p><b>Why this method:</b> parallel subagents (and parallel tool calls inside them) cut research time by up to 90% for complex queries, at a much higher token cost (Lesson 6.5).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Voting: self-consistency</b> <span class="tag res">🧪 Research · 2022</span> <a href="https://arxiv.org/abs/2203.11171" target="_blank" rel="noopener">Self-Consistency (Wang et al.)</a></div>
+      <p><b>How:</b> sample several chain-of-thought answers to the same question and take the most common final answer.</p>
+      <p><b>Why this method:</b> different reasoning paths tend to agree on the right answer; on the GSM8K math benchmark it added +17.9% accuracy over a single greedy chain of thought.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Evaluator–optimizer with one model</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2303.17651" target="_blank" rel="noopener">Self-Refine (Madaan et al.)</a></div>
+      <p><b>How:</b> the same LLM writes, gives itself feedback, and refines, over several rounds, with no extra training.</p>
+      <p><b>Why this method:</b> across 7 tasks, outputs improved by about 20% absolute on average over one-shot generation, and were preferred by humans and automatic metrics.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the cheapest pattern can beat the single call</span>
+    <p>Routing is the one pattern that can lower your bill: send the easy 70–80% of requests (an illustrative share; measure yours) to a small, fast model and only the hard ones to a large model. Lesson 8.2 turns this into model routing for cost.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>These patterns build on the agent loop (6.1) and on well-designed tools (6.2). Evaluator–optimizer reuses LLM-as-judge (5.3), and agentic RAG (4.4) is routing and evaluator loops applied to retrieval. Planner–executor, DAG and tree-of-thought architectures (6.7) generalise these shapes; orchestrator–workers grows into multi-agent systems (6.5), and every node needs the reliability guards of 6.6. Durable workflows and sagas for long-running steps are covered in the System Design course: <a href="../../system-design-course/phase3/5-distributed-transactions.html">distributed transactions & sagas</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://www.anthropic.com/research/building-effective-agents" target="_blank" rel="noopener">Anthropic: Building effective agents</a>. The five patterns with diagrams and examples.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.langchain.com/oss/python/langgraph/workflows-agents" target="_blank" rel="noopener">LangGraph: workflows and agents</a>. Each pattern implemented as a graph.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2303.17651" target="_blank" rel="noopener">Self-Refine</a>. Evaluator–optimizer with a single model, measured on 7 tasks.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A workflow runs 3 chained steps of 2 s each, then 4 parallel workers of 3 s each, then a 1 s merge. What's the wall-clock time?</div>
+    <div class="opts"><button class="opt" data-ok>10 s</button><button class="opt">19 s</button><button class="opt">7 s</button></div>
+    <div class="explain">Critical path: 3 × 2 (chain) + 3 (the slowest parallel worker) + 1 (merge) = <b>10 s</b>. Run one by one it would be 6 + 12 + 1 = 19 s. The token cost is the same either way.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your support bot uses one giant prompt for billing, technical and refund questions. It's slow and refunds are handled badly. Which pattern fits first?</div>
+    <div class="opts"><button class="opt">Evaluator–optimizer on every answer</button><button class="opt" data-ok>Routing: a small classifier sends each ticket to a focused prompt (and tools) per category</button><button class="opt">Voting with 5 copies of the giant prompt</button></div>
+    <div class="explain">Distinct input types with different handling is exactly routing. Each handler gets a short, specialised prompt, easy categories can use a cheap model, and the refund path can get its own tools and approval rules.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your evaluator–optimizer loop always runs to the maximum 8 rounds and the drafts barely change after round 3. What's most likely?</div>
+    <div class="opts"><button class="opt">The generator needs a higher temperature</button><button class="opt" data-ok>The pass threshold is above what the generator can reach (or the judge is miscalibrated): lower it from measured scores and make the feedback specific</button><button class="opt">You need more rounds</button></div>
+    <div class="explain">Diminishing returns plus an unreachable threshold means you pay for every round. Calibrate the threshold on known-good outputs, turn vague critique into checks (length in code, required facts, tests), and keep the cap.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Five patterns: chain (+ gates), route, parallel (sectioning, voting), orchestrator–workers, evaluator–optimizer.</li>
+      <li>Tokens = sum of all calls; latency = critical path. Run independent calls in parallel.</li>
+      <li>Routing can cut cost; voting and orchestrators multiply it. Orchestrator–workers only when subtasks can't be listed in advance.</li>
+      <li>Evaluator loops need reachable thresholds, specific feedback, a calibrated judge and a round cap.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  document.querySelectorAll(".seg button").forEach(b => { if (!b.id) b.id = b.parentElement.id + "-" + b.dataset.v; });
+
+  // ---------- Playground 1: pattern simulator ----------
+  const TASKS = [
+    ["Translate a product page into several languages", { single: [1, "One call writing all languages: slow, long output, quality drops for later languages."], chain: [1, "Works, but languages don't depend on each other, so the chain wastes time."], route: [0, "Nothing to classify: every page needs every language."], section: [2, "Each language is an independent subtask: one focused call each, in parallel."], vote: [0, "Several copies of the same translation triple the cost for little gain."], orch: [0, "Overkill: you already know the subtasks (one per language)."], evalopt: [1, "Helps for nuance-heavy copy, at several times the cost."] }],
+    ["Answer support tickets: billing, technical, refunds", { single: [1, "One giant prompt for all types: long, slow, and every type gets diluted instructions."], chain: [0, "The steps differ by ticket type, so one fixed chain doesn't fit."], route: [2, "Distinct input types → classify, then a focused handler per type (cheap model for easy ones)."], section: [0, "A ticket isn't several independent parts."], vote: [0, "N copies of a support answer cost N× without fixing the real issue."], orch: [0, "Overkill for a handful of known categories."], evalopt: [1, "Can polish tone, but adds latency to every ticket."] }],
+    ["Decide if a code change has a security bug (high stakes)", { single: [1, "One opinion on a high-stakes yes/no: misses are costly."], chain: [1, "Explain-then-decide helps a little."], route: [0, "Nothing to route."], section: [1, "Splitting by bug class (injection, auth, secrets) is a reasonable alternative."], vote: [2, "Several independent reviews, flag if any (or a majority) see a bug: fewer misses."], orch: [0, "Overkill unless the change spans many unknown files."], evalopt: [0, "There's no draft to improve, just a decision."] }],
+    ["Write a marketing email that follows brand rules", { single: [1, "Often fine, but rule breaks slip through."], chain: [2, "Outline → check in code (length, banned words) → write → final check: cheap and controllable."], route: [0, "Nothing to classify."], section: [0, "An email isn't independent parts."], vote: [0, "Picking among copies doesn't enforce the rules."], orch: [0, "Overkill."], evalopt: [2, "Clear criteria + iteration helps; cap the rounds."] }],
+    ["Change a feature across an unknown number of files", { single: [0, "One call can't see or edit every file it needs."], chain: [0, "You can't write the steps in advance: which files?"], route: [0, "Not a classification problem."], section: [1, "Only if you already know the files."], vote: [0, "Copies of the same change don't help find the files."], orch: [2, "The planner discovers which files need work, then dispatches a worker per file."], evalopt: [1, "Useful as the outer loop: run tests, fix, repeat."] }],
+  ];
+  $("pTask").innerHTML = TASKS.map((t, i) => `<option value="${i}">${t[0]}</option>`).join("");
+  const C = (id, label, s, tok, kind) => ({ id, label, s, tok, kind: kind || "nw" });
+  // returns { nodes:[{id,label,s,tok,x,y,kind}], edges:[[a,b]], stages:[[ids…]] } — stages run in order; ids within a stage are independent
+  function graph(p, n) {
+    const W = 680, mid = 108;
+    const fan = (ids, x) => ids.map((id, i) => ({ id, x, y: ids.length === 1 ? mid : 26 + i * (164 / (ids.length - 1)) }));
+    let stages = [], E = [];
+    if (p === "single") stages = [[C("g", "one big call", 4, 2500)]];
+    if (p === "chain") { stages = [[C("a", "outline", 2, 1200)], [C("gate", "check (code)", 0, 0, "ca")], [C("b", "draft", 3, 2200)], [C("c", "polish", 2, 1800)]]; }
+    if (p === "route") { stages = [[C("r", "classify (small model)", 0.6, 400, "ca")], [C("h0", "handler: chosen", 3, 1600)]]; }
+    if (p === "section") { stages = [Array.from({ length: n }, (_, i) => C("w" + i, "subtask " + (i + 1), 3, 1500, "sv")), [C("m", "merge", 1.5, 2500)]]; }
+    if (p === "vote") { stages = [Array.from({ length: n }, (_, i) => C("w" + i, "copy " + (i + 1), 3, 1500, "sv")), [C("m", "majority (code)", 0, 0, "ca")]]; }
+    if (p === "orch") { stages = [[C("o", "orchestrator plans", 2, 1500)], Array.from({ length: n }, (_, i) => C("w" + i, "worker " + (i + 1), 3, 1800, "sv")), [C("s", "synthesize", 3, 3500)]]; }
+    if (p === "evalopt") { for (let r = 0; r < n; r++) stages.push([C("g" + r, "generate " + (r + 1), 3, 2000 + 300 * r)], [C("e" + r, "evaluate " + (r + 1), 1.5, 1500 + 300 * r, "ca")]); }
+    // layout: x by stage
+    const cols = stages.length + 2, nodes = [{ id: "in", label: "input", s: 0, tok: 0, kind: "cl", x: 40, y: mid }];
+    const dx = (W - 120) / (cols - 1);
+    stages.forEach((st, k) => fan(st.map(c => c.id), 40 + dx * (k + 1)).forEach((pos, j) => nodes.push(Object.assign({}, st[j], pos))));
+    nodes.push({ id: "out", label: "output", s: 0, tok: 0, kind: "cl", x: W - 40, y: mid });
+    const seq = [["in"], ...stages.map(st => st.map(c => c.id)), ["out"]];
+    for (let k = 0; k < seq.length - 1; k++) seq[k].forEach(a => seq[k + 1].forEach(b => E.push([a, b])));
+    if (p === "route") { nodes.push({ id: "h1", label: "other handler", s: 0, tok: 0, kind: "sv", x: nodes.find(x => x.id === "h0").x, y: 34 }, { id: "h2", label: "other handler", s: 0, tok: 0, kind: "sv", x: nodes.find(x => x.id === "h0").x, y: 182 }); E.push(["r", "h1"], ["r", "h2"]); }
+    return { nodes, E, stages, seq };
+  }
+  let pat = "single", F = null, G = null;
+  function calc(G, par) {
+    let tok = 0, ser = 0, lat = 0, calls = 0;
+    G.stages.forEach(st => { const ts = st.map(c => c.s); tok += st.reduce((a, c) => a + c.tok, 0); ser += ts.reduce((a, b) => a + b, 0); lat += par ? Math.max(...ts) : ts.reduce((a, b) => a + b, 0); calls += st.filter(c => c.tok > 0).length; });
+    return { tok, ser, lat, calls };
+  }
+  function draw() {
+    const n = +$("pN").value; $("pNv").textContent = n;
+    G = graph(pat, n);
+    const narrow = pat === "evalopt" && n > 3;
+    F = new Flow($("pFlow"), { width: 680, height: 216 });
+    G.nodes.forEach(nd => F.node(nd.id, { x: nd.x, y: nd.y, w: nd.id === "in" || nd.id === "out" ? 60 : narrow ? 52 : Math.min(110, 560 / (G.stages.length + 1)), h: 34, label: narrow && nd.id !== "in" && nd.id !== "out" ? (nd.id[0] === "g" ? "gen " : "eval ") + nd.id.slice(1).replace(/\d+/, m => +m + 1) : nd.label, sub: nd.s ? nd.s + " s" : "", kind: nd.kind }));
+    G.E.forEach(([a, b]) => F.edge(a, b, pat === "route" && (b === "h1" || b === "h2") ? { dashed: true } : {}));
+    if (pat === "evalopt") for (let r = 0; r < n - 1; r++) F.edgeStyle("e" + r, "g" + (r + 1), { dashed: true });
+    F.render();
+    const par = $("pPar").checked, r = calc(G, par), fit = TASKS[+$("pTask").value][1][pat];
+    $("pCalls").textContent = r.calls;
+    $("pTok").textContent = r.tok.toLocaleString();
+    $("pLat").textContent = r.lat.toFixed(1) + " s";
+    $("pSer").textContent = r.ser.toFixed(1) + " s";
+    $("pFit").innerHTML = `<span class="${["rk", "tk", "ev"][fit[0]]}">${["❌ Poor fit or overkill", "⚠️ Workable", "✅ Good fit"][fit[0]]}: ${fit[1]}</span>`;
+  }
+  async function run() {
+    const par = $("pPar").checked;
+    for (const st of G.seq.slice(1)) {
+      const prev = G.seq[G.seq.indexOf(st) - 1];
+      const legs = st.flatMap(b => prev.map(a => [a, b])).filter(([a, b]) => G.E.some(e => e[0] === a && e[1] === b));
+      if (par) await Promise.all(legs.map(l => F.packet(l, { color: "--c-tl", dur: 420 })));
+      else for (const l of legs) await F.packet(l, { color: "--c-tl", dur: 300 });
+    }
+  }
+  const pb = [...$("pPat").querySelectorAll("button")];
+  pb.forEach(b => (b.onclick = () => { pb.forEach(x => x.classList.toggle("on", x === b)); pat = b.dataset.v; draw(); }));
+  $("pN").oninput = draw; $("pPar").onchange = draw; $("pTask").onchange = draw;
+  $("pRun").onclick = run;
+  draw();
+
+  // ---------- Playground 2: evaluator–optimizer ----------
+  const DRAFTS = [
+    ["Our jacket is good for rain and stuff!!", "Vague, two exclamation marks, doesn't say lightweight."],
+    ["A waterproof jacket for rainy days.", "Says waterproof but not lightweight; generic."],
+    ["Waterproof and lightweight: the jacket for every trail.", "Both claims present; “every trail” is a cliché."],
+    ["Waterproof, featherlight, and it packs into its own pocket.", "Concrete and specific; under 60 characters."],
+    ["Storm-proof and featherlight. Packs into its own pocket.", "Slightly punchier; tiny gain."],
+    ["Storm-proof, featherlight, pocket-sized.", "Marginal change: diminishing returns."],
+    ["Storm-proof. Featherlight. Pocket-sized.", "Style tweak only."],
+    ["Storm-proof. Featherlight. Fits your pocket.", "Style tweak only."],
+  ];
+  let seed = 1;
+  function loop() {
+    const th = +$("eTh").value, max = +$("eMax").value, noise = +$("eNoise").value;
+    $("eThv").textContent = th.toFixed(2); $("eMaxv").textContent = max; $("eNoisev").textContent = noise.toFixed(2); $("eSeedv").textContent = seed;
+    const rnd = MX.seeded(seed), gauss = () => { let u = 0; while (!u) u = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * rnd()); };
+    let q = 0.42, tok = 0, lat = 0, stop = "max";
+    const Q = [], S = [];
+    for (let i = 1; i <= max; i++) {
+      if (i > 1) q = q + (0.9 - q) * 0.45;
+      const s = Math.min(1, Math.max(0, q + noise * gauss()));
+      Q.push([i, q]); S.push([i, s]);
+      tok += 2000 + 1500 + 600 * (i - 1); lat += 4.5;
+      if (s >= th) { stop = "pass"; break; }
+    }
+    const k = Q.length, d = DRAFTS[k - 1];
+    Plot.line($("eChart"), { series: [{ label: "true quality (hidden in real life)", color: MX.css("--c-cx"), data: Q, width: 3, dots: true }, { label: "judge's score", color: MX.css("--c-ev"), data: S, dash: [5, 4], dots: true }],
+      hlines: [{ y: th, label: "threshold", color: MX.css("--c-rk") }, { y: 0.9, label: "generator ceiling", color: MX.css("--muted") }], yMin: 0.3, yMax: 1, xMin: 1, xMax: Math.max(2, max), xLabel: "round" });
+    const fooled = stop === "pass" && Q[k - 1][1] < th - 0.08;
+    $("eVerdict").innerHTML = stop === "max" ? `<span class="rk">🔁 Hit the ${max}-round cap without passing. ${th > 0.9 ? "The threshold is above the generator's ceiling: every extra round was wasted tokens." : "Raise max rounds a little or lower the threshold."}</span>`
+      : fooled ? `<span class="rk">🎲 Passed on a lucky score: the judge said ${S[k - 1][1].toFixed(2)} but the true quality is ${Q[k - 1][1].toFixed(2)}. A noisy judge ships mediocre drafts.</span>`
+      : `<span class="ev">✅ Passed in round ${k} (judge ${S[k - 1][1].toFixed(2)} ≥ ${th.toFixed(2)}).</span>`;
+    $("eDraft").innerHTML = `<b>Shipped draft (round ${k}):</b> ${d[0]}<br><span class="muted">Last critique: ${d[1]}</span>`;
+    $("eRounds").textContent = k; $("eQ").textContent = Q[k - 1][1].toFixed(2); $("eTok").textContent = tok.toLocaleString(); $("eLat").textContent = lat.toFixed(1) + " s";
+  }
+  ["eTh", "eMax", "eNoise"].forEach(id => ($(id).oninput = loop));
+  $("eRun").onclick = loop;
+  $("eSeed").onclick = () => { seed++; loop(); };
+  loop();
+})();
+</script>
+</body>
+</html>

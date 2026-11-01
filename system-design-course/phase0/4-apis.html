@@ -1,0 +1,465 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0.4 APIs: REST, gRPC, GraphQL, WebSockets · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .strip { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 8px 12px; margin: 10px 0; }
+  .lane { display: grid; grid-template-columns: 130px 1fr; gap: 8px; align-items: center; font-size: .8rem; margin: 4px 0; }
+  .lane .tr { position: relative; height: 18px; background: var(--panel); border-radius: 4px; overflow: hidden; }
+  .lane .tr i { position: absolute; top: 3px; bottom: 3px; border-radius: 3px; }
+  .lane .tr i.dot { width: 8px; height: 8px; top: 5px; border-radius: 50%; margin-left: -4px; }
+  .lane .tr i.tick { width: 2px; top: 1px; bottom: 1px; }
+  .pcols { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; margin: 10px 0; }
+  .pcol { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+  .pcol h4 { margin: 0 0 6px; font-size: .92rem; }
+  .pg { border-top: 1px dashed var(--line); padding: 4px 0; display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .pg .pn { font-size: .72rem; color: var(--muted); width: 48px; }
+  .it { font-family: var(--mono); font-size: .78rem; padding: 1px 7px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); }
+  .it.dup { border-color: var(--c-er); color: var(--c-er); font-weight: 700; }
+  .it.new { border-color: var(--c-ca); color: var(--c-ca); }
+  .feed { display: flex; flex-wrap: wrap; gap: 4px; margin: 6px 0; }
+  .miss { color: var(--c-er); font-size: .82rem; }
+</style>
+</head>
+<body data-lesson="s0-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 0 · Lesson 4</div>
+  <h1>APIs: REST, gRPC, GraphQL, WebSockets</h1>
+  <p class="subtitle">An API is the contract for how clients and services talk to you: what they can ask, in what shape, and how updates reach them. The choice decides how many requests you serve, how fast users see changes, and how painful it is to change later.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>HTTP</b> = request (method, path, headers, body) → response (status code, body), over a connection that can be reused (Lesson 0.2).</li>
+      <li><b>RTT</b> = one network round trip; every extra request a screen needs adds latency, especially on mobile (Lesson 0.2).</li>
+      <li><b>QPS</b> = requests per second; clients × requests each ÷ time (Lesson 0.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2016 GitHub wrote that its REST API was responsible for <b>over 60% of the requests made to its database tier</b>. Part of the reason: to build one screen, a client had to call one endpoint, follow the links in the response, call again, and again. Responses were bloated with fields nobody asked for.</p>
+    <p>GitHub's answer was a new API in GraphQL, where a client asks for exactly the fields it needs in one request. The API style you choose isn't cosmetic: it directly sets how many requests hit your servers.</p>
+  </div>
+
+  <h2>Numbers first: one screen, three ways</h2>
+  <p>A mobile profile screen shows a user, their 10 latest posts, and each post's like count. The phone is 100 ms round trip from your servers.</p>
+  <table>
+    <tr><th>API design</th><th>Requests for one screen</th><th>Time on the network</th></tr>
+    <tr><td>Naive REST: <code>/users/7</code>, then <code>/posts/{id}</code> for each post</td><td class="er">1 + 10 = 11 (if made one after another)</td><td>~1,100 ms</td></tr>
+    <tr><td>REST with a screen-shaped endpoint: <code>/users/7?include=posts</code></td><td>1</td><td>~100 ms</td></tr>
+    <tr><td>GraphQL: one query naming exactly the fields</td><td>1</td><td>~100 ms</td></tr>
+  </table>
+  <p>Multiply by a million users opening the screen a few times a day, and the naive version sends <b>11× the requests</b> to your servers and database. That's the 60% GitHub saw.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Design an API around <b>what clients actually need per screen or per call</b>, and around <b>how updates must reach them</b>. Request count, payload size and freshness are all decided by the contract, long before any server is tuned.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: ordering food</span>
+    <p><b>REST</b> is a menu of numbered dishes: simple, everyone understands it, but you get the whole dish. <b>GraphQL</b> is telling the waiter exactly what you want on one plate. <b>gRPC</b> is the kitchen's ticket shorthand that front and back of house agreed on: fast and compact, not meant for customers. For “is my food ready?”: <b>polling</b> is walking to the counter every minute to ask; <b>long polling</b> is waiting at the counter until it's ready; <b>WebSockets</b> and <b>SSE</b> are the buzzer they hand you; a <b>webhook</b> is them phoning you when it's done.</p>
+  </div>
+
+  <h2>REST: resources and verbs</h2>
+  <p><b>REST</b> (REpresentational State Transfer) models your system as <b>resources</b> (nouns with URLs: <code>/users/7</code>, <code>/orders/123</code>) and uses <b>HTTP methods</b> as verbs. Responses are usually JSON.</p>
+  <table>
+    <tr><th>Method</th><th>Meaning</th><th>Idempotent?</th></tr>
+    <tr><td><code>GET /orders/123</code></td><td>Read</td><td>Yes</td></tr>
+    <tr><td><code>POST /orders</code></td><td>Create (the server picks the ID)</td><td class="er">No</td></tr>
+    <tr><td><code>PUT /orders/123</code></td><td>Replace</td><td>Yes</td></tr>
+    <tr><td><code>PATCH /orders/123</code></td><td>Change some fields</td><td>Not guaranteed</td></tr>
+    <tr><td><code>DELETE /orders/123</code></td><td>Delete</td><td>Yes</td></tr>
+  </table>
+  <p><b>Idempotent</b> means doing it twice has the same effect as once, so a client can safely retry it after a timeout. <code>POST</code> isn't: retrying “create payment” could charge twice. Payment APIs like Stripe's fix this with an <b>idempotency key</b>: the client sends a unique ID with the request, and the server remembers the first result for that key, so a retry returns the same answer instead of doing the work again (Lesson 3.3 goes deep).</p>
+  <h3>Status codes worth knowing</h3>
+  <table>
+    <tr><th>Code</th><th>Means</th><th>Client should…</th></tr>
+    <tr><td>200 OK / 201 Created / 204 No Content</td><td>Success</td><td>Carry on</td></tr>
+    <tr><td>400 Bad Request / 422</td><td>Your input is wrong</td><td>Fix the request; don't retry as is</td></tr>
+    <tr><td>401 Unauthorized / 403 Forbidden</td><td>Not logged in / not allowed</td><td>Log in or give up</td></tr>
+    <tr><td>404 Not Found / 409 Conflict</td><td>No such thing / clashes with current state</td><td>Don't retry blindly</td></tr>
+    <tr><td><span class="er">429 Too Many Requests</span></td><td>You're being rate limited (Lesson 1.5)</td><td>Back off, then retry</td></tr>
+    <tr><td><span class="er">500 / 502 / 503 / 504</span></td><td>Server or upstream failure</td><td>Retry with backoff (if the call is idempotent)</td></tr>
+  </table>
+  <h3>Pagination: offset vs cursor</h3>
+  <p>Lists must come in pages. <b>Offset</b> pagination says “skip 40, give me 20” (<code>?offset=40&amp;limit=20</code>). It's simple and lets users jump to page 7, but the database still reads all the skipped rows, and if new items arrive between pages, everything shifts: you see duplicates or miss items. <b>Cursor</b> pagination says “give me 20 items after the one with ID <code>abc</code>” (Stripe calls it <code>starting_after</code>). It stays fast at any depth and is stable while items are added. Try both below.</p>
+
+  <h2>gRPC: fast, typed calls between services</h2>
+  <p><b>gRPC</b> is an RPC framework (remote procedure call: call a function on another machine as if it were local). Google <a href="https://grpc.io/about/" target="_blank" rel="noopener">created it</a> and open-sourced it in 2015 as the next version of Stubby, the internal RPC system that connected its microservices for over a decade. You define the service and messages in a <code>.proto</code> file using <b>Protocol Buffers</b> (protobuf), a binary format that's smaller and faster than JSON; code for client and server is generated from it. It runs on HTTP/2, so many calls share one connection, and supports <b>streaming</b> in either or both directions. It's the usual choice <b>between your own services</b>; browsers need a proxy to call it.</p>
+
+  <h2>GraphQL: one endpoint, ask for exactly what you need</h2>
+  <p><b>GraphQL</b> was built at Facebook from 2012, when its new native mobile apps needed News Feed as data instead of HTML. The client sends a query listing the fields and nested objects it wants; one request returns exactly that. It's great for many different clients (web, iOS, Android) with different needs. The costs: caching is harder (everything is a <code>POST</code> to one URL), and a single clever query can ask the server for a huge amount of work, so you need query cost limits.</p>
+
+  <h2>Getting updates to clients: real time</h2>
+  <table>
+    <tr><th>Technique</th><th>How it works</th><th>Good for</th></tr>
+    <tr><td><b>Short polling</b></td><td>Client asks “anything new?” every N seconds</td><td>Rare updates, simplest to build; wasteful at scale</td></tr>
+    <tr><td><b>Long polling</b></td><td>Client asks; server holds the request open until there's news (or a timeout), then the client asks again</td><td>Near real time over plain HTTP</td></tr>
+    <tr><td><b>SSE</b> (Server-Sent Events)</td><td>One long HTTP response; the server keeps writing events (<code>text/event-stream</code>). One-way: server → client</td><td>Live feeds, notifications, streaming AI tokens</td></tr>
+    <tr><td><b>WebSocket</b></td><td>An HTTP connection upgraded to a two-way channel that stays open</td><td>Chat, games, collaboration, anything both sides talk</td></tr>
+    <tr><td><b>Webhook</b></td><td>Your server calls the <i>customer's</i> URL when something happens</td><td>Server-to-server events (“payment succeeded”)</td></tr>
+  </table>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what polling costs at a million users</span>
+    <p>A messaging app has <b>1,000,000</b> users online. Each gets about <b>1 message a minute</b>.</p>
+    <ul>
+      <li><b>Short polling every 5 s:</b> 1,000,000 ÷ 5 = <b>200,000 requests/s</b>. Messages: 1,000,000 ÷ 60 ≈ 16,700/s. So about <b>92%</b> of requests come back empty, and users wait 2.5 s on average to see a message.</li>
+      <li><b>Poll every 1 s</b> to make it feel live: <b>1,000,000 requests/s</b>. You've built a denial-of-service attack against yourself.</li>
+      <li><b>WebSockets:</b> 1,000,000 open connections, and only the ~16,700 messages/s actually travel, each arriving in about half a round trip. The new cost is memory and long-lived connections (Lesson 7.4 designs this).</li>
+    </ul>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Polling vs long polling vs SSE vs WebSocket</span>
+    <p class="hint">One user, 60 seconds, messages arriving at random. Each technique shows the requests it sends and how long each message waits before the user sees it (gold bars). Then scale to millions of users. Network round trip: 100 ms. Long polls time out after 30 s.</p>
+    <div class="controls">
+      <span class="seg" id="mode"><button id="mode-poll" data-v="poll" class="on">Short polling</button><button id="mode-long" data-v="long">Long polling</button><button id="mode-sse" data-v="sse">SSE</button><button id="mode-ws" data-v="ws">WebSocket</button></span>
+    </div>
+    <div class="controls">
+      <label>poll every <input type="range" id="iv" min="1" max="30" step="1" value="5"> <b class="mono" id="ivv"></b></label>
+      <label>messages per minute <input type="range" id="mr" min="0" max="5" step="1" value="2"> <b class="mono" id="mrv"></b></label>
+      <label>users online <input type="range" id="nu" min="0" max="4" step="1" value="2"> <b class="mono" id="nuv"></b></label>
+    </div>
+    <div class="strip" id="strip"></div>
+    <svg id="fl"></svg>
+    <div class="controls"><button class="btn primary" id="play">▶ Animate 10 seconds</button><button class="btn" id="reroll">🎲 New random messages</button></div>
+    <div class="stat-row">
+      <div class="stat">requests / min (one user) <b id="rq">–</b></div>
+      <div class="stat">empty responses <b id="em">–</b></div>
+      <div class="stat">avg wait to see a message <b id="aw">–</b></div>
+      <div class="stat">server load, all users <b id="sl">–</b></div>
+      <div class="stat">open connections <b id="oc">–</b></div>
+    </div>
+    <p class="hint" id="pmsg"></p>
+  </div>
+  <p>Things to try: short polling every 1 s at 1 M users is a million requests per second, almost all empty. Stretch it to 30 s and the server relaxes but messages wait 15 s. Long polling, SSE and WebSockets all deliver in about 50 ms; the difference is that long polling still sends one request per message, while SSE and WebSockets just keep one connection open.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Offset vs cursor pagination</span>
+    <p class="hint">A feed shows the newest posts first, 5 per page. Two readers scroll the same feed: one asks by offset (“skip 5×page”), the other by cursor (“5 posts older than the last one I saw”). Read a page, then make new posts arrive or delete one, then read the next page.</p>
+    <div class="controls">
+      <button class="btn primary" id="next">📄 Both read the next page</button>
+      <button class="btn" id="add">✍️ 3 new posts arrive</button>
+      <button class="btn" id="del">🗑️ Delete the newest post</button>
+      <button class="btn" id="preset">Reset</button>
+    </div>
+    <div class="hint">The feed right now (newest first):</div>
+    <div class="feed" id="feed"></div>
+    <div class="pcols">
+      <div class="pcol"><h4>Offset: <code>?offset=N&amp;limit=5</code></h4><div id="po"></div><div class="miss" id="mo"></div></div>
+      <div class="pcol"><h4>Cursor: <code>?starting_after=ID&amp;limit=5</code></h4><div id="pc"></div><div class="miss" id="mc"></div></div>
+    </div>
+    <div class="stat-row">
+      <div class="stat">offset: seen twice <b id="do">0</b></div>
+      <div class="stat">offset: skipped <b id="so">0</b></div>
+      <div class="stat">cursor: seen twice <b id="dc">0</b></div>
+      <div class="stat">cursor: skipped <b id="sc">0</b></div>
+      <div class="stat">rows read for page 10,000 <b id="rows">–</b></div>
+    </div>
+  </div>
+  <p>The offset reader goes wrong the moment the feed changes under it: new posts push old ones down, so they reappear on the next page; a deletion pulls them up, so one is skipped forever. The cursor reader remembers <i>where</i> it was, not <i>how far</i> it was, so neither happens. And at page 10,000 the offset query makes the database walk past 50,000 rows to return 5.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>curl</b> and Postman for REST; <b>OpenAPI</b> (formerly Swagger) to describe a REST API and generate docs and clients; <b>protoc</b> / <b>buf</b> and <b>grpcurl</b> for gRPC; Apollo or GraphQL Yoga for GraphQL; Socket.IO, or managed services like Pusher, Ably and AWS API Gateway WebSockets for real-time. Snippets:</p>
+<pre><code><span class="c"># REST with cursor pagination and an idempotent POST (Stripe-style)</span>
+curl <span class="s">"https://api.example.com/v1/posts?limit=20&amp;starting_after=post_8f3a"</span>
+curl -X POST https://api.example.com/v1/payments \
+  -H <span class="s">"Idempotency-Key: 5b1d3c2e-9f6a-4c1e-8e7a-2f0d9b4c6a11"</span> \
+  -d amount=<span class="n">2000</span> -d currency=usd
+
+<span class="c"># Watch a Server-Sent Events stream (-N = don't buffer)</span>
+curl -N https://api.example.com/v1/events</code></pre>
+<pre><code><span class="c"># openapi.yaml: the contract for one endpoint</span>
+openapi: <span class="s">3.1.0</span>
+info: { title: <span class="s">Posts API</span>, version: <span class="s">"1"</span> }
+paths:
+  /posts:
+    get:
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, maximum: <span class="n">100</span> } }
+        - { name: starting_after, in: query, schema: { type: string } }
+      responses:
+        <span class="s">"200"</span>: { description: <span class="s">A page of posts, plus has_more</span> }</code></pre>
+<pre><code><span class="c">// posts.proto: a gRPC service between your own services</span>
+syntax = <span class="s">"proto3"</span>;
+<span class="k">service</span> Posts {
+  <span class="k">rpc</span> GetPost (GetPostRequest) <span class="k">returns</span> (Post);
+  <span class="k">rpc</span> WatchFeed (WatchRequest) <span class="k">returns</span> (<span class="k">stream</span> Post);   <span class="c">// server streaming</span>
+}
+<span class="k">message</span> GetPostRequest { string id = <span class="n">1</span>; }
+<span class="k">message</span> Post { string id = <span class="n">1</span>; string author_id = <span class="n">2</span>; string text = <span class="n">3</span>; int64 likes = <span class="n">4</span>; }</code></pre>
+    <p class="hint">Try it locally: with a gRPC server that has reflection on, <code>grpcurl -plaintext localhost:50051 list</code> shows its services. For SSE, <code>curl -N</code> against any endpoint that returns <code>text/event-stream</code> prints events as they arrive.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Style</th><th>✅ Use when…</th><th>❌ Avoid when…</th></tr>
+      <tr><td>REST + JSON</td><td>Public APIs, browsers, simple create/read/update/delete (CRUD); HTTP caching and tooling for free</td><td>Screens need many related objects (chatty), or service-to-service calls are very hot</td></tr>
+      <tr><td>gRPC + protobuf</td><td>Internal service-to-service calls; strict contracts; streaming</td><td>Browsers or third parties are the main clients (needs a proxy; binary is harder to debug)</td></tr>
+      <tr><td>GraphQL</td><td>Many client types with different data needs; product teams iterating fast</td><td>Simple APIs; you need easy HTTP caching; you can't afford to build query-cost limits</td></tr>
+      <tr><td>Polling</td><td>Updates are rare (minutes) and clients are few</td><td>Many clients want near-instant updates</td></tr>
+      <tr><td>SSE</td><td>Server → client only: feeds, notifications, AI token streams</td><td>The client sends a lot too (use WebSockets)</td></tr>
+      <tr><td>WebSocket</td><td>Two-way, low latency: chat, games, live docs</td><td>You can't run stateful long-lived connections (some serverless platforms), or updates are rare</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>One REST/JSON API with cursor pagination from day one (changing it later breaks clients), idempotency keys on anything that charges money, and an OpenAPI file. For live features, start with SSE or a managed WebSocket service rather than running your own fleet.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Public REST APIs with strict versioning and long deprecation windows, gRPC between hundreds of internal services, often a GraphQL layer for the apps, and dedicated real-time gateways holding millions of WebSocket connections (Lessons 4.3, 4.5, 7.4).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Most designs include an “API” step. A senior answer:</p>
+    <ul>
+      <li>Writes 3–5 key endpoints with methods, paths, request and response fields, e.g. <code>POST /v1/messages</code>, <code>GET /v1/chats/{id}/messages?cursor=…</code>.</li>
+      <li>Uses <b>cursor pagination</b> for feeds, <b>idempotency keys</b> for writes that matter, and says how the API is <b>versioned</b>.</li>
+      <li>Picks the <b>real-time mechanism</b> from the numbers (users online, update rate, one-way or two-way) and mentions the cost of holding connections.</li>
+      <li>Says why gRPC internally and REST/GraphQL externally, if the design has both.</li>
+    </ul>
+    <p>Common follow-ups: “What happens if the client retries this POST?” “How do you add a field without breaking old apps?” “How does a user who was offline catch up?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Cursors, idempotency keys and dated versions</b> <span class="tag co">🏢 Stripe</span> <a href="https://docs.stripe.com/api/pagination" target="_blank" rel="noopener">Stripe API: pagination</a> · <a href="https://docs.stripe.com/api/idempotent_requests" target="_blank" rel="noopener">idempotent requests</a> · <a href="https://docs.stripe.com/api/versioning" target="_blank" rel="noopener">versioning</a></div>
+      <p><b>How:</b> list endpoints take <code>limit</code> and <code>starting_after</code>; writes accept an <code>Idempotency-Key</code> header so they can be safely retried; and API versions are released monthly without breaking changes, with breaking changes only in twice-yearly major releases.</p>
+      <p><b>Why this method:</b> payments must never double-charge on a retry, and thousands of businesses' integrations must keep working while the API evolves.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Moving from offsets to cursors</b> <span class="tag co">🏢 Slack</span> <a href="https://slack.engineering/evolving-api-pagination-at-slack/" target="_blank" rel="noopener">Evolving API Pagination at Slack</a></div>
+      <p><b>How:</b> endpoints that once returned hundreds of records grew to hundreds of thousands. Slack moved from no pagination, to offsets, to cursor-based pagination.</p>
+      <p><b>Why this method:</b> as they explain, <code>LIMIT … OFFSET …</code> makes the database read offset + count rows, and when items are written frequently the page window shifts, skipping or duplicating results.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>REST to GraphQL</b> <span class="tag co">🏢 GitHub · 2016</span> <a href="https://github.blog/news-insights/the-library/the-github-graphql-api/" target="_blank" rel="noopener">The GitHub GraphQL API</a></div>
+      <p><b>How:</b> GitHub's REST API was responsible for over 60% of requests to its database tier, partly because hypermedia navigation makes clients call repeatedly; they launched a GraphQL API where one query fetches what a client needs.</p>
+      <p><b>Why this method:</b> fewer, better-shaped requests cut load on the servers and round trips for clients.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A WebSocket gateway for real-time events</b> <span class="tag co">🏢 Discord</span> <a href="https://discord.com/developers/docs/events/gateway" target="_blank" rel="noopener">Discord Gateway docs</a></div>
+      <p><b>How:</b> apps open a WebSocket to Discord's Gateway to receive events (a message posted, a channel updated). After connecting, the app sends a heartbeat at the interval the server gives it, and can resume a dropped connection.</p>
+      <p><b>Why this method:</b> pushing events over one open connection is how millions of clients see messages instantly without polling; heartbeats detect dead connections.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>WebSockets instead of polling</b> <span class="tag co">🏢 Stack Overflow · 2016</span> <a href="https://nickcraver.com/blog/2016/02/17/stack-overflow-the-architecture-2016-edition/" target="_blank" rel="noopener">Stack Overflow: The Architecture, 2016 Edition</a></div>
+      <p><b>How:</b> about 500,000 concurrent WebSocket connections at peak push live updates: notifications, vote counts, new answers and comments.</p>
+      <p><b>Why this method:</b> in their words, WebSockets are “tremendously more efficient than polling” at their scale: more data with fewer resources, and more instant for users.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the 18-month tab</span>
+    <p>Stack Overflow's architecture post notes that some of the browsers holding its WebSocket connections had been open for <b>over 18 months</b>. Long-lived connections really are long-lived, which is why servers must handle reconnects, heartbeats and deploys without dropping everyone at once.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Idempotency and retries get their own lesson (Lesson 3.3), rate limiting returns 429s (Lesson 1.5), API gateways sit in front of your APIs (Lesson 1.6), service-to-service communication and gRPC return in Lesson 4.3, and API versioning in Lesson 4.5. Chat (Lesson 7.4) and notifications (Lesson 7.8) are built on WebSockets and webhooks. For AI apps, SSE is the standard way chat interfaces stream tokens as they're generated.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.stripe.com/api" target="_blank" rel="noopener">Stripe API reference</a>. A thoroughly documented REST API to learn from: errors, pagination, idempotency, versioning.</li>
+      <li><span class="kind">Docs</span> <a href="https://grpc.io/docs/what-is-grpc/introduction/" target="_blank" rel="noopener">Introduction to gRPC</a>. Protocol buffers, service definitions and the four kinds of calls.</li>
+      <li><span class="kind">Blog</span> <a href="https://slack.engineering/evolving-api-pagination-at-slack/" target="_blank" rel="noopener">Evolving API Pagination at Slack</a>. Offset vs cursor, with the SQL, from a team that hit the limits.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 500,000 users keep a dashboard open that polls for updates every 2 seconds. How many requests per second does that cost?</div>
+    <div class="opts"><button class="opt">About 4,000/s</button><button class="opt" data-ok>About 250,000/s</button><button class="opt">About 1,000,000/s</button></div>
+    <div class="explain">500,000 ÷ 2 = <b>250,000 requests/s</b>, whether or not anything changed. If updates are rare, SSE or WebSockets would send only the actual changes over 500,000 open connections.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. An infinite-scroll feed gets new posts every second. Users complain they see the same post twice while scrolling. What's the fix?</div>
+    <div class="opts"><button class="opt">Make pages bigger so fewer page boundaries happen</button><button class="opt" data-ok>Switch from offset to cursor pagination (“items older than ID X”)</button><button class="opt">Cache each page for 10 minutes</button></div>
+    <div class="explain">New posts at the top shift every offset, so items slide into the next page. A cursor anchors on the last item seen, so inserts above it don't matter. It's also faster deep into the feed, since the database doesn't read and discard skipped rows.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A mobile app's “Pay” request times out. The app retries, and the customer is charged twice. Which API design prevents this?</div>
+    <div class="opts"><button class="opt" data-ok>The client sends a unique idempotency key with the POST; the server stores the result per key and returns it again on a retry</button><button class="opt">Use PUT instead of POST, and nothing else</button><button class="opt">Tell the app never to retry</button></div>
+    <div class="explain">Timeouts are ambiguous: the first request may have succeeded. With an idempotency key (as Stripe's API uses), the retry is recognised and returns the original result. Never retrying means real failures leave customers stuck.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>REST: resources + HTTP verbs + status codes. GET/PUT/DELETE are idempotent; make POSTs safe with idempotency keys.</li>
+      <li>Use cursor pagination for anything that changes or gets deep; offset skips, duplicates and slows down.</li>
+      <li>gRPC + protobuf between services; GraphQL when many clients need differently shaped data in one round trip.</li>
+      <li>Real time: polling costs clients ÷ interval requests/s; long polling, SSE (one-way) and WebSockets (two-way) push instead.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const n0 = v => Math.round(v).toLocaleString("en-US");
+  const big = v => v >= 1e6 ? (v / 1e6).toFixed(v >= 1e7 ? 0 : 1) + " M" : v >= 1e3 ? (v / 1e3).toFixed(v >= 1e4 ? 0 : 1) + " k" : n0(v);
+
+  // ---------- real-time simulator ----------
+  const RATES = [0.2, 1, 2, 6, 12, 30], USERS = [1e3, 1e4, 1e5, 1e6, 1e7], RTT = 0.1, T = 60, LP_TIMEOUT = 30;
+  let seed = 3, msgs = [];
+  const getMode = seg("mode", () => sim());
+  function gen() {
+    const rate = RATES[+$("mr").value] / 60;
+    for (let tries = 0; tries < 20; tries++) { // re-roll until at least one message lands in the minute
+      const rng = MX.seeded(seed + 97 * tries); msgs = [];
+      let t = 0;
+      while (true) { t += -Math.log(1 - rng()) / rate; if (t >= T) break; msgs.push(t); }
+      if (msgs.length) break;
+    }
+  }
+  const F = new Flow($("fl"), { width: 720, height: 120 });
+  F.node("c", { x: 110, y: 60, w: 150, label: "📱 Users", kind: "cl" }).node("s", { x: 610, y: 60, w: 150, label: "Server", kind: "sv" })
+   .edge("c", "s", { noArrow: true, label: " " }).render();
+  let last = null;
+  function sim() {
+    const mode = getMode(), iv = +$("iv").value, N = USERS[+$("nu").value];
+    $("ivv").textContent = iv + " s"; $("mrv").textContent = RATES[+$("mr").value]; $("nuv").textContent = big(N);
+    $("iv").disabled = mode !== "poll";
+    const reqs = [], waits = [], evs = []; // reqs: {t, empty}; evs for animation: {t, kind}
+    if (mode === "poll") {
+      const polls = []; for (let t = iv * 0.37; t < T; t += iv) polls.push(t);
+      let mi = 0;
+      polls.forEach(p => {
+        const arrive = p + RTT / 2; let got = 0;
+        while (mi < msgs.length && msgs[mi] <= arrive) { waits.push([msgs[mi], arrive + RTT / 2]); mi++; got++; }
+        reqs.push({ t: p, empty: !got }); evs.push({ t: p, kind: got ? "full" : "empty" });
+      });
+      while (mi < msgs.length) { const nextPoll = polls.find(p => p + RTT / 2 > msgs[mi]); waits.push([msgs[mi], (nextPoll ?? T) + RTT]); mi++; }
+    } else if (mode === "long") {
+      let t = 0, mi = 0;
+      while (t < T) {
+        reqs.push({ t, empty: true });
+        const open = t + RTT / 2, next = mi < msgs.length ? Math.max(msgs[mi], open) : Infinity;
+        if (next - open < LP_TIMEOUT && next < T) {
+          let deliver = next; reqs[reqs.length - 1].empty = false; evs.push({ t, kind: "hold" });
+          while (mi < msgs.length && msgs[mi] <= deliver) { waits.push([msgs[mi], deliver + RTT / 2]); mi++; }
+          t = deliver + RTT / 2;
+        } else { evs.push({ t, kind: "empty" }); t = open + LP_TIMEOUT + RTT / 2; }
+      }
+    } else {
+      reqs.push({ t: 0, empty: false });
+      msgs.forEach(m => { waits.push([m, m + RTT / 2]); evs.push({ t: m, kind: "push" }); });
+    }
+    const perMin = reqs.length * 60 / T, empty = reqs.filter(r => r.empty).length;
+    const avgW = waits.length ? MX.mean(waits.map(w => w[1] - w[0])) : 0;
+    const serverRps = mode === "poll" ? N / iv : mode === "long" ? N * perMin / 60 : N * RATES[+$("mr").value] / 60;
+    const conns = mode === "poll" ? N * RTT / iv : N;
+    const pct = x => (100 * x / T) + "%";
+    $("strip").innerHTML =
+      `<div class="lane"><span>message arrives</span><div class="tr">${msgs.map(m => `<i class="dot" style="left:${pct(m)};background:var(--c-nw)"></i>`).join("")}</div></div>` +
+      `<div class="lane"><span>${mode === "poll" ? "poll requests" : mode === "long" ? "long-poll requests" : "connection"}</span><div class="tr">${
+        mode === "sse" || mode === "ws" ? `<i style="left:0;width:100%;background:color-mix(in srgb, var(--c-ca) 35%, transparent)"></i>` :
+        reqs.map(r => `<i class="tick" style="left:${pct(r.t)};background:var(${r.empty ? "--muted" : "--c-cl"})"></i>`).join("")}</div></div>` +
+      `<div class="lane"><span>waiting to be seen</span><div class="tr">${waits.map(w => `<i style="left:${pct(w[0])};width:max(3px, ${pct(Math.min(T, w[1]) - w[0])});background:var(--c-lt);opacity:.85"></i>`).join("")}</div></div>` +
+      `<div class="lane"><span></span><div class="hint" style="display:flex;justify-content:space-between"><span>0 s</span><span>30 s</span><span>60 s</span></div></div>`;
+    $("rq").textContent = perMin.toFixed(perMin < 10 ? 1 : 0);
+    $("em").textContent = reqs.length && mode !== "sse" && mode !== "ws" ? Math.round(100 * empty / reqs.length) + "%" : "–";
+    $("aw").textContent = waits.length ? (avgW < 1 ? Math.round(avgW * 1000) + " ms" : avgW.toFixed(1) + " s") : "no messages";
+    $("sl").textContent = big(serverRps) + (mode === "sse" || mode === "ws" ? " msgs/s" : " req/s");
+    $("oc").textContent = big(conns);
+    F.set("c", { sub: big(N) + " online" }).set("s", { sub: big(serverRps) + (mode === "sse" || mode === "ws" ? " pushes/s" : " req/s"), load: Math.min(1, serverRps / 200000), hot: serverRps > 200000 });
+    F.edgeStyle("c", "s", { width: mode === "sse" || mode === "ws" ? 4 : 2, color: mode === "sse" || mode === "ws" ? "--c-ca" : "--line", label: mode === "ws" ? "one open two-way connection" : mode === "sse" ? "one open stream (server → client)" : mode === "long" ? "a request waits at the server" : "a new request every " + iv + " s" });
+    $("pmsg").textContent = mode === "poll" ? (serverRps > 200000 ? `${big(serverRps)} requests/s, ${Math.round(100 * empty / Math.max(1, reqs.length))}% of them empty. The server (load bar assumes a fleet sized for 200 k req/s) is overwhelmed by questions with no news.` : `Messages wait about half the poll interval. Shorter interval = fresher but more requests.`) :
+      mode === "long" ? "Near-instant delivery over plain HTTP, but every message costs a fresh request, and each waiting request ties up a connection on the server." :
+      mode === "sse" ? "One open HTTP response per user; the server writes events into it. Perfect when only the server talks." :
+      "One open connection per user, both directions. Load is just the real messages, plus memory for every open connection.";
+    last = { mode, evs, iv };
+  }
+  let playing = false;
+  $("play").onclick = async () => {
+    if (playing || !last) return; playing = true;
+    const t0 = performance.now(), evs = last.evs.filter(e => e.t < 10).sort((a, b) => a.t - b.t), SPEED = 600; // ms of animation per simulated second
+    const pending = [];
+    for (const e of evs) {
+      const wait = e.t * SPEED - (performance.now() - t0);
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
+      if (e.kind === "push") pending.push(F.packet(["s", "c"], { color: "--c-ca", dur: 350 }));
+      else if (e.kind === "hold") pending.push(F.packet(["c", "s"], { color: "--c-cl", dur: 350, back: true }));
+      else pending.push(F.packet(["c", "s"], { color: e.kind === "empty" ? "--muted" : "--c-cl", dur: 300, back: true }));
+    }
+    await Promise.all(pending);
+    playing = false;
+  };
+  $("reroll").onclick = () => { seed++; gen(); sim(); };
+  $("mr").oninput = () => { gen(); sim(); };
+  $("iv").oninput = sim; $("nu").oninput = sim;
+  gen(); sim();
+
+  // ---------- pagination ----------
+  const LIMIT = 5;
+  let posts, nextId, rdO, rdC, snapshot;
+  function presetP() {
+    posts = []; for (let i = 1; i <= 30; i++) posts.push(i); // ids; bigger = newer
+    nextId = 31; snapshot = new Set(posts);
+    rdO = { pages: [], offset: 0 }; rdC = { pages: [], cursor: null };
+    paintP();
+  }
+  const feedNow = () => posts.slice().sort((a, b) => b - a);
+  function readNext() {
+    const f = feedNow();
+    rdO.pages.push(f.slice(rdO.offset, rdO.offset + LIMIT)); rdO.offset += LIMIT;
+    const after = rdC.cursor == null ? f : f.filter(id => id < rdC.cursor);
+    const pg = after.slice(0, LIMIT); rdC.pages.push(pg); if (pg.length) rdC.cursor = pg[pg.length - 1];
+    paintP();
+  }
+  function stats(rd) {
+    const seen = rd.pages.flat(), cnt = {}; seen.forEach(id => (cnt[id] = (cnt[id] || 0) + 1));
+    const dups = Object.values(cnt).filter(c => c > 1).reduce((s, c) => s + c - 1, 0);
+    if (!seen.length) return { dups: 0, missed: [] };
+    const lo = Math.min(...seen), hi = Math.max(...rd.pages[0]);
+    const missed = posts.filter(id => snapshot.has(id) && id >= lo && id <= hi && !cnt[id]);
+    return { dups, missed, cnt };
+  }
+  function paintP() {
+    const f = feedNow();
+    $("feed").innerHTML = f.map(id => `<span class="it ${snapshot.has(id) ? "" : "new"}">#${id}</span>`).join("");
+    const col = (rd, el) => {
+      const s = stats(rd), seenOnce = {};
+      $(el).innerHTML = rd.pages.map((pg, i) => `<div class="pg"><span class="pn">page ${i + 1}</span>${pg.length ? pg.map(id => { const d = seenOnce[id]; seenOnce[id] = 1; return `<span class="it ${d ? "dup" : ""}">#${id}${d ? " again" : ""}</span>`; }).join("") : '<span class="hint">(empty)</span>'}</div>`).join("") || '<div class="hint">Press “read the next page”.</div>';
+      return s;
+    };
+    const so = col(rdO, "po"), sc = col(rdC, "pc");
+    $("do").textContent = so.dups; $("so").textContent = so.missed.length; $("dc").textContent = sc.dups; $("sc").textContent = sc.missed.length;
+    $("do").style.color = so.dups ? "var(--c-er)" : ""; $("so").style.color = so.missed.length ? "var(--c-er)" : "";
+    $("mo").textContent = so.missed.length ? "Never shown: " + so.missed.map(i => "#" + i).join(", ") : "";
+    $("mc").textContent = sc.missed.length ? "Never shown: " + sc.missed.map(i => "#" + i).join(", ") : "";
+    $("rows").textContent = `offset ${n0(9999 * LIMIT + LIMIT)} · cursor ${LIMIT}`;
+  }
+  $("next").onclick = readNext;
+  $("add").onclick = () => { for (let i = 0; i < 3; i++) posts.push(nextId++); paintP(); };
+  $("del").onclick = () => { const f = feedNow(); if (f.length) { posts = posts.filter(id => id !== f[0]); snapshot.delete(f[0]); } paintP(); };
+  $("preset").onclick = presetP;
+  presetP();
+})();
+</script>
+</body>
+</html>

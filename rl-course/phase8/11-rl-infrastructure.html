@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.11 RL infrastructure · RL from Zero</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+</head>
+<body data-lesson="p8-11" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8B · Lesson 11</div>
+  <h1>RL infrastructure: rollouts, async training &amp; mismatches</h1>
+  <p class="subtitle">At scale, LLM RL is mostly a systems problem: generating rollouts fast enough, keeping GPUs busy, and making sure "the same model" really gives the same probabilities everywhere.</p>
+  <p class="hint">🗓️ Last reviewed: Oct 2026. Frameworks and tricks here change fast.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>On-policy vs off-policy</b>: learning from your own current behavior vs from someone else's (Lessons 3.3–3.4).</li>
+      <li><b>PPO's ratio</b> = new probability ÷ old probability of a token (Lesson 5.6).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2025, researchers noticed something odd: the program that generates answers fast (an inference engine like vLLM) and the program that computes the training updates (a training engine like PyTorch FSDP) could give <b>noticeably different token probabilities for the same weights</b>, occasionally wildly different. Same model, two programs, two different answers to "how likely is this token?". "On-policy" RL (learning only from your own current behavior) was secretly off-policy (learning from slightly different behavior). Fixes ranged from importance-sampling corrections to simply switching number formats from BF16 to FP16.</p>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    An RL training system has two engines: a fast <b>inference engine</b> that generates rollouts (most of the time goes here) and a <b>training engine</b> that updates weights, plus reward services (verifiers, sandboxes, judges) and a way to <b>sync weights</b> between them. Most systems work is about keeping every GPU busy without breaking the RL math.
+  </div>
+  <p><b>Why two engines and not one?</b> Training frameworks are built to compute gradients over whole sequences at once; generating text one token at a time with them is far slower. Inference engines like <b>vLLM</b> and <b>SGLang</b> are built for exactly that: they store each request's memory of past tokens (the "KV cache") in small pages, like an operating system's virtual memory, and keep swapping finished requests out and new ones in mid-batch ("continuous batching"). The vLLM paper reported 2–4× higher throughput than the best serving systems before it. The price: <b>two copies of the model</b>, in two programs, that must agree on every probability. They don't quite, which is the mismatch below.</p>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a restaurant kitchen</span>
+    <p><b>Cooks</b> (inference engine) prepare dishes: generating answers is slow and takes most of the time. <b>Tasters</b> (reward services) score each dish. The <b>head chef</b> (training engine) adjusts the recipe based on the scores and hands the new recipe to the cooks (weight sync). The problems in this lesson: cooks standing idle while one slow dish finishes, cooks still using yesterday's recipe (staleness), and cooks and chef reading the same recipe slightly differently (the mismatch).</p>
+  </div>
+
+  <figure class="diagram">
+    <svg viewBox="0 0 640 170" width="640">
+      <defs><marker id="im" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0,0L10,5L0,10z" fill="var(--muted)"/></marker></defs>
+      <rect x="10" y="20" width="170" height="60" rx="12" fill="var(--panel)" stroke="var(--c-policy)" stroke-width="2"/><text x="95" y="46" text-anchor="middle" font-weight="800" fill="var(--c-policy)">Inference engine</text><text x="95" y="66" text-anchor="middle" font-size="12" fill="var(--muted)">vLLM / SGLang: rollouts</text>
+      <rect x="235" y="20" width="170" height="60" rx="12" fill="var(--panel)" stroke="var(--c-reward)" stroke-width="2"/><text x="320" y="46" text-anchor="middle" font-weight="800" fill="var(--c-reward)">Reward services</text><text x="320" y="66" text-anchor="middle" font-size="12" fill="var(--muted)">verifiers, sandboxes, judges</text>
+      <rect x="460" y="20" width="170" height="60" rx="12" fill="var(--panel)" stroke="var(--c-value)" stroke-width="2"/><text x="545" y="46" text-anchor="middle" font-weight="800" fill="var(--c-value)">Training engine</text><text x="545" y="66" text-anchor="middle" font-size="12" fill="var(--muted)">FSDP / Megatron: gradients</text>
+      <path d="M180,50 L233,50" stroke="var(--muted)" stroke-width="2.5" marker-end="url(#im)"/><path d="M405,50 L458,50" stroke="var(--muted)" stroke-width="2.5" marker-end="url(#im)"/>
+      <path d="M545,82 C545,150 95,150 95,84" fill="none" stroke="var(--c-gamma)" stroke-width="2.5" marker-end="url(#im)"/><text x="320" y="160" text-anchor="middle" font-weight="700" fill="var(--c-gamma)">weight sync (new policy → inference engine)</text>
+    </svg>
+  </figure>
+
+  <h2>Synchronous vs asynchronous</h2>
+  <div class="playground">
+    <span class="label">🎮 Playground · Why GPUs sit idle</span>
+    <p class="hint">Each step needs a batch of responses. Response lengths have a <b>long tail</b>: most are short, a few are very long. <b>Synchronous</b>: generate the whole batch, wait for the slowest response, then train (the generators wait while training runs). <b>Asynchronous</b>: generators keep producing with slightly old weights while the trainer trains.</p>
+    <div class="controls">
+      <label>long-tail severity <input type="range" id="tail" min="0" max="1.5" step="0.05" value="0.8"> <b class="mono" id="tv"></b></label>
+      <label>training time per step <input type="range" id="tr" min="0.2" max="3" step="0.1" value="1"> <b class="mono" id="trv"></b></label>
+      <button class="btn small" id="re">🎲 Resample lengths</button>
+    </div>
+    <canvas class="chart" id="chart" style="height:200px"></canvas>
+    <p class="hint" id="msg"></p>
+  </div>
+  <p>In synchronous mode, one 32k-token response holds up the whole batch. Async pipelines (ScaleRL picked one, and AReaL, slime and prime-rl are built around them) keep GPUs busy, but the data is now generated by a policy a step or two <b>stale</b>. That's off-policy: like the cooks using yesterday's recipe. The fix is to reweight each sample by "how likely is this answer under today's recipe vs yesterday's" (importance sampling, the same ratio PPO uses, 5.6), cap those weights so one weird sample can't dominate, and limit how stale data may get.</p>
+
+  <h2>The training–inference mismatch</h2>
+  <ul>
+    <li><b>Problem</b>: the two programs do arithmetic in slightly different orders and number formats, so π<sub>sampler</sub>(token) ≠ π<sub>learner</sub>(token) for the same weights. Example: the sampler thinks a rare token had probability 0.001, the learner computes 0.0001. The ratio between them is 10, and the update treats that token as if it had become 10× more likely, which is pure noise.</li>
+    <li><b>Fixes reported in 2025</b>:
+      <ul>
+        <li><b>Truncated importance sampling (TIS)</b>: correct each token by the ratio between the two programs' probabilities, but cap it (e.g. at 2) so a crazy ratio can't blow up the batch.</li>
+        <li><b>Extra precision in the last layer</b>: the "LM head" is the final layer that turns the model's internal numbers into token probabilities. Computing just that layer in 32-bit floats (FP32) removes much of the mismatch (MiniMax-M1, adopted by ScaleRL).</li>
+        <li><b>Switch to FP16</b> instead of BF16 for both programs (explained below), reported in "Defeating the Training-Inference Mismatch via FP16".</li>
+      </ul></li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: truncated importance sampling on 3 tokens</span>
+    <p>The sampler and the learner each report a probability for the same three tokens:</p>
+    <table>
+      <tr><th>token</th><th>sampler said</th><th>learner says</th><th>ratio = learner ÷ sampler</th><th>capped at 2</th></tr>
+      <tr><td>"the"</td><td>0.50</td><td>0.51</td><td>1.02</td><td>1.02</td></tr>
+      <tr><td>"Wait"</td><td>0.010</td><td>0.012</td><td>1.2</td><td>1.2</td></tr>
+      <tr><td>"∴"</td><td>0.001</td><td>0.004</td><td><b>4.0</b></td><td><b>2.0</b></td></tr>
+    </table>
+    <p>Each token's gradient is multiplied by its capped ratio. Common tokens barely change. The rare token, where tiny rounding differences become huge relative errors, would have counted 4× without the cap; with it, at most 2×.</p>
+  </div>
+
+  <details class="mathbox">
+    <summary><span class="pill">Math refresher</span> BF16 vs FP16 in one line</summary>
+    <div class="inner"><p>Both use 16 bits. BF16 spends more bits on the exponent (huge range, low precision: about 3 significant digits). FP16 spends more on the mantissa (smaller range, higher precision). Pretraining prefers BF16's range, but RL's ratio π<sub>new</sub>/π<sub>old</sub> divides two nearly equal numbers, so tiny rounding differences become big relative errors. Precision matters more than range there.</p></div>
+  </details>
+
+  <div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">
+    <div class="card"><div class="emoji">🦕</div><h4>The ancestor: IMPALA (2018)</h4><p>Async LLM RL is an old idea in new clothes. DeepMind's IMPALA had many "actors" playing games with slightly old weights while one "learner" trained, and corrected the staleness with capped importance weights (V-trace). That's the same trade and the same fix as above.</p></div>
+    <div class="card"><div class="emoji">🪶</div><h4>Sidebar: LoRA for RL</h4><p>LoRA trains small add-on matrices instead of all the weights (rank = their size). Thinking Machines' "LoRA Without Regret" (2025) found that even <b>rank-1</b> LoRA matched full fine-tuning for policy-gradient RL in their experiments, arguing RL gets only about 1 bit of information per episode, so it needs little capacity. It's not settled for every setting, so check before relying on it.</p></div>
+  </div>
+
+  <h2>Open-source frameworks you'll meet <span class="muted" style="font-size:.8rem">(as of Oct 2026)</span></h2>
+  <table>
+    <tr><th>Framework</th><th>Use it when…</th><th>Notes</th></tr>
+    <tr><td><b>TRL</b> (Hugging Face)</td><td><b>Start here.</b> You want GRPO/DPO/PPO on one GPU (e.g. Colab) with a few lines of code.</td><td>Built on the transformers library you used in Labs 7–8.</td></tr>
+    <tr><td><b>verl</b> (ByteDance)</td><td>You're reproducing a paper or training on many GPUs.</td><td>The most common choice in research papers (DAPO was built on it).</td></tr>
+    <tr><td><b>OpenRLHF</b></td><td>You want a scalable multi-GPU setup that's simpler than verl.</td><td>Uses Ray to spread work across machines.</td></tr>
+    <tr><td><b>slime</b>, <b>AReaL</b>, <b>prime-rl</b>, <b>SkyRL</b>, <b>rLLM</b></td><td>You need asynchronous rollouts at scale, very large models, or multi-turn agents.</td><td>Built by Zhipu, Ant Group, Prime Intellect, Berkeley and Agentica. Mostly for teams with many GPUs.</td></tr>
+  </table>
+
+  <div class="box used">
+    <span class="label">🌍 Where it's used</span>
+    <div class="use">
+      <div class="use-head"><b>Sync for math, async for agents</b> <span class="tag prod">🏭 In production · 2025</span> <a href="https://arxiv.org/abs/2508.06471" target="_blank" rel="noopener">GLM-4.5 (Zhipu AI), trained with slime</a></div>
+      <p><b>How:</b> math and code RL (<span class="r">reward</span> = answer check or tests) runs synchronously, sharing GPUs. Software agents run asynchronously: Docker sandboxes keep producing <span class="a">episodes</span> while training proceeds. Rollouts use FP8.</p>
+      <p><b>Why this method:</b> short math answers keep GPUs busy in lockstep. Long agent episodes would stall a synchronous trainer, so the team decoupled them.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Partial rollouts for the long tail</b> <span class="tag prod">🏭 In production · 2025</span> <a href="https://arxiv.org/abs/2501.12599" target="_blank" rel="noopener">Kimi k1.5 (Moonshot AI)</a></div>
+      <p><b>How:</b> with up to 128k-token answers, unfinished long <span class="a">rollouts</span> are saved to a buffer and continued in a later iteration, instead of regenerated from scratch or waited on.</p>
+      <p><b>Why this method:</b> a handful of very long answers would otherwise hold up every batch, which is the idle-GPU problem from this lesson.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Fixing a mismatch special to MoE models</b> <span class="tag prod">🏭 In production · 2025</span> <a href="https://arxiv.org/abs/2512.02556" target="_blank" rel="noopener">DeepSeek-V3.2: “Keep Routing”</a></div>
+      <p><b>How:</b> a Mixture-of-Experts model sends each token to a few expert sub-networks. Record which experts inference used when sampling, and force the same ones in the training pass.</p>
+      <p><b>Why this method:</b> the two engines can route the same token differently, so training would update experts that never produced the sample. DeepSeek found this crucial for stability.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact</span>
+    <p>In 2025, Prime Intellect's <b>INTELLECT-2</b>, a 32B reasoning model, was trained with RL on compute contributed by participants around the world, connected over the internet. Asynchronous RL tolerates slow, distant workers, which made globally distributed training practical.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 Why researchers should care about systems</span>
+    <p>Many "algorithm" improvements are partly systems effects: a loss that tolerates stale data enables async pipelines, and a stable ratio survives precision noise. Understanding the infrastructure helps you read papers critically and run experiments that actually finish.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2506.13585" target="_blank" rel="noopener">MiniMax-M1 (2025)</a>: FP32 LM head, CISPO and large-scale RL engineering.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2510.13786" target="_blank" rel="noopener">ScaleRL (2025)</a>: Which systems choices matter at scale.</li>
+      <li><span class="kind">Code</span> <a href="https://huggingface.co/docs/trl" target="_blank" rel="noopener">TRL docs</a>: The easiest place to start running LLM RL.</li>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/1802.01561" target="_blank" rel="noopener">IMPALA (Espeholt et al., 2018)</a>: Async actors + learner, with V-trace corrections.</li>
+      <li><span class="kind">Blog</span> <a href="https://thinkingmachines.ai/blog/lora/" target="_blank" rel="noopener">Thinking Machines: LoRA Without Regret</a>: Why low-rank adapters can be enough for RL.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself ✅</h2>
+  <div class="quiz"><div class="qtext">1. Where does most wall-clock time go in LLM RL?</div>
+    <div class="opts"><button class="opt">Computing the loss</button><button class="opt" data-ok>Generating rollouts (sampling responses), especially long ones</button><button class="opt">Loading data</button></div>
+    <div class="explain">Autoregressive generation is slow, and long-tail lengths make it slower.</div></div>
+  <div class="quiz"><div class="qtext">2. What's the cost of asynchronous RL?</div>
+    <div class="opts"><button class="opt">More memory only</button><button class="opt" data-ok>Data comes from slightly stale policies, making training off-policy and needing corrections</button><button class="opt">It can't use GPUs</button></div>
+    <div class="explain">Higher throughput in exchange for staleness. Importance weights and staleness caps manage it.</div></div>
+  <div class="quiz"><div class="qtext">3. The training–inference mismatch means…</div>
+    <div class="opts"><button class="opt">The model is too big for inference</button><button class="opt" data-ok>The sampler and the learner compute different probabilities for the same weights, silently making on-policy RL off-policy</button><button class="opt">The tokenizer differs</button></div>
+    <div class="explain">Numerical differences, worst for rare tokens. Fixed with TIS, an FP32 LM head, or FP16.</div></div>
+
+  <div class="box tldr"><span class="label">📝 TL;DR</span><ul>
+    <li>Inference engine (rollouts) + reward services + training engine + weight sync.</li>
+    <li>Long-tail response lengths idle synchronous pipelines. Async boosts throughput but adds staleness.</li>
+    <li>Training–inference mismatch: fix with truncated IS, an FP32 LM head, or FP16.</li>
+    <li>Frameworks: verl, TRL, OpenRLHF, slime, AReaL, prime-rl, SkyRL, rLLM.</li>
+  </ul></div>
+</main>
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  let seed = 3; const rnd = () => (seed = (seed * 16807) % 2147483647) / 2147483647;
+  const gauss = () => { const u = rnd() || 1e-9, v = rnd(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+  function sim() {
+    const tail = +$("tail").value, tr = +$("tr").value; $("tv").textContent = tail.toFixed(2); $("trv").textContent = tr.toFixed(1);
+    const steps = 20, B = 16, W = 8; // W generator slots
+    const lens = Array.from({ length: steps * B }, () => Math.exp(tail * gauss()) * 0.3);
+    // synchronous: per step, B responses on W slots (greedy), makespan = max load, then training
+    let syncTime = 0, genWork = 0;
+    for (let s = 0; s < steps; s++) {
+      const load = new Array(W).fill(0);
+      lens.slice(s * B, (s + 1) * B).sort((a, b) => b - a).forEach(l => { const i = load.indexOf(Math.min(...load)); load[i] += l; genWork += l; });
+      syncTime += Math.max(...load) + tr;
+    }
+    const syncUtil = genWork / (W * syncTime);
+    // asynchronous: generators run continuously; trainer consumes batches; time = max(total gen / W, steps * tr)
+    const asyncTime = Math.max(genWork / W, steps * tr) + tr;
+    const asyncUtil = genWork / (W * asyncTime);
+    Plot.bars($("chart"), { bars: [
+      { label: `sync: total time ${syncTime.toFixed(1)}`, value: syncTime, color: RL.css("--bad") },
+      { label: `async: total time ${asyncTime.toFixed(1)}`, value: asyncTime, color: RL.css("--good") },
+    ], yMin: 0, yLabel: "time for 20 training steps" });
+    $("msg").textContent = `Generator GPU utilization: sync ${(100 * syncUtil).toFixed(0)}% vs async ${(100 * asyncUtil).toFixed(0)}%. Async is ${(syncTime / asyncTime).toFixed(1)}× faster here, paid for with 1–2 steps of policy staleness.`;
+  }
+  ["tail", "tr"].forEach(id => ($(id).oninput = sim)); $("re").onclick = () => { seed = Math.floor(Math.random() * 1e6) + 1; sim(); }; sim();
+})();
+</script>
+</body>
+</html>

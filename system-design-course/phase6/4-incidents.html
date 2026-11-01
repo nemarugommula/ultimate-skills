@@ -1,0 +1,420 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.4 Alerting, on-call, incidents & postmortems · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .scene { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 12px 16px; }
+  .scene .clock { font-family: var(--mono); color: var(--c-lt); font-weight: 700; }
+  .choices { display: grid; gap: 8px; margin-top: 10px; }
+  .choices .btn { text-align: left; }
+  .log { font-family: var(--mono); font-size: .8rem; color: var(--muted); margin-top: 10px; max-height: 160px; overflow-y: auto; }
+</style>
+</head>
+<body data-lesson="s6-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 4</div>
+  <h1>Alerting, on-call, incidents &amp; postmortems</h1>
+  <p class="subtitle">Things will break. What separates good teams is how fast they find out, how calmly they stop the bleeding, and how honestly they learn from it, so the same thing doesn't break twice.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>SLO</b> (service level objective): a target such as “99.9% of requests succeed over 30 days”; the <b>error budget</b> is the 0.1% you're allowed to fail (Lesson 0.5).</li>
+      <li><b>Metrics</b> like error rate and p99 latency, queried with PromQL (Lesson 6.3).</li>
+      <li><b>Rollback</b> is usually the fastest fix for a bad release (Lesson 6.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On January 31, 2017, a GitLab engineer was trying to fix database replication. Trying to wipe the database directory on the <i>secondary</i> server, they ran the command on the <b>primary</b>. They stopped it a second or two later, but about <b>300 GB</b> of data was already gone. Then the team found that the regular <code>pg_dump</code> backups weren't there: the storage bucket was empty.</p>
+    <p>GitLab.com was down for about <b>18 hours</b> and permanently lost the database changes made between 17:20 and midnight UTC that day. Then GitLab did something unusual: it published a detailed, <b>blameless</b> postmortem, focused on the broken processes rather than the person. This lesson is about everything around that night: alerts, on-call, incident roles, and the postmortem.</p>
+  </div>
+
+  <h2>Numbers first: how much failure is allowed?</h2>
+  <p>A 99.9% availability SLO over 30 days allows 0.1% of requests to fail. If every request failed at once, that's:</p>
+  <div class="eq">
+    30 days × 24 h × 60 min × 0.1% = <span class="lt">43.2 minutes</span> of total outage per month
+  </div>
+  <p>That's the <b>error budget</b>. Now the key idea for alerting: <b>burn rate</b>, how fast you're spending it.</p>
+  <div class="eq">
+    burn rate = <span class="er">current error rate</span> ÷ <span class="db">error rate the SLO allows</span>
+    <span class="say">“A burn rate of 1 spends the budget in exactly 30 days. A burn rate of 14.4 spends 2% of a 30-day budget in one hour.” 14.4 × 1 hour ÷ 720 hours = 2%.</span>
+  </div>
+  <table>
+    <tr><th>Budget spent</th><th>In this window</th><th>Burn rate</th><th>Action (Google SRE workbook)</th></tr>
+    <tr><td>2%</td><td>1 hour</td><td class="er">14.4</td><td><b>Page</b> a human now</td></tr>
+    <tr><td>5%</td><td>6 hours</td><td class="lt">6</td><td><b>Page</b></td></tr>
+    <tr><td>10%</td><td>3 days</td><td>1</td><td><b>Ticket</b> (fix during work hours)</td></tr>
+  </table>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Page on symptoms users feel, not on causes.</b> “Checkout errors are eating the error budget fast” deserves a 3 a.m. phone call. “CPU is at 85%” doesn't: it might be fine, and if it isn't, a user-facing symptom will tell you. Every page should be <b>urgent, real and actionable</b>; everything else becomes a ticket or a dashboard.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a smoke alarm that cries wolf</span>
+    <p>A smoke alarm that goes off every time you make toast gets its battery pulled. Then the real fire comes. Alerts work the same way: each false page trains people to ignore pages. A good alert goes off for every real fire, early enough to matter, and almost never for toast.</p>
+  </div>
+
+  <h2>Tuning an alert: four things you trade</h2>
+  <p>The SRE workbook judges an alert on four properties:</p>
+  <ul>
+    <li><b>Precision</b>: of the alerts that fire, how many were real problems? (Low precision = false pages.)</li>
+    <li><b>Recall</b>: of the real problems, how many caused an alert?</li>
+    <li><b>Detection time</b>: how long until it fires.</li>
+    <li><b>Reset time</b>: how long it keeps firing after the problem is gone.</li>
+  </ul>
+  <p>A naive rule like “error rate above 0.1% for 5 minutes” has great detection time and terrible precision: every brief blip pages someone. A burn-rate rule over 1 hour ignores short blips but catches real outages within minutes. Adding a <b>short window</b> (1/12 of the long one: 5 minutes for a 1-hour rule) makes it stop firing soon after the problem ends.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: when does the 14.4× alert fire?</span>
+    <p>SLO 99.9%, so the allowed error rate is 0.1%. The fast-burn rule pages when the 1-hour average error rate is at least 14.4 × 0.1% = <b>1.44%</b> (and the 5-minute average is too).</p>
+    <ul>
+      <li>A full outage at <b>30% errors</b>: the 1-hour average reaches 1.44% after 1.44 ÷ 30 × 60 min ≈ <b>2.9 minutes</b>.</li>
+      <li>A partial outage at <b>2% errors</b>: 1.44 ÷ 2 × 60 ≈ <b>43 minutes</b>. Slower, because it's burning slower.</li>
+      <li>A blip at <b>5% for 8 minutes</b>: the 1-hour average peaks at 5 × 8 ÷ 60 ≈ <b>0.67%</b>. Never pages. Good: it cost under 1% of the month's budget.</li>
+      <li>A slow leak at <b>0.8%</b> (burn rate 8) never reaches 1.44%. That's why there's a second rule: 6× over 6 hours, which fires after 6 × 0.6 ÷ 0.8 = 4.5 hours.</li>
+    </ul>
+    <p>Notice the pattern: when it fires, about 2% of the budget is gone, whatever the error rate. That's the design.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Tune the pager</span>
+    <p class="hint">A simulated month (30 days, one point per minute) with normal background errors and a dozen short blips that don't matter. Pick a real incident, then an alert rule. Count the pages: the ones during the incident are good; every other page is a 3 a.m. false alarm.</p>
+    <div class="controls">
+      <span class="hint">Incident on day 15:</span>
+      <span class="seg" id="aw-inc"><button id="aw-inc-big" data-v="big" class="on">Full outage 30% · 20 min</button><button id="aw-inc-part" data-v="part">Partial 2% · 3 h</button><button id="aw-inc-leak" data-v="leak">Slow leak 0.8% · 2 days</button><button id="aw-inc-none" data-v="none">No incident</button></span>
+    </div>
+    <div class="controls">
+      <label>long window <input type="range" id="aw-win" min="0" max="4" step="1" value="2"> <b class="mono" id="aw-winv"></b></label>
+      <label>burn-rate threshold <input type="range" id="aw-b" min="0" max="4" step="1" value="3"> <b class="mono" id="aw-bv"></b></label>
+      <label><input type="checkbox" id="aw-short" checked> also require short window (1/12)</label>
+      <label><input type="checkbox" id="aw-combo"> add 2nd rule: 6× over 6 h (+30 min)</label>
+    </div>
+    <div class="controls">
+      <button class="btn" id="aw-p1">Naive: &gt; 0.1% over 5 min</button>
+      <button class="btn primary" id="aw-p2">Google fast burn: 14.4× over 1 h</button>
+      <button class="btn" id="aw-p3">Fast + slow (multi-window)</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">real pages <b id="aw-tp">–</b></div>
+      <div class="stat">false pages this month <b id="aw-fp">–</b></div>
+      <div class="stat">detection time <b id="aw-dt">–</b></div>
+      <div class="stat">budget burnt before the page <b id="aw-bb">–</b></div>
+      <div class="stat">keeps firing after it ends <b id="aw-rt">–</b></div>
+    </div>
+    <canvas class="chart" id="aw-c" style="height:210px"></canvas>
+    <p class="hint" id="aw-msg"></p>
+  </div>
+  <p>Things to try: the naive rule catches everything instantly, and pages you a dozen times for nothing. The fast-burn rule is quiet but misses the slow leak entirely. Combining a fast and a slow burn-rate rule (Google calls it multiwindow, multi-burn-rate alerting) catches all three incidents with zero false pages here.</p>
+
+  <h2>On-call: humans are part of the system</h2>
+  <p>Someone has to answer the page. Healthy on-call is designed, not hoped for:</p>
+  <ul>
+    <li><b>A rotation</b>: a primary and a secondary on call, usually a week at a time, handing over with notes.</li>
+    <li><b>A load limit</b>: Google's SRE book estimates each incident takes about <b>6 hours</b> of work counting analysis, fixes and the postmortem, so it sets a maximum of <b>2 incidents per 12-hour shift</b>, and caps on-call at <b>25%</b> of an SRE's time.</li>
+    <li><b>Runbooks</b>: for each alert, a page explaining what it means, what to check and how to mitigate. An alert without a runbook is a riddle at 3 a.m.</li>
+    <li><b>Severity levels</b>: SEV1 (many users down, all hands), SEV2 (degraded), SEV3 (minor). Severity decides who gets woken up and how often updates go out.</li>
+  </ul>
+
+  <h2>During an incident: roles, then mitigate, then debug</h2>
+  <p>When things are on fire, confusion is the enemy. Google's incident management (based on the firefighters' Incident Command System) and PagerDuty's public incident response guide both split the work into roles:</p>
+  <table>
+    <tr><th>Role</th><th>Job</th><th>Does NOT</th></tr>
+    <tr><td><b>Incident commander (IC)</b></td><td>Owns the incident: decides, delegates, keeps the big picture. Holds every role not yet given away.</td><td>Type commands into production</td></tr>
+    <tr><td><b>Ops lead</b> / subject matter experts</td><td>The only people changing the system: rollback, failover, scaling</td><td>Write status updates</td></tr>
+    <tr><td><b>Communications</b> (internal and customer liaison)</td><td>Regular updates to stakeholders and the status page</td><td>Debug</td></tr>
+    <tr><td><b>Scribe</b> / planning</td><td>Keeps the live incident document and timeline; files follow-ups, arranges handoffs</td><td>Make decisions</td></tr>
+  </table>
+  <p>The first goal is <b>mitigation</b>, not understanding. Roll back the last deploy, shift traffic away from the bad region, turn off the feature flag, add capacity. You can find the root cause tomorrow with the system healthy. Debugging in production while users are failing is the most common way a 10-minute incident becomes a 2-hour one.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · You're on call</span>
+    <p class="hint">A real-feeling incident with choices. Every minute until mitigation costs about 4,800 failed checkouts (1,000 requests/s × 8% errors × 60 s). There are several paths; replay to compare.</p>
+    <div class="scene" id="ir-scene"></div>
+    <div class="stat-row">
+      <div class="stat">time since page <b id="ir-t">–</b></div>
+      <div class="stat">failed checkouts <b id="ir-f">–</b></div>
+      <div class="stat">stakeholders informed <b id="ir-c">–</b></div>
+    </div>
+    <div class="log" id="ir-log"></div>
+    <div class="controls"><button class="btn" id="ir-restart">↺ Restart the incident</button></div>
+  </div>
+
+  <h2>After the incident: the blameless postmortem</h2>
+  <p>A <b>postmortem</b> is a written record of an incident: what happened, the impact, the timeline, the contributing causes, and the action items to prevent it or make it smaller next time. Google's SRE book calls blameless postmortems a tenet of SRE culture: it must focus on identifying the contributing causes “without indicting any individual or team.”</p>
+  <p>Why blameless? Because if people get punished for mistakes, they hide them, and you lose the information you need. The GitLab engineer typed a command on the wrong server; the real problems were a confusing tool with no warning, untested backups, and no clear sign of which server you were on. Those are fixable. “Be more careful” isn't.</p>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: a postmortem skeleton</span>
+    <ul>
+      <li><b>Summary:</b> 14:02 deploy of checkout v2.31 caused 8% of checkout requests to fail for 20 minutes.</li>
+      <li><b>Impact:</b> 20 × 4,800 = 96,000 failed checkout requests: about 3.7% of the month's error budget (a 30-day month at 1,000 req/s is 2.59 billion requests; 0.1% of that is 2.59 million).</li>
+      <li><b>Timeline:</b> 14:02 deploy → 14:13 fast-burn alert pages (the 1-hour error average crossed 1.44%) → 14:15 IC declared, rollback started → 14:22 errors back to normal.</li>
+      <li><b>Contributing causes:</b> discount code crashed on carts with no items in stock; no test covered it; the deploy went to 100% at once.</li>
+      <li><b>Action items</b> (each with an owner and a date): add the missing test; move checkout to canary deploys; add a kill-switch flag around discounts.</li>
+    </ul>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Alert rules: <b>Prometheus + Alertmanager</b> (routing, grouping, silences), <b>Grafana Alerting</b>, Datadog monitors. Paging and on-call schedules: <b>PagerDuty</b>, <b>Opsgenie</b>, <b>incident.io</b>, Grafana OnCall. Status pages: Atlassian Statuspage, Instatus. A multiwindow burn-rate alert for a 99.9% SLO as a Prometheus rule, following the SRE workbook:</p>
+<pre><code><span class="c"># recording rules first: the error ratio over several windows</span>
+<span class="k">groups:</span>
+- <span class="k">name:</span> slo-checkout
+  <span class="k">rules:</span>
+  - <span class="k">record:</span> job:slo_errors_per_request:ratio_rate1h
+    <span class="k">expr:</span> sum(rate(http_requests_total{job=<span class="s">"checkout"</span>,status=~<span class="s">"5.."</span>}[1h]))
+          / sum(rate(http_requests_total{job=<span class="s">"checkout"</span>}[1h]))
+  <span class="c"># ... same for 5m, 30m and 6h windows</span>
+  - <span class="k">alert:</span> CheckoutErrorBudgetBurn
+    <span class="k">expr:</span> |
+      (job:slo_errors_per_request:ratio_rate1h{job="checkout"} &gt; (<span class="n">14.4</span> * <span class="n">0.001</span>)
+       and job:slo_errors_per_request:ratio_rate5m{job="checkout"} &gt; (<span class="n">14.4</span> * <span class="n">0.001</span>))
+      or
+      (job:slo_errors_per_request:ratio_rate6h{job="checkout"} &gt; (<span class="n">6</span> * <span class="n">0.001</span>)
+       and job:slo_errors_per_request:ratio_rate30m{job="checkout"} &gt; (<span class="n">6</span> * <span class="n">0.001</span>))
+    <span class="k">labels:</span>
+      <span class="k">severity:</span> page
+    <span class="k">annotations:</span>
+      <span class="k">summary:</span> <span class="s">"Checkout is burning its error budget fast"</span>
+      <span class="k">runbook_url:</span> <span class="s">"https://wiki.example.com/runbooks/checkout-errors"</span></code></pre>
+    <p class="hint">Try it locally: Prometheus and Alertmanager both run as single containers (<code>prom/prometheus</code>, <code>prom/alertmanager</code>); <code>promtool check rules slo.yml</code> validates a rule file before you deploy it. Tools like Sloth or Pyrra generate these rules from a short SLO definition.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Threshold alerts on causes (CPU, disk, queue length)</td><td>Simple; can warn early about things that will break</td><td>Noisy; fire when users are fine. Make them tickets, not pages (except things like a disk about to fill).</td></tr>
+      <tr><td>SLO burn-rate alerts</td><td>Precise, tied to what users feel, scale with severity</td><td>Need good SLIs; low-traffic services have noisy ratios (use longer windows or synthetic traffic)</td></tr>
+      <tr><td>Short window added</td><td>Stops firing soon after recovery</td><td>A bit more config; slightly later detection if errors are bursty</td></tr>
+      <tr><td>Formal incident roles</td><td>Calm, parallel work; clear communication</td><td>Overkill for a tiny blip; declare early anyway, it's cheap to downgrade</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Two or three pages total: the site is down (an external uptime check), checkout or sign-up error rate is burning budget, and the database is nearly out of disk. Route them to a free-tier pager. Write a one-page postmortem for every user-facing outage, even when it's just you. A shared status page builds trust with early customers.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>SLOs per service with burn-rate alerts generated from config, follow-the-sun rotations across time zones, trained incident commanders, severity definitions tied to customer impact, a postmortem review meeting, and action items tracked to completion. Error budgets connect alerts to release decisions (Lesson 8.4).</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Two places this shows up: “how would you know it's broken?” in design rounds, and “tell me about an incident” in behavioral rounds. A senior answer covers:</p>
+    <ul>
+      <li><b>SLIs and SLOs</b> first, then <b>burn-rate alerts</b> on them; symptoms page, causes go to dashboards or tickets.</li>
+      <li><b>Mitigate first</b> (rollback, failover, flag off), debug later.</li>
+      <li><b>Incident roles</b> and communication cadence.</li>
+      <li>A <b>blameless postmortem</b> with owned, dated action items, and how you checked they actually got done.</li>
+    </ul>
+    <p class="hint">Behavioral tip: tell an incident story in the shape of a postmortem: impact, timeline, what you did to mitigate, root causes, and what changed afterwards. Interviewers listen for ownership without blame.</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Burn-rate alerting</b> <span class="tag co">🏢 Google · SRE workbook</span> <a href="https://sre.google/workbook/alerting-on-slos/" target="_blank" rel="noopener">Alerting on SLOs</a></div>
+      <p><b>How:</b> the chapter walks through six alerting approaches, from a simple threshold up to multiwindow, multi-burn-rate alerts, and recommends paging at 2% of budget in 1 hour and 5% in 6 hours, with a ticket at 10% in 3 days. The short window is 1/12 of the long one.</p>
+      <p><b>Why this method:</b> it balances precision, recall, detection time and reset time at once: big outages page in minutes, slow burns page in hours, and blips don't page at all.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Blameless postmortems</b> <span class="tag co">🏢 Google · SRE book</span> <a href="https://sre.google/sre-book/postmortem-culture/" target="_blank" rel="noopener">Postmortem Culture: Learning from Failure</a></div>
+      <p><b>How:</b> define postmortem triggers in advance (any stakeholder may also request one), write them blamelessly, review them, and visibly reward people for writing good ones.</p>
+      <p><b>Why this method:</b> a culture that punishes mistakes hides them; a blameless one surfaces the process and tooling gaps that let a single slip become an outage.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Incident command</b> <span class="tag co">🏢 Google · SRE book</span> <a href="https://sre.google/sre-book/managing-incidents/" target="_blank" rel="noopener">Managing Incidents</a></div>
+      <p><b>How:</b> roles modelled on the Incident Command System: an incident commander, an ops lead (the only group modifying the system), a communications role, and a planning role; plus a live incident state document.</p>
+      <p><b>Why this method:</b> separating responsibilities stops several people from changing production at once, and keeps stakeholders informed without interrupting the responders.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>An open incident playbook</b> <span class="tag prod">🏭 In production · PagerDuty</span> <a href="https://response.pagerduty.com/before/different_roles/" target="_blank" rel="noopener">PagerDuty incident response: roles</a></div>
+      <p><b>How:</b> PagerDuty publishes its own process, with roles including incident commander, deputy, scribe, subject matter expert, customer liaison and internal liaison, plus training material for each.</p>
+      <p><b>Why this method:</b> a written, rehearsed process means nobody has to invent one at 3 a.m.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A postmortem in public</b> <span class="tag co">🏢 GitLab · 2017</span> <a href="https://about.gitlab.com/blog/postmortem-of-database-outage-of-january-31/" target="_blank" rel="noopener">Postmortem of database outage of January 31</a></div>
+      <p><b>How:</b> the postmortem covers the database setup, a detailed timeline, why each backup method failed (the <code>pg_dump</code> bucket was empty), a “5 whys” analysis, and the improvements. It estimates roughly 5,000 projects, 5,000 comments and 700 new user accounts were affected.</p>
+      <p><b>Why this method:</b> backups you've never restored are not backups. Publishing the analysis rebuilt trust and taught the whole industry that lesson.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the most-watched database restore</span>
+    <p>During the 2017 outage, GitLab kept its working notes in a public Google document and streamed the recovery on YouTube. According to its postmortem, the stream peaked at around 5,000 viewers and was the #2 live stream on YouTube for several hours.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Alerts are built on the SLOs from Lesson 0.5 and the metrics from Lesson 6.3. The fastest mitigations are the rollbacks and feature flags from Lesson 6.2. Lesson 8.4 turns error budgets into a policy (freeze risky launches when the budget is gone) and adds chaos engineering, which practices incidents on purpose. For AI systems, the same playbook applies to quality incidents: a model update that starts giving bad answers needs symptom-based alerts (user ratings, eval scores) and a fast rollback.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Book</span> <a href="https://sre.google/workbook/alerting-on-slos/" target="_blank" rel="noopener">SRE workbook: Alerting on SLOs</a>. The six alert designs, with the math and figures.</li>
+      <li><span class="kind">Docs</span> <a href="https://response.pagerduty.com/" target="_blank" rel="noopener">PagerDuty Incident Response</a>. A complete, free incident process you can copy.</li>
+      <li><span class="kind">Blog</span> <a href="https://about.gitlab.com/blog/postmortem-of-database-outage-of-january-31/" target="_blank" rel="noopener">GitLab's 2017 postmortem</a>. Read it as a template for an honest, detailed write-up.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Your SLO is 99.9% over 30 days. An incident fails 5% of requests. What's the burn rate, and how long until the whole month's budget is gone?</div>
+    <div class="opts"><button class="opt">Burn rate 5; about 6 days</button><button class="opt" data-ok>Burn rate 50; about 14 hours</button><button class="opt">Burn rate 0.05; it never runs out</button></div>
+    <div class="explain">5% ÷ 0.1% = 50. At 50× the budget lasts 30 days ÷ 50 = 0.6 days ≈ 14.4 hours. That's well above the 14.4× paging threshold: wake someone up.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. 14:13, you're paged: checkout errors at 8%, starting right after a 14:02 deploy. What's the best first move?</div>
+    <div class="opts"><button class="opt">Read the new code until you find the bug, then ship a fix</button><button class="opt" data-ok>Declare an incident and roll back the 14:02 deploy, then investigate</button><button class="opt">Wait 15 minutes to see if it recovers on its own</button></div>
+    <div class="explain">Mitigate first. A rollback takes minutes and is almost always safe; finding and fixing the bug under pressure can take an hour while users keep failing. Debug tomorrow, on a healthy system.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Your team gets 40 pages a week, mostly “CPU above 80%” and “error rate above 0.1% for 5 minutes,” and most need no action. What do you change?</div>
+    <div class="opts"><button class="opt">Raise the CPU threshold to 95%</button><button class="opt">Add a second person on call to share the load</button><button class="opt" data-ok>Page only on SLO burn rate (symptoms), and turn cause-based alerts into tickets or dashboards</button></div>
+    <div class="explain">Pages that need no action destroy trust in the pager. Burn-rate alerts fire only when users are hurt badly enough to matter; CPU and short blips belong on dashboards or in tickets.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Error budget = 1 − SLO; burn rate = error rate ÷ allowed rate. 14.4× for 1 hour = 2% of a month's budget.</li>
+      <li>Page on symptoms with multiwindow, multi-burn-rate alerts; send causes to dashboards and tickets.</li>
+      <li>In an incident: roles (IC, ops, comms, scribe), mitigate first (rollback, flag off, failover), debug later.</li>
+      <li>Blameless postmortems with owned, dated action items turn incidents into improvements.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const dur = m => m >= 1440 ? (m / 1440).toFixed(1) + " days" : m >= 60 ? (m / 60).toFixed(1) + " h" : Math.round(m) + " min";
+
+  // ---------- burn-rate alert tuning ----------
+  const MIN = 43200, SLO_RATE = 0.001, START = 15 * 1440 + 540;
+  const WINS = [5, 30, 60, 360, 1440], BURNS = [1, 2, 6, 14.4, 36];
+  const INC = { big: [0.30, 20], part: [0.02, 180], leak: [0.008, 2880], none: [0, 0] };
+  const rng = MX.seeded(42), bg = new Float64Array(MIN);
+  for (let i = 0; i < MIN; i++) bg[i] = 0.0002 + 0.0001 * Math.abs(Math.sqrt(-2 * Math.log(rng() + 1e-12)) * Math.cos(2 * Math.PI * rng()));
+  for (let k = 0; k < 12; k++) { // short blips that should not page anyone
+    let s = Math.floor(rng() * (MIN - 20)); if (Math.abs(s - START) < 3000) s = (s + 6000) % (MIN - 20);
+    const d = 2 + Math.floor(rng() * 7), e = 0.01 + rng() * 0.05;
+    for (let i = s; i < s + d; i++) bg[i] = Math.max(bg[i], e);
+  }
+  const getInc = seg("aw-inc", () => alerts());
+  function alerts() {
+    const W = WINS[+$("aw-win").value], B = BURNS[+$("aw-b").value], short = $("aw-short").checked, combo = $("aw-combo").checked;
+    $("aw-winv").textContent = dur(W); $("aw-bv").textContent = B + "×";
+    const [ie, idur] = INC[getInc()], iEnd = START + idur;
+    const r = Float64Array.from(bg); for (let i = START; i < iEnd; i++) r[i] = Math.max(r[i], ie);
+    const P = new Float64Array(MIN + 1); for (let i = 0; i < MIN; i++) P[i + 1] = P[i] + r[i];
+    const avg = (t, w) => { const a = Math.max(0, t + 1 - w); return (P[t + 1] - P[a]) / (t + 1 - a); };
+    const rules = [{ w: W, b: B, s: short }]; if (combo) rules.push({ w: 360, b: 6, s: true });
+    const fire = new Uint8Array(MIN);
+    for (let t = 0; t < MIN; t++) fire[t] = rules.some(u => avg(t, u.w) >= u.b * SLO_RATE && (!u.s || avg(t, Math.max(1, Math.round(u.w / 12))) >= u.b * SLO_RATE)) ? 1 : 0;
+    // episodes, merging gaps under 30 minutes into one page
+    const eps = []; let cur = null;
+    for (let t = 0; t < MIN; t++) if (fire[t]) { if (cur && t - cur.e <= 30) cur.e = t; else { cur = { s: t, e: t }; eps.push(cur); } }
+    const isReal = ep => idur > 0 && ep.e >= START && ep.s <= iEnd + 60;
+    const tp = eps.filter(isReal), fp = eps.length - tp.length;
+    $("aw-tp").textContent = idur ? (tp.length ? tp.length : "0 (missed!)") : "–";
+    $("aw-fp").textContent = fp;
+    let firstFire = null; for (let t = START; t < Math.min(MIN, iEnd + 60); t++) if (fire[t]) { firstFire = t; break; }
+    if (idur && firstFire !== null) {
+      $("aw-dt").textContent = dur(firstFire - START + 1);
+      $("aw-bb").textContent = (100 * (P[firstFire + 1] - P[START]) / (SLO_RATE * MIN)).toFixed(1) + "%";
+      let last = firstFire; while (last + 1 < MIN && fire[last + 1]) last++;
+      $("aw-rt").textContent = last >= iEnd ? dur(last - iEnd + 1) : "stops before end";
+    } else {
+      $("aw-dt").textContent = idur ? "never" : "–";
+      $("aw-bb").textContent = idur ? (100 * (P[iEnd] - P[START]) / (SLO_RATE * MIN)).toFixed(0) + "%, never paged" : "–";
+      $("aw-rt").textContent = "–";
+    }
+    const hours = [], fh = []; let ymax = 0;
+    for (let h = 0; h < 720; h++) { const v = 100 * (P[(h + 1) * 60] - P[h * 60]) / 60; hours.push([h / 24, v]); ymax = Math.max(ymax, v); }
+    ymax = Math.max(ymax * 1.15, 0.5);
+    for (let h = 0; h < 720; h++) { let f = 0; for (let m = h * 60; m < h * 60 + 60; m++) if (fire[m]) { f = 1; break; } fh.push([h / 24, f ? ymax * 0.95 : 0]); }
+    Plot.line($("aw-c"), { series: [{ label: "error rate % (hourly avg)", color: MX.css("--c-er"), data: hours, fill: true }, { label: "alert firing", color: MX.css("--c-lt"), data: fh, dash: [4, 3], width: 1.5 }], xLabel: "day of month", yMin: 0, yMax: ymax, hlines: [{ y: 100 * B * SLO_RATE, label: "threshold " + (B * 0.1).toFixed(2) + "%", color: MX.css("--muted") }] });
+    $("aw-msg").textContent = fp >= 5 ? `${fp} false pages a month: people will start ignoring this alert.` :
+      idur && !tp.length ? "Quiet, but it missed a real incident. The budget burned and nobody was told. Add a slower, longer-window rule." :
+      idur ? `Caught the incident after ${dur(firstFire - START + 1)} with ${fp} false page${fp === 1 ? "" : "s"}.` :
+      fp ? "No real incident this month, yet the pager went off." : "No incident, no pages. A quiet month, as it should be.";
+  }
+  const preset = (w, b, s, c) => { $("aw-win").value = w; $("aw-b").value = b; $("aw-short").checked = s; $("aw-combo").checked = c; alerts(); };
+  $("aw-p1").onclick = () => preset(0, 0, false, false);
+  $("aw-p2").onclick = () => preset(2, 3, true, false);
+  $("aw-p3").onclick = () => preset(2, 3, true, true);
+  ["aw-win", "aw-b"].forEach(id => ($(id).oninput = alerts));
+  ["aw-short", "aw-combo"].forEach(id => ($(id).onchange = alerts));
+  alerts();
+
+  // ---------- choose-your-path incident ----------
+  const PER_MIN = 4800;
+  const S = {
+    start: { text: "📟 <b>Page:</b> checkout error rate 8% (burn rate 80×). The deploy log shows checkout v2.31 went out at 14:02. Support is starting to see tickets. You're the primary on call.", opts: [
+      ["Declare an incident, take incident commander, open #inc-checkout", 2, "ic", "Declared SEV2 incident, IC = you", true],
+      ["Start reading logs on your own to find the bug", 15, "solo", "Investigated alone in the logs"],
+      ["Roll back v2.31 right away, tell nobody yet", 4, "quiet", "Rolled back silently"]] },
+    ic: { text: "You're IC. A teammate joins and takes ops lead; another offers to handle comms. What do you tell ops?", opts: [
+      ["Ops: roll back v2.31 now. Comms: post a status update. We debug after.", 5, "END_good", "Ops rolled back; comms posted status", true],
+      ["Ops: find the root cause first so we fix it properly", 25, "rootcause", "Ops investigated root cause under fire"],
+      ["Ops: scale up checkout pods, maybe it's load", 6, "scale", "Scaled checkout from 10 to 20 pods"]] },
+    solo: { text: "15 minutes in. You found it: a null pointer in the new discount code. Errors still at 8%. Your manager is asking for updates in three different DMs.", opts: [
+      ["Write a hotfix and push it through the pipeline (about 25 minutes)", 25, "END_fwd", "Hotfix written and deployed (roll forward)"],
+      ["Roll back now, then declare the incident and post an update", 6, "END_late", "Rolled back, then declared and posted", true]] },
+    quiet: { text: "Errors drop to normal 4 minutes after the page. But support and your manager are still escalating: nobody knows it's fixed, and nobody knows it happened.", opts: [
+      ["Declare the incident (now mitigated) and post a status update", 3, "END_quiet", "Declared incident, posted that it's resolved", true]] },
+    rootcause: { text: "25 more minutes. Root cause: the discount code crashes on carts with out-of-stock items. Errors still 8%.", opts: [
+      ["Now roll back", 5, "END_slow", "Rolled back after finding root cause"]] },
+    scale: { text: "Twice the pods, same 8% errors. Load was never the problem: errors started at the deploy, not at a traffic peak.", opts: [
+      ["Roll back v2.31", 5, "END_detour", "Rolled back"]] },
+  };
+  const ENDS = {
+    END_good: "✅ <b>Mitigated.</b> Fast and calm: rollback first, stakeholders informed, root cause found tomorrow on a healthy system. This is the textbook path.",
+    END_fwd: "⚠️ <b>Mitigated by rolling forward.</b> It worked this time, but under pressure, with a rushed, half-reviewed change. If the hotfix had a bug, you'd be starting over. Roll back first when you can.",
+    END_late: "🙂 <b>Mitigated, late.</b> Finding the bug first cost 15 minutes of failures, and nobody knew what was going on. The rollback was available from minute one.",
+    END_quiet: "🙂 <b>Fast mitigation, poor communication.</b> Users recovered quickly, but people wasted time escalating. Declaring is cheap; do it early.",
+    END_slow: "❌ <b>Mitigated after half an hour.</b> Root cause analysis is the postmortem's job, not the incident's. Every minute of debugging cost about 4,800 failed checkouts.",
+    END_detour: "😬 <b>Mitigated after a detour.</b> Check what changed before guessing: the errors lined up with the deploy, not with traffic. Ask “what changed?” first.",
+  };
+  let st;
+  function render() {
+    const node = S[st.id], end = ENDS[st.id];
+    const clock = m => { const t = 14 * 60 + 13 + m; return String(Math.floor(t / 60)).padStart(2, "0") + ":" + String(t % 60).padStart(2, "0"); };
+    $("ir-t").textContent = st.min + " min"; $("ir-f").textContent = (st.min * PER_MIN).toLocaleString(); $("ir-c").textContent = st.comms ? "yes" : "no";
+    $("ir-log").innerHTML = st.log.map(l => `<div>${l}</div>`).join("");
+    if (end) {
+      $("ir-scene").innerHTML = `<div class="clock">${clock(st.min)}</div><p>${end}</p><p class="hint">Time to mitigate: ${st.min} minutes, about ${(st.min * PER_MIN).toLocaleString()} failed checkouts. Restart to try another path.</p><div class="choices"><button class="btn" id="ir-0">↺ Try another path</button></div>`;
+      $("ir-0").onclick = restart;
+      return;
+    }
+    $("ir-scene").innerHTML = `<div class="clock">${clock(st.min)}</div><p>${node.text}</p><div class="choices">${node.opts.map((o, i) => `<button class="btn" id="ir-${i}">${o[0]}</button>`).join("")}</div>`;
+    node.opts.forEach((o, i) => ($("ir-" + i).onclick = () => {
+      st.min += o[1]; st.log.push(clock(st.min) + "  " + o[3]); if (o[4]) st.comms = true; st.id = o[2]; render();
+    }));
+  }
+  function restart() { st = { id: "start", min: 0, comms: false, log: ["14:13  Paged: checkout errors 8%"] }; render(); }
+  $("ir-restart").onclick = restart;
+  restart();
+})();
+</script>
+</body>
+</html>

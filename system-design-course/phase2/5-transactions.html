@@ -1,0 +1,432 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.5 Transactions, ACID &amp; isolation levels · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 14px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .lanes { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0; }
+  .lane { background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 10px; min-height: 150px; }
+  .lane h4 { margin: 0 0 6px; font-size: .9rem; }
+  .lane .st { font-family: var(--mono); font-size: .8rem; padding: 3px 6px; border-radius: 6px; margin: 3px 0; opacity: .35; }
+  .lane .st.done { opacity: 1; }
+  .lane .st.now { opacity: 1; outline: 2px solid var(--accent); }
+  .lane .st .nt2 { display: block; font-family: var(--font); color: var(--muted); font-size: .78rem; }
+  @media (max-width: 600px) { .lanes { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body data-lesson="s2-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 5</div>
+  <h1>Transactions, ACID &amp; isolation levels</h1>
+  <p class="subtitle">A transaction makes several reads and writes behave like one safe step, even when thousands of requests run at once. At scale, “at once” happens every second, and the gaps between isolation levels turn into real money.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>SQL tables and rows (Lesson 2.1); a write goes to a <b>WAL</b> (write-ahead log) first (Lesson 2.2).</li>
+      <li>On a sharded database, a transaction usually covers only one shard (Lesson 2.4).</li>
+      <li>Web servers handle many requests <b>concurrently</b>: at the same time, on different threads or machines (Lesson 1.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On 2 March 2014, the Flexcoin Bitcoin exchange was attacked through a concurrency bug: by sending thousands of simultaneous transfer requests, the attacker “moved” coins from one account to another until the sending account was overdrawn, before balances were updated, then withdrew them. Every Bitcoin stored at Flexcoin was stolen and the exchange was forced to shut down.</p>
+    <p>A 2017 study (“ACIDRain”, SIGMOD) then checked 12 popular open-source e-commerce apps, deployed on over 2 million websites, and found <b>22</b> similar attacks, like buying one gift card and spending it an unlimited number of times with concurrent checkouts. All 22 worked under the databases' default isolation settings.</p>
+  </div>
+
+  <h2>Numbers first: the double withdrawal</h2>
+  <p>An account holds <b>$100</b>. Two requests to withdraw <b>$80</b> arrive 5 ms apart (a double-click, or an attacker). Each request runs the obvious code: read the balance, check it's enough, write the new balance.</p>
+  <table>
+    <tr><th>Time</th><th>Request 1</th><th>Request 2</th><th>Balance in DB</th></tr>
+    <tr><td>0 ms</td><td>reads $100</td><td></td><td>$100</td></tr>
+    <tr><td>5 ms</td><td></td><td>reads $100</td><td>$100</td></tr>
+    <tr><td>20 ms</td><td>$100 ≥ $80 ✓ writes $20</td><td></td><td>$20</td></tr>
+    <tr><td>25 ms</td><td></td><td>$100 ≥ $80 ✓ writes $20</td><td>$20</td></tr>
+    <tr><td colspan="3"><b>Paid out $160 from a $100 account</b></td><td class="er">bank lost $80</td></tr>
+  </table>
+  <p>This is a <b>lost update</b>: request 2's write silently overwrote request 1's. Wrapping each request in <code>BEGIN … COMMIT</code> does <b>not</b> fix it at the default isolation level of Postgres. The two requests are each correct alone; it's their overlap that's wrong.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A transaction promises to behave as if it ran <b>alone</b>. How strictly the database keeps that promise is the <b>isolation level</b>. Weaker levels are faster and allow certain anomalies; you must know which ones, and protect the few places (money, stock, seats) where they hurt.
+  </div>
+
+  <h2>ACID, in plain words</h2>
+  <table>
+    <tr><th>Letter</th><th>Means</th><th>Plain meaning</th><th>How databases do it</th></tr>
+    <tr><td><b>A</b></td><td>Atomicity</td><td>All of the transaction happens, or none of it</td><td>Undo on error or crash, using the log</td></tr>
+    <tr><td><b>C</b></td><td>Consistency</td><td>Your rules (constraints) hold before and after</td><td><code>CHECK (balance &gt;= 0)</code>, foreign keys, unique keys</td></tr>
+    <tr><td><b>I</b></td><td>Isolation</td><td>Concurrent transactions don't see each other's half-done work</td><td>Locks and/or MVCC (below), at a chosen level</td></tr>
+    <tr><td><b>D</b></td><td>Durability</td><td>Once committed, it survives a crash</td><td>WAL flushed to disk (and replicas, Lesson 2.3)</td></tr>
+  </table>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the shared whiteboard</span>
+    <p>Two people update a shared whiteboard tally. If both glance at “12”, both walk off to think, and both come back and write “13”, one update vanished. You can <b>take the marker</b> before you look and keep it until you're done (pessimistic locking). Or you can write “13, if it still says 12” and start over if it doesn't (optimistic). Or the board itself can refuse anything that wouldn't have happened in some one-at-a-time order (serializable).</p>
+  </div>
+
+  <h2>Isolation levels and the anomalies they allow</h2>
+  <p>Most databases use <b>MVCC</b> (multi-version concurrency control): a write creates a new version of the row instead of overwriting it, so readers see a consistent snapshot without blocking writers. Locks are still used between writers. The SQL standard defines four levels; here's what each allows in Postgres:</p>
+  <table>
+    <tr><th>Level</th><th>Dirty read<br><span class="muted">see uncommitted data</span></th><th>Non-repeatable read<br><span class="muted">re-read gives a new value</span></th><th>Lost update<br><span class="muted">read-modify-write overwritten</span></th><th>Write skew<br><span class="muted">two safe changes, unsafe together</span></th></tr>
+    <tr><td><b>Read committed</b> (Postgres default)</td><td class="db">no</td><td class="er">possible</td><td class="er">possible</td><td class="er">possible</td></tr>
+    <tr><td><b>Repeatable read</b> (snapshot isolation in Postgres)</td><td class="db">no</td><td class="db">no</td><td class="db">no: aborts one with an error</td><td class="er">possible</td></tr>
+    <tr><td><b>Serializable</b></td><td class="db">no</td><td class="db">no</td><td class="db">no</td><td class="db">no: aborts one</td></tr>
+  </table>
+  <p>Two things to remember. Stronger levels don't make the conflict disappear: they <b>abort</b> one transaction with a serialization error, and your code must <b>retry</b> it. And level names differ between databases: Jepsen's 2020 analysis showed that Postgres's “repeatable read” is really snapshot isolation, which allows write skew.</p>
+  <p><b>Write skew</b> example: a hospital rule says at least one doctor must be on call. Alice and Bob are both on call and both feel ill. Each transaction checks “is someone else on call?” (yes), and each takes itself off. Each change was safe alone; together they leave zero doctors. Only serializable isolation, or an explicit lock, catches this.</p>
+
+  <div class="playground" id="pg-step">
+    <span class="label">🎮 Playground · Two withdrawals, step by step</span>
+    <p class="hint">Balance $100, two concurrent $80 withdrawals. Pick a strategy and press <b>Step</b> to run the interleaving one statement at a time. Then press <b>Simulate 1,000 double-clicks</b> to see how often each strategy pays out twice in practice.</p>
+    <div class="controls">
+      <span class="seg" id="t-mode"><button id="t-mode-naive" data-v="naive" class="on">Read committed (read, then write)</button><button id="t-mode-rr" data-v="rr">Repeatable read</button><button id="t-mode-lock" data-v="lock">SELECT … FOR UPDATE</button><button id="t-mode-atomic" data-v="atomic">Atomic conditional UPDATE</button><button id="t-mode-occ" data-v="occ">Optimistic version column</button></span>
+    </div>
+    <div class="lanes">
+      <div class="lane" id="t-l1"><h4>Request 1 (T1)</h4></div>
+      <div class="lane" id="t-l2"><h4>Request 2 (T2)</h4></div>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="t-step">Step ▶</button>
+      <button class="btn" id="t-all">Run to the end</button>
+      <button class="btn" id="t-reset">Reset</button>
+      <label>app work between read and write <input type="range" id="t-work" min="1" max="100" step="1" value="20"> <b class="mono" id="t-workv"></b></label>
+      <button class="btn" id="t-sim">Simulate 1,000 double-clicks</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">balance <b id="t-bal">$100</b></div>
+      <div class="stat">paid out <b id="t-paid">$0</b></div>
+      <div class="stat">row lock held by <b id="t-lockv">–</b></div>
+      <div class="stat">double payouts in 1,000 <b id="t-dbl">–</b></div>
+    </div>
+    <p class="hint" id="t-msg"></p>
+  </div>
+  <p>Things to try: step through Read committed and watch both reads see $100. Then Repeatable read: T2's update fails with <code>could not serialize access due to concurrent update</code>, retries, sees $20 and declines. <code>FOR UPDATE</code> makes T2 <b>wait</b> instead. The atomic <code>UPDATE … WHERE balance &gt;= 80</code> needs no read at all. Then simulate: with 20 ms of app work and double-clicks up to 200 ms apart, about 1 in 10 double-clicks pays out twice with the naive code. Slide the work time up and it gets worse.</p>
+
+  <h2>Pessimistic vs optimistic concurrency</h2>
+  <p>Two families of fixes for read-modify-write:</p>
+  <ul>
+    <li><b>Pessimistic locking</b>: lock the row when you read it (<code>SELECT … FOR UPDATE</code>), so others wait. No wasted work, but waiting, and with several rows a risk of <b>deadlock</b> (two transactions each waiting for the other's lock; Postgres detects it and aborts one).</li>
+    <li><b>Optimistic concurrency control</b> (OCC): don't lock; keep a <code>version</code> number on the row, and update only <code>WHERE version = the one I read</code>. If zero rows changed, someone beat you: re-read and retry. No waiting, but conflicts waste the work done so far.</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: how hot can one row get?</span>
+    <p>A flash sale: every purchase decrements one row, <code>stock</code> for a single product.</p>
+    <ul>
+      <li>With a row lock held for <b>5 ms</b> per transaction (read, check, write, commit), the row can do at most 1,000 ÷ 5 = <b>200 purchases per second</b>, however many servers you add.</li>
+      <li>If 2,000 buyers per second arrive, the queue grows by 1,800 per second; after 10 s, the last buyer waits about 18,000 ÷ 200 = <b>90 s</b>.</li>
+      <li>Shrink the lock time to 1 ms with a single atomic statement (<code>UPDATE … SET stock = stock - 1 WHERE stock &gt; 0</code>): <b>1,000 per second</b>. Or split the stock into 10 rows of 100 units each (like splitting a hot key, Lesson 2.4): about 10× more.</li>
+    </ul>
+    <p>The throughput of a hot row is roughly <b>1 ÷ lock time</b>. That's the number to estimate whenever many users update the same thing.</p>
+  </div>
+
+  <div class="playground" id="pg-cc">
+    <span class="label">🎮 Playground · Optimistic vs pessimistic under contention</span>
+    <p class="hint">Clients run transactions back to back against a set of rows, each picking a row at random. Each transaction does some work, then commits. Pessimistic: lock first, others queue (each lock costs an assumed extra 0.5 ms). Optimistic: no lock, retry on a version conflict. Simulates 2 seconds.</p>
+    <div class="controls">
+      <label>clients <input type="range" id="c-n" min="1" max="64" step="1" value="16"> <b class="mono" id="c-nv"></b></label>
+      <label>rows being updated <input type="range" id="c-r" min="0" max="3" step="1" value="3"> <b class="mono" id="c-rv"></b></label>
+      <label>work per transaction <input type="range" id="c-d" min="1" max="20" step="1" value="5"> <b class="mono" id="c-dv"></b></label>
+      <button class="btn primary" id="c-run">▶ Run</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">pessimistic commits/s <b id="c-pt">–</b></div>
+      <div class="stat">optimistic commits/s <b id="c-ot">–</b></div>
+      <div class="stat">optimistic wasted work <b id="c-ow">–</b></div>
+      <div class="stat">p99 latency (pess / opt) <b id="c-p99">–</b></div>
+    </div>
+    <canvas class="chart" id="c-chart" style="height:200px"></canvas>
+    <p class="hint" id="c-msg"></p>
+  </div>
+  <p>Things to try: with 1,000 rows, optimistic edges ahead: about 2% of attempts conflict and it skips the lock overhead. At 100 rows with 64 clients, about 40% of optimistic attempts conflict and locks win. Drop to <b>1 row</b> with 16 clients: both cap near 1,000 ÷ 5.5 ≈ 180 commits/s, but optimistic throws away over 90% of its work and its p99 latency (the slowest 1% of transactions) passes a second, because some clients keep losing the race. That's the rule of thumb: <b>optimistic for low contention, pessimistic (or a single atomic statement) for hot rows</b>.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Every relational database (Postgres, MySQL, SQL Server, Oracle) and distributed SQL (Spanner, CockroachDB) gives you these. DynamoDB offers conditional writes and transactions; MongoDB has multi-document transactions. Your ORM wraps them: Django <code>select_for_update()</code>, Rails <code>with_lock</code> and the <code>lock_version</code> column for optimistic locking.</p>
+<pre><code><span class="c">-- 1. Simplest and best when it fits: one atomic, conditional statement</span>
+<span class="k">UPDATE</span> accounts <span class="k">SET</span> balance = balance - <span class="n">80</span>
+<span class="k">WHERE</span> id = <span class="n">1</span> <span class="k">AND</span> balance &gt;= <span class="n">80</span>;        <span class="c">-- 0 rows updated = insufficient funds</span>
+
+<span class="c">-- 2. Pessimistic: lock the row you're about to change</span>
+<span class="k">BEGIN</span>;
+<span class="k">SELECT</span> balance <span class="k">FROM</span> accounts <span class="k">WHERE</span> id = <span class="n">1</span> <span class="k">FOR UPDATE</span>;   <span class="c">-- others wait here</span>
+<span class="k">UPDATE</span> accounts <span class="k">SET</span> balance = <span class="n">20</span> <span class="k">WHERE</span> id = <span class="n">1</span>;
+<span class="k">COMMIT</span>;
+
+<span class="c">-- 3. Optimistic: a version column</span>
+<span class="k">UPDATE</span> accounts <span class="k">SET</span> balance = <span class="n">20</span>, version = version + <span class="n">1</span>
+<span class="k">WHERE</span> id = <span class="n">1</span> <span class="k">AND</span> version = <span class="n">7</span>;              <span class="c">-- 0 rows = someone changed it: re-read and retry</span>
+
+<span class="c">-- 4. Let the database check everything; be ready to retry</span>
+<span class="k">BEGIN ISOLATION LEVEL SERIALIZABLE</span>;</code></pre>
+<pre><code><span class="k">import</span> psycopg
+<span class="k">def</span> run_with_retry(conn, fn, tries=<span class="n">5</span>):
+    <span class="k">for</span> attempt <span class="k">in</span> range(tries):
+        <span class="k">try</span>:
+            <span class="k">with</span> conn.transaction():
+                <span class="k">return</span> fn(conn)
+        <span class="k">except</span> psycopg.errors.SerializationFailure:   <span class="c"># SQLSTATE 40001: safe to retry</span>
+            <span class="k">continue</span>
+    <span class="k">raise</span> RuntimeError(<span class="s">"too much contention"</span>)</code></pre>
+    <p class="hint">Try it locally: open two <code>psql</code> sessions against <code>docker run -e POSTGRES_PASSWORD=dev -p 5432:5432 postgres</code>, run <code>BEGIN ISOLATION LEVEL REPEATABLE READ;</code> in both, and replay the withdrawal by hand. Seeing the 40001 error yourself makes it stick.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Approach</th><th>Use when</th><th>Watch out for</th></tr>
+      <tr><td>Atomic conditional UPDATE</td><td>The change fits in one statement (counters, balances, stock)</td><td>Logic that needs several reads first</td></tr>
+      <tr><td><code>SELECT … FOR UPDATE</code></td><td>Hot rows, complex logic, money</td><td>Waiting, deadlocks (always lock rows in the same order), locks held across slow calls</td></tr>
+      <tr><td>Optimistic version column</td><td>Low contention, long “think” times (a user editing a form)</td><td>Retry storms on hot rows</td></tr>
+      <tr><td>Serializable isolation</td><td>Complex invariants across rows (write skew)</td><td>More aborts under load; every transaction needs retry code</td></tr>
+      <tr><td>Read committed + nothing else</td><td>Most reads and independent writes</td><td>Any read-modify-write: it's where lost updates live</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Keep money, credits, inventory and bookings in Postgres, inside one transaction, with constraints (<code>CHECK (balance &gt;= 0)</code>, unique keys) as a safety net. Use atomic conditional updates wherever you can and <code>FOR UPDATE</code> elsewhere. Add idempotency keys so a retried request can't charge twice (Lesson 3.3).</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Data is sharded, so transactions stay within one shard by design (put an account's rows on the same shard). Cross-service work uses sagas and the outbox pattern instead of distributed transactions (Lesson 3.5). Some teams pay for distributed SQL (Spanner, CockroachDB) to get serializable transactions across shards. Isolation bugs are tested for with tools like Jepsen.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Whenever a design has money, inventory or seats, the interviewer is waiting for you to mention concurrency. A senior answer covers:</p>
+    <ul>
+      <li>Where the <b>read-modify-write</b> races are, and which fix you'd use (atomic update, lock, version, serializable).</li>
+      <li>The <b>throughput of hot rows</b> (≈ 1 ÷ lock time) and how you'd split them.</li>
+      <li><b>Retries</b>: which errors are safe to retry, and idempotency so retries don't double-charge.</li>
+      <li>What happens <b>across shards or services</b>, where a single ACID transaction no longer exists.</li>
+    </ul>
+    <p>Common follow-ups: “Two users book the last seat at the same moment. Walk me through it.” “Why not make everything serializable?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Concurrency attacks on real stores</b> <span class="tag hist">📜 Research · SIGMOD 2017</span> <a href="http://www.bailis.org/papers/acidrain-sigmod2017.pdf" target="_blank" rel="noopener">ACIDRain: Concurrency-Related Attacks on Database-Backed Web Applications</a></div>
+      <p><b>How:</b> the authors analysed 12 popular e-commerce apps and found 22 attacks, including the Flexcoin case. 17 of the 22 came from using transactions incorrectly, so even the strongest isolation level wouldn't have stopped them without code changes.</p>
+      <p><b>Why this method:</b> the paper's lesson is that isolation levels only help when the whole read-check-write sits inside one correctly used transaction (or uses explicit locks like <code>SELECT … FOR UPDATE</code>).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The isolation levels, as implemented</b> <span class="tag oss">🧰 Open source · PostgreSQL</span> <a href="https://www.postgresql.org/docs/current/transaction-iso.html" target="_blank" rel="noopener">Postgres: Transaction Isolation</a></div>
+      <p><b>How:</b> Read Committed is the default. Repeatable Read aborts a transaction that tries to modify a row changed since it started; Serializable uses Serializable Snapshot Isolation, which adds checks for anomalies. Apps at those levels must be prepared to retry.</p>
+      <p><b>Why this method:</b> MVCC lets readers never block writers; aborting on conflict, instead of locking everything up front, keeps throughput high when conflicts are rare.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Testing isolation claims</b> <span class="tag oss">🧰 Jepsen · 2020</span> <a href="https://jepsen.io/analyses/postgresql-12.3" target="_blank" rel="noopener">Jepsen: PostgreSQL 12.3</a></div>
+      <p><b>How:</b> Jepsen's checker (Elle) found that Postgres 12.3's serializable level could occasionally allow a non-serializable anomaly under normal operation (a bug fixed in the next minor release), and that its repeatable read is snapshot isolation.</p>
+      <p><b>Why this method:</b> isolation is hard to get right even for mature databases. Generating concurrent histories and checking them against a formal model finds bugs no one would find by reading code.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Optimistic locking in a NoSQL store</b> <span class="tag co">🏢 Amazon Web Services</span> <a href="https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/DynamoDBMapper.OptimisticLocking.html" target="_blank" rel="noopener">DynamoDB: optimistic locking with version number</a></div>
+      <p><b>How:</b> each item carries a version attribute; an update succeeds only if the version on the server hasn't changed since you read it. On a mismatch the update fails and you retry with fresh data.</p>
+      <p><b>Why this method:</b> a distributed key-value store can't hold long locks for clients, but a conditional write is cheap and works on every partition.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · even “serializable” needed a patch</span>
+    <p>Jepsen's PostgreSQL report was done independently and without payment, and a patch for the serializability bug it found was scheduled for the very next minor release. Postgres has one of the most careful concurrency implementations around, and a randomized tester still found a hole. If your design depends on an isolation guarantee, test it under real concurrency.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>A transaction is safe on one database; across shards (Lesson 2.4) or services it becomes a <b>distributed transaction</b>, handled with two-phase commit or sagas (Lesson 3.5). Retries need <b>idempotency</b> so they don't apply twice (Lesson 3.3). The payment system design (Lesson 7.7) puts all of this together: ledgers, locks, idempotency keys and reconciliation.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://www.postgresql.org/docs/current/transaction-iso.html" target="_blank" rel="noopener">Postgres: Transaction Isolation</a>. The clearest official description of what each level really does.</li>
+      <li><span class="kind">Paper</span> <a href="http://www.bailis.org/papers/acidrain-sigmod2017.pdf" target="_blank" rel="noopener">ACIDRain (SIGMOD 2017)</a>. Real attacks on real apps, with the code patterns that caused them.</li>
+      <li><span class="kind">Blog</span> <a href="https://jepsen.io/analyses" target="_blank" rel="noopener">Jepsen analyses</a>. Independent tests of many databases' consistency and isolation claims.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Every ticket sale for a concert locks one <code>seats_left</code> row for about 4 ms. What's the most sales per second that row can handle?</div>
+    <div class="opts"><button class="opt">About 25</button><button class="opt" data-ok>About 250</button><button class="opt">About 4,000</button></div>
+    <div class="explain">One transaction at a time × 4 ms each = 1,000 ÷ 4 = <b>250 per second</b>, regardless of how many app servers you add. To go faster, shorten the lock (one atomic statement) or split the counter into several rows.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Code does <code>SELECT stock</code>, checks it's above 0, then <code>UPDATE … SET stock = :new</code>, inside BEGIN/COMMIT on Postgres defaults. During a sale, stock goes negative. Why?</div>
+    <div class="opts"><button class="opt" data-ok>Read committed allows two transactions to read the same stock and both write; the read-modify-write isn't protected</button><button class="opt">The transaction wasn't durable</button><button class="opt">Postgres doesn't support transactions on integers</button></div>
+    <div class="explain">That's the lost-update anomaly. Fix with <code>UPDATE … SET stock = stock - 1 WHERE stock &gt; 0</code>, or <code>SELECT … FOR UPDATE</code>, or a higher isolation level with retries. A <code>CHECK (stock &gt;= 0)</code> constraint is a good safety net too.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Users edit long wiki pages for minutes at a time, and two people rarely edit the same page at once. Which approach fits?</div>
+    <div class="opts"><button class="opt">SELECT … FOR UPDATE when the editor opens</button><button class="opt" data-ok>Optimistic: save only if the page's version hasn't changed, otherwise show a conflict</button><button class="opt">Serializable isolation for the whole editing session</button></div>
+    <div class="explain">Holding a lock for minutes would block everyone else and leak locks when browsers close. Conflicts are rare, so optimistic concurrency fits: cheap when it succeeds, and a clear “someone else edited this” message when it doesn't.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>ACID = all-or-nothing, rules hold, transactions don't see each other's half-done work, commits survive crashes.</li>
+      <li>Postgres defaults to read committed, which allows lost updates on read-modify-write. Higher levels abort one transaction; you must retry (SQLSTATE 40001).</li>
+      <li>Fixes, in order of preference: one atomic conditional UPDATE, <code>SELECT … FOR UPDATE</code>, a version column, serializable.</li>
+      <li>A hot row's throughput ≈ 1 ÷ lock time. Optimistic for low contention, pessimistic or atomic for hot rows.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ---------- playground 1: step-through ----------
+  // each step: [txn, sql, note, effect(state)]
+  const pay = s => { s.paid += 80; };
+  const SCRIPTS = {
+    naive: [
+      [1, "SELECT balance FROM accounts WHERE id = 1;", "→ $100", s => (s.r1 = s.bal)],
+      [2, "SELECT balance FROM accounts WHERE id = 1;", "→ $100 (T1 hasn't written yet)", s => (s.r2 = s.bal)],
+      [1, "-- 100 ≥ 80 ✓\nUPDATE accounts SET balance = 20 WHERE id = 1;", "computed from its read: 100 − 80", s => { s.bal = s.r1 - 80; s.lock = "T1"; }],
+      [1, "COMMIT;", "pays out $80", s => { pay(s); s.lock = null; }],
+      [2, "-- 100 ≥ 80 ✓ (stale read!)\nUPDATE accounts SET balance = 20 WHERE id = 1;", "overwrites T1's write: lost update", s => { s.bal = s.r2 - 80; s.lock = "T2"; }],
+      [2, "COMMIT;", "pays out $80 again ❌", s => { pay(s); s.lock = null; }],
+    ],
+    rr: [
+      [1, "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT balance …;", "→ $100 (snapshot)", s => (s.r1 = s.bal)],
+      [2, "BEGIN ISOLATION LEVEL REPEATABLE READ;\nSELECT balance …;", "→ $100 (its own snapshot)", s => (s.r2 = s.bal)],
+      [1, "UPDATE accounts SET balance = 20 …;", "row now locked by T1", s => { s.bal = 20; s.lock = "T1"; }],
+      [1, "COMMIT;", "pays out $80", s => { pay(s); s.lock = null; }],
+      [2, "UPDATE accounts SET balance = 20 …;", "ERROR: could not serialize access due to concurrent update (40001)", s => { s.err = true; }],
+      [2, "ROLLBACK; -- retry\nSELECT balance …;", "→ $20: 20 < 80, declined ✅", s => {}],
+    ],
+    lock: [
+      [1, "BEGIN;\nSELECT balance … FOR UPDATE;", "→ $100, row locked by T1", s => { s.r1 = s.bal; s.lock = "T1"; }],
+      [2, "BEGIN;\nSELECT balance … FOR UPDATE;", "⏳ waits for T1's lock", s => { s.wait = true; }],
+      [1, "UPDATE accounts SET balance = 20 …;", "", s => { s.bal = 20; }],
+      [1, "COMMIT;", "pays out $80, releases the lock", s => { pay(s); s.lock = "T2"; }],
+      [2, "-- the waiting SELECT returns", "→ $20 (the updated row): declined ✅", s => {}],
+      [2, "COMMIT;", "no payout", s => { s.lock = null; }],
+    ],
+    atomic: [
+      [1, "UPDATE accounts SET balance = balance - 80\nWHERE id = 1 AND balance >= 80;", "1 row updated, row locked by T1", s => { s.bal -= 80; s.lock = "T1"; }],
+      [2, "UPDATE accounts SET balance = balance - 80\nWHERE id = 1 AND balance >= 80;", "⏳ waits for T1's row lock", s => {}],
+      [1, "COMMIT;", "pays out $80", s => { pay(s); s.lock = "T2"; }],
+      [2, "-- re-checks WHERE on the new row: 20 >= 80?", "0 rows updated: declined ✅", s => { s.lock = null; }],
+    ],
+    occ: [
+      [1, "SELECT balance, version …;", "→ $100, version 7", s => (s.r1 = s.bal)],
+      [2, "SELECT balance, version …;", "→ $100, version 7", s => (s.r2 = s.bal)],
+      [1, "UPDATE … SET balance = 20, version = 8\nWHERE id = 1 AND version = 7;", "1 row updated", s => { s.bal = 20; s.ver = 8; s.lock = "T1"; }],
+      [1, "COMMIT;", "pays out $80", s => { pay(s); s.lock = null; }],
+      [2, "UPDATE … SET balance = 20, version = 8\nWHERE id = 1 AND version = 7;", "0 rows updated: version is now 8", s => {}],
+      [2, "-- retry: SELECT balance, version …;", "→ $20, version 8: declined ✅", s => {}],
+    ],
+  };
+  const getT = seg("t-mode", () => tReset());
+  let st, step;
+  function tReset() {
+    st = { bal: 100, paid: 0, lock: null, ver: 7 }; step = 0;
+    const sc = SCRIPTS[getT()];
+    ["t-l1", "t-l2"].forEach((id, k) => {
+      const lane = $(id); lane.querySelectorAll(".st").forEach(e => e.remove());
+      sc.forEach((s, i) => { if (s[0] !== k + 1) return; const d = document.createElement("div"); d.className = "st"; d.id = "t-s" + i; d.innerHTML = `<b>${i + 1}.</b> ` + s[1].replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/\n/g, "<br>") + `<span class="nt2">${s[2]}</span>`; lane.appendChild(d); });
+    });
+    tPaint();
+  }
+  function tPaint() {
+    const sc = SCRIPTS[getT()];
+    sc.forEach((s, i) => { const e = $("t-s" + i); if (e) { e.classList.toggle("done", i < step); e.classList.toggle("now", i === step - 1); } });
+    $("t-bal").textContent = "$" + st.bal; $("t-paid").textContent = "$" + st.paid; $("t-lockv").textContent = st.lock || "nobody";
+    const end = step >= sc.length;
+    $("t-msg").textContent = !end ? `Step ${step} of ${sc.length}.` :
+      st.paid > 100 ? `Paid out $${st.paid} from a $100 account. The bank lost $${st.paid - 100}: a lost update.` :
+      `Paid out $${st.paid}, balance $${st.bal}. Correct: the second withdrawal was declined.`;
+  }
+  $("t-step").onclick = () => { const sc = SCRIPTS[getT()]; if (step < sc.length) { sc[step][3](st); step++; } tPaint(); };
+  $("t-all").onclick = () => { const sc = SCRIPTS[getT()]; while (step < sc.length) { sc[step][3](st); step++; } tPaint(); };
+  $("t-reset").onclick = tReset;
+  $("t-work").oninput = () => ($("t-workv").textContent = $("t-work").value + " ms");
+  $("t-sim").onclick = () => {
+    const mode = getT(), work = +$("t-work").value, rng = MX.seeded(4);
+    let dbl = 0, waits = 0, retries = 0;
+    for (let i = 0; i < 1000; i++) {
+      const gap = rng() * 200; // second click lands 0–200 ms after the first
+      const overlap = gap < work; // T2 reads before T1 commits
+      if (!overlap) continue;
+      if (mode === "naive") dbl++;
+      else if (mode === "lock" || mode === "atomic") waits++;
+      else retries++;
+    }
+    $("t-dbl").textContent = dbl;
+    $("t-msg").textContent = mode === "naive" ? `${dbl} of 1,000 double-clicks paid out twice: every time the second request read before the first committed (${work} ms window).` :
+      mode === "lock" || mode === "atomic" ? `0 double payouts. ${waits} second requests had to wait for the row lock (up to ${work} ms).` :
+      `0 double payouts. ${retries} second requests hit a conflict and retried.`;
+  };
+  $("t-workv").textContent = $("t-work").value + " ms";
+  tReset();
+
+  // ---------- playground 2: optimistic vs pessimistic ----------
+  const ROWS = [1, 10, 100, 1000], LOCK_COST = 0.5, THINK = 1, DUR = 2000;
+  function simulate(n, rows, d, mode, seed) {
+    const rng = MX.seeded(seed);
+    const next = new Float64Array(n), first = new Float64Array(n), row = new Int32Array(n), readVer = new Float64Array(n);
+    const ver = new Float64Array(rows), freeAt = new Float64Array(rows);
+    let commits = 0, aborts = 0; const lat = [];
+    const start = (c, t) => { row[c] = Math.floor(rng() * rows); first[c] = t; };
+    for (let c = 0; c < n; c++) {
+      start(c, rng() * d);
+      if (mode === "opt") { readVer[c] = ver[row[c]]; next[c] = first[c] + d; }
+      else { const s0 = Math.max(first[c], freeAt[row[c]]); freeAt[row[c]] = s0 + d + LOCK_COST; next[c] = s0 + d + LOCK_COST; }
+    }
+    for (;;) {
+      let c = 0; for (let i = 1; i < n; i++) if (next[i] < next[c]) c = i;
+      const t = next[c]; if (t > DUR) break;
+      if (mode === "opt") {
+        if (ver[row[c]] === readVer[c]) { ver[row[c]]++; commits++; lat.push(t - first[c]); start(c, t + THINK); readVer[c] = ver[row[c]]; next[c] = first[c] + d; }
+        else { aborts++; const r = t + rng() * d; readVer[c] = ver[row[c]]; next[c] = r + d; } // retry after a random backoff
+      } else {
+        commits++; lat.push(t - first[c]); start(c, t + THINK);
+        const s0 = Math.max(first[c], freeAt[row[c]]); freeAt[row[c]] = s0 + d + LOCK_COST; next[c] = s0 + d + LOCK_COST;
+      }
+    }
+    lat.sort((a, b) => a - b);
+    return { tps: commits / (DUR / 1000), wasted: aborts / Math.max(1, aborts + commits), p99: lat.length ? lat[Math.floor(lat.length * 0.99)] : 0 };
+  }
+  function cc() {
+    const n = +$("c-n").value, rows = ROWS[+$("c-r").value], d = +$("c-d").value;
+    $("c-nv").textContent = n; $("c-rv").textContent = rows === 1 ? "1 (one hot row)" : rows.toLocaleString(); $("c-dv").textContent = d + " ms";
+    const p = simulate(n, rows, d, "pess", 1), o = simulate(n, rows, d, "opt", 1);
+    $("c-pt").textContent = Math.round(p.tps).toLocaleString(); $("c-ot").textContent = Math.round(o.tps).toLocaleString();
+    $("c-ow").textContent = (100 * o.wasted).toFixed(0) + "% of attempts";
+    $("c-p99").textContent = p.p99.toFixed(0) + " / " + o.p99.toFixed(0) + " ms";
+    const xs = [1, 2, 4, 8, 16, 32, 64], ps = [], os = [];
+    xs.forEach(x => { ps.push([x, simulate(x, rows, d, "pess", 2).tps]); os.push([x, simulate(x, rows, d, "opt", 2).tps]); });
+    Plot.line($("c-chart"), { series: [
+      { label: "pessimistic (locks)", color: MX.css("--c-sv"), data: ps, dots: true },
+      { label: "optimistic (version)", color: MX.css("--c-ca"), data: os, dots: true },
+    ], xMin: 1, xMax: 64, yMin: 0, xLabel: "clients", yLabel: "commits per second" });
+    const cap = 1000 / d;
+    $("c-msg").textContent = rows === 1 ? `One hot row: at most about 1,000 ÷ ${d} ms ≈ ${Math.round(cap)} commits/s for anyone. Optimistic wasted ${(100 * o.wasted).toFixed(0)}% of its attempts getting there.` :
+      o.wasted < 0.05 ? `Low contention: only ${(100 * o.wasted).toFixed(1)}% of optimistic attempts conflicted, and it skipped the lock overhead.` :
+      `Some contention: ${(100 * o.wasted).toFixed(0)}% of optimistic attempts were thrown away and retried.`;
+  }
+  $("c-run").onclick = cc;
+  ["c-n", "c-r", "c-d"].forEach(id => ($(id).oninput = cc));
+  cc();
+})();
+</script>
+</body>
+</html>

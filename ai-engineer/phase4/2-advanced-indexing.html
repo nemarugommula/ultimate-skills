@@ -1,0 +1,426 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.2 Advanced indexing · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .doc .sec { margin: 4px 0 8px; }
+  .doc .sec h5 { margin: 4px 0 2px; font-size: .9rem; }
+  .s { border-radius: 4px; padding: 1px 2px; }
+  .s.match { outline: 2px solid var(--c-in); outline-offset: 1px; }
+  .s.sent { background: color-mix(in srgb, var(--c-cx) 26%, transparent); }
+  .s.need { text-decoration: underline wavy var(--c-ev); text-underline-offset: 3px; }
+  .tree { display: grid; gap: 8px; margin: 10px 0; }
+  .tree .lvl { display: grid; gap: 8px; }
+  .tree .lvl.l2 { grid-template-columns: 1fr; }
+  .tree .lvl.l1 { grid-template-columns: repeat(3, 1fr); }
+  .tree .lvl.l0 { grid-template-columns: repeat(9, 1fr); }
+  .tree .nd { border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font-size: .78rem; background: var(--bg2); line-height: 1.35; }
+  .tree .l2 .nd { border-top: 4px solid var(--c-md); }
+  .tree .l1 .nd { border-top: 4px solid var(--c-md); }
+  .tree .l0 .nd { border-top: 4px solid var(--c-cx); }
+  .tree .nd.got { outline: 3px solid var(--c-ev); outline-offset: 1px; }
+  .tree .nd.dim { opacity: .45; }
+  .tree .nd .k { font-size: .7rem; color: var(--muted); display: block; }
+  @media (max-width: 760px) { .tree .lvl.l0 { grid-template-columns: repeat(3, 1fr); } .tree .lvl.l1 { grid-template-columns: 1fr; } }
+  table.sim td { text-align: center; font-family: var(--mono); font-size: .85rem; }
+  table.sim td.mx { background: color-mix(in srgb, var(--c-ev) 25%, transparent); font-weight: 700; }
+</style>
+</head>
+<body data-lesson="a4-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 2</div>
+  <h1>Advanced indexing: parent-child, hierarchical, multi-vector, ColBERT</h1>
+  <p class="subtitle">Naive RAG embeds a chunk and hands that same chunk to the model. Advanced indexes break that rule: what you search with and what you read don't have to be the same text.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Chunking</b>: small chunks match precisely but may miss context; big chunks are complete but blurry (Lesson 3.3).</li>
+      <li><b>Embedding</b>: one vector per piece of text; similar meaning → nearby vectors (Lesson 2.1). A <b>vector index</b> such as HNSW (a graph-based approximate nearest-neighbour index) finds the nearest ones fast (Lesson 2.2).</li>
+      <li><b>Reranking</b>: a slower model re-scores the top candidates (Lesson 3.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>QuALITY is a benchmark of multiple-choice questions about long stories and articles, the kind where you must understand the whole text, not find one sentence. In 2024 a Stanford team stopped feeding the model flat chunks. They clustered the chunks, had an LLM summarise each cluster, clustered the summaries, summarised again, and searched the whole tree at once.</p>
+    <p>That method, RAPTOR, paired with GPT-4, improved the best published QuALITY result by <b>20 points of absolute accuracy</b>. Same documents, same model, just a smarter index.</p>
+  </div>
+
+  <h2>Numbers first: the precision–completeness squeeze</h2>
+  <p>Take one handbook question, “How long do Plus members have to ask for a refund?”. The answer needs two adjacent sentences: “Refunds are available within 30 days…” and “<i>This window</i> extends to 60 days for members of the Plus program.”</p>
+  <table>
+    <tr><th>What you index and return</th><th>Embedding is about…</th><th>Tokens sent (top-2)</th><th>Answer complete?</th></tr>
+    <tr><td>One sentence per chunk</td><td class="ev">exactly one fact: sharp match</td><td class="tk">≈ 30</td><td class="rk">No: “this window” has lost its subject</td></tr>
+    <tr><td>One whole section per chunk</td><td class="rk">5 topics averaged into one vector</td><td class="tk">≈ 120</td><td class="ev">Yes, plus ~80% irrelevant text</td></tr>
+    <tr><td><b>Search sentences, return their neighbours</b></td><td class="ev">one fact</td><td class="tk">≈ 60</td><td class="ev">Yes</td></tr>
+  </table>
+  <p class="muted">Token counts are from the playground below. On real corpora with thousands of sections, the blur of big chunks also costs you retrieval accuracy: the Dense X Retrieval study found that indexing fine-grained propositions instead of passages raised average Recall@5 by 12.0 and 9.3 points for two unsupervised retrievers.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Decouple the retrieval unit from the reading unit.</b> Index small, sharp, self-contained things to <i>find</i> (sentences, propositions, summaries, hypothetical questions, even single tokens), and keep a pointer from each to the bigger thing the model should <i>read</i> (the parent section, a window of neighbours, the whole page). Almost every technique here is a different choice of “what to search” and “what to return”.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the index at the back of a book</span>
+    <p>A book's index lists tiny, precise terms (“refund window, 60 days … p. 42”). You never read the index entry as the answer: you follow it to page 42 and read the page. The table of contents is a different index for a different job: chapter summaries for broad questions (“what's this book about?”). Small-to-big retrieval is the back-of-book index; hierarchical summaries are the table of contents.</p>
+  </div>
+
+  <h2>The techniques</h2>
+  <table>
+    <tr><th>Technique</th><th>What gets embedded</th><th>What the model reads</th><th>Best for</th></tr>
+    <tr><td><b>Parent-document</b> (small-to-big)</td><td>Small child chunks (≈ 100–400 tokens)</td><td>The parent section or document they came from</td><td>Answers that need surrounding context</td></tr>
+    <tr><td><b>Sentence window</b></td><td>Single sentences</td><td>The sentence ± N neighbours</td><td>Dense prose; cheap context</td></tr>
+    <tr><td><b>Auto-merging</b></td><td>Leaf chunks of a chunk hierarchy</td><td>The parent, if enough of its children were retrieved</td><td>Long structured docs (LlamaIndex)</td></tr>
+    <tr><td><b>Multi-vector</b>: summaries</td><td>An LLM summary of each chunk</td><td>The original chunk</td><td>Noisy chunks: tables, code, transcripts</td></tr>
+    <tr><td><b>Multi-vector</b>: hypothetical questions</td><td>3–5 LLM-written questions each chunk answers</td><td>The original chunk</td><td>Question vs answer vocabulary gap (HyDE in reverse: done once at index time)</td></tr>
+    <tr><td><b>Propositions</b> (Dense X)</td><td>Atomic, standalone facts rewritten by an LLM</td><td>The propositions, or their source passage</td><td>Fact lookup; entity questions</td></tr>
+    <tr><td><b>Hierarchical summaries</b> (RAPTOR)</td><td>Chunks + summaries of clusters + summaries of summaries</td><td>Whichever level matched</td><td>Broad, “whole document” questions</td></tr>
+    <tr><td><b>Late interaction</b> (ColBERT)</td><td>One small vector <i>per token</i></td><td>The chunk</td><td>Precise matching of rare terms, names, codes</td></tr>
+  </table>
+  <p>Contextual retrieval and late chunking from Lesson 3.3 are cousins: they keep one vector per chunk but make it carry its surrounding context.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Small-to-big</span>
+    <p class="hint">An eight-section handbook and eight questions. Each sentence is a small chunk; each section is a big one. Pick what you index and what you return. Blue outline = the units search matched; green = text sent to the model; wavy underline = the sentences the answer needs. Start with “small chunks” on question 1.</p>
+    <div class="controls">
+      <span class="seg" id="smode"><button data-v="small" class="on" id="m-small">Small chunks</button><button data-v="big" id="m-big">Big chunks</button><button data-v="parent" id="m-parent">Small-to-big (parent)</button><button data-v="window" id="m-window">Sentence window</button></span>
+    </div>
+    <div class="controls">
+      <label>top-k <input type="range" id="sk" min="1" max="3" value="2"> <b class="mono" id="skv"></b></label>
+      <label>window ± <input type="range" id="sw" min="1" max="2" value="1"> <b class="mono" id="swv"></b></label>
+      <label>question <select id="sq" class="btn small"></select></label>
+    </div>
+    <div class="doc" id="sdoc"></div>
+    <div class="verdict" id="sverdict"></div>
+    <div class="stat-row">
+      <div class="stat">questions answerable <b id="sok">–</b></div>
+      <div class="stat">avg tokens sent <b id="stok">–</b></div>
+      <div class="stat">context precision <b id="sprec">–</b></div>
+      <div class="stat">vectors in index <b id="svec">–</b></div>
+    </div>
+    <p class="hint">Context precision = share of the sentences you sent that the answer actually needs. Uses the course's offline toy hybrid search; real embeddings behave the same way at this scale, and big chunks get blurrier as the corpus grows.</p>
+  </div>
+  <p>What you should see: small chunks are the cheapest and most precise but answer only 6 of 8 (the two-sentence answers break). Big chunks answer everything here, but at about 4× the tokens with most of it irrelevant. <b>Sentence window</b> gets the same 8 of 8 for about half the tokens of returning whole sections. That's the whole case for decoupling.</p>
+
+  <h2>Multi-vector and propositions: index what people will ask</h2>
+  <p>A chunk of a pricing table embeds badly: numbers and pipes, little meaning. Index an LLM-written <b>summary</b> (“Prices of the Team and Business plans per seat per month”) or a few <b>hypothetical questions</b> (“How much is the Team plan?”, “Is SSO included in Business?”) and point each back to the chunk. Questions match questions far better than they match tables. <b>Propositions</b> push the same idea to atomic facts: “Plus members can get refunds within 60 days of delivery.” Each is standalone, so pronouns and missing subjects disappear.</p>
+  <div class="prompt"><span class="md">For the chunk below, write 3 questions a customer might ask that this chunk answers. One per line.</span>
+<span class="cx">Refunds are available within 30 days of delivery. This window extends to 60 days for members of the Plus program.</span>
+→ How long do I have to return an item?
+→ Do Plus members get longer to ask for a refund?
+→ Is the refund window 30 or 60 days?   <span class="muted">(embed these 3; each points to the chunk)</span></div>
+
+  <h2>Hierarchical summaries: RAPTOR</h2>
+  <p>“What are the main themes in this quarter's feedback?” has no single chunk that answers it. RAPTOR (Recursive Abstractive Processing for Tree-Organized Retrieval) builds a tree bottom-up: embed the chunks, cluster them (with Gaussian mixture models), have an LLM summarise each cluster, then repeat on the summaries until one root remains. At query time the paper's best variant, the <b>collapsed tree</b>, puts every node from every level into one pool and retrieves the best matches up to a token budget, so specific questions hit leaves and broad ones hit summaries. (The alternative, walking the tree top-down layer by layer, did consistently worse.)</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · A RAPTOR-style tree</span>
+    <p class="hint">Nine pieces of customer feedback (leaves, green), three cluster summaries and one root summary (purple, <b>simulated LLM-written summaries</b>). Ask a specific question and a broad one, with normal leaf-only retrieval and with the collapsed tree. Retrieved nodes get a teal outline.</p>
+    <div class="controls">
+      <span class="seg" id="rmode"><button data-v="leaves" class="on" id="r-leaves">Leaves only (normal RAG)</button><button data-v="collapsed" id="r-collapsed">Collapsed tree (all levels)</button></span>
+      <label>top-k <input type="range" id="rk" min="1" max="4" value="2"> <b class="mono" id="rkv"></b></label>
+    </div>
+    <div class="controls"><label>question <select id="rq" class="btn small"></select></label></div>
+    <div class="tree" id="tree"></div>
+    <div class="verdict" id="rverdict"></div>
+    <div class="controls"><button class="btn primary" id="rall">▶ Score all questions, both modes</button></div>
+    <div id="rout"></div>
+  </div>
+  <p>With leaves only, a broad question retrieves a couple of individual complaints and the model “summarises” from a keyhole: at best two of the three themes. The collapsed tree retrieves the root and a cluster summary, covering all three, while the specific question about the Toronto parcel still lands on its leaf. The price is paid once, at indexing: one LLM call per cluster per level, and a rebuild of the affected branches when documents change.</p>
+
+  <h2>Late interaction: ColBERT</h2>
+  <p>A single vector squeezes a whole chunk into one point. <b>ColBERT</b> (Khattab and Zaharia, 2020) keeps one small vector (128 numbers) <b>per token</b>. To score a document, each query token finds its most similar document token and the maxima are added up: <b>MaxSim</b>. It's called <i>late</i> interaction because query and document are encoded separately (so documents can be pre-computed) and only meet at the end, in this cheap step.</p>
+  <table class="sim">
+    <tr><th>query token ↓ · doc token →</th><th>jacket</th><th>warranty</th><th>defects</th><th>zippers</th><th>max</th></tr>
+    <tr><td>warranty</td><td>0.20</td><td class="mx">0.95</td><td>0.50</td><td>0.10</td><td><b>0.95</b></td></tr>
+    <tr><td>zip</td><td>0.30</td><td>0.10</td><td>0.40</td><td class="mx">0.90</td><td><b>0.90</b></td></tr>
+  </table>
+  <p class="muted">Illustrative similarities. Score = 0.95 + 0.90 = 1.85. Every query word must find its own match, so rare terms (product codes, names, “zip”) aren't averaged away.</p>
+  <p>The paper reported quality competitive with BERT cross-encoder rerankers while running two orders of magnitude faster, with four orders of magnitude fewer FLOPs (floating-point operations) per query. The catch is storage, which ColBERTv2's compression attacks.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what each index costs to store</span>
+    <p>1 million chunks of 200 tokens.</p>
+    <ul>
+      <li><b>Single vector</b>, 1,024 dimensions × 4 bytes (float32): 1,000,000 × 1,024 × 4 = <b>4.1 GB</b>.</li>
+      <li><b>ColBERT</b>, 200 token vectors × 128 dimensions × 2 bytes (float16): 1,000,000 × 200 × 128 × 2 = <b>51.2 GB</b>, about 12× more.</li>
+      <li><b>ColBERTv2</b> residual compression shrinks late-interaction indexes by 6–10×: 51.2 ÷ 10 to 51.2 ÷ 6 ≈ <b>5.1–8.5 GB</b>.</li>
+      <li><b>Multi-vector</b> (chunk + 1 summary + 3 questions = 5 single vectors): 5 × 4.1 = <b>20.5 GB</b>, plus an LLM call per chunk at indexing. At an illustrative $1 per million input and $5 per million output tokens, 300 tokens in and 80 out per chunk: 1M × (300 × $1 + 80 × $5) ÷ 1M = <b>$700</b>, once.</li>
+    </ul>
+    <p>None of these is outrageous, but each is a line in the budget, and each must be rebuilt when you change the embedding model (Lesson 4.7).</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>LlamaIndex</b>: <code>SentenceWindowNodeParser</code> + <code>MetadataReplacementPostProcessor</code>, <code>HierarchicalNodeParser</code> + <code>AutoMergingRetriever</code>. <b>LangChain</b>: <code>ParentDocumentRetriever</code> and <code>MultiVectorRetriever</code> (in <code>langchain_classic</code>). <b>ColBERT</b>: PyLate or RAGatouille, or natively in Vespa and Qdrant (multivectors with MaxSim). RAPTOR's reference code is on GitHub.</p>
+<pre><code><span class="c"># Sentence window: embed one sentence, give the model its neighbours</span>
+<span class="k">from</span> llama_index.core <span class="k">import</span> VectorStoreIndex
+<span class="k">from</span> llama_index.core.node_parser <span class="k">import</span> SentenceWindowNodeParser
+<span class="k">from</span> llama_index.core.postprocessor <span class="k">import</span> MetadataReplacementPostProcessor
+
+parser = SentenceWindowNodeParser.from_defaults(window_size=<span class="n">2</span>)          <span class="c"># ±2 sentences stored as metadata</span>
+index = VectorStoreIndex(parser.get_nodes_from_documents(docs))
+engine = index.as_query_engine(similarity_top_k=<span class="n">3</span>, node_postprocessors=[
+    MetadataReplacementPostProcessor(target_metadata_key=<span class="s">"window"</span>)])   <span class="c"># swap sentence → window</span>
+
+<span class="c"># Small-to-big with LangChain: search 400-char children, return 2,000-char parents</span>
+<span class="k">from</span> langchain_classic.retrievers <span class="k">import</span> ParentDocumentRetriever
+<span class="k">from</span> langchain_classic.storage <span class="k">import</span> InMemoryStore
+<span class="k">from</span> langchain_text_splitters <span class="k">import</span> RecursiveCharacterTextSplitter
+retriever = ParentDocumentRetriever(vectorstore=vectorstore, docstore=InMemoryStore(),
+    child_splitter=RecursiveCharacterTextSplitter(chunk_size=<span class="n">400</span>),
+    parent_splitter=RecursiveCharacterTextSplitter(chunk_size=<span class="n">2000</span>))
+retriever.add_documents(docs)
+
+<span class="c"># ColBERT-style late interaction with PyLate</span>
+<span class="k">from</span> pylate <span class="k">import</span> indexes, models, retrieve
+model = models.ColBERT(model_name_or_path=<span class="s">"lightonai/GTE-ModernColBERT-v1"</span>)
+index = indexes.PLAID(index_folder=<span class="s">"pylate-index"</span>, index_name=<span class="s">"handbook"</span>, override=<span class="k">True</span>)
+index.add_documents(documents_ids=ids, documents_embeddings=model.encode(texts, is_query=<span class="k">False</span>))
+hits = retrieve.ColBERT(index=index).retrieve(queries_embeddings=model.encode([q], is_query=<span class="k">True</span>), k=<span class="n">10</span>)</code></pre>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Technique</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Small-to-big / window</td><td>Precise match + complete context; no LLM at index time</td><td>Parent may be long; duplicates when two children share a parent (dedupe!)</td></tr>
+      <tr><td>Multi-vector (summaries, questions)</td><td>Big recall gains on tables, code, jargon</td><td>LLM call per chunk; 3–5× more vectors; regenerate when chunks change</td></tr>
+      <tr><td>Propositions</td><td>Sharp, standalone facts</td><td>Many more units; LLM rewriting can drop nuance</td></tr>
+      <tr><td>RAPTOR tree</td><td>Answers broad questions that no chunk answers</td><td>Clustering + summarising cost; summaries can be wrong; incremental updates are awkward</td></tr>
+      <tr><td>ColBERT</td><td>Precise, robust matching; strong out of domain</td><td>~10× storage before compression; fewer managed databases support it</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Sentence window or parent-document retrieval: a parser setting, no extra LLM cost, often a clear win. Add hypothetical questions only for content that embeds badly (tables, FAQs with odd wording). Keep everything in one vector database with a parent ID in metadata.</p></div>
+      <div><h4>At scale</h4><p>Several indexes per corpus (chunks, propositions or questions, summaries), a late-interaction or cross-encoder reranker, and index builds run as versioned batch pipelines with their own evals. Teams measure index size and rebuild time as carefully as recall.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Our retrieved chunks match well but the answers miss context. And sometimes nothing matches broad questions.” A senior answer:</p>
+    <ul>
+      <li>Names the cause: <b>retrieval unit = reading unit</b>. Proposes small-to-big or sentence windows for the context problem.</li>
+      <li>For broad, corpus-level questions, proposes <b>hierarchical summaries</b> (RAPTOR) or GraphRAG's community summaries (Lesson 4.3), with their indexing cost.</li>
+      <li>Mentions multi-vector indexing (questions/summaries) for tables and jargon, and ColBERT when exact terms matter, with the storage math.</li>
+      <li>Says how to measure: recall@k and context precision on a labelled set, tokens per answer, and index size/rebuild time.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>A tree of summaries</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2401.18059" target="_blank" rel="noopener">RAPTOR (Stanford)</a></div>
+      <p><b>How:</b> recursively embed, cluster (Gaussian mixtures) and summarise chunks into a tree; retrieve from all levels at once (“collapsed tree”).</p>
+      <p><b>Why this method:</b> questions about whole documents need integrated context. With GPT-4 it improved the best QuALITY result by 20% absolute accuracy; summaries averaged a 72% compression of their children.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Index facts, not passages</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2312.06648" target="_blank" rel="noopener">Dense X Retrieval</a></div>
+      <p><b>How:</b> an LLM rewrites passages into propositions (atomic, self-contained factoids), and those are indexed.</p>
+      <p><b>Why this method:</b> proposition-level retrieval beat sentence and passage level for every dense retriever tested; for unsupervised retrievers average Recall@5 rose by 12.0 and 9.3 points (35% and 22.5% relative).</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Token-level vectors, compressed</b> <span class="tag res">🧪 Research · 2021</span> <a href="https://arxiv.org/abs/2112.01488" target="_blank" rel="noopener">ColBERTv2 (Stanford)</a></div>
+      <p><b>How:</b> late interaction with residual compression of token vectors and denoised training.</p>
+      <p><b>Why this method:</b> kept late interaction's quality in and out of domain while cutting its storage footprint 6–10×, the main obstacle to production use.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Parent-document retrieval as a built-in</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/langchain-ai/langchain/blob/master/libs/langchain/langchain_classic/retrievers/parent_document_retriever.py" target="_blank" rel="noopener">LangChain ParentDocumentRetriever</a></div>
+      <p><b>How:</b> splits documents into parents and children, embeds children, stores parents in a document store, and returns parents by ID at query time.</p>
+      <p><b>Why this method:</b> its docstring states the tension directly: small documents for accurate embeddings, long enough documents to retain context. One retriever gives you both.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · ColBERT's padding trick</span>
+    <p>ColBERT pads every query with special mask tokens up to a fixed length (32 in the original setup). Those extra tokens get their own vectors too, and act as a learned, soft query expansion: the model uses them to add related terms you never typed. ColPali (Lesson 4.5) uses the same trick for page images.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This lesson builds on chunking (3.3) and reranking (3.4); hypothetical-question indexing is the index-time twin of HyDE (4.1). GraphRAG (4.3) is another way to answer broad questions, using a graph instead of a tree. ColBERT's late interaction returns for images in ColPali (4.5), and index rebuild costs come back in 4.7. The geometry of why one vector blurs many topics: <a href="../../math-course/phase1/5-embeddings.html">embeddings as geometry</a> and <a href="../../math-course/phase1/3-dot-product.html">the dot product</a> in the Math for AI course.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2004.12832" target="_blank" rel="noopener">ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction</a>. The MaxSim idea in its original form.</li>
+      <li><span class="kind">Code</span> <a href="https://github.com/parthsarthi03/raptor" target="_blank" rel="noopener">RAPTOR reference implementation</a>. Build and query a summary tree.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.llamaindex.ai/en/stable/examples/retrievers/auto_merging_retriever/" target="_blank" rel="noopener">LlamaIndex: Auto Merging Retriever</a>. Hierarchical chunks that merge into parents.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You switch 2 million chunks (250 tokens each) from one 768-dimension float32 vector to ColBERT token vectors (128 dims, float16, no compression). Roughly how big is the new index?</div>
+    <div class="opts"><button class="opt">≈ 6 GB, about the same</button><button class="opt" data-ok>≈ 128 GB, about 21× bigger</button><button class="opt">≈ 1.3 TB</button></div>
+    <div class="explain">Single: 2M × 768 × 4 B ≈ 6.1 GB. ColBERT: 2M × 250 × 128 × 2 B = <b>128 GB</b>, ≈ 21×. That's why ColBERTv2's 6–10× compression (or using ColBERT only as a reranker on top candidates) matters.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Retrieved sentences match questions perfectly, but answers often say “the policy doesn't specify”. Logs show the retrieved text is “This applies to members only.” What's the cheapest fix?</div>
+    <div class="opts"><button class="opt" data-ok>Sentence-window or parent-document retrieval: keep searching sentences, but send their neighbours or parent section</button><button class="opt">Switch to a larger embedding model</button><button class="opt">Build a RAPTOR tree</button></div>
+    <div class="explain">The match is fine; the reading unit is too small (“this” has lost its subject). Returning the surrounding context fixes it without any extra LLM calls at indexing time.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Users of your contracts assistant ask both “What's the termination notice period in the Acme MSA?” and “What are the riskiest themes across all our vendor contracts?”. Which index design fits both?</div>
+    <div class="opts"><button class="opt">Larger chunks for everything</button><button class="opt" data-ok>Fine-grained chunks for lookups plus a hierarchy of summaries (or graph community summaries) retrieved together for broad questions</button><button class="opt">Only document-level summaries</button></div>
+    <div class="explain">Specific questions need precise leaves; corpus-wide questions need pre-computed summaries that no single chunk contains. A collapsed tree (or GraphRAG, Lesson 4.3) serves both from one pool.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Search with small, sharp units; read bigger ones: small-to-big, sentence windows, auto-merging.</li>
+      <li>Index what people will ask: summaries, hypothetical questions, propositions, each pointing back to the source chunk.</li>
+      <li>Broad questions need summaries no chunk contains: RAPTOR's collapsed tree retrieves from every level.</li>
+      <li>ColBERT keeps a vector per token and scores with MaxSim: precise, but plan for ~10× storage before compression.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  // ---------- playground 1: small-to-big ----------
+  const SECS = [
+    ["Returns and money", ["Refunds are available within 30 days of delivery.", "This window extends to 60 days for members of the Plus program.", "Refunds go back to the original payment method within 5 business days.", "Gift returns get store credit instead of cash.", "We match a lower price if you send us the link within 7 days."]],
+    ["Delivery", ["Standard shipping takes 3 to 5 business days.", "Express arrives the next business day if you order before 2 pm.", "Orders placed after that cutoff leave the warehouse the following morning.", "Tracking links are emailed as soon as the parcel leaves.", "We ship to Canada and Mexico, where import duties may apply."]],
+    ["Warranty and repairs", ["Every jacket has a two-year warranty against defects.", "It does not cover damage from normal wear or washing at high heat.", "To make a claim, send a photo of the defect to support.", "Approved repairs are free and take about two weeks."]],
+    ["Plus membership", ["Plus costs 49 dollars per year.", "It includes free express shipping on every order.", "Members also get early access to sales.", "You can cancel it any time from your account page, and we refund the unused months."]],
+    ["Care instructions", ["Wash jackets cold and hang them to dry.", "High heat can melt the waterproof coating.", "Reproof the shell once a year with a spray.", "Store jackets unfolded in a dry place."]],
+    ["Gift cards and credit", ["Gift cards never expire.", "Store credit can be used online or in any shop.", "Gift cards cannot be exchanged for cash.", "Lost cards can be replaced with the original receipt."]],
+    ["Stores and pickup", ["Order online and pick up in a shop within 2 hours.", "Pickup orders are held for 7 days.", "Shops can accept returns of online orders.", "Opening hours are listed on each shop page."]],
+    ["Account and security", ["If you are locked out, use the Forgot password link on the sign in page.", "The reset link expires after 30 minutes.", "For security, we never ask for your password by email.", "Turn on two-factor login in settings to protect your account."]],
+  ];
+  const sents = []; SECS.forEach(([h, ss], p) => ss.forEach((s, j) => sents.push({ p, j, s })));
+  const secText = p => SECS[p][0] + ". " + SECS[p][1].join(" ");
+  const QS = [
+    ["How long do Plus members have to ask for a refund?", [[0, 0], [0, 1]]],
+    ["If I order express at 3 pm, when does it ship?", [[1, 1], [1, 2]]],
+    ["Does the warranty cover washing damage?", [[2, 0], [2, 1]]],
+    ["How much does Plus cost?", [[3, 0]]],
+    ["When does the password reset link expire?", [[7, 1]]],
+    ["Can I cancel Plus and get money back?", [[3, 3]]],
+    ["How long do repairs take?", [[2, 3]]],
+    ["Do I pay duties when shipping to Canada?", [[1, 4]]],
+  ];
+  const key = (p, j) => p + "," + j;
+  function run(mode, k, w, need, q) {
+    let matched = [], units = new Map();
+    if (mode === "big") {
+      const r = AI.search(SECS.map((_, p) => secText(p)), q, { mode: "hybrid", k });
+      r.forEach(x => SECS[x.i][1].forEach((_, j) => { matched.push(key(x.i, j)); units.set(key(x.i, j), [x.i, j]); }));
+    } else {
+      const r = AI.search(sents.map(x => x.s), q, { mode: "hybrid", k });
+      r.forEach(x => {
+        const { p, j } = sents[x.i]; matched.push(key(p, j));
+        if (mode === "small") units.set(key(p, j), [p, j]);
+        else if (mode === "parent") SECS[p][1].forEach((_, jj) => units.set(key(p, jj), [p, jj]));
+        else for (let d = -w; d <= w; d++) { const jj = j + d; if (jj >= 0 && jj < SECS[p][1].length) units.set(key(p, jj), [p, jj]); }
+      });
+    }
+    const sent = [...units.values()];
+    const ok = need.every(([p, j]) => units.has(key(p, j)));
+    const tok = sent.reduce((s, [p, j]) => s + AI.countTokens(SECS[p][1][j]), 0);
+    const prec = need.filter(([p, j]) => units.has(key(p, j))).length / (sent.length || 1);
+    return { matched: new Set(matched), units, ok, tok, prec };
+  }
+  let smode = "small";
+  const sBtns = [...$("smode").querySelectorAll("button")];
+  sBtns.forEach(b => (b.onclick = () => { sBtns.forEach(x => x.classList.toggle("on", x === b)); smode = b.dataset.v; renderS(); }));
+  $("sq").innerHTML = QS.map((q, i) => `<option value="${i}">${i + 1}. ${q[0]}</option>`).join("");
+  function renderS() {
+    const k = +$("sk").value, w = +$("sw").value; $("skv").textContent = k; $("swv").textContent = smode === "window" ? w : w + " (not used)";
+    const [q, need] = QS[+$("sq").value], r = run(smode, k, w, need, q);
+    const needSet = new Set(need.map(([p, j]) => key(p, j)));
+    $("sdoc").innerHTML = SECS.map(([h, ss], p) => `<div class="sec"><h5>${esc(h)}</h5>${ss.map((s, j) => {
+      const kk = key(p, j), cls = ["s", r.matched.has(kk) ? "match" : "", r.units.has(kk) ? "sent" : "", needSet.has(kk) ? "need" : ""].join(" ");
+      return `<span class="${cls}">${esc(s)}</span>`; }).join(" ")}</div>`).join("");
+    $("sverdict").innerHTML = r.ok ? `<span class="ev">✅ Everything the answer needs was sent (${r.tok} tokens, ${Math.round(r.prec * 100)}% of them needed).</span>`
+      : `<span class="rk">❌ Part of the answer is missing from what the model sees. It will guess or say it doesn't know.</span>`;
+    let ok = 0, tok = 0, prec = 0;
+    QS.forEach(([qq, nn]) => { const x = run(smode, k, w, nn, qq); ok += x.ok; tok += x.tok; prec += x.prec; });
+    $("sok").textContent = ok + " / " + QS.length;
+    $("stok").textContent = Math.round(tok / QS.length);
+    $("sprec").textContent = Math.round(100 * prec / QS.length) + "%";
+    $("svec").textContent = smode === "big" ? SECS.length : sents.length;
+  }
+  ["sk", "sw", "sq"].forEach(id => ($(id).oninput = renderS));
+  renderS();
+
+  // ---------- playground 2: RAPTOR-style tree ----------
+  const N = [
+    { l: 0, c: 0, t: "Ticket 112: my parcel to Toronto arrived 6 days late and the tracking link never updated." },
+    { l: 0, c: 0, t: "Ticket 131: the courier left the package at the wrong address in Leeds." },
+    { l: 0, c: 0, t: "Ticket 154: express delivery took four days instead of one." },
+    { l: 0, c: 1, t: "Review: the Trailblazer jacket stayed dry in heavy rain all week." },
+    { l: 0, c: 1, t: "Review: seams and zipper still perfect after two winters." },
+    { l: 0, c: 1, t: "Review: warm but light, the best shell I have owned." },
+    { l: 0, c: 2, t: "Ticket 170: I cannot log in to the app after the update." },
+    { l: 0, c: 2, t: "Ticket 188: the password reset email never arrives." },
+    { l: 0, c: 2, t: "Ticket 193: two-factor codes are rejected as expired." },
+    { l: 1, c: 0, t: "Summary of delivery feedback: several orders arrived late or at the wrong address, express was slow, and tracking was unreliable." },
+    { l: 1, c: 1, t: "Summary of product reviews: customers praise the jacket quality, waterproofing, durable seams and light weight." },
+    { l: 1, c: 2, t: "Summary of account issues: after the app update many customers could not log in, reset emails failed and two-factor codes were rejected." },
+    { l: 2, c: -1, t: "Overall summary of this quarter's feedback: the main themes are late or lost deliveries, strong praise for jacket quality, and login problems after the app update." },
+  ];
+  const RQ = [
+    { q: "How late was the Toronto parcel?", kind: "fact", need: 0 },
+    { q: "What are the main themes in customer feedback this quarter?", kind: "themes" },
+    { q: "What do customers say about delivery?", kind: "cluster", c: 0 },
+    { q: "Why can't people log in?", kind: "cluster", c: 2 },
+    { q: "What problems and praise came up overall?", kind: "themes" },
+  ];
+  const THEME = ["deliveries", "jacket quality", "login"];
+  function rRetrieve(mode, q, k) {
+    const pool = N.map((n, i) => i).filter(i => mode === "collapsed" || N[i].l === 0);
+    return AI.search(pool.map(i => N[i].t), q, { mode: "hybrid", k }).map(x => pool[x.i]);
+  }
+  function rJudge(item, ids) {
+    const leavesOf = c => ids.filter(i => N[i].l === 0 && N[i].c === c).length;
+    if (item.kind === "fact") return { ok: ids.includes(item.need), txt: ids.includes(item.need) ? "the leaf with the fact (6 days late) was retrieved" : "the leaf with the fact wasn't retrieved" };
+    if (item.kind === "cluster") { const ok = ids.includes(9 + item.c) || ids.includes(12) || leavesOf(item.c) >= 2; return { ok, txt: ok ? "enough of that topic was retrieved to summarise it" : "too little of that topic was retrieved" }; }
+    const got = [0, 1, 2].filter(c => ids.includes(12) || ids.includes(9 + c) || leavesOf(c) >= 1);
+    return { ok: got.length === 3, txt: `themes covered: ${got.length} / 3 (${got.map(c => THEME[c]).join(", ") || "none"})` };
+  }
+  let rmode = "leaves";
+  const rBtns = [...$("rmode").querySelectorAll("button")];
+  rBtns.forEach(b => (b.onclick = () => { rBtns.forEach(x => x.classList.toggle("on", x === b)); rmode = b.dataset.v; renderR(); }));
+  $("rq").innerHTML = RQ.map((q, i) => `<option value="${i}">${i + 1}. ${q.q}</option>`).join("");
+  function renderR() {
+    const k = +$("rk").value; $("rkv").textContent = k;
+    const item = RQ[+$("rq").value], ids = rRetrieve(rmode, item.q, k), got = new Set(ids);
+    const nd = i => `<div class="nd${got.has(i) ? " got" : ""}${rmode === "leaves" && N[i].l > 0 ? " dim" : ""}"><span class="k">${N[i].l === 2 ? "root summary" : N[i].l === 1 ? "cluster summary" : "leaf"}${got.has(i) ? " · #" + (ids.indexOf(i) + 1) : ""}</span>${esc(N[i].t)}</div>`;
+    $("tree").innerHTML = `<div class="lvl l2">${nd(12)}</div><div class="lvl l1">${[9, 10, 11].map(nd).join("")}</div><div class="lvl l0">${[0, 1, 2, 3, 4, 5, 6, 7, 8].map(nd).join("")}</div>`;
+    const j = rJudge(item, ids);
+    $("rverdict").innerHTML = j.ok ? `<span class="ev">✅ ${j.txt}.</span>` : `<span class="rk">❌ ${j.txt}.</span>`;
+  }
+  ["rk", "rq"].forEach(id => ($(id).oninput = renderR));
+  renderR();
+  $("rall").onclick = () => {
+    const k = +$("rk").value;
+    const row = m => RQ.map(item => rJudge(item, rRetrieve(m, item.q, k)).ok);
+    const a = row("leaves"), b = row("collapsed");
+    $("rout").innerHTML = `<table><tr><th>question (top-${k})</th><th>leaves only</th><th>collapsed tree</th></tr>${RQ.map((it, i) => `<tr><td>${i + 1}. ${esc(it.q)}</td><td>${a[i] ? "✅" : "❌"}</td><td>${b[i] ? "✅" : "❌"}</td></tr>`).join("")}
+      <tr><td><b>answerable</b></td><td><b>${a.filter(Boolean).length} / ${RQ.length}</b></td><td><b>${b.filter(Boolean).length} / ${RQ.length}</b></td></tr></table>`;
+  };
+})();
+</script>
+</body>
+</html>

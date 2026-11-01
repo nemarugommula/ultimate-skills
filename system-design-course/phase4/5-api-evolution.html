@@ -1,0 +1,407 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.5 API design, versioning & backward compatibility · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .changes { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0; }
+  .changes button { font: inherit; font-size: .82rem; padding: 5px 10px; border-radius: 999px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); cursor: pointer; }
+  .changes button.on { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .clients { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: 10px; margin: 10px 0; }
+  .client { border: 2px solid var(--line); border-radius: 12px; padding: 10px; background: var(--bg2); font-size: .86rem; }
+  .client b { display: block; margin-bottom: 4px; }
+  .client.ok { border-color: var(--c-db); } .client.bad { border-color: var(--c-er); } .client.silent { border-color: var(--c-lt); }
+  .client .v { font-weight: 800; margin-top: 6px; }
+  .cols2 { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 12px; }
+</style>
+</head>
+<body data-lesson="s4-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 5</div>
+  <h1>API design, versioning & backward compatibility</h1>
+  <p class="subtitle">You can deploy your server in minutes, but you can't update the apps on people's phones or the code your partners wrote three years ago. Changing an API without breaking them is a core senior skill.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>APIs, REST, gRPC and protocol buffers (protobuf)</b>: how programs call each other, and gRPC's compact binary format with a schema (Lessons 0.4 and 4.3).</li>
+      <li><b>Rolling deploy</b>: replace servers a few at a time, so old and new code run side by side for a while (Lesson 6.2 goes deeper).</li>
+      <li><b>Events in Kafka</b> are stored for days or forever, so new code must read messages written by old code (Lesson 3.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2017, Stripe wrote that it had maintained compatibility with <b>every version of its API since the company started in 2011</b>. Code written against Stripe years earlier still worked unchanged.</p>
+    <p>The trick: every account is <b>pinned</b> to the API version that was current on its very first request. When Stripe makes a breaking change, it ships a small “version change module” that can transform new responses back into the old shape. Requests walk back through those modules until they match the caller's version. Today Stripe releases a new API version monthly. This lesson is how to evolve an API without breaking the people who depend on it.</p>
+  </div>
+
+  <h2>Numbers first: who is still running old code?</h2>
+  <p>A typical consumer app with <b>2 million</b> monthly users. App stores let you ship an update, not force one. Suppose (typical shape, your numbers will differ):</p>
+  <table>
+    <tr><th>Client</th><th>Share of traffic</th><th>Can you make them update?</th></tr>
+    <tr><td class="cl">App versions from the last month</td><td>60%</td><td>They'll update soon</td></tr>
+    <tr><td class="cl">App versions 1–12 months old</td><td>30%</td><td>Only with a “please update” screen, which annoys people</td></tr>
+    <tr><td class="cl">Partner integrations</td><td>10%</td><td>No: they shipped once and moved on</td></tr>
+  </table>
+  <p>Rename one field in a response and up to <b>40%</b> of traffic, about <b>800,000 people</b>, may see errors. Even your own services aren't safe: during a rolling deploy of 6 servers, old and new code serve traffic together for minutes. Every change must work with <b>both</b>.</p>
+
+  <h2>Two directions of compatibility</h2>
+  <div class="cols2">
+    <div class="box" style="margin:0"><b>Backward compatible</b><br>New server, old clients still work. “I can upgrade the server without anyone updating.” This is the one you must never break.</div>
+    <div class="box" style="margin:0"><b>Forward compatible</b><br>Old code copes with data from newer code, for example by <b>ignoring unknown fields</b>. This is what makes rolling deploys and stored events safe.</div>
+  </div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    An API is a <b>promise</b>. Make changes <b>additive</b> (new optional fields, new endpoints) and make readers <b>tolerant</b> (ignore what they don't know). For anything else, run the old and new forms <b>side by side</b>, move everyone over, then remove the old one.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the electrical socket</span>
+    <p>Houses built decades ago still take today's appliances because the socket shape didn't change. Manufacturers <b>add</b> things (a USB port next to the socket) without changing the holes. When a country really does switch standards, it sells adapters and lets both shapes coexist for years. Removing the old socket on a Tuesday would break every lamp in town.</p>
+  </div>
+
+  <h2>Safe changes vs breaking changes</h2>
+  <p>These rules come from Google's API guidelines (AIP-180; AIPs are “API Improvement Proposals”) and the protobuf docs:</p>
+  <table>
+    <tr><th>✅ Usually safe</th><th>❌ Breaking</th></tr>
+    <tr><td>Add a new endpoint or method</td><td>Remove or rename a field, endpoint or enum value</td></tr>
+    <tr><td>Add an <b>optional</b> field to a response</td><td>Change a field's type (integer → string) or format</td></tr>
+    <tr><td>Add an optional request field whose default keeps the old behavior</td><td>Add a <b>required</b> request field, or make an optional one required</td></tr>
+    <tr><td>Add an enum value (⚠️ wire-safe, but breaks clients that switch over every value and crash on unknown ones)</td><td>Change the <b>meaning</b> of a field (cents → dollars) even if the type stays the same</td></tr>
+    <tr><td>Protobuf: delete a field and mark its number <code>reserved</code></td><td>Protobuf: change a field's number, or reuse an old one</td></tr>
+  </table>
+  <p class="muted">Protobuf sends field <b>numbers</b>, not names, on the wire, so a rename doesn't break binary data, but it does break JSON clients and generated code. A semantic change is the worst kind: nothing errors; everyone silently gets wrong answers.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Will this change break anyone?</span>
+    <p class="hint">Your API returns an order: <code>{"id", "amount" (integer cents), "currency", "status": "paid" | "refunded", "customer_email"}</code>. Pick a change and see which of your four clients break, and how many requests a day fail. Then turn on <b>Stripe-style version pinning</b>: old clients keep getting the old shape through a transformation layer.</p>
+    <div class="changes" id="chg"></div>
+    <div class="controls">
+      <button class="btn" id="pinBtn">Version pinning: off</button>
+    </div>
+    <div class="clients" id="cli"></div>
+    <div class="stat-row">
+      <div class="stat">requests/day failing <b id="vFail">–</b></div>
+      <div class="stat">silently wrong <b id="vSilent">–</b></div>
+      <div class="stat">verdict <b id="vVerdict">–</b></div>
+    </div>
+    <p class="hint" id="vmsg"></p>
+  </div>
+  <p>Notice two things. Version pinning rescues the HTTP clients, because the server can translate new responses back into what they expect. It can't rescue <b>data at rest</b>: events written last year still have the old shape, and the pipeline reading them must handle both forever. And the scariest row is “change the meaning of amount”: nothing turns red, so nobody notices until finance does.</p>
+
+  <h2>Versioning: when you really must break</h2>
+  <table>
+    <tr><th>Style</th><th>Looks like</th><th>Who uses it</th><th>Trade-off</th></tr>
+    <tr><td><b>URL major version</b></td><td><code>/v1/orders</code> → <code>/v2/orders</code></td><td>Google APIs, most public APIs</td><td>Obvious and cache-friendly, but a v2 is a big, rare, painful migration</td></tr>
+    <tr><td><b>Header version</b></td><td><code>Stripe-Version: 2024-09-30.acacia</code></td><td>Stripe; GitHub (<code>X-GitHub-Api-Version</code>)</td><td>Clean URLs; easy to forget in curl</td></tr>
+    <tr><td><b>Date-based rolling versions + pinning</b></td><td>Account pinned to its first version; small dated changes</td><td>Stripe</td><td>Painless for clients; the provider maintains a chain of transformations</td></tr>
+    <tr><td><b>No versions, additive only</b></td><td>Never break; add fields; deprecate slowly</td><td>Many internal gRPC APIs; GraphQL schemas</td><td>Simple, but needs discipline and tolerant readers</td></tr>
+  </table>
+  <p><b>Deprecating</b> something old: announce it, add response headers (<code>Deprecation</code>, RFC 9745, and <code>Sunset</code>, RFC 8594, which gives the shutdown date), <b>measure</b> who still calls it (log by API key and client version), contact them, and only then turn it off. Without usage data, “deprecated” lasts forever.</p>
+  <p><b>Contract tests</b> catch breaks before deploy. With <b>Pact</b>, each consumer's tests record what it expects from a provider (a “pact”); the provider's CI (the automated build and test on every change) checks every change against all its consumers' pacts. For protobuf, <code>buf breaking</code> compares your schema with the last released one and fails the build on breaking changes.</p>
+
+  <h2>Changing the database under a running system: expand and contract</h2>
+  <p>The same problem hits your own database. Renaming a column in one step breaks every server still running the old code. The fix is <b>parallel change</b>, also called <b>expand and contract</b>: expand (add the new form alongside the old), migrate (move readers and writers over, backfill old rows), contract (remove the old form). Each step is safe with both the previous and next version of the code.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the cost of a one-step rename</span>
+    <p>Rename <code>users.fullname</code> to <code>display_name</code>. The service runs <b>6 servers</b> at <b>1,000 requests/s</b>; a rolling deploy replaces one server every <b>30 s</b>, so it takes 3 minutes.</p>
+    <ul>
+      <li>The rename runs first. Old servers still query <code>fullname</code> and fail.</li>
+      <li>Old servers left in each 30-s slice: 6, 5, 4, 3, 2, 1 (out of 6).</li>
+      <li>Failed requests ≈ 1,000 × 30 × (6 + 5 + 4 + 3 + 2 + 1) ÷ 6 = 1,000 × 30 × 3.5 = <b>105,000</b>.</li>
+    </ul>
+    <p>That's over half of the 180,000 requests during the deploy. Expand and contract takes 6 small steps and fails <b>zero</b>. Run both below.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Expand–contract through a rolling deploy</span>
+    <p class="hint">6 servers behind a load balancer, 1,000 requests/s; each deploy replaces one server every 30 s (sped up here). Press <b>Next step</b> to walk the safe path, or <b>One-step rename</b> to see the naive way. There's also a tempting shortcut: skipping the backfill.</p>
+    <svg id="ecf"></svg>
+    <div class="controls">
+      <button class="btn primary" id="ecNext">Next step ▶</button>
+      <button class="btn" id="ecSkip">Shortcut: skip the backfill</button>
+      <button class="btn" id="ecNaive">One-step rename</button>
+      <button class="btn" id="ecReset">Reset</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">step <b id="ecStep">–</b></div>
+      <div class="stat">columns <b id="ecCols">–</b></div>
+      <div class="stat">failed requests <b id="ecErr">0</b></div>
+      <div class="stat">users with blank names <b id="ecBlank">0</b></div>
+    </div>
+    <p id="ecDesc"></p>
+    <p class="hint" id="ecmsg"></p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Schemas:</b> OpenAPI for REST, <code>.proto</code> files for gRPC, schema registries for events (Confluent Schema Registry checks Avro/protobuf compatibility). <b>Break detection:</b> <code>buf breaking</code>, Pact contract tests, OpenAPI diff tools. <b>Migrations:</b> Flyway, Liquibase, Rails/Django migrations, plus online schema-change tools such as GitHub's gh-ost for big MySQL tables.</p>
+<pre><code><span class="c">// order.proto: evolving a message safely</span>
+message Order {
+  <span class="k">reserved</span> <span class="n">4</span>;                    <span class="c">// field 4 (old "coupon_code") was deleted: never reuse the number</span>
+  <span class="k">reserved</span> <span class="s">"coupon_code"</span>;
+  <span class="k">string</span> id = <span class="n">1</span>;
+  <span class="k">int64</span> amount_cents = <span class="n">2</span>;         <span class="c">// the unit is in the name, so nobody guesses</span>
+  <span class="k">string</span> currency = <span class="n">3</span>;
+  <span class="k">optional string</span> discount_id = <span class="n">5</span>;  <span class="c">// added later: old readers just ignore it</span>
+}
+
+<span class="c"># CI: fail the build if this schema breaks what's on main</span>
+$ buf breaking --against <span class="s">'.git#branch=main'</span></code></pre>
+<pre><code><span class="c">-- expand and contract, as separate migrations shipped days apart</span>
+<span class="k">ALTER TABLE</span> users <span class="k">ADD COLUMN</span> display_name text;            <span class="c">-- 1. expand (nullable, instant)</span>
+<span class="c">-- 2. deploy code that writes both columns</span>
+<span class="k">UPDATE</span> users <span class="k">SET</span> display_name = fullname                 <span class="c">-- 3. backfill, in batches</span>
+ <span class="k">WHERE</span> display_name <span class="k">IS NULL AND</span> id <span class="k">BETWEEN</span> <span class="n">1</span> <span class="k">AND</span> <span class="n">10000</span>;
+<span class="c">-- 4. deploy code that reads display_name   5. stop writing fullname</span>
+<span class="k">ALTER TABLE</span> users <span class="k">DROP COLUMN</span> fullname;                   <span class="c">-- 6. contract</span></code></pre>
+    <p class="hint">On deprecated endpoints, send <code>Deprecation: @1688169599</code> and <code>Sunset: Sat, 31 Dec 2026 23:59:59 GMT</code>, and log the caller's API key so you know whom to email.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Approach</th><th>✅ Good</th><th>❌ Costs</th></tr>
+      <tr><td>Additive-only, no versions</td><td>Simplest for everyone; no migrations for clients</td><td>Old fields pile up; needs strict review discipline</td></tr>
+      <tr><td>URL major versions</td><td>Clear, explicit, easy to route and cache</td><td>Running v1 and v2 side by side for years; big-bang client migrations</td></tr>
+      <tr><td>Date versions + pinning</td><td>Clients upgrade when they want, in small steps</td><td>The provider maintains and tests a growing chain of transformations</td></tr>
+      <tr><td>Expand and contract</td><td>Zero-downtime schema and API changes</td><td>Several deploys over days instead of one; temporary double writes</td></tr>
+      <tr><td>Contract tests</td><td>Breaks found in CI, not production</td><td>Consumers must write and maintain pacts; shared broker to run</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Put <code>/v1/</code> in public URLs from day one (it's free), make every change additive, put units in field names (<code>amount_cents</code>), and use expand-and-contract for any rename. Ship a minimum-supported-version check in your mobile app early, so you can force an update in an emergency.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>API review boards and style guides (Google's AIPs), linters and breaking-change checks in CI, schema registries enforcing compatibility for events, usage dashboards per client version, and formal deprecation policies measured in months or years for external APIs.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>When you sketch an API in an interview, add one sentence on evolution. A senior answer covers:</p>
+    <ul>
+      <li>Which changes are <b>additive</b> and safe, and that readers <b>ignore unknown fields</b>.</li>
+      <li>A <b>versioning</b> choice with a reason (URL version for a public API; additive-only for internal gRPC).</li>
+      <li>How you'd make a breaking change: <b>side by side</b>, measure usage, migrate, deprecate, remove.</li>
+      <li>For storage: <b>expand and contract</b>, and that rolling deploys mean two code versions run at once.</li>
+    </ul>
+    <p class="hint">Common follow-ups: “You need to change a field's type. Walk me through it.” · “How do you know when it's safe to remove v1?” · “What about the events already in Kafka?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Date-based versions with pinning</b> <span class="tag co">🏢 Stripe · 2017</span> <a href="https://stripe.com/blog/api-versioning" target="_blank" rel="noopener">APIs as infrastructure: future-proofing Stripe with versioning</a></div>
+      <p><b>How:</b> versions are named by release date; an account is pinned to the latest version on its first request; a <code>Stripe-Version</code> header can override per request; breaking changes live in version change modules that transform responses back to older versions. Since 2024-09-30.acacia, monthly releases have no breaking changes and two major releases a year carry them (<a href="https://docs.stripe.com/api/versioning" target="_blank" rel="noopener">Stripe docs</a>).</p>
+      <p><b>Why this method:</b> businesses run on Stripe as infrastructure; forcing them to rewrite integrations would break their revenue, so the cost of compatibility is carried by Stripe.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Compatibility rules for every Google API</b> <span class="tag co">🏢 Google · AIP-180</span> <a href="https://google.aip.dev/180" target="_blank" rel="noopener">AIP-180: Backwards compatibility</a></div>
+      <p><b>How:</b> within a major version, existing components must not be removed or renamed, and new required fields must not be added to existing requests; new fields must default to the old behavior.</p>
+      <p><b>Why this method:</b> users write code against an API and ship it to production expecting it to keep working; written rules let thousands of engineers review changes the same way.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Updating a protobuf message</b> <span class="tag oss">🧰 Open source · Protocol Buffers</span> <a href="https://protobuf.dev/programming-guides/proto3/" target="_blank" rel="noopener">Language guide: updating a message type</a></div>
+      <p><b>How:</b> adding fields is safe (old binaries ignore them); removing fields is safe if the number is never reused (mark it <code>reserved</code>); changing a field number is not safe; int32 → int64 is “compatible” but can silently truncate.</p>
+      <p><b>Why this method:</b> the wire format identifies fields by number, so numbers are the real contract.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Parallel change</b> <span class="tag hist">📜 Danilo Sato · 2014</span> <a href="https://martinfowler.com/bliki/ParallelChange.html" target="_blank" rel="noopener">ParallelChange (expand, migrate, contract)</a></div>
+      <p><b>How:</b> split a backward-incompatible interface change into three phases: expand to support old and new, migrate the clients, then contract by removing the old.</p>
+      <p><b>Why this method:</b> each phase is independently deployable and reversible, which is exactly what rolling deploys and many independent clients need.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Consumer-driven contract tests</b> <span class="tag oss">🧰 Open source · Pact</span> <a href="https://docs.pact.io/" target="_blank" rel="noopener">Pact docs</a></div>
+      <p><b>How:</b> consumers record the requests they send and the responses they expect; providers verify against those contracts in CI.</p>
+      <p><b>Why this method:</b> without it, the only way to know two services still work together is to deploy them both and test end to end.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · still on v1</span>
+    <p>Stripe's URLs carry a major version, <code>/v1/charges</code>. In its 2017 post, Stripe said it reserves the right to use that prefix someday but found it hard to imagine a redesign important enough to justify the user impact. Small, dated versions did the job instead. And in protobuf, field numbers 19,000 to 19,999 are reserved for the protobuf implementation itself; the compiler rejects them.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>API styles came from Lesson 0.4 and gateways from Lesson 1.6 (a natural place for version routing). Event schemas in Kafka (Lesson 3.2) need the same rules, forever. Rolling deploys and canaries (Lesson 6.2) are why every change must work with two versions at once. In AI systems, the same discipline applies to prompts and tool schemas: an agent built against yesterday's tool definition breaks when a field is renamed, so tool APIs are versioned and changed additively too.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://stripe.com/blog/api-versioning" target="_blank" rel="noopener">Stripe: APIs as infrastructure</a>. The version-change-module design, with code.</li>
+      <li><span class="kind">Docs</span> <a href="https://google.aip.dev/180" target="_blank" rel="noopener">Google AIP-180</a>. A precise list of what counts as breaking, including subtle cases.</li>
+      <li><span class="kind">Docs</span> <a href="https://buf.build/docs/breaking/" target="_blank" rel="noopener">buf breaking</a>. Automatic breaking-change detection for protobuf in CI.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 25% of your traffic comes from app versions that read the <code>customer_email</code> field. You rename it to <code>email</code> in one deploy. At 4 million requests a day, roughly how many requests may break daily?</div>
+    <div class="opts"><button class="opt">40,000</button><button class="opt" data-ok>1,000,000</button><button class="opt">4,000,000</button></div>
+    <div class="explain">25% × 4,000,000 = <b>1,000,000</b> requests a day from clients that can't be updated quickly. The safe path: add <code>email</code> alongside <code>customer_email</code>, move clients over, measure, then remove the old field.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. In a protobuf message, field 7 is no longer needed. What should you do?</div>
+    <div class="opts"><button class="opt">Delete it and give number 7 to the next new field</button><button class="opt" data-ok>Delete it and mark 7 (and its name) as <code>reserved</code></button><button class="opt">Keep it forever and never add fields</button></div>
+    <div class="explain">Old data and old binaries still use number 7 with the old meaning. Reusing it makes old messages decode as the new field: silent corruption. <code>reserved</code> makes the compiler refuse any reuse.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You must change <code>price</code> from an integer (cents) to a decimal string. Public partners use the API. Which plan is best?</div>
+    <div class="opts"><button class="opt">Change the type and email partners the same day</button><button class="opt">Keep the name and type, but start sending dollars instead of cents</button><button class="opt" data-ok>Add a new field (<code>price_decimal</code>), keep the old one, track who reads which, deprecate with a Sunset date, then remove</button></div>
+    <div class="explain">That's expand, migrate, contract for an API. Changing the type breaks every partner at once; changing the meaning silently corrupts their numbers, which is even worse.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>You can't update every client: old apps, partners, stored events, and the other half of a rolling deploy.</li>
+      <li>Safe: add endpoints and optional fields; readers ignore unknown fields. Breaking: remove, rename, retype, make required, change meaning, reuse protobuf numbers.</li>
+      <li>When you must break: version (URL, header, or Stripe-style pinned dates), deprecate with data, then remove.</li>
+      <li>Expand → migrate → contract for APIs and databases; catch breaks in CI with contract tests and <code>buf breaking</code>.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // ---------- schema-change checker ----------
+  const CLIENTS = [
+    { id: "mob", name: "📱 Old mobile app", note: "JSON; creates orders; reads amount, status, customer_email; exhaustive switch on status", per: 1200000, http: true },
+    { id: "par", name: "🤝 Partner integration", note: "JSON; sends orders, reads amount + currency; never updated", per: 400000, http: true },
+    { id: "int", name: "⚙️ Internal service", note: "protobuf (old generated code); ignores unknown fields", per: 2000000, http: false, proto: true },
+    { id: "pipe", name: "📊 Data pipeline", note: "reads last year's events from Kafka (JSON), written in the old shape", per: 400000, http: false, rest: true },
+  ];
+  // effect per client: 0 ok, 1 breaks loudly, 2 silently wrong
+  const CHANGES = [
+    { id: "add", label: "Add optional field discount", e: { mob: 0, par: 0, int: 0, pipe: 0 }, why: "Additive: old readers ignore the new field." },
+    { id: "reqopt", label: "Add optional request field coupon", e: { mob: 0, par: 0, int: 0, pipe: 0 }, why: "Old clients don't send it; the default keeps the old behavior." },
+    { id: "reqreq", label: "New required request field shipping_address", e: { mob: 1, par: 1, int: 1, pipe: 0 }, why: "Every old client that creates orders now gets 400 Bad Request." },
+    { id: "rename", label: "Rename customer_email → email", e: { mob: 1, par: 0, int: 0, pipe: 1 }, why: "JSON uses names. Protobuf sends numbers, so the old internal binary still decodes it." },
+    { id: "remove", label: "Remove currency", e: { mob: 0, par: 1, int: 0, pipe: 0 }, why: "The partner reads currency. Protobuf readers treat a missing field as its default." },
+    { id: "retype", label: "amount: integer cents → string \"12.50\"", e: { mob: 1, par: 1, int: 1, pipe: 1 }, why: "Everyone who parses amount as a number fails." },
+    { id: "enum", label: "Add status value disputed", e: { mob: 1, par: 0, int: 0, pipe: 0 }, why: "Wire-safe, but the old app's exhaustive switch crashes on an unknown value." },
+    { id: "reuse", label: "Protobuf: reuse field number 4 for a new field", e: { mob: 0, par: 0, int: 2, pipe: 0 }, why: "Old binaries decode the new field as the old one: wrong data, no error." },
+    { id: "meaning", label: "amount now means dollars (same type)", e: { mob: 2, par: 2, int: 2, pipe: 2 }, why: "Nothing fails. Every client is off by 100× and nobody is alerted." },
+  ];
+  let cur = "rename", pin = false;
+  $("chg").innerHTML = CHANGES.map(c => `<button id="c-${c.id}" data-id="${c.id}">${c.label}</button>`).join("");
+  function check() {
+    const c = CHANGES.find(x => x.id === cur);
+    let fail = 0, silent = 0;
+    document.querySelectorAll("#chg button").forEach(b => b.classList.toggle("on", b.dataset.id === cur));
+    $("cli").innerHTML = CLIENTS.map(k => {
+      let eff = c.e[k.id];
+      const rescued = pin && k.http && eff > 0;
+      if (rescued) eff = 0;
+      if (eff === 1) fail += k.per; if (eff === 2) silent += k.per;
+      const cls = eff === 0 ? "ok" : eff === 1 ? "bad" : "silent";
+      const v = eff === 0 ? (rescued ? "✅ OK (pinned to old version)" : "✅ OK") : eff === 1 ? "❌ breaks" : "⚠️ silently wrong";
+      return `<div class="client ${cls}" id="k-${k.id}"><b>${k.name}</b>${k.note}<div class="mono">${(k.per / 1e6).toFixed(1)}M req/day</div><div class="v">${v}</div></div>`;
+    }).join("");
+    $("vFail").textContent = fail.toLocaleString();
+    $("vSilent").textContent = silent.toLocaleString();
+    $("vVerdict").textContent = !fail && !silent ? "safe ✅" : silent && !fail ? "dangerous (silent) ⚠️" : "breaking ❌";
+    $("vmsg").textContent = c.why + (pin && CLIENTS.some(k => k.http && c.e[k.id] > 0) ? " Pinning rescued the HTTP clients: the server transforms responses back to the version each one was built for." :
+      pin && (c.e.pipe || c.e.int) ? " Pinning can't help stored events or binaries decoding protobuf directly." : "");
+    $("pinBtn").textContent = "Version pinning: " + (pin ? "on" : "off");
+  }
+  document.querySelectorAll("#chg button").forEach(b => (b.onclick = () => { cur = b.dataset.id; check(); }));
+  $("pinBtn").onclick = () => { pin = !pin; check(); };
+  check();
+
+  // ---------- expand / contract ----------
+  const PODS = 6, RPS = 1000, SLICE = 30, USERS = 50000;
+  const F = new Flow($("ecf"), { width: 720, height: 300 });
+  F.node("lb", { x: 90, y: 150, w: 120, label: "Load balancer", sub: "1,000 req/s", kind: "nw" });
+  for (let i = 0; i < PODS; i++) F.node("p" + i, { x: 360, y: 30 + i * 48, w: 170, h: 38, label: "server " + (i + 1), sub: "v1", kind: "sv" }).edge("lb", "p" + i);
+  F.node("db", { x: 620, y: 150, w: 170, h: 70, label: "🗄️ users table", sub: "fullname", kind: "db" });
+  for (let i = 0; i < PODS; i++) F.edge("p" + i, "db", { noArrow: true });
+  F.render();
+  // code versions: v1 read/write fullname; v2 write both, read fullname; v3 write both, read display_name; v4 write+read display_name
+  const STEPS = [
+    { t: "Start: every server runs v1, which reads and writes fullname.", cols: ["fullname"] },
+    { t: "1 · Expand: ADD COLUMN display_name (nullable). v1 doesn't know it exists, and that's fine.", cols: ["fullname", "display_name"], mig: true },
+    { t: "2 · Deploy v2: writes BOTH columns, still reads fullname. During the rolling deploy v1 and v2 coexist safely.", cols: ["fullname", "display_name"], deploy: "v2" },
+    { t: "3 · Backfill: copy fullname into display_name for old rows, in small batches.", cols: ["fullname", "display_name"], backfill: true },
+    { t: "4 · Deploy v3: reads display_name, still writes both. v2 and v3 coexist safely because both keep both columns filled.", cols: ["fullname", "display_name"], deploy: "v3" },
+    { t: "5 · Deploy v4: stops writing fullname. Nothing reads it any more.", cols: ["fullname", "display_name"], deploy: "v4" },
+    { t: "6 · Contract: DROP COLUMN fullname. Done, with zero failed requests.", cols: ["display_name"], mig: true },
+  ];
+  let step = 0, ver = Array(PODS).fill("v1"), cols = ["fullname"], errs = 0, blank = 0, backfilled = false, busy = false;
+  const reads = v => (v === "v1" || v === "v2" ? "fullname" : "display_name");
+  const writes = v => (v === "v1" ? ["fullname"] : v === "v4" ? ["display_name"] : ["fullname", "display_name"]);
+  const okFor = v => cols.includes(reads(v)) && writes(v).every(c => cols.includes(c));
+  function paint(msg) {
+    for (let i = 0; i < PODS; i++) {
+      const ok = okFor(ver[i]);
+      F.set("p" + i, { sub: ver[i] + " · reads " + reads(ver[i]) + (ok ? "" : " ✖"), down: !ok, hot: !ok });
+    }
+    F.set("db", { sub: cols.join(" + ") });
+    $("ecStep").textContent = step + " / " + (STEPS.length - 1);
+    $("ecCols").textContent = cols.join(", ");
+    $("ecErr").textContent = Math.round(errs).toLocaleString();
+    $("ecBlank").textContent = blank.toLocaleString();
+    $("ecDesc").textContent = STEPS[step].t;
+    if (msg != null) $("ecmsg").textContent = msg;
+  }
+  const sliceErrors = () => ver.filter(v => !okFor(v)).length / PODS * RPS * SLICE;
+  async function rolling(to) {
+    for (let i = 0; i < PODS; i++) {
+      errs += sliceErrors();
+      ver[i] = to; paint(); await sleep(260);
+    }
+  }
+  async function doStep(s) {
+    const S = STEPS[s];
+    if (S.mig) cols = S.cols.slice();
+    if (S.backfill) backfilled = true;
+    if (S.deploy) await rolling(S.deploy);
+    if (S.deploy === "v3" && !backfilled) blank = Math.round(USERS * 0.4);
+    paint();
+  }
+  $("ecNext").onclick = async () => {
+    if (busy || step >= STEPS.length - 1) return; busy = true;
+    step++; paint(""); await doStep(step);
+    $("ecmsg").textContent = errs ? `${Math.round(errs).toLocaleString()} requests failed.` :
+      blank ? `No errors, but ${blank.toLocaleString()} users now see a blank name: v3 reads display_name, which was never backfilled for old rows. A silent bug.` :
+      step === STEPS.length - 1 ? "Six small steps, each compatible with the version before and after it. Zero failed requests." : "No failed requests so far.";
+    busy = false;
+  };
+  $("ecSkip").onclick = async () => {
+    if (busy) return; busy = true;
+    reset(true);
+    for (const s of [1, 2]) { step = s; paint(); await doStep(s); }
+    step = 4; paint(); await doStep(4);
+    $("ecmsg").textContent = `Skipped the backfill: zero errors, yet ${blank.toLocaleString()} users (every account not written since v2 went out, here 40%) now have blank names. Nothing alerts you; support tickets do.`;
+    busy = false;
+  };
+  $("ecNaive").onclick = async () => {
+    if (busy) return; busy = true;
+    reset(true);
+    $("ecDesc").textContent = "One migration: RENAME COLUMN fullname TO display_name, then a rolling deploy straight to v4.";
+    cols = ["display_name"]; paint();
+    await rolling("v4");
+    $("ecmsg").textContent = `${Math.round(errs).toLocaleString()} failed requests during a 3-minute deploy (of ${(RPS * SLICE * PODS).toLocaleString()}): every old server broke the moment the column was renamed.`;
+    busy = false;
+  };
+  function reset(quiet) { step = 0; ver = Array(PODS).fill("v1"); cols = ["fullname"]; errs = 0; blank = 0; backfilled = false; paint(quiet ? null : ""); }
+  $("ecReset").onclick = () => { if (!busy) reset(); };
+  reset();
+})();
+</script>
+</body>
+</html>

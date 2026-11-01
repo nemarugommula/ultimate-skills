@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>2.2 Similarity search & ANN indexes · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .pts { width: 100%; height: 400px; display: block; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; cursor: crosshair; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .calcgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr)); gap: 8px 16px; }
+  .calcgrid label { display: flex; flex-direction: column; gap: 4px; font-size: .9rem; }
+  .calcgrid input, .calcgrid select { font: inherit; padding: 4px 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg2); color: var(--text); }
+</style>
+</head>
+<body data-lesson="a2-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 2 · Lesson 2</div>
+  <h1>Similarity search & ANN indexes: HNSW, IVF, PQ</h1>
+  <p class="subtitle">Comparing a query with every vector works for thousands of documents and collapses at millions. Approximate nearest-neighbour indexes look at a tiny fraction of the vectors and still find almost all the right ones.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>An <b>embedding</b> is a vector for a text; similar meanings are close (Lesson 2.1).</li>
+      <li>Closeness is measured with cosine similarity, dot product or Euclidean distance; for normalized vectors they rank the same (2.1).</li>
+      <li>A database <b>index</b> trades extra memory and build time for fast lookups (like a B-tree for <code>WHERE id = 42</code>).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>Spotify built and open-sourced its nearest-neighbour library Annoy in 2013, and it powered features like Discover Weekly for a decade. By 2023 Spotify's engineers wrote that newer methods could give results <b>twice as accurate in the same time</b>, or similar quality in <b>one-tenth the time</b>. So they built Voyager, based on the HNSW algorithm you'll meet here: more than 10× faster than Annoy at the same recall, with up to 4× less memory, and queried hundreds of millions of times a day.</p>
+    <p>Same vectors, same question (“which songs are near this one?”). The only thing that changed was the <b>index</b>.</p>
+  </div>
+
+  <h2>Numbers first: why exact search breaks</h2>
+  <p>Exact (“brute-force”, or flat) search compares the query with every vector: <b>N × d</b> multiply-adds per query.</p>
+  <table>
+    <tr><th>Vectors (d = 1,536)</th><th>Multiply-adds per query</th><th>Raw vector memory (float32)</th></tr>
+    <tr><td>10,000 (a product's docs)</td><td>15 million: trivial, milliseconds</td><td>61 MB</td></tr>
+    <tr><td>1 million</td><td class="tk">1.5 billion</td><td class="tk">6.1 GB</td></tr>
+    <tr><td>10 million</td><td class="rk">15 billion per query, times every query per second</td><td class="rk">61 GB</td></tr>
+    <tr><td>1 billion (web scale)</td><td class="rk">1.5 trillion</td><td class="rk">6.1 TB</td></tr>
+  </table>
+  <p>Up to about 100,000 vectors, exact search is fine and gives perfect answers: <b>don't add an index you don't need</b>. Beyond that, we accept answers that are <i>almost</i> always the true nearest neighbours in exchange for doing 100× to 1,000× less work. That is <b>ANN, approximate nearest neighbour search</b>.</p>
+  <p>We measure “almost” with <b>recall@k</b>: of the true k nearest neighbours, what share did the index return? Recall@10 = 0.95 means 9.5 of the real top 10, on average. Every ANN index is a dial between <b>recall</b>, <b>latency</b> and <b>memory</b>.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    You don't need to look at every vector to find the closest ones. Organize the vectors once (a <b>graph</b> of neighbours, or <b>clusters</b>), then at query time only visit the promising part. Compress them (<b>quantization</b>) and they fit in RAM. Then tune one knob per index to buy recall with latency.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: finding a house without a full map</span>
+    <p><b>HNSW</b> is asking for directions: take the motorway to the right region (top layer, few long hops), then main roads, then walk door to door asking “is anyone closer to the address?” (bottom layer). <b>IVF</b> is a postcode system: first find the few postcodes nearest the address, then check every house in just those postcodes. <b>PQ</b> is describing each house with a short code (“red roof, two floors, corner plot”) instead of a full photo, so the whole city fits in one notebook.</p>
+  </div>
+
+  <h2>HNSW: a graph you walk downhill</h2>
+  <p><b>HNSW, Hierarchical Navigable Small World</b> graphs (Malkov and Yashunin, 2016), is the most widely used ANN index today. Every vector is a node linked to a handful of near neighbours. A few nodes are also copied into sparser upper layers that have longer links, like express lanes. The paper notes the structure resembles a <b>skip list</b>.</p>
+  <ul>
+    <li><b>Search</b>: start at the top layer's entry point, greedily hop to whichever neighbour is closer to the query, drop a layer when stuck, and repeat. On the bottom layer, keep a candidate list of size <b>efSearch</b> instead of just one best node, so the walk can step around dead ends.</li>
+    <li><b>M</b>: links per node (typical 16; pgvector's default is 16). More links = better recall and robustness, more memory, slower builds.</li>
+    <li><b>efConstruction</b>: candidate list size while building (pgvector default 64, hnswlib 200). Higher = better graph, slower build.</li>
+    <li><b>efSearch</b>: candidate list size at query time (pgvector default 40). The knob you tune live: higher = better recall, more distance computations.</li>
+  </ul>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Walk the graph (HNSW-style)</span>
+    <p class="hint">500 vectors drawn as 2D points, linked into a small HNSW-style graph. Click anywhere to place a query (✚). The search starts at the entry point (big ring), hops down the layers, then explores the bottom layer with a candidate list of size efSearch. Gold dots = vectors whose distance was computed; green rings = the 5 results; red rings = true top-5 neighbours the search missed.</p>
+    <div class="controls">
+      <label>efSearch <input type="range" id="ef" min="5" max="80" step="1" value="5"> <b class="mono" id="efv"></b></label>
+      <label>M (links per node) <span class="seg" id="mseg"><button id="m2">2</button><button id="m3" class="on">3</button><button id="m4">4</button><button id="m8">8</button></span></label>
+      <button class="btn" id="randq">🎲 Random query</button>
+      <button class="btn primary" id="hsweep">▶ Test 200 queries at every efSearch</button>
+    </div>
+    <canvas class="pts" id="hcv"></canvas>
+    <div class="stat-row">
+      <div class="stat">distances computed <b id="hcomp">–</b></div>
+      <div class="stat">exact search would compute <b>500</b></div>
+      <div class="stat">recall@5 (this query) <b id="hrec">–</b></div>
+      <div class="stat">upper-layer nodes <b id="hlay">–</b></div>
+    </div>
+    <div class="verdict" id="hmsg"></div>
+    <canvas class="chart" id="hchart" style="height:220px"></canvas>
+    <p class="hint" id="hsmsg">Run the test to see recall and work across efSearch values for the chosen M.</p>
+  </div>
+  <p>What you should see: with M = 3 and efSearch = 5, some queries land in a dead end and miss true neighbours (red rings). Raise efSearch and recall climbs toward 100% while the work grows, still far below 500. With M = 2 the graph breaks into poorly connected islands, and even a large efSearch stays far from 100%: that needs a rebuild with more links. Real embeddings have hundreds of dimensions and are much harder than 2D points, which is why production systems use M = 16 and efSearch from 40 up to a few hundred. The shape of the trade-off is the same.</p>
+
+  <h2>IVF: search only the nearest clusters</h2>
+  <p><b>IVF, the inverted file index</b>, runs k-means clustering (Lesson 2.5) to split the vectors into <b>nlist</b> clusters, each with a centre (centroid). At query time it compares the query with the centroids, then scans every vector in the <b>nprobe</b> nearest clusters. The trap: a true neighbour sitting just across a cluster border is missed when nprobe = 1. pgvector's IVFFlat guidance is a good start: nlist ≈ rows ÷ 1,000 up to 1 million rows (√rows above that), and nprobe ≈ √nlist.</p>
+
+  <h2>PQ and quantization: shrink the vectors</h2>
+  <p><b>Quantization</b> stores each vector with fewer bits.</p>
+  <ul>
+    <li><b>Scalar quantization (int8)</b>: each float32 becomes one byte: <b>4× smaller</b>, small recall loss.</li>
+    <li><b>Binary quantization</b>: keep only the sign of each number, 1 bit: <b>32× smaller</b>. Hugging Face measured about 92.5% of retrieval quality kept, and about 96% when the top candidates are <b>rescored</b> with the full-precision query.</li>
+    <li><b>PQ, product quantization</b> (Jégou, Douze and Schmid, 2011): cut the vector into <b>m</b> sub-vectors, run k-means on each part with 256 centroids, and store just the centroid number (1 byte) per part. A 1,536-dim vector with m = 96 becomes <b>96 bytes instead of 6,144</b>: 64× smaller. Distances are approximate, so systems fetch extra candidates and rescore them.</li>
+  </ul>
+  <p>The classic billion-scale recipe combines them: <b>IVF + PQ</b> (Faiss's <code>IndexIVFPQ</code>), or HNSW over quantized vectors. Disk-based graph indexes such as Microsoft's <a href="https://proceedings.neurips.cc/paper_files/paper/2019/file/09853c7fb1d3f8ee67a61b6bf4a7f8e6-Paper.pdf" target="_blank" rel="noopener">DiskANN</a> keep compressed vectors in RAM and the full vectors and graph on SSD: its 2019 paper served a billion vectors from one machine with 64 GB of RAM at under 3 ms mean latency and 95%+ recall@1.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: will 10 million vectors fit on one machine?</span>
+    <p>10 million chunks, 1,536 dimensions.</p>
+    <ul>
+      <li>Raw float32: 10,000,000 × 1,536 × 4 bytes = <b>61.4 GB</b>.</li>
+      <li>HNSW links with M = 16: about 2 × 16 links × 4 bytes = 128 bytes per vector on the bottom layer → <b>1.3 GB</b> more (a rough estimate; implementations differ).</li>
+      <li>int8: <b>15.4 GB</b>. Binary: <b>1.9 GB</b>. PQ with 96 bytes: <b>0.96 GB</b>.</li>
+      <li>Or truncate to 512 Matryoshka dims first (Lesson 2.1): float32 <b>20.5 GB</b>, int8 <b>5.1 GB</b>.</li>
+    </ul>
+    <p>A 64 GB server can't hold the raw HNSW index; it holds the int8 or PQ version easily. That's usually the real reason teams quantize: RAM, not speed.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · IVF probes and the memory bill</span>
+    <p class="hint">1,500 points split into nlist clusters by k-means (coloured groups; small crosses = centroids). Click to place a query. The search scans only the nprobe nearest clusters (bright points). Raise nlist and probes get cheaper but border misses get more common; raise nprobe to win recall back.</p>
+    <div class="controls">
+      <label>nlist (clusters) <span class="seg" id="nlseg"><button id="nl16">16</button><button id="nl36">36</button><button id="nl64" class="on">64</button></span></label>
+      <label>nprobe <input type="range" id="np" min="1" max="10" step="1" value="1"> <b class="mono" id="npv"></b></label>
+      <button class="btn primary" id="isweep">▶ Test 200 queries for nprobe 1 → 10</button>
+    </div>
+    <canvas class="pts" id="icv" style="height:340px"></canvas>
+    <div class="stat-row">
+      <div class="stat">vectors scanned <b id="iscan">–</b></div>
+      <div class="stat">recall@10 (this query) <b id="irec">–</b></div>
+      <div class="stat">avg recall@10 (200 queries) <b id="iavg">–</b></div>
+    </div>
+    <canvas class="chart" id="ichart" style="height:200px"></canvas>
+    <h4>Memory calculator</h4>
+    <div class="calcgrid">
+      <label>vectors <input type="number" id="cN" value="10000000" min="1000" step="1000000"></label>
+      <label>dimensions <input type="number" id="cD" value="1536" min="16" step="64"></label>
+      <label>storage
+        <select id="cT"><option value="4">float32 (4 bytes/dim)</option><option value="2">float16 (2 bytes/dim)</option><option value="1">int8 (1 byte/dim)</option><option value="0.125">binary (1 bit/dim)</option><option value="pq">PQ (m bytes per vector)</option></select></label>
+      <label>PQ bytes per vector (m) <input type="number" id="cM" value="96" min="8" step="8"></label>
+      <label>HNSW M (0 = no graph) <input type="number" id="cG" value="16" min="0" step="4"></label>
+      <label>RAM per machine (GB) <input type="number" id="cR" value="64" min="8" step="8"></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">vectors <b id="oV">–</b></div>
+      <div class="stat">graph links <b id="oG">–</b></div>
+      <div class="stat">total <b id="oT">–</b></div>
+      <div class="stat">machines needed <b id="oM">–</b></div>
+    </div>
+    <p class="hint" id="cmsg"></p>
+    <p class="hint">The 2D points are a stand-in for real embeddings; borders between clusters are a much bigger problem in 1,000+ dimensions, so real systems use nprobe in the tens. Calculator: graph links estimated as 2 × M × 4 bytes per vector; leave about 30% of RAM free for the OS, queries and growth.</p>
+  </div>
+
+  <h2>Which index when</h2>
+  <table>
+    <tr><th>Index</th><th>Recall at speed</th><th>Memory</th><th>Build / updates</th><th>Use it when</th></tr>
+    <tr><td><b>Flat</b> (exact)</td><td>Perfect, slow at scale</td><td>Raw vectors</td><td>Instant; trivial updates</td><td>Under ~100k vectors, or heavy filters that leave few rows</td></tr>
+    <tr><td><b>HNSW</b></td><td class="ev">Best all-round</td><td>Raw + graph (high)</td><td>Slow build; inserts fine, deletes awkward</td><td>The default for most RAG and search up to hundreds of millions</td></tr>
+    <tr><td><b>IVF</b> (Flat)</td><td>Good with enough probes</td><td>Raw + centroids (low overhead)</td><td>Needs training data; drifts as data changes</td><td>Large, fairly static datasets; GPU search</td></tr>
+    <tr><td><b>IVF + PQ</b></td><td>Lower; rescoring helps</td><td class="ev">Tiny (e.g. 64× smaller)</td><td>Training step</td><td>Billions of vectors, memory-bound</td></tr>
+    <tr><td><b>Disk-based graph</b> (DiskANN style)</td><td>High</td><td>Compressed in RAM, full on SSD</td><td>Heavy build</td><td>Billions on one node, when RAM is the limit</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Faiss</b> (Meta's library: flat, IVF, PQ, HNSW, GPU), <b>hnswlib</b>, Spotify's <b>Voyager</b>, Google's <b>ScaNN</b>. Most of the time you'll set these knobs inside a vector database instead (Lesson 2.3): pgvector's <code>m</code>, <code>ef_construction</code> and <code>hnsw.ef_search</code>, or Qdrant's <code>hnsw_ef</code>.</p>
+<pre><code><span class="k">import</span> faiss, numpy <span class="k">as</span> np
+
+d = <span class="n">1536</span>
+xb = np.random.rand(<span class="n">100_000</span>, d).astype(<span class="s">"float32"</span>)   <span class="c"># your document vectors</span>
+xq = np.random.rand(<span class="n">5</span>, d).astype(<span class="s">"float32"</span>)         <span class="c"># queries</span>
+faiss.normalize_L2(xb); faiss.normalize_L2(xq)            <span class="c"># unit vectors: inner product = cosine</span>
+
+flat = faiss.IndexFlatIP(d); flat.add(xb)                  <span class="c"># exact baseline, for measuring recall</span>
+D_true, I_true = flat.search(xq, <span class="n">10</span>)
+
+hnsw = faiss.IndexHNSWFlat(d, <span class="n">16</span>, faiss.METRIC_INNER_PRODUCT)   <span class="c"># M = 16</span>
+hnsw.hnsw.efConstruction = <span class="n">200</span>
+hnsw.add(xb)
+hnsw.hnsw.efSearch = <span class="n">64</span>                                   <span class="c"># tune live: recall vs latency</span>
+D, I = hnsw.search(xq, <span class="n">10</span>)
+
+recall = np.mean([len(set(I[i]) &amp; set(I_true[i])) / <span class="n">10</span> <span class="k">for</span> i <span class="k">in</span> range(len(xq))])
+<span class="k">print</span>(<span class="s">f"recall@10 = {recall:.2f}"</span>)
+
+<span class="c"># Memory-bound? IVF + PQ: 1,024 clusters, 96 bytes per vector</span>
+ivfpq = faiss.IndexIVFPQ(faiss.IndexFlatIP(d), d, <span class="n">1024</span>, <span class="n">96</span>, <span class="n">8</span>, faiss.METRIC_INNER_PRODUCT)
+ivfpq.train(xb); ivfpq.add(xb); ivfpq.nprobe = <span class="n">16</span></code></pre>
+    <p class="hint">Always keep an exact (flat) baseline on a sample to measure recall. An index with untested recall is a guess. The <a href="https://ann-benchmarks.com/" target="_blank" rel="noopener">ANN-Benchmarks</a> site compares libraries on public datasets.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Knob</th><th>Turn it up: ✅ gains</th><th>❌ costs</th></tr>
+      <tr><td>HNSW efSearch</td><td>Recall</td><td>Latency (more distance computations)</td></tr>
+      <tr><td>HNSW M</td><td>Recall, robustness on hard data</td><td>Memory, build time</td></tr>
+      <tr><td>HNSW efConstruction</td><td>Graph quality</td><td>Build time (once)</td></tr>
+      <tr><td>IVF nlist</td><td>Fewer vectors per probe</td><td>More border misses; needs more probes</td></tr>
+      <tr><td>IVF nprobe</td><td>Recall</td><td>Latency, roughly linearly</td></tr>
+      <tr><td>Quantization</td><td>4× to 64× less memory, faster scans</td><td>Recall loss; rescoring step to win it back</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Under a few hundred thousand chunks, use exact search or the database's default HNSW and move on. Measure recall@10 against flat search on 100 queries once, so you know the index isn't the problem when answers go wrong.</p></div>
+      <div><h4>At scale</h4><p>Billions of vectors, memory budgets per shard, quantization with rescoring, GPU index builds, recall SLOs (for example recall@10 ≥ 0.95 at p99 under 50 ms) monitored like latency, and index rebuilds scheduled because deletes and drift slowly degrade the graph or the clusters.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Design similarity search over 500 million embeddings.” A senior answer:</p>
+    <ul>
+      <li>Does the <b>memory math</b> first (500M × 768 × 4 bytes ≈ 1.5 TB raw) and concludes: shard, quantize, or both.</li>
+      <li>Picks an index for the access pattern: <b>HNSW</b> for low latency and steady inserts, <b>IVF-PQ</b> or a disk graph when memory-bound, <b>rescoring</b> with full vectors on the top few hundred.</li>
+      <li>Defines success as <b>recall@k at a latency target</b>, measured against exact search on a sample, and says which knob (efSearch, nprobe) trades one for the other.</li>
+      <li>Mentions <b>filters, deletes and rebuilds</b> as the operational pain (Lesson 2.3).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The graph index everyone uses</b> <span class="tag res">🧪 Research · 2016</span> <a href="https://arxiv.org/abs/1603.09320" target="_blank" rel="noopener">HNSW (Malkov & Yashunin)</a></div>
+      <p><b>How:</b> a multi-layer graph where each element's top layer is chosen at random with exponentially decaying probability; search starts at the top and descends.</p>
+      <p><b>Why this method:</b> separating long and short links gives logarithmic-style scaling, and a neighbour-selection heuristic keeps recall high on clustered data. It strongly beat previous open-source methods.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A billion vectors on four GPUs</b> <span class="tag co">🏢 Meta (Facebook AI) · 2017</span> <a href="https://arxiv.org/abs/1702.08734" target="_blank" rel="noopener">Billion-scale similarity search with GPUs</a></div>
+      <p><b>How:</b> GPU brute-force, IVF and product-quantized search with a fast k-selection kernel; the code became Faiss.</p>
+      <p><b>Why this method:</b> compressed-domain search (PQ) on GPUs built a k-NN graph over 1 billion vectors in under 12 hours on 4 GPUs, 8.5× faster than the previous GPU state of the art.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>From Annoy to HNSW for music</b> <span class="tag co">🏢 Spotify · 2023</span> <a href="https://engineering.atspotify.com/introducing-voyager-spotifys-new-nearest-neighbor-search-library" target="_blank" rel="noopener">Introducing Voyager</a></div>
+      <p><b>How:</b> an in-memory HNSW library (built on hnswlib) with 8-bit floating-point storage, Python and Java bindings.</p>
+      <p><b>Why this method:</b> in-memory indexes keep services stateless on Kubernetes; HNSW gave 10× speed at equal recall, and 8-bit storage cut memory up to 4×.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Quantize for what matters</b> <span class="tag co">🏢 Google · 2020</span> <a href="https://research.google/blog/announcing-scann-efficient-vector-similarity-search/" target="_blank" rel="noopener">Announcing ScaNN</a></div>
+      <p><b>How:</b> anisotropic quantization penalizes compression error that distorts large inner products (the top results) more than other error.</p>
+      <p><b>Why this method:</b> search only cares about the best matches being scored right; on the glove-100-angular benchmark ScaNN handled roughly twice the queries per second of the next-fastest library at the same accuracy.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · in high dimensions, everything is far</span>
+    <p>Pick two random directions in 2D and their cosine is all over the place. In 1,536 dimensions, random vectors are almost exactly perpendicular: their cosine has a spread of only about 1/√1,536 ≈ 0.026. That's why a cosine of 0.3 between real embeddings can be meaningful, why scores from different models can't be compared, and why ANN is hard: in high dimensions, “nearest” and “second nearest” are often nearly the same distance away.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Vectors come from Lesson 2.1. Lesson 2.3 puts these indexes inside databases, where filters and deletes complicate them; Lesson 2.5 uses the same k-means that IVF uses. The database-index idea is the same one as in the System Design course's <a href="../../system-design-course/phase2/2-indexes.html">indexes and query performance</a>, and splitting a huge index across machines is <a href="../../system-design-course/phase2/4-sharding.html">sharding</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2401.08281" target="_blank" rel="noopener">The Faiss library (2024)</a>. A tour of every index family and their trade-offs, by its authors.</li>
+      <li><span class="kind">Guide</span> <a href="https://www.pinecone.io/learn/series/faiss/hnsw/" target="_blank" rel="noopener">Pinecone: HNSW explained</a>. Illustrated walk-through with Faiss code.</li>
+      <li><span class="kind">Benchmarks</span> <a href="https://ann-benchmarks.com/" target="_blank" rel="noopener">ANN-Benchmarks</a>. Recall vs queries per second for many libraries.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 50 million vectors of 768 dimensions, compressed with PQ to 64 bytes each. About how much RAM do the codes need, compared with float32?</div>
+    <div class="opts"><button class="opt" data-ok>3.2 GB instead of about 154 GB</button><button class="opt">32 GB instead of about 154 GB</button><button class="opt">320 MB instead of about 15 GB</button></div>
+    <div class="explain">float32: 50M × 768 × 4 = 153.6 GB. PQ: 50M × 64 bytes = <b>3.2 GB</b>, 48× smaller. You'd typically keep full vectors on disk to rescore the top candidates.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your HNSW index has recall@10 of 0.82 against exact search, and latency has headroom. What's the first knob to turn?</div>
+    <div class="opts"><button class="opt">Lower M to make the graph lighter</button><button class="opt" data-ok>Raise efSearch, and re-measure recall and latency</button><button class="opt">Switch to binary quantization</button></div>
+    <div class="explain">efSearch is the query-time knob: a larger candidate list explores more of the graph, raising recall at some latency cost, with no rebuild. If recall plateaus, then rebuild with larger M or efConstruction.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. An IVF index with nprobe = 1 often misses a document that's clearly relevant. What's the most likely cause?</div>
+    <div class="opts"><button class="opt">The embedding model is broken</button><button class="opt">The vectors aren't normalized</button><button class="opt" data-ok>The document sits in a neighbouring cluster; only the single nearest cluster was scanned</button></div>
+    <div class="explain">IVF only scans the clusters whose centroids are nearest the query. Vectors near cluster borders fall into the next cell. Raising nprobe (a few to tens of clusters) fixes it at the cost of scanning more vectors.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Exact search costs N × d per query; fine under ~100k vectors, too slow at millions.</li>
+      <li>ANN indexes trade a little recall for 100× to 1,000× less work: HNSW (graph), IVF (clusters), PQ and quantization (compression).</li>
+      <li>Knobs: efSearch and nprobe buy recall with latency; M and quantization trade memory for recall.</li>
+      <li>Do the memory math (N × d × 4 bytes) first: RAM usually decides the design.</li>
+      <li>Measure recall@k against exact search on a sample; never assume it.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const d2 = (a, b) => (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2;
+  function gen(N, seed, nc) {
+    const r = MX.seeded(seed), C = [];
+    for (let i = 0; i < nc; i++) C.push([r() * 0.84 + 0.08, r() * 0.84 + 0.08]);
+    const g = () => { const u = r() || 1e-9, v = r(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
+    return Array.from({ length: N }, () => { const c = C[Math.floor(r() * nc)]; return [MX.clamp(c[0] + g() * 0.07, 0.01, 0.99), MX.clamp(c[1] + g() * 0.07, 0.01, 0.99)]; });
+  }
+  function canvas(cv) {
+    const dpr = window.devicePixelRatio || 1, w = cv.clientWidth || 600, h = cv.clientHeight || 400;
+    cv.width = w * dpr; cv.height = h * dpr;
+    const c = cv.getContext("2d"); c.setTransform(dpr, 0, 0, dpr, 0, 0); c.clearRect(0, 0, w, h);
+    return { c, w, h, X: x => 10 + x * (w - 20), Y: y => 10 + y * (h - 20) };
+  }
+  const dot = (c, x, y, r, col) => { c.fillStyle = col; c.beginPath(); c.arc(x, y, r, 0, 7); c.fill(); };
+  const ring = (c, x, y, r, col, w) => { c.strokeStyle = col; c.lineWidth = w || 2; c.beginPath(); c.arc(x, y, r, 0, 7); c.stroke(); };
+  const cross = (c, x, y, s, col) => { c.strokeStyle = col; c.lineWidth = 2.5; c.beginPath(); c.moveTo(x - s, y); c.lineTo(x + s, y); c.moveTo(x, y - s); c.lineTo(x, y + s); c.stroke(); };
+  const topk = (P, q, k) => P.map((_, i) => i).sort((a, b) => d2(P[a], q) - d2(P[b], q)).slice(0, k);
+
+  // ================= HNSW-style graph =================
+  const HP = gen(500, 7, 9);
+  let M = 3, H, hq = [0.52, 0.47], last = null;
+  function build(P, M, seed) { // toy HNSW: random levels, connect to M nearest per layer (brute force), prune reverse links
+    const r = MX.seeded(seed), mL = 1 / Math.log(Math.max(M, 2)), L = [], G = [];
+    let entry = 0, top = 0;
+    P.forEach((p, i) => {
+      const l = Math.min(4, Math.floor(-Math.log(r() || 1e-9) * mL));
+      L.push(l); G.push(Array.from({ length: l + 1 }, () => []));
+      if (i === 0) { top = l; return; }
+      for (let k = Math.min(l, top); k >= 0; k--) {
+        const cand = []; for (let j = 0; j < i; j++) if (L[j] >= k) cand.push(j);
+        cand.sort((a, b) => d2(P[a], p) - d2(P[b], p));
+        const nb = cand.slice(0, M), mx = k ? M : 2 * M;
+        G[i][k] = nb.slice();
+        nb.forEach(j => { G[j][k].push(i); if (G[j][k].length > mx) { G[j][k].sort((a, b) => d2(P[a], P[j]) - d2(P[b], P[j])); G[j][k].length = mx; } });
+      }
+      if (l > top) { top = l; entry = i; }
+    });
+    return { L, G, entry, top };
+  }
+  function search(H, P, q, ef, k) {
+    let ep = H.entry; const seen = new Set([ep]), path = [ep];
+    for (let l = H.top; l > 0; l--) {
+      let ch = true;
+      while (ch) { ch = false; for (const n of H.G[ep][l]) { seen.add(n); if (d2(P[n], q) < d2(P[ep], q)) { ep = n; ch = true; path.push(n); } } }
+    }
+    const E = Math.max(ef, k), by = (a, b) => d2(P[a], q) - d2(P[b], q);
+    const C = [ep], W = [ep], v0 = new Set([ep]);
+    while (C.length) {
+      C.sort(by); const c = C.shift(); W.sort(by);
+      if (W.length >= E && d2(P[c], q) > d2(P[W[W.length - 1]], q)) break;
+      for (const n of H.G[c][0]) {
+        if (v0.has(n)) continue; v0.add(n); seen.add(n);
+        if (W.length < E || d2(P[n], q) < d2(P[W[W.length - 1]], q)) { C.push(n); W.push(n); W.sort(by); if (W.length > E) W.pop(); }
+      }
+    }
+    W.sort(by);
+    return { res: W.slice(0, k), seen, path };
+  }
+  function rebuild() { H = build(HP, M, 3); $("hlay").textContent = [1, 2, 3, 4].map(l => H.L.filter(x => x >= l).length).filter(x => x).join(" / "); runH(); $("hsweep").onclick(); }
+  function runH() {
+    const ef = +$("ef").value; $("efv").textContent = ef;
+    last = search(H, HP, hq, ef, 5);
+    const truth = topk(HP, hq, 5), got = new Set(last.res), rec = truth.filter(i => got.has(i)).length / 5;
+    $("hcomp").textContent = last.seen.size; $("hrec").textContent = Math.round(rec * 100) + "%";
+    $("hmsg").innerHTML = rec === 1 ? `<span class="ev">✅ Found all 5 true neighbours after computing ${last.seen.size} of 500 distances (${Math.round(last.seen.size / 5)}% of the work of exact search).</span>`
+      : `<span class="rk">❌ Missed ${5 - Math.round(rec * 5)} of the true top 5 (red rings). The walk got stuck in a local dead end. Raise efSearch or M.</span>`;
+    drawH(truth);
+  }
+  function drawH(truth) {
+    const { c, X, Y } = canvas($("hcv"));
+    c.strokeStyle = MX.css("--line"); c.lineWidth = 1;
+    HP.forEach((p, i) => H.G[i][0].forEach(j => { if (j > i) { c.beginPath(); c.moveTo(X(p[0]), Y(p[1])); c.lineTo(X(HP[j][0]), Y(HP[j][1])); c.stroke(); } }));
+    HP.forEach((p, i) => dot(c, X(p[0]), Y(p[1]), H.L[i] ? 3.5 : 2.5, H.L[i] ? MX.css("--c-md") : MX.css("--muted")));
+    last.seen.forEach(i => dot(c, X(HP[i][0]), Y(HP[i][1]), 3.5, MX.css("--c-tk")));
+    c.strokeStyle = MX.css("--c-in"); c.lineWidth = 2.5; c.beginPath();
+    last.path.forEach((i, n) => (n ? c.lineTo(X(HP[i][0]), Y(HP[i][1])) : c.moveTo(X(HP[i][0]), Y(HP[i][1])))); c.stroke();
+    ring(c, X(HP[H.entry][0]), Y(HP[H.entry][1]), 9, MX.css("--c-in"), 3);
+    const got = new Set(last.res);
+    last.res.forEach(i => ring(c, X(HP[i][0]), Y(HP[i][1]), 6, MX.css("--c-cx"), 2.5));
+    truth.filter(i => !got.has(i)).forEach(i => ring(c, X(HP[i][0]), Y(HP[i][1]), 7, MX.css("--c-rk"), 2.5));
+    cross(c, X(hq[0]), Y(hq[1]), 8, MX.css("--text"));
+  }
+  $("hcv").addEventListener("click", e => { const r = $("hcv").getBoundingClientRect(); hq = [MX.clamp((e.clientX - r.left - 10) / (r.width - 20), 0, 1), MX.clamp((e.clientY - r.top - 10) / (r.height - 20), 0, 1)]; runH(); });
+  $("randq").onclick = () => { const p = HP[MX.randint(HP.length)]; hq = [p[0] + (Math.random() - 0.5) * 0.08, p[1] + (Math.random() - 0.5) * 0.08]; runH(); };
+  $("ef").oninput = runH;
+  const mb = [...$("mseg").querySelectorAll("button")];
+  mb.forEach(b => (b.onclick = () => { mb.forEach(x => x.classList.toggle("on", x === b)); M = +b.textContent; rebuild(); }));
+  $("hsweep").onclick = () => {
+    const r = MX.seeded(99), Q = [];
+    for (let i = 0; i < 200; i++) { const p = HP[Math.floor(r() * HP.length)]; Q.push([p[0] + (r() - 0.5) * 0.08, p[1] + (r() - 0.5) * 0.08]); }
+    const T = Q.map(q => new Set(topk(HP, q, 5))), rec = [], work = [];
+    [5, 8, 12, 16, 20, 30, 40, 60, 80].forEach(ef => {
+      let rr = 0, ww = 0;
+      Q.forEach((q, n) => { const s = search(H, HP, q, ef, 5); rr += s.res.filter(i => T[n].has(i)).length / 5; ww += s.seen.size; });
+      rec.push([ef, 100 * rr / Q.length]); work.push([ef, 100 * ww / Q.length / HP.length]);
+    });
+    Plot.line($("hchart"), { series: [
+      { label: "recall@5 %", color: MX.css("--c-ev"), data: rec, width: 3, dots: true },
+      { label: "% of vectors compared", color: MX.css("--c-tk"), data: work, dash: [6, 4], dots: true },
+    ], xLabel: "efSearch", yMin: 0, yMax: 100 });
+    $("hsmsg").textContent = `M = ${M}: recall@5 goes from ${rec[0][1].toFixed(1)}% at efSearch 5 to ${rec[rec.length - 1][1].toFixed(1)}% at 80, while comparing ${work[0][1].toFixed(0)}% → ${work[work.length - 1][1].toFixed(0)}% of the vectors.` + (M === 2 ? " With M = 2 the graph is so sparse it breaks into poorly connected islands: even a big efSearch stays far from 100%." : "");
+  };
+  rebuild();
+
+  // ================= IVF =================
+  const IP = gen(1500, 11, 9);
+  let NL = 64, IV, iq = [0.5, 0.5];
+  function kmeans(P, K, seed) {
+    const r = MX.seeded(seed); let C = Array.from({ length: K }, () => P[Math.floor(r() * P.length)].slice()), A = [];
+    for (let it = 0; it < 15; it++) {
+      A = P.map(p => { let b = 0, bd = 1e9; C.forEach((c, j) => { const d = d2(p, c); if (d < bd) { bd = d; b = j; } }); return b; });
+      C = C.map((c, j) => { let sx = 0, sy = 0, n = 0; P.forEach((p, i) => { if (A[i] === j) { sx += p[0]; sy += p[1]; n++; } }); return n ? [sx / n, sy / n] : c; });
+    }
+    return { C, A };
+  }
+  function ivfSearch(q, np) {
+    const cl = IV.C.map((_, j) => j).sort((a, b) => d2(IV.C[a], q) - d2(IV.C[b], q)).slice(0, np), S = new Set(cl);
+    const cand = IP.map((_, i) => i).filter(i => S.has(IV.A[i]));
+    return { cl: S, cand, res: cand.sort((a, b) => d2(IP[a], q) - d2(IP[b], q)).slice(0, 10) };
+  }
+  function runI() {
+    const np = +$("np").value; $("npv").textContent = np;
+    const s = ivfSearch(iq, np), truth = topk(IP, iq, 10), got = new Set(s.res);
+    $("iscan").textContent = `${s.cand.length} of 1,500 (+${NL} centroids)`;
+    $("irec").textContent = truth.filter(i => got.has(i)).length * 10 + "%";
+    const { c, X, Y } = canvas($("icv")), cols = ["--c-in", "--c-cx", "--c-tl", "--c-md", "--c-ev", "--c-tk"].map(MX.css);
+    IP.forEach((p, i) => { c.globalAlpha = s.cl.has(IV.A[i]) ? 1 : 0.22; dot(c, X(p[0]), Y(p[1]), s.cl.has(IV.A[i]) ? 3 : 2.2, cols[IV.A[i] % cols.length]); });
+    c.globalAlpha = 1;
+    IV.C.forEach(p => cross(c, X(p[0]), Y(p[1]), 4, MX.css("--text")));
+    s.res.forEach(i => ring(c, X(IP[i][0]), Y(IP[i][1]), 5, MX.css("--c-cx"), 2));
+    truth.filter(i => !got.has(i)).forEach(i => ring(c, X(IP[i][0]), Y(IP[i][1]), 6, MX.css("--c-rk"), 2.5));
+    cross(c, X(iq[0]), Y(iq[1]), 8, MX.css("--c-rk"));
+  }
+  function retrain() { IV = kmeans(IP, NL, 5); runI(); $("isweep").onclick(); }
+  $("icv").addEventListener("click", e => { const r = $("icv").getBoundingClientRect(); iq = [MX.clamp((e.clientX - r.left - 10) / (r.width - 20), 0, 1), MX.clamp((e.clientY - r.top - 10) / (r.height - 20), 0, 1)]; runI(); });
+  $("np").oninput = runI;
+  const nb = [...$("nlseg").querySelectorAll("button")];
+  nb.forEach(b => (b.onclick = () => { nb.forEach(x => x.classList.toggle("on", x === b)); NL = +b.textContent; retrain(); }));
+  $("isweep").onclick = () => {
+    const r = MX.seeded(4), Q = [];
+    for (let i = 0; i < 200; i++) { const p = IP[Math.floor(r() * IP.length)]; Q.push([p[0] + (r() - 0.5) * 0.1, p[1] + (r() - 0.5) * 0.1]); }
+    const T = Q.map(q => new Set(topk(IP, q, 10))), rec = [], work = [];
+    for (let np = 1; np <= 10; np++) {
+      let rr = 0, ww = 0;
+      Q.forEach((q, n) => { const s = ivfSearch(q, np); rr += s.res.filter(i => T[n].has(i)).length / 10; ww += s.cand.length + NL; });
+      rec.push([np, 100 * rr / Q.length]); work.push([np, 100 * ww / Q.length / IP.length]);
+    }
+    Plot.line($("ichart"), { series: [
+      { label: "avg recall@10 %", color: MX.css("--c-ev"), data: rec, width: 3, dots: true },
+      { label: "% of exact-search work", color: MX.css("--c-tk"), data: work, dash: [6, 4], dots: true },
+    ], xLabel: "nprobe", yMin: 0, yMax: 100 });
+    const cur = rec[+$("np").value - 1];
+    $("iavg").textContent = cur[1].toFixed(0) + "%";
+  };
+  $("np").addEventListener("input", () => $("isweep").onclick());
+  retrain();
+
+  // ================= memory calculator =================
+  const gb = b => (b >= 1e12 ? (b / 1e12).toFixed(2) + " TB" : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : (b / 1e6).toFixed(0) + " MB");
+  function calc() {
+    const N = +$("cN").value, D = +$("cD").value, T = $("cT").value, m = +$("cM").value, G = +$("cG").value, R = +$("cR").value;
+    const vec = N * (T === "pq" ? m : D * +T), links = N * 2 * G * 4, tot = vec + links;
+    const machines = Math.max(1, Math.ceil(tot / (R * 1e9 * 0.7)));
+    $("oV").textContent = gb(vec); $("oG").textContent = gb(links); $("oT").textContent = gb(tot); $("oM").textContent = machines;
+    const raw = N * D * 4;
+    $("cmsg").textContent = (raw / vec > 1.01 ? `Raw float32 would be ${gb(raw)}; this setup stores the vectors ${(raw / vec).toFixed(1)}× smaller. ` : "This is the raw float32 size. ") +
+      (machines === 1 ? "Fits on one machine." : `Needs ${machines} machines (shards) at ${R} GB each, using 70% of RAM.`);
+  }
+  ["cN", "cD", "cT", "cM", "cG", "cR"].forEach(id => ($(id).oninput = calc));
+  calc();
+
+  window.addEventListener("resize", () => { if (H) runH(); if (IV) runI(); });
+  new MutationObserver(() => { if (H) runH(); if (IV) runI(); }).observe(document.documentElement, { attributes: true, attributeFilter: ["data-theme", "class"] });
+})();
+</script>
+</body>
+</html>

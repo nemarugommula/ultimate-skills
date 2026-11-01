@@ -1,0 +1,587 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.1b Versioning & releases: SemVer, lockfiles & changelogs · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .strip { display: flex; gap: 1px; margin: 8px 0 2px; height: 26px; }
+  .strip i { flex: 1; border-radius: 2px; background: var(--c-db); opacity: .85; }
+  .strip i.bad { background: var(--c-er); } .strip i.vul { background: var(--c-lt); } .strip i.now { outline: 2px solid var(--text); opacity: 1; }
+  table.reg td, table.reg th { font-size: .84rem; padding: 3px 8px; }
+  table.reg tr.future td { opacity: .35; }
+  table.reg tr.cur td { font-weight: 700; }
+  .clist label { display: flex; gap: 8px; align-items: flex-start; font-family: var(--mono); font-size: .8rem; margin: 4px 0; white-space: pre-wrap; }
+  .clist .eff { font-family: var(--font); font-size: .78rem; color: var(--muted); margin-left: auto; white-space: nowrap; padding-left: 8px; }
+  .clist .eff.major { color: var(--c-er); font-weight: 700; } .clist .eff.minor { color: var(--c-sv); font-weight: 700; } .clist .eff.patch { color: var(--c-db); font-weight: 700; }
+  .bigver { font-family: var(--mono); font-size: 1.6rem; font-weight: 800; }
+  .playground input[type=text] { font: inherit; font-family: var(--mono); font-size: .82rem; padding: 4px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); min-width: 200px; flex: 1; }
+  pre.chg { font-size: .78rem; white-space: pre-wrap; min-height: 4em; }
+</style>
+</head>
+<body data-lesson="s6-1b" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 1b</div>
+  <h1>Versioning & releases: SemVer, lockfiles & changelogs</h1>
+  <p class="subtitle">Most of the code you ship was written by strangers and arrives through version numbers. How you number your own releases, and how you pin everyone else's, decides whether builds are reproducible, upgrades are boring, and one bad package can break you overnight.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>CI</b> (continuous integration) builds and tests every change; build once and promote the same artifact (Lesson 6.1).</li>
+      <li><b>Backward compatible</b> = new code still works for old callers; make changes additive (Lesson 4.5).</li>
+      <li><b>Supply chain</b>: most of your code is dependencies of dependencies; Log4Shell arrived that way (Lesson 6.6).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>On Tuesday, March 22, 2016, shortly after 2:30 PM Pacific, npm started seeing <b>hundreds of failed installs per minute</b>. After a dispute over a package name, developer Azer Koçulu had unpublished 273 of his packages. One was <b>left-pad</b>, a tiny string-padding helper that huge projects pulled in indirectly.</p>
+    <p>Within ten minutes a volunteer published a working replacement as version 1.0.0, and the errors kept coming. Why? Babel and Atom reached left-pad through a package called <code>line-numbers</code>, which asked for <b>exactly 0.0.3</b>. A new number didn't match. npm took the unprecedented step of restoring the original 0.0.3 from a backup; the disruption lasted <b>2.5 hours</b>. Version numbers, and how you ask for them, are part of your system's design.</p>
+  </div>
+
+  <h2>Numbers first: your dependency tree is a lottery</h2>
+  <p>A typical web app lists 20 to 50 direct dependencies, but installs <b>hundreds to over a thousand</b> packages once you count their dependencies (check yours: <code>npm ls --all | wc -l</code>). Suppose (illustrative numbers):</p>
+  <ul>
+    <li><b>1,000</b> packages in the tree, each releasing about <b>once a month</b>: about <b>1,000 new versions a month</b>, 33 a day.</li>
+    <li>1 release in <b>1,000</b> breaks something you rely on, by accident.</li>
+  </ul>
+  <table>
+    <tr><th>If every build re-resolves to the newest allowed version…</th><th>Chance at least one breaking release lands</th></tr>
+    <tr><td>Over a week (≈ 233 releases)</td><td class="lt">1 − 0.999<sup>233</sup> ≈ <b>21%</b></td></tr>
+    <tr><td>Over a month (≈ 1,000 releases)</td><td class="er">1 − 0.999<sup>1000</sup> ≈ <b>63%</b></td></tr>
+    <tr><td>With a committed lockfile</td><td class="db"><b>0%</b> surprise: nothing changes until you change it on purpose</td></tr>
+  </table>
+  <div class="eq">
+    P(surprise breakage) = 1 − (1 − <span class="er">b</span>)<sup><span class="nw">N</span> · <span class="nw">r</span> · <span class="lt">d</span></sup>
+    <span class="say">“One minus the chance that every one of the N × r × d releases in that window is fine.” Small risks multiply across a big tree, just like flaky tests in Lesson 6.1.</span>
+  </div>
+  <div class="legend"><span class="er">b: chance one release breaks you</span><span class="nw">N: packages · r: releases per package per day</span><span class="lt">d: days</span></div>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A <b>version number is a promise</b> about compatibility. A <b>range</b> says how much of other people's promises you trust. A <b>lockfile</b> is the receipt for exactly what you got. Apps lock exact versions and move the lock forward <b>on purpose</b>, through a robot that opens a pull request and CI that tests it. Libraries declare ranges and keep their promises.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a shopping list and a receipt</span>
+    <p>Your <code>package.json</code> is a shopping list: “milk, any brand, 1 to 2 litres” (a range). Shop from the list every day and you'll get whatever's on the shelf that day, sometimes a new brand that tastes wrong. The lockfile is <b>the receipt</b>: exactly which carton you bought on Tuesday. To cook Tuesday's recipe again, shop from the receipt. The SemVer label on the carton is the dairy's promise: “same recipe, new packaging” (patch) versus “new recipe” (major).</p>
+  </div>
+
+  <h2>SemVer: MAJOR.MINOR.PATCH</h2>
+  <p><b>Semantic Versioning</b> (SemVer, <a href="https://semver.org/" target="_blank" rel="noopener">semver.org</a>) gives each part of <code>2.7.1</code> a meaning, based on your <b>public API</b> (the functions, options and behavior other people use):</p>
+  <table>
+    <tr><th>Bump</th><th>When</th><th>Example</th><th>What users can do</th></tr>
+    <tr><td><b class="er">MAJOR</b> 2.7.1 → 3.0.0</td><td>Any incompatible change to the public API</td><td>Rename <code>parse()</code>, remove an option, change a default, drop a supported runtime</td><td>Upgrade deliberately, read the migration notes</td></tr>
+    <tr><td><b class="sv">MINOR</b> 2.7.1 → 2.8.0</td><td>New functionality, backward compatible</td><td>A new optional argument, a new function</td><td>Take it automatically</td></tr>
+    <tr><td><b class="db">PATCH</b> 2.7.1 → 2.7.2</td><td>Backward compatible bug fixes</td><td>Fix a crash, fix a wrong rounding</td><td>Take it automatically</td></tr>
+  </table>
+  <ul>
+    <li><b>Pre-releases</b> add a hyphen: <code>3.0.0-beta.1</code>. They sort <i>before</i> the release (<code>3.0.0-alpha &lt; 3.0.0</code>), and npm ranges skip them unless you ask for that exact version line, so betas don't leak into anyone's build.</li>
+    <li><b>Build metadata</b> adds a plus: <code>3.0.0+20261031.sha.5114f85</code>. It's ignored for ordering.</li>
+    <li><b>0.y.z</b> means initial development: the spec says anything may change at any time. If people depend on you in production, you should be at 1.0.0.</li>
+    <li><b>Released versions are immutable.</b> If you accidentally break compatibility in a minor, the spec's advice is to ship another minor that restores compatibility, never to edit or reuse a released version.</li>
+  </ul>
+  <p>What counts as “breaking” is wider than it looks: a stricter input check, a changed error message that callers parse, a slower algorithm someone depends on. The honest test: <b>could a correct program written against the old version stop working?</b> If yes, it's major.</p>
+
+  <h2>Ranges: how much of the promise you trust</h2>
+  <p>Your manifest usually asks for a <b>range</b>, not one version. npm's default when you run <code>npm install x</code> is the caret, <code>^</code>. The rules, from npm's <code>node-semver</code>:</p>
+  <table>
+    <tr><th>You write</th><th>Means</th><th>Takes</th></tr>
+    <tr><td><code>^1.4.0</code> (caret)</td><td>≥ 1.4.0 and &lt; 2.0.0</td><td>New minors and patches</td></tr>
+    <tr><td><code>~1.4.0</code> (tilde)</td><td>≥ 1.4.0 and &lt; 1.5.0</td><td>Patches only</td></tr>
+    <tr><td><code>1.4.0</code></td><td>exactly 1.4.0</td><td>Nothing new, including security fixes</td></tr>
+    <tr><td><code>^0.4.0</code></td><td>≥ 0.4.0 and &lt; 0.5.0</td><td>In 0.x, the caret treats the minor as major</td></tr>
+    <tr><td><code>&gt;=1.4.0</code> or <code>*</code></td><td>anything newer</td><td>Majors too: breaking changes arrive by themselves</td></tr>
+  </table>
+  <p><b>The catch is transitive dependencies.</b> You depend on library A; A's author wrote <code>"B": "^1.4.0"</code>. You never chose that range. When B ships a buggy 1.6.0, your next fresh install picks it up, with no change in your repo. That's “it worked yesterday and nobody touched anything”.</p>
+
+  <h2>Lockfiles: the receipt</h2>
+  <p>npm's docs say <code>package-lock.json</code> describes <b>the exact tree that was generated</b>, so later installs produce identical trees regardless of new releases, and that it's meant to be committed. Then use the right command:</p>
+  <ul>
+    <li><code>npm install</code> may update the lockfile. Use it on your laptop when you <i>mean</i> to change dependencies.</li>
+    <li><code>npm ci</code> requires a lockfile, <b>exits with an error</b> if it doesn't match <code>package.json</code>, deletes <code>node_modules</code>, and never writes to the lockfile: “essentially frozen” installs. Use it in CI and Docker builds.</li>
+  </ul>
+  <table>
+    <tr><th>Ecosystem</th><th>Manifest (ranges)</th><th>Lockfile (exact)</th><th>Frozen install</th></tr>
+    <tr><td>npm / pnpm / Yarn</td><td><code>package.json</code></td><td><code>package-lock.json</code>, <code>pnpm-lock.yaml</code>, <code>yarn.lock</code></td><td><code>npm ci</code>, <code>pnpm install --frozen-lockfile</code></td></tr>
+    <tr><td>Python (Poetry, uv)</td><td><code>pyproject.toml</code></td><td><code>poetry.lock</code>, <code>uv.lock</code></td><td><code>poetry install</code>, <code>uv sync --locked</code></td></tr>
+    <tr><td>Rust</td><td><code>Cargo.toml</code></td><td><code>Cargo.lock</code></td><td><code>cargo build --locked</code></td></tr>
+    <tr><td>Go</td><td><code>go.mod</code> (minimum versions)</td><td><code>go.sum</code> (hashes)</td><td>the default</td></tr>
+  </table>
+  <p>Go is the interesting exception. Its <b>minimal version selection</b> (MVS) picks the <i>lowest</i> version that satisfies every requirement, not the newest, so a new release upstream changes nothing until someone raises a minimum. <code>go.sum</code> then stores <b>cryptographic hashes</b> of every module, so a tampered download fails the build. Selection and verification are separate jobs.</p>
+  <p><b>Libraries vs apps:</b> npm ignores a <code>package-lock.json</code> anywhere except the root project and won't publish it. So your library's users resolve your ranges themselves, on the day they install. Lock your app; for a library, also run CI against the newest allowed versions, because that's what your users get.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The version-range resolver</span>
+    <p class="hint">Library A (which you use) depends on package B with the range you pick. Below is B's real-world-style release history: a security fix, a buggy minor, a breaking major. Pick a range and a strategy, then drag the day or press <b>Play 120 days</b>. The strip shows each day's build: <span class="db">green = fine</span>, <span class="lt">gold = works but has a known vulnerability</span>, <span class="er">red = broken</span>.</p>
+    <div class="controls">
+      <span class="hint">Range A declares:</span>
+      <span class="seg" id="rrange"><button data-v="caret" class="on" id="r-caret">^1.4.0</button><button data-v="tilde" id="r-tilde">~1.4.0</button><button data-v="exact" id="r-exact">1.4.0</button><button data-v="gte" id="r-gte">&gt;=1.4.0</button></span>
+    </div>
+    <div class="controls">
+      <span class="hint">Your strategy:</span>
+      <span class="seg" id="rstrat"><button data-v="nolock" class="on" id="st-nolock">No lockfile (npm install)</button><button data-v="lock" id="st-lock">Lockfile + npm ci, never updated</button><button data-v="bot" id="st-bot">Lockfile + bot PRs tested by CI</button></span>
+    </div>
+    <div class="controls">
+      <label>day <input type="range" id="rday" min="0" max="120" step="1" value="62"> <b class="mono" id="rdayv"></b></label>
+      <button class="btn primary" id="rplay">▶ Play 120 days</button>
+    </div>
+    <div class="strip" id="rstrip"></div>
+    <p class="hint">day 0 → day 120</p>
+    <div class="stat-row">
+      <div class="stat">B installed today <b id="r-now">–</b></div>
+      <div class="stat">broken build days <b id="r-broken">–</b></div>
+      <div class="stat">unreviewed version changes <b id="r-surprise">–</b></div>
+      <div class="stat">days vulnerable after the fix shipped <b id="r-vuln">–</b></div>
+      <div class="stat">PRs needing a human <b id="r-human">–</b></div>
+    </div>
+    <p class="hint" id="rmsg"></p>
+    <canvas class="chart" id="rchart" style="height:210px"></canvas>
+    <p class="hint">Version of B each day under all three strategies (1.62 = 1.6.2, 2 = 2.0.0). The bot waits 3 days after each release (Dependabot's default cooldown), proposes the newest 1.x in a PR, and merges only when CI is green; a major gets its own PR for a human.</p>
+    <table class="reg" id="rreg"></table>
+  </div>
+  <p>Things to try: with <code>^1.4.0</code> and no lockfile, slide to day 61: the build breaks with no commit, then heals by itself on day 63. Switch to <code>&gt;=1.4.0</code> and it breaks for good on day 90. A lockfile never breaks, but it sits on a vulnerable 1.4.0 forever. The bot gets the security fix within days, never merges the buggy 1.6.0 (CI is red), and parks 2.0.0 for a human. Notice the pre-release <code>2.0.0-beta.1</code> never installs under any range.</p>
+
+  <h2>Robots that move the lock forward</h2>
+  <p>A lockfile alone just freezes you, and frozen means slowly accumulating known vulnerabilities. <b>Dependabot</b> (built into GitHub) and <b>Renovate</b> (open source, many platforms) watch registries and open pull requests that update the manifest and lockfile. CI runs your tests on each one. The settings that matter:</p>
+  <ul>
+    <li><b>Wait a few days</b> before proposing a release: Dependabot applies a <b>3-day cooldown</b> to version updates by default (security updates skip it); Renovate's equivalent is <code>minimumReleaseAge</code>. Most broken or malicious releases are caught and pulled by others in that window.</li>
+    <li><b>Group</b> non-major updates into one weekly PR per repo, or the PR count drowns your team (worked example below).</li>
+    <li><b>Automerge</b> green minor and patch updates; Renovate's docs show a rule that excludes <code>0.x</code> packages, since those may break at any time.</li>
+    <li><b>Majors get their own PR</b> and a human, with the changelog linked.</li>
+  </ul>
+
+  <h2>Changelogs and commit messages that pick the version</h2>
+  <p>People don't read diffs; they read changelogs. <b>Keep a Changelog</b> suggests a human-written file with an <b>Unreleased</b> section on top and six kinds of change: <b>Added, Changed, Deprecated, Removed, Fixed, Security</b>.</p>
+  <p><b>Conventional Commits</b> makes commit messages machine-readable so the version can be computed instead of argued about:</p>
+  <ul>
+    <li><code>fix: …</code> → PATCH. <code>feat: …</code> → MINOR.</li>
+    <li>A footer <code>BREAKING CHANGE: …</code>, or a <code>!</code> after the type (<code>feat(api)!: …</code>) → MAJOR, whatever the type.</li>
+    <li>Other types (<code>docs</code>, <code>chore</code>, <code>refactor</code>, <code>test</code>, <code>ci</code>…) are allowed and release nothing by themselves.</li>
+  </ul>
+  <p><b>semantic-release</b> reads those commits in CI, computes the next version, generates release notes and publishes, which, in its own words, removes the link between human emotions and version numbers. Its default rules also release <code>perf</code> and reverts as patches.</p>
+
+  <div class="playground" id="pg-ver">
+    <span class="label">🎮 Playground · Commits → next version</span>
+    <p class="hint">Your library is at the version shown. Tick the commits merged since the last release (or type your own) and see the bump and the generated changelog. Then press <b>🪤 The squash-merge trap</b>, based on a real 2026 accident.</p>
+    <svg id="vfl"></svg>
+    <div class="clist" id="clist"></div>
+    <div class="controls">
+      <input type="text" id="cin" placeholder="fix(cart): handle an empty basket" aria-label="commit message">
+      <button class="btn" id="cadd">+ Add commit</button>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="crel">▶ Merge &amp; release</button>
+      <button class="btn" id="ctrap">🪤 The squash-merge trap</button>
+      <button class="btn" id="cedit">✏️ Reword that commit</button>
+      <button class="btn" id="creset">Reset</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">current <b id="v-cur">–</b></div>
+      <div class="stat">bump <b id="v-bump">–</b></div>
+      <div class="stat">next version <b class="bigver" id="v-next">–</b></div>
+      <div class="stat">released so far <b id="v-hist">–</b></div>
+    </div>
+    <p class="hint" id="vmsg"></p>
+    <pre class="chg" id="vchg"></pre>
+  </div>
+  <p>Notice two things. The non-conventional <code>Fixed stuff</code> commit vanishes from the changelog: the tooling only knows what you tell it. And in the trap, one line pasted into a commit body turns a small feature into a major release that can never be taken back.</p>
+
+  <h2>Not everything should be SemVer</h2>
+  <table>
+    <tr><th>What you ship</th><th>Version it with</th><th>Why</th></tr>
+    <tr><td>A library others install (npm, PyPI = the Python Package Index, Maven)</td><td>SemVer, strictly</td><td>Machines read your number through ranges; it's an API contract</td></tr>
+    <tr><td>An internal service deployed continuously</td><td>The git commit SHA (a unique hash of the commit) on the image (Lesson 6.1)</td><td>Nobody installs it; callers depend on its API, not its build number</td></tr>
+    <tr><td>An HTTP or gRPC API</td><td>Don't break it: additive changes, rare <code>/v2</code>, or dated versions like Stripe's (Lesson 4.5)</td><td>You can't make clients upgrade, so “bump the major” isn't a plan</td></tr>
+    <tr><td>Products, OS releases, tools on a schedule</td><td><b>CalVer</b> (calendar versioning): Ubuntu <code>24.04</code> is YY.0M; pip uses YY.MINOR.MICRO</td><td>The number tells users how old it is; good when every release may change things</td></tr>
+  </table>
+  <p><b>Release trains vs continuous delivery.</b> A release train leaves on a fixed schedule with whatever is ready; late features wait for the next one. Chrome ships a new milestone every 4 weeks. Continuous delivery ships each change when it's ready (Lesson 6.1). Trains suit things users must download and install; web services, which you can roll back in a minute (Lesson 6.2), usually skip versions entirely.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: the bot PR budget</span>
+    <p>Your company has <b>30 repos</b>, each with <b>40 direct dependencies</b> that release about <b>once a month</b> (typical). You turn on a dependency bot.</p>
+    <ul>
+      <li><b>One PR per update</b>: 30 × 40 = <b>1,200 PRs a month</b>, about 1,200 ÷ 22 working days ≈ <b>55 a day</b>. Nobody reviews 55 PRs a day; people start clicking merge without reading, or turn the bot off.</li>
+      <li><b>Group non-major updates weekly per repo</b>: 30 repos × 52 ÷ 12 weeks a month ≈ <b>130 PRs a month</b>.</li>
+      <li><b>Automerge the green ones</b>: if about 1 in 10 groups fails CI, humans look at ≈ <b>13 a month</b>, plus the majors.</li>
+    </ul>
+    <p>Same safety, a hundredth of the noise. The cost of keeping up is a design decision, not a fixed tax.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>npm / pnpm / Yarn</b>, <b>Poetry / uv</b>, <b>Cargo</b>, <b>Go modules</b>; <b>Dependabot</b> and <b>Renovate</b> for update PRs; <b>semantic-release</b>, <b>release-please</b> or <b>Changesets</b> for versions and changelogs; <b>commitlint</b> to enforce Conventional Commits; private registries and proxies (<b>Artifactory</b>, <b>Nexus</b>, <b>GitHub Packages</b>) so an upstream deletion can't break your builds.</p>
+<pre><code><span class="c">// package.json: ranges for direct deps, and an override for a transitive one (comments added here; real JSON has none)</span>
+{
+  <span class="s">"dependencies"</span>: {
+    <span class="s">"express"</span>: <span class="s">"^4.21.2"</span>,          <span class="c">// minors + patches</span>
+    <span class="s">"pg"</span>: <span class="s">"~8.13.1"</span>                <span class="c">// patches only</span>
+  },
+  <span class="s">"overrides"</span>: { <span class="s">"left-pad"</span>: <span class="s">"1.3.0"</span> } <span class="c">// force one version deep in the tree</span>
+}</code></pre>
+<pre><code><span class="c"># Conventional Commits: the version is computed from these</span>
+fix(cart): round totals to whole cents                 <span class="c"># → patch</span>
+feat(search): add fuzzy matching                       <span class="c"># → minor</span>
+feat(api)!: remove the deprecated v1 client            <span class="c"># → major</span>
+
+refactor(auth): split token parsing
+
+BREAKING CHANGE: verify() now throws instead of returning null   <span class="c"># footer → major</span></code></pre>
+<pre><code><span class="c"># .github/dependabot.yml</span>
+version: <span class="n">2</span>
+updates:
+  - package-ecosystem: <span class="s">"npm"</span>
+    directory: <span class="s">"/"</span>
+    schedule:
+      interval: <span class="s">"weekly"</span>
+    cooldown:
+      default-days: <span class="n">3</span>                 <span class="c"># let a release age before proposing it</span>
+      semver-major-days: <span class="n">14</span>
+    groups:
+      non-major:                      <span class="c"># one PR for all minor + patch updates</span>
+        patterns: [<span class="s">"*"</span>]
+        update-types: [<span class="s">"minor"</span>, <span class="s">"patch"</span>]</code></pre>
+<pre><code><span class="c"># CI (GitHub Actions steps): frozen install, test, then release from main</span>
+- run: npm ci                      <span class="c"># fails if package.json and the lockfile disagree</span>
+- run: npm test
+- run: npx semantic-release        <span class="c"># reads commits, bumps, writes notes, publishes</span>
+  env:
+    GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    NPM_TOKEN: ${{ secrets.NPM_TOKEN }}</code></pre>
+    <p class="hint">Try it locally: <code>npx semver -r "^1.4.0" 1.4.0 1.6.0 2.0.0-beta.1 2.0.0</code> prints only the versions the range accepts (1.4.0 and 1.6.0). <code>npm outdated</code> shows what's behind; <code>npm ls left-pad</code> shows who pulls a package in.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Good</th><th>❌ Costs</th></tr>
+      <tr><td>Wide ranges, no lockfile</td><td>Always the newest fixes</td><td>Builds change without commits; can't reproduce last week's build</td></tr>
+      <tr><td>Exact pins, no bot</td><td>Totally predictable</td><td>Security fixes never arrive; upgrades pile up into a scary big-bang</td></tr>
+      <tr><td>Lockfile + bot + CI (+ automerge)</td><td>Reproducible <i>and</i> current; every change tested</td><td>Needs a trustworthy test suite and PR grouping, or it's noise</td></tr>
+      <tr><td>SemVer</td><td>Tools can act on the number</td><td>Only as honest as the maintainer; “breaking” is a judgment call</td></tr>
+      <tr><td>CalVer</td><td>Says how old a release is</td><td>Says nothing about compatibility</td></tr>
+      <tr><td>Release train</td><td>Predictable dates for users, docs and support</td><td>Ready work waits; a missed train means weeks</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Commit the lockfile on day one and use <code>npm ci</code> (or your ecosystem's frozen install) in CI and Docker. Turn on Dependabot or Renovate with weekly grouped PRs and automerge for green patch/minor updates. Tag service images with the commit SHA. Only keep a changelog for things other people install.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Internal registry proxies so builds never depend on the public registry being up or a package not being deleted; bots across thousands of repos with org-wide presets and cooldowns; Conventional Commits enforced in CI so internal libraries release automatically; SBOMs (software bills of materials: a list of everything inside each build) to answer “where do we run version X?” (Lesson 6.6); release trains for client apps, continuous delivery for services.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>It shows up in “how do you run 200 services safely?” and in debugging stories. A senior answer:</p>
+    <ul>
+      <li>Explains why a build broke with no commit (a transitive range picked up a new release) and the fix: committed lockfile, frozen installs, updates only via tested PRs.</li>
+      <li>Distinguishes what to version how: SemVer for libraries, commit SHAs for deployed services, compatibility rules rather than majors for APIs.</li>
+      <li>Treats dependency freshness as a cost to manage: cooldowns, grouping, automerge, and owners for majors.</li>
+      <li>Links it to the supply chain: registry proxies, hash verification, and knowing exactly what you run.</li>
+    </ul>
+    <p class="hint">Common follow-ups: “A library used by 40 internal teams needs a breaking change. How do you roll it out?” · “Monorepo with one version of each library, or versioned packages?” · “How fast can you ship a fix for a vulnerable dependency to every service?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>An exact pin vs a deleted package</b> <span class="tag hist">📜 npm · 2016</span> <a href="https://blog.npmjs.org/post/141577284765/kik-left-pad-and-npm" target="_blank" rel="noopener">kik, left-pad, and npm</a></div>
+      <p><b>How:</b> after left-pad and 272 other packages were unpublished, a replacement 1.0.0 didn't help chains that asked for exactly 0.0.3, so npm restored 0.0.3 from backup. npm's <a href="https://docs.npmjs.com/policies/unpublish" target="_blank" rel="noopener">unpublish policy</a> now allows removal freely only within 72 hours of publishing and only if no other public package depends on it.</p>
+      <p><b>Why this method:</b> a registry is shared infrastructure; once others depend on a version, deleting it breaks strangers' builds.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Minimal version selection</b> <span class="tag oss">🧰 Go modules · 2018</span> <a href="https://research.swtch.com/vgo-mvs" target="_blank" rel="noopener">Russ Cox: Minimal Version Selection</a></div>
+      <p><b>How:</b> each module lists minimum versions of its dependencies, and the build uses the lowest version that satisfies them all. <a href="https://go.dev/ref/mod" target="_blank" rel="noopener">go.sum</a> holds hashes of every module that are checked on download.</p>
+      <p><b>Why this method:</b> it produces what the post calls high-fidelity builds, close to what the author tested, and it's simple: no solver, and no surprise upgrades when someone publishes.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A default cooldown</b> <span class="tag co">🏢 GitHub Dependabot</span> <a href="https://docs.github.com/en/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file" target="_blank" rel="noopener">dependabot.yml options</a></div>
+      <p><b>How:</b> Dependabot doesn't consider a new version for a version update until 3 days after its release, even without configuration; <code>cooldown</code> can set separate days for major, minor and patch. Security updates skip the wait.</p>
+      <p><b>Why this method:</b> brand-new releases are the riskiest; a short delay lets the wider community find a broken or malicious version first.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A 4-week release train</b> <span class="tag co">🏢 Google Chrome · 2021</span> <a href="https://blog.chromium.org/2021/03/speeding-up-release-cycle.html" target="_blank" rel="noopener">Speeding up Chrome's release cycle</a></div>
+      <p><b>How:</b> starting with Chrome 94, a new milestone every 4 weeks, plus an Extended Stable option with milestones every 8 weeks for enterprises that need more time.</p>
+      <p><b>Why this method:</b> a browser must be downloaded by billions of devices; a fixed rhythm lets web developers, enterprises and embedders plan, while features ship faster than before.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Calendar versions</b> <span class="tag oss">🧰 Ubuntu · pip</span> <a href="https://calver.org/" target="_blank" rel="noopener">calver.org</a></div>
+      <p><b>How:</b> Ubuntu numbers releases YY.0M (<code>24.04</code> = April 2024); pip uses YY.MINOR.MICRO; Stripe's API versions are dates.</p>
+      <p><b>Why this method:</b> for scheduled releases, the date is the most useful fact: it tells you how old and how supported a version is.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the bot that bumped itself</span>
+    <p>On July 29, 2026, Renovate, the dependency-update bot, released <b>44.0.0</b>, a major version, right after 43.288.0. Its maintainers explained the changes weren't breaking at all: a squash-merged commit message contained a <code>BREAKING CHANGE</code> reference, and their automated release tooling did exactly what the spec says. Because released versions can't be taken back, they <a href="https://github.com/renovatebot/renovate/discussions/44952" target="_blank" rel="noopener">announced</a> they'd simply continue on 44.x. Even the experts get bitten by one line of text.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The pipeline that runs <code>npm ci</code> and tests every bot PR is Lesson 6.1; rolling out and rolling back a bad version is Lesson 6.2. API versioning without majors is Lesson 4.5. Supply-chain attacks, SBOMs and scanning are Lesson 6.6. In AI systems, the same discipline applies to models: pin an exact model version and a prompt version in production, and upgrade through an evaluation run, the way you'd upgrade a dependency through CI.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://semver.org/" target="_blank" rel="noopener">Semantic Versioning 2.0.0</a>. Short; the FAQ answers most real arguments.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.conventionalcommits.org/en/v1.0.0/" target="_blank" rel="noopener">Conventional Commits</a> and <a href="https://keepachangelog.com/en/1.1.0/" target="_blank" rel="noopener">Keep a Changelog</a>. The two conventions behind automated releases.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.npmjs.com/cli/v10/configuring-npm/package-lock-json" target="_blank" rel="noopener">npm: package-lock.json</a> and the <a href="https://semver.npmjs.com/" target="_blank" rel="noopener">npm semver calculator</a>. See exactly which versions a range accepts.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Your app's tree has 800 packages, each releasing about once a month, and about 1 release in 400 breaks you. With no lockfile, roughly what's the chance at least one breaking release lands in a month?</div>
+    <div class="opts"><button class="opt">About 2%</button><button class="opt">About 50%</button><button class="opt" data-ok>About 86%</button></div>
+    <div class="explain">800 releases a month, each fine with probability 399/400: 1 − (399/400)<sup>800</sup> ≈ 1 − e<sup>−2</sup> ≈ <b>86%</b>. Small per-release risks multiply across a big tree, which is why apps commit a lockfile and take updates through tested PRs.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your library is at 3.4.1. Since then you merged: fix(io): close file handles; feat: add a timeout option; docs: fix typos; refactor!: drop Node 18 support. What does semantic-release publish?</div>
+    <div class="opts"><button class="opt">3.4.2</button><button class="opt">3.5.0</button><button class="opt" data-ok>4.0.0</button></div>
+    <div class="explain">The <code>!</code> marks a breaking change, whatever the type, and the biggest bump wins: <b>4.0.0</b>. Dropping a supported runtime breaks every user still on it, so it really is major. The fix and feat still appear in the changelog.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. CI started failing overnight with no new commits. The failing package is a dependency of a dependency, which released a new minor version. What's the best lasting fix?</div>
+    <div class="opts"><button class="opt">Pin your direct dependencies to exact versions</button><button class="opt" data-ok>Commit a lockfile, install with npm ci, and take updates through bot PRs that CI tests</button><button class="opt">Skip the failing tests until the package is fixed</button></div>
+    <div class="explain">Pinning direct dependencies doesn't pin <i>their</i> ranges: the transitive package would still float. The lockfile freezes the whole tree, <code>npm ci</code> enforces it, and a bot keeps you current, so changes arrive as tested PRs instead of overnight surprises.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>SemVer: MAJOR = incompatible API change, MINOR = compatible feature, PATCH = compatible fix; 0.x promises nothing; released versions are immutable.</li>
+      <li><code>^1.4.0</code> = &lt; 2.0.0, <code>~1.4.0</code> = &lt; 1.5.0, <code>^0.4.0</code> = &lt; 0.5.0; pre-releases are skipped. Transitive ranges are chosen by other people.</li>
+      <li>Apps: commit the lockfile, <code>npm ci</code> in CI, and move it forward with Dependabot/Renovate PRs (cooldown, grouping, automerge on green). Libraries: test against the newest allowed versions.</li>
+      <li>Conventional Commits (<code>fix</code> → patch, <code>feat</code> → minor, <code>!</code> or <code>BREAKING CHANGE:</code> → major) let semantic-release pick versions and write changelogs (Keep a Changelog).</li>
+      <li>SemVer for libraries, commit SHAs for services, no-breaking-changes for APIs, CalVer for scheduled products; trains for installed software, continuous delivery for services.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+
+  // ================= range resolver =================
+  const REG = [
+    { v: "1.4.0", d: 0, s: "ok", note: "what A was built against" },
+    { v: "1.4.1", d: 10, s: "ok", note: "patch: fixes a rounding bug" },
+    { v: "1.5.0", d: 30, s: "ok", note: "minor: adds an option" },
+    { v: "1.5.1", d: 42, s: "ok", note: "patch" },
+    { v: "1.5.2", d: 50, s: "ok", note: "🔒 patch: security fix; every version below 1.5.2 is vulnerable" },
+    { v: "1.6.0", d: 60, s: "bug", note: "🐛 minor, but crashes on empty input (an honest mistake)" },
+    { v: "1.6.1", d: 63, s: "ok", note: "patch: fixes 1.6.0's crash" },
+    { v: "2.0.0-beta.1", d: 70, s: "major", note: "pre-release of 2.0" },
+    { v: "2.0.0", d: 90, s: "major", note: "💥 major: renames parse() to parseInput()" },
+    { v: "1.6.2", d: 95, s: "ok", note: "patch, backported to the 1.x line" },
+  ];
+  const parse = v => { const [core, pre] = v.split("-"); const [a, b, c] = core.split(".").map(Number); return { a, b, c, pre: !!pre }; };
+  const cmp = (x, y) => { const p = parse(x), q = parse(y); return p.a - q.a || p.b - q.b || p.c - q.c || (p.pre === q.pre ? 0 : p.pre ? -1 : 1); };
+  const RANGES = { // all ranges here exclude pre-releases (they don't name a pre-release on the same x.y.z)
+    caret: v => cmp(v, "1.4.0") >= 0 && cmp(v, "2.0.0-0") < 0,
+    tilde: v => cmp(v, "1.4.0") >= 0 && cmp(v, "1.5.0-0") < 0,
+    exact: v => v === "1.4.0",
+    gte: v => cmp(v, "1.4.0") >= 0,
+  };
+  const status = v => REG.find(r => r.v === v).s;
+  const num = v => { const p = parse(v); return p.a + p.b / 10 + p.c / 100; };
+  const released = t => REG.filter(r => r.d <= t && !parse(r.v).pre).map(r => r.v);
+  const newest = list => list.slice().sort(cmp).pop();
+  const COOL = 3;
+
+  function simulate(rangeK) {
+    const ok = RANGES[rangeK], days = 121;
+    const nolock = [], lock = [], bot = [];
+    let botV = "1.4.0", human = 0; const redPRs = new Set();
+    for (let t = 0; t < days; t++) {
+      nolock.push(newest(released(t).filter(ok)));
+      lock.push("1.4.0");
+      // the bot: newest 1.x released at least COOL days ago; merged only if CI is green
+      const cand = newest(released(t - COOL).filter(v => parse(v).a === 1));
+      if (cand && cmp(cand, botV) > 0) {
+        if (status(cand) === "ok") botV = cand;
+        else if (!redPRs.has(cand)) { redPRs.add(cand); human++; }
+      }
+      const maj = released(t - COOL).find(v => parse(v).a === 2);
+      if (maj && !redPRs.has(maj)) { redPRs.add(maj); human++; }
+      bot.push(botV);
+    }
+    const stats = arr => {
+      let broken = 0, surprise = 0, vuln = 0;
+      arr.forEach((v, t) => {
+        if (status(v) !== "ok") broken++;
+        if (t > 0 && v !== arr[t - 1]) surprise++;
+        if (t >= 50 && cmp(v, "1.5.2") < 0) vuln++;
+      });
+      return { broken, surprise, vuln };
+    };
+    return { nolock, lock, bot, S: { nolock: stats(nolock), lock: stats(lock), bot: Object.assign(stats(bot), { surprise: 0 }) }, human };
+  }
+  const getRange = seg("rrange", () => rrun());
+  const getStrat = seg("rstrat", () => rrun());
+  for (let i = 0; i <= 120; i++) $("rstrip").appendChild(document.createElement("i"));
+  let lastSim = null;
+  function rrun() {
+    const rk = getRange(), sk = getStrat(), day = +$("rday").value;
+    $("rdayv").textContent = day;
+    const sim = (lastSim = simulate(rk)), arr = sim[sk], st = sim.S[sk];
+    [...$("rstrip").children].forEach((c, t) => {
+      const v = arr[t];
+      c.className = (status(v) !== "ok" ? "bad" : t >= 50 && cmp(v, "1.5.2") < 0 ? "vul" : "") + (t === day ? " now" : "");
+      c.title = `day ${t}: ${v}`;
+    });
+    const v = arr[day], s = status(v);
+    $("r-now").textContent = v + (s === "bug" ? " 🐛" : s === "major" ? " 💥" : day >= 50 && cmp(v, "1.5.2") < 0 ? " 🔓" : " ✅");
+    $("r-broken").textContent = st.broken;
+    $("r-surprise").textContent = sk === "bot" ? "0 (all via PRs)" : st.surprise;
+    $("r-vuln").textContent = st.vuln;
+    $("r-human").textContent = sk === "bot" ? sim.human : "0";
+    $("rmsg").textContent =
+      sk === "nolock" && st.broken ? `Every build re-resolves the range: the newest allowed version installs that day, with no commit in your repo. ${st.broken} days of red builds.` :
+      sk === "nolock" && st.surprise ? `No breakage with this range, but B changed ${st.surprise} time(s) with no commit, so you can't reproduce last month's build${st.vuln ? `, and the range never reaches the security fix: ${st.vuln} days vulnerable` : ""}.` :
+      sk === "nolock" ? `An exact pin never changes, so nothing breaks, but it never gets the security fix either: ${st.vuln} days vulnerable. And it only pins B; B's own dependencies still float.` :
+      sk === "lock" ? `Rock steady and reproducible, but stuck on 1.4.0: vulnerable for ${st.vuln} days after the fix shipped, and every future upgrade gets bigger.` :
+      `Reproducible and current: CI turned the buggy 1.6.0 and breaking 2.0.0 into red PRs instead of red builds. Exposure to the vulnerability: ${st.vuln} days (cooldown + merge).`;
+    const D = a => a.map((x, t) => [t, num(x)]);
+    Plot.line($("rchart"), {
+      series: [
+        { label: "no lockfile", color: MX.css("--c-er"), data: D(sim.nolock) },
+        { label: "lockfile only", color: MX.css("--c-lt"), data: D(sim.lock), dash: [6, 4] },
+        { label: "lockfile + bot", color: MX.css("--c-db"), data: D(sim.bot) },
+      ], xLabel: "day", yLabel: "version of B", yMin: 1.35, yMax: 2.05,
+      hlines: [{ y: 1.6, label: "🐛 1.6.0", color: MX.css("--c-er") }, { y: 2.0, label: "💥 2.0.0", color: MX.css("--c-er") }],
+    });
+    $("rreg").innerHTML = "<tr><th>day</th><th>B version</th><th>what it is</th><th>allowed by the range?</th></tr>" + REG.map(r =>
+      `<tr class="${r.d > day ? "future" : ""}${r.v === v ? " cur" : ""}"><td>${r.d}</td><td class="mono">${r.v}</td><td>${r.note}</td><td>${RANGES[rk](r.v) ? "✅" : "–"}</td></tr>`).join("");
+  }
+  $("rday").oninput = rrun;
+  let playing = false;
+  $("rplay").onclick = async () => {
+    if (playing) return; playing = true;
+    for (let t = 0; t <= 120; t += 2) { $("rday").value = t; rrun(); await new Promise(r => setTimeout(r, 25)); }
+    playing = false;
+  };
+  rrun();
+
+  // ================= commits → next version =================
+  const VF = new Flow($("vfl"), { width: 720, height: 110 });
+  VF.node("c", { x: 85, y: 55, w: 140, label: "📝 Commits", sub: "merged to main", kind: "cl" })
+    .node("ci", { x: 270, y: 55, w: 150, label: "🧪 CI", sub: "npm ci + tests", kind: "sv" })
+    .node("sr", { x: 460, y: 55, w: 160, label: "🏷️ semantic-release", sub: "reads commits", kind: "nw" })
+    .node("reg", { x: 640, y: 55, w: 130, label: "📦 Registry", sub: "", kind: "db" })
+    .edge("c", "ci").edge("ci", "sr").edge("sr", "reg").render();
+  const TRAP = "feat(managers): update lock files if present\n\nUpstream release notes, pasted by the squash merge:\nBREAKING CHANGE: (upstream) removed the --legacy flag";
+  const TRAP_FIXED = "feat(managers): update lock files if present\n\nUpstream release notes: see the linked PR.";
+  const START = [
+    { m: "fix(cart): round totals to whole cents", on: true },
+    { m: "feat(search): add fuzzy matching", on: true },
+    { m: "docs: explain the retry option", on: true },
+    { m: "chore(deps): bump lodash to 4.17.21", on: true },
+    { m: "Fixed stuff", on: true },
+    { m: "perf(parser): cache compiled patterns", on: false },
+    { m: "feat(api)!: remove the deprecated v1 client", on: false },
+  ];
+  let commits, cur, hist;
+  const reset = () => { commits = START.map(c => ({ ...c })); cur = "1.4.2"; hist = []; };
+  reset();
+  function analyze(msg) {
+    const head = msg.split("\n")[0];
+    const m = head.match(/^(\w+)(\([^)]*\))?(!)?: (.+)$/);
+    if (!m) return { type: null, bump: null, why: "not a Conventional Commit: ignored", text: head };
+    const type = m[1].toLowerCase(), bang = !!m[3];
+    const footer = /^BREAKING[ -]CHANGE: /m.test(msg.split("\n").slice(1).join("\n"));
+    let bump = null, why;
+    if (bang || footer) { bump = "major"; why = bang ? "“!” after the type → major" : "BREAKING CHANGE footer → major"; }
+    else if (type === "feat") { bump = "minor"; why = "feat → minor"; }
+    else if (type === "fix" || type === "perf" || type === "revert") { bump = "patch"; why = type + " → patch"; }
+    else why = type + ": no release";
+    return { type, bump, why, text: m[4], scope: m[2] ? m[2].slice(1, -1) : null, breaking: bump === "major" };
+  }
+  const RANK = { major: 3, minor: 2, patch: 1 };
+  const bumpV = (v, b) => { let [a, x, y] = v.split(".").map(Number); if (b === "major") return `${a + 1}.0.0`; if (b === "minor") return `${a}.${x + 1}.0`; return `${a}.${x}.${y + 1}`; };
+  function vrun() {
+    const list = $("clist");
+    list.innerHTML = "";
+    let best = null;
+    commits.forEach((c, i) => {
+      const a = analyze(c.m);
+      if (c.on && a.bump && (!best || RANK[a.bump] > RANK[best])) best = a.bump;
+      const lab = document.createElement("label");
+      lab.innerHTML = `<input type="checkbox" id="cm${i}" ${c.on ? "checked" : ""}><span>${esc(c.m)}</span><span class="eff ${a.bump || ""}">${esc(a.why)}</span>`;
+      lab.querySelector("input").onchange = e => { c.on = e.target.checked; vrun(); };
+      list.appendChild(lab);
+    });
+    const next = best ? bumpV(cur, best) : cur;
+    $("v-cur").textContent = cur;
+    $("v-bump").textContent = best || "none";
+    $("v-next").textContent = best ? next : "no release";
+    $("v-hist").textContent = hist.length ? hist.join(" → ") : "–";
+    const on = commits.filter(c => c.on).map(c => ({ c, a: analyze(c.m) }));
+    const sec = { Changed: [], Added: [], Fixed: [] };
+    on.forEach(({ a }) => {
+      if (!a.type) return;
+      const line = `- ${a.scope ? "**" + a.scope + ":** " : ""}${a.text}`;
+      if (a.breaking) sec.Changed.push(line.replace("- ", "- ⚠️ BREAKING: "));
+      else if (a.type === "feat") sec.Added.push(line);
+      else if (a.type === "fix") sec.Fixed.push(line);
+      else if (a.type === "perf") sec.Changed.push(line);
+    });
+    const ignored = on.filter(x => !x.a.type).length;
+    const date = new Date().toISOString().slice(0, 10);
+    $("vchg").textContent = best ? `## [${next}] - ${date}\n` + Object.entries(sec).filter(([, l]) => l.length).map(([k, l]) => `### ${k}\n${l.join("\n")}`).join("\n") + (ignored ? `\n\n(${ignored} non-conventional commit${ignored > 1 ? "s" : ""} left out: nobody will know what changed)` : "") : "No feat, fix, perf or breaking commits: nothing to release.";
+    const trapOn = commits.some(c => c.on && c.m === TRAP);
+    $("vmsg").textContent = trapOn ? "A pasted line in the commit body starts with BREAKING CHANGE:, so the tooling ships a major. Once published, you can't take it back: users' bots will open “major upgrade” PRs everywhere. Reword before merging." :
+      best === "major" ? "A breaking change wins over everything else: users' ^ ranges will NOT pick this up automatically; they'll need to upgrade on purpose." :
+      best === "minor" ? "A new feature: every user on a ^ range gets it on their next update." :
+      best === "patch" ? "Fixes only: users on ^ and ~ ranges get it." : "";
+    VF.set("reg", { sub: "v" + cur }).set("sr", { sub: best ? `next: ${next}` : "nothing to release", hot: best === "major" });
+  }
+  $("cadd").onclick = () => {
+    const m = $("cin").value.trim() || $("cin").placeholder;
+    commits.push({ m, on: true }); $("cin").value = ""; vrun();
+  };
+  $("cin").onkeydown = e => { if (e.key === "Enter") $("cadd").click(); };
+  $("ctrap").onclick = () => {
+    commits.forEach(c => (c.on = false));
+    let t = commits.find(c => c.m === TRAP || c.m === TRAP_FIXED);
+    if (!t) { t = { m: TRAP, on: true }; commits.push(t); }
+    t.m = TRAP; t.on = true; vrun();
+  };
+  $("cedit").onclick = () => { const t = commits.find(c => c.m === TRAP); if (t) t.m = TRAP_FIXED; else $("vmsg").textContent = "Press 🪤 first to load the trap commit."; if (t) vrun(); };
+  let vbusy = false;
+  $("crel").onclick = async () => {
+    const on = commits.filter(c => c.on);
+    let best = null;
+    on.forEach(c => { const a = analyze(c.m); if (a.bump && (!best || RANK[a.bump] > RANK[best])) best = a.bump; });
+    if (!best) { $("vmsg").textContent = "semantic-release found no releasable commits, so nothing was published."; return; }
+    const next = bumpV(cur, best);
+    hist.push(next); cur = next;
+    commits = commits.filter(c => !c.on);
+    vrun();
+    $("vmsg").textContent = `Published ${next}. Commits are cleared: the next release counts from here.`;
+    if (vbusy) return; vbusy = true;
+    try { await VF.packet(["c", "ci", "sr", "reg"], { color: best === "major" ? "--c-er" : "--c-db", dur: 900 }); } finally { vbusy = false; }
+  };
+  $("creset").onclick = () => { reset(); vrun(); };
+  vrun();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,528 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.4 Design a chat system · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .mlog { font-family: var(--mono); font-size: .82rem; background: var(--bg2); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; max-height: 170px; overflow-y: auto; }
+  .mlog div { margin: 2px 0; }
+</style>
+</head>
+<body data-lesson="s7-4" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 4</div>
+  <h1>Design a chat system (WhatsApp)</h1>
+  <p class="subtitle">Deliver every message once, in order, within a fraction of a second, to whichever of a billion phones is online, and to the rest as soon as they come back. Chat turns stateless request/response on its head: the servers hold live connections.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>WebSockets</b>: one long-lived connection the server can push messages down at any time (Lesson 0.4).</li>
+      <li><b>Consistent hashing</b> maps a key (a user, a channel) to one server so everyone agrees who owns it (Lesson 2.4).</li>
+      <li><b>Idempotency</b>: if a retry can deliver something twice, give it a unique ID and drop the duplicate (Lesson 3.3).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In January 2012, WhatsApp posted a blog entry titled <b>“1 million is so 2011”</b>. A few months earlier one of their servers had held a million TCP connections; now a single FreeBSD box running Erlang showed <b>2,277,845</b> open sockets, “with plenty of CPU and memory to spare”.</p>
+    <p>Two million people connected to one machine, each able to receive a message at any instant. Building chat is mostly about those connections: how many fit on a server, how a message finds the right one, and what happens when one disappears.</p>
+  </div>
+
+  <h2>Step 1 · Requirements</h2>
+  <p><b>Functional:</b> 1:1 and group chats (assume groups up to a few hundred members); messages sync across a user's devices with full history; <b>delivery and read receipts</b>; <b>presence</b> (online / last seen); offline users get a <b>push notification</b> and the messages when they reconnect; photos and voice notes (stored as files, Lesson 2.7).</p>
+  <p><b>Non-functional:</b> low latency (well under a second end to end); <b>no lost messages</b>; <b>per-conversation ordering</b> (everyone sees a chat in the same order); high availability; and privacy: <b>end-to-end encryption</b> (E2E, only the devices in the chat can read messages, not the server).</p>
+  <table>
+    <tr><th>Clarifying question</th><th>Assumed answer</th><th>Design impact</th></tr>
+    <tr><td>Daily users? Messages per user?</td><td>500M, about 40 a day</td><td>Message rate and storage (below)</td></tr>
+    <tr><td>Max group size?</td><td>A few hundred</td><td>Server fans out each message; 100k-member channels would need a different design (like Discord or Slack)</td></tr>
+    <tr><td>Keep history forever? On the server?</td><td>Yes, synced across devices</td><td>Big durable message store, read by conversation</td></tr>
+    <tr><td>End-to-end encrypted?</td><td>Yes</td><td>Server stores and routes ciphertext; no server-side search of content</td></tr>
+    <tr><td>Multiple devices per user?</td><td>Phone + laptop</td><td>Deliver to each device; track “last seen sequence” per device</td></tr>
+  </table>
+
+  <h2>Step 2 · Estimates (by hand)</h2>
+  <div class="box walk">
+    <span class="label">✏️ Worked example: chat at WhatsApp-like scale</span>
+    <ul>
+      <li>Messages: 500M × 40 = 20B a day ÷ 86,400 ≈ <b>231,000/s</b>, peak (×2) ≈ <b>460,000/s</b>.</li>
+      <li>Storage at about 100 bytes per text message: 20B × 100 B = <b>2 TB a day</b>, 730 TB a year, about <b>2.2 PB</b> with 3 copies. Media goes to object storage, not here.</li>
+      <li>Concurrent connections: if 30% of daily users are online at peak = <b>150M open WebSockets</b>.</li>
+      <li>At 500,000 connections per gateway server: 150M ÷ 500k = <b>300 servers</b>, ×1.5 headroom to survive losing a zone ≈ <b>450</b>.</li>
+      <li>Memory at about 20 KB per connection (buffers, TLS state, session): 500k × 20 KB = <b>10 GB</b> per server. WhatsApp's 2012 box showed 35 GB active for 2.28M sockets, roughly <b>15 KB each</b>.</li>
+      <li>Heartbeats every 30 s to detect dead connections: 150M ÷ 30 = <b>5M tiny messages/s</b>, more than the chat messages themselves.</li>
+    </ul>
+  </div>
+
+  <h2>Step 3 · API (over the WebSocket)</h2>
+<pre><code><span class="c">// client → server</span>
+{<span class="s">"type"</span>:<span class="s">"send"</span>, <span class="s">"client_msg_id"</span>:<span class="s">"a1b2…"</span>, <span class="s">"conv"</span>:<span class="s">"c42"</span>, <span class="s">"body"</span>:<span class="s">"&lt;ciphertext&gt;"</span>}
+<span class="c">// server → sender: stored durably, here is its place in the conversation</span>
+{<span class="s">"type"</span>:<span class="s">"ack"</span>, <span class="s">"client_msg_id"</span>:<span class="s">"a1b2…"</span>, <span class="s">"msg_id"</span>:<span class="n">1790…</span>, <span class="s">"seq"</span>:<span class="n">318</span>}
+<span class="c">// server → recipient device, which answers {"type":"delivered","msg_id":…}, later {"type":"read",…}</span>
+{<span class="s">"type"</span>:<span class="s">"msg"</span>, <span class="s">"conv"</span>:<span class="s">"c42"</span>, <span class="s">"seq"</span>:<span class="n">318</span>, <span class="s">"msg_id"</span>:<span class="n">1790…</span>, <span class="s">"from"</span>:<span class="s">"alice"</span>, <span class="s">"body"</span>:<span class="s">"…"</span>}
+<span class="c">// on reconnect: “give me everything after what I have”</span>
+{<span class="s">"type"</span>:<span class="s">"sync"</span>, <span class="s">"since"</span>:{<span class="s">"c42"</span>:<span class="n">317</span>, <span class="s">"g7"</span>:<span class="n">1204</span>}}</code></pre>
+  <p>Plus plain HTTPS for the rest: <code>GET /v1/conversations/{id}/messages?before_seq=…</code> for scrolling history, and media upload URLs.</p>
+
+  <h2>Step 4 · Data model</h2>
+  <table>
+    <tr><th>Store</th><th>Shape</th><th>Why</th></tr>
+    <tr><td><span class="db">messages</span> (wide-column: Cassandra, ScyllaDB)</td><td>partition <code>(conv_id, bucket)</code>, rows sorted by <code>seq</code></td><td>Every read is “recent messages of one conversation”: one partition, a sorted range scan. Buckets (say 10 days) keep partitions small, as Discord does.</td></tr>
+    <tr><td><span class="db">conversations</span> + <span class="db">members</span> (SQL or wide-column)</td><td>conv_id → members, type, next_seq</td><td>Who to fan out to</td></tr>
+    <tr><td><span class="db">device_state</span></td><td>(user, device, conv) → last delivered seq, last read seq</td><td>Sync on reconnect, receipts</td></tr>
+    <tr><td><span class="ca">session registry</span> (Redis)</td><td><code>user:{id}</code> → {gateway, device} with a TTL</td><td>“Which gateway holds Bob's connection?”; expires if heartbeats stop</td></tr>
+  </table>
+  <p><b>Wide-column</b> stores (Lesson 2.1) are built on log-structured storage (LSM trees, Lesson 2.2) that make writes cheap and sequential, which suits a firehose of 460,000 small writes per second that are read back by conversation.</p>
+
+  <h2>Step 5 · High-level design: following one message</h2>
+  <p>Alice's phone holds a WebSocket to <b>gateway 1</b>. She sends; the <b>chat service</b> gives the message the next sequence number for that conversation, writes it to the message store, and acks Alice (“✓ stored”). Then it asks the <b>session registry</b> where Bob is connected, and pushes the message to <b>gateway 2</b>, which sends it down Bob's socket. Bob's phone acks (“✓✓ delivered”). If Bob is offline, a <b>push notification</b> goes out through Apple's or Google's push service, and his phone syncs when it reconnects.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Message delivery across gateways</span>
+    <p class="hint">Bob is on gateway 2, Carol on gateway 3, Dan is offline. Send messages, take Bob offline, crash his gateway mid-delivery, and turn delivery acks off to see what they protect against. Ticks: ✓ stored on the server, ✓✓ delivered to the device, 👁 read.</p>
+    <svg id="cf"></svg>
+    <div class="controls">
+      <button class="btn primary" id="toBob">Alice → Bob</button>
+      <button class="btn" id="toGroup">Alice → group (Bob, Carol, Dan)</button>
+      <button class="btn" id="bobToggle">Bob goes offline</button>
+      <button class="btn" id="bobRead">Bob reads</button>
+    </div>
+    <div class="controls">
+      <button class="btn" id="crash">💥 Crash Bob's gateway mid-delivery</button>
+      <span class="hint">Delivery acks + retry:</span><span class="seg" id="ack"><button id="ackOn" data-v="on" class="on">on</button><button id="ackOff" data-v="off">off (fire and forget)</button></span>
+      <button class="btn" id="cReset">↺ Reset</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">messages stored <b id="mSt">0</b></div>
+      <div class="stat">device deliveries done <b id="mDl">0</b></div>
+      <div class="stat">waiting for offline device <b id="mWt">0</b></div>
+      <div class="stat">lost <b id="mLs">0</b></div>
+      <div class="stat">duplicates dropped <b id="mDp">0</b></div>
+    </div>
+    <div class="mlog" id="mlog"></div>
+  </div>
+  <p>Things to try: send to Bob, then take him offline and send two more: they wait, with a push notification, and arrive in order when he's back. Now crash his gateway with acks <b>off</b>: the server handed the message to a gateway that died, assumed it was delivered, and Bob never sees it. With acks <b>on</b>, the missing ack triggers a resend after Bob reconnects, and because the device had actually received the first copy, the duplicate is dropped by its message ID.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Store first, then deliver, then confirm. A message is safe the moment it's written to the store with a <b>sequence number</b>; delivery is <b>at least once</b> (retry until the device acks), and the device makes it look like <b>exactly once</b> by dropping duplicates by message ID. Anything can crash in between and nothing is lost.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a post office with tracking numbers</span>
+    <p>The gateways are mail carriers who each know a few streets. The session registry is the address book saying which carrier serves Bob's street today. Every letter gets a tracking number (sequence) and a copy at the post office (the store) before it's sent. The recipient signs for it (the ack). No signature? The post office sends it again. And if Bob has moved to a new street (reconnected to another gateway), the address book is updated and the next attempt goes to the new carrier. Bob's “I already have letter 318” stops a double delivery.</p>
+  </div>
+
+  <h2>Deep dive 1 · Connections: how many, where, and when they all drop</h2>
+  <p>Gateways are <b>stateful</b>: each one holds hundreds of thousands of live sockets, so you can't treat them like stateless web servers (Lesson 1.1). Three rules:</p>
+  <ul>
+    <li><b>Keep gateways dumb.</b> They hold sockets and forward frames. Chat logic lives in services behind them, so a gateway deploy only drops connections, never data.</li>
+    <li><b>A registry maps user → gateway.</b> Written on connect, refreshed by heartbeats, expired by TTL. Slack's design hashes channels to stateful “channel servers” with consistent hashing, and gateways subscribe to the channels their users are in.</li>
+    <li><b>Plan for reconnect storms.</b> When a gateway dies, all its users reconnect at once, and each reconnect also costs a session lookup and a history sync. Clients must retry with <b>exponential backoff and jitter</b> (random delays that double each time, Lesson 4.4).</li>
+  </ul>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Connection capacity estimator</span>
+    <p class="hint">Size the gateway fleet, then kill one server. Reconnects go through a session service that handles about 100,000 reconnects/s (an assumption). Past that, it spends its time on failing handshakes and its useful throughput collapses.</p>
+    <div class="controls">
+      <label>daily users <input type="range" id="dau" min="0" max="4" step="1" value="2"> <b class="mono" id="dauv"></b></label>
+      <label>online at peak <input type="range" id="onl" min="5" max="60" step="5" value="30"> <b class="mono" id="onlv"></b></label>
+    </div>
+    <div class="controls">
+      <label>connections per server <input type="range" id="cps" min="0" max="5" step="1" value="3"> <b class="mono" id="cpsv"></b></label>
+      <label>memory per connection <input type="range" id="kb" min="5" max="100" step="5" value="20"> <b class="mono" id="kbv"></b></label>
+      <label>heartbeat every <input type="range" id="hb" min="10" max="120" step="10" value="30"> <b class="mono" id="hbv"></b></label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">open connections <b id="cConn">–</b></div>
+      <div class="stat">gateway servers (×1.5 headroom) <b id="cSrv">–</b></div>
+      <div class="stat">RAM per server <b id="cRam">–</b></div>
+      <div class="stat">heartbeats <b id="cHb">–</b></div>
+    </div>
+    <div class="controls"><button class="btn primary" id="killGw">💥 Kill one gateway server</button></div>
+    <canvas class="chart" id="sc" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">all back (instant retry) <b id="tImm">–</b></div>
+      <div class="stat">all back (backoff + jitter) <b id="tJit">–</b></div>
+    </div>
+    <p class="hint" id="cmsg">Press “Kill one gateway server” to watch its users reconnect.</p>
+  </div>
+  <p>Notice the trade: packing 2 million connections per server (as WhatsApp did) means fewer machines, but each failure throws 2 million clients at the session service. Instant retries make it collapse and recovery takes many minutes; backoff with jitter spreads the herd and recovers far sooner.</p>
+
+  <h2>Deep dive 2 · Ordering, delivery guarantees and receipts</h2>
+  <ul>
+    <li><b>Order per conversation, not globally.</b> Phone clocks disagree, so never sort by client timestamps. One owner per conversation (the chat service instance that the conversation ID hashes to) hands out <code>seq</code> 1, 2, 3… Everyone sorts by <code>seq</code>. A global order across all chats is unnecessary and would be a bottleneck.</li>
+    <li><b>At least once + dedupe.</b> The client generates <code>client_msg_id</code>; if Alice's send times out and she retries, the server sees the same ID and returns the same <code>seq</code> instead of storing twice (Lesson 3.3). Recipients dedupe by <code>msg_id</code>.</li>
+    <li><b>Gaps tell you something's missing.</b> If Bob's device has seq 316 and receives 318, it asks for 317. On reconnect it sends “since 317” for each conversation, and the server replies with everything newer.</li>
+    <li><b>Receipts are just more messages.</b> “Delivered” and “read” flow back to the sender as small events, and in groups are aggregated (“read by 12”). They are cheap individually and huge in total, so batch them.</li>
+  </ul>
+
+  <h2>Deep dive 3 · Storage, groups, presence and encryption</h2>
+  <ul>
+    <li><b>Storage.</b> Partition by conversation, sort by sequence or a time-sortable ID, bucket by time. Discord reached trillions of messages with exactly this key shape: <code>((channel_id, bucket), message_id)</code>.</li>
+    <li><b>Group fan-out.</b> One send becomes one delivery per member device: a 200-member group turns 1 message into 199 deliveries. With E2E encryption, WhatsApp's whitepaper describes “sender keys”: the sender encrypts once and transmits a single ciphertext, and “the server … does server-side fan-out to all group participants”.</li>
+    <li><b>Presence is expensive.</b> “Bob is online” changes constantly and is interesting to many people. Send it only to contacts who currently have the app open, debounce flapping (a phone switching networks), and derive “last seen” from heartbeats with a TTL rather than writing on every change.</li>
+    <li><b>Offline delivery.</b> Phones kill background sockets, so offline delivery means a push notification through <b>APNs</b> (Apple Push Notification service) or <b>FCM</b> (Firebase Cloud Messaging): “you have a new message”, then the app wakes, connects and syncs. Notifications at scale get their own design in Lesson 7.8.</li>
+    <li><b>End-to-end encryption.</b> Clients exchange keys (WhatsApp uses the Signal Protocol); the server only ever sees ciphertext. Trade-off: the server can't search, index, preview or moderate message contents, and a new device can't read old history unless it's transferred from another device.</li>
+  </ul>
+
+  <h2>Bottlenecks and the scaling path</h2>
+  <table>
+    <tr><th>Stage</th><th>Design</th><th>What forces the next step</th></tr>
+    <tr><td><b>v1: startup</b> (thousands online)</td><td>One app process holding WebSockets (Socket.IO, Phoenix Channels), Postgres <code>messages(conv_id, seq, …)</code> with an index, Redis pub/sub so 2–3 app servers can reach each other's users, FCM/APNs for push</td><td>Too many sockets per process; deploys drop everyone; Postgres write volume</td></tr>
+    <tr><td><b>v2</b> (millions online)</td><td>Separate gateway tier + session registry, chat service sharded by conversation, Kafka between them, message store on Cassandra/ScyllaDB</td><td>Reconnect storms, hot group chats, presence traffic</td></tr>
+    <tr><td><b>v3</b> (100M+ online)</td><td>Gateways in many regions near users, regional failover with draining, presence as its own service, receipts batched, E2E multi-device key management</td><td>Cross-region latency and keeping per-conversation order across regions</td></tr>
+  </table>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>WebSocket servers: <b>ws</b> / <b>Socket.IO</b> (Node.js), <b>Phoenix Channels</b> (Elixir), <b>Netty</b> (Java); managed: <b>AWS API Gateway WebSockets</b>, Pusher, Ably. Stores: <b>Cassandra</b>, <b>ScyllaDB</b>, DynamoDB. Registry and fan-out between servers: <b>Redis</b> pub/sub or Kafka. Push: <b>APNs</b> and <b>FCM</b>. A gateway in Node.js, plus the message table in CQL (Cassandra's query language):</p>
+<pre><code><span class="c">// gateway.js: hold sockets, register users, forward frames</span>
+<span class="k">import</span> { WebSocketServer } <span class="k">from</span> <span class="s">"ws"</span>;
+<span class="k">import</span> Redis <span class="k">from</span> <span class="s">"ioredis"</span>;
+<span class="k">const</span> redis = <span class="k">new</span> Redis(), sub = <span class="k">new</span> Redis(), ME = process.env.GATEWAY_ID;
+<span class="k">const</span> sockets = <span class="k">new</span> Map();                          <span class="c">// userId → socket</span>
+<span class="k">new</span> WebSocketServer({ port: <span class="n">8080</span> }).on(<span class="s">"connection"</span>, (ws, req) =&gt; {
+  <span class="k">const</span> user = authenticate(req);                      <span class="c">// token from the URL or a header</span>
+  sockets.set(user, ws);
+  redis.set(<span class="s">`user:${user}`</span>, ME, <span class="s">"EX"</span>, <span class="n">90</span>);              <span class="c">// registry entry, refreshed by heartbeats</span>
+  ws.on(<span class="s">"message"</span>, m =&gt; chatService.handle(user, JSON.parse(m)));
+  ws.on(<span class="s">"close"</span>, () =&gt; { sockets.delete(user); redis.del(<span class="s">`user:${user}`</span>); });
+});
+sub.subscribe(<span class="s">`gw:${ME}`</span>);                               <span class="c">// the chat service publishes here</span>
+sub.on(<span class="s">"message"</span>, (_, frame) =&gt; { <span class="k">const</span> f = JSON.parse(frame); sockets.get(f.to)?.send(frame); });</code></pre>
+<pre><code><span class="k">CREATE TABLE</span> messages (
+  conv_id <span class="k">bigint</span>, bucket <span class="k">int</span>, seq <span class="k">bigint</span>,
+  msg_id <span class="k">bigint</span>, sender <span class="k">bigint</span>, body <span class="k">blob</span>,            <span class="c">-- ciphertext</span>
+  <span class="k">PRIMARY KEY</span> ((conv_id, bucket), seq)
+) <span class="k">WITH CLUSTERING ORDER BY</span> (seq <span class="k">DESC</span>);
+<span class="k">SELECT</span> * <span class="k">FROM</span> messages <span class="k">WHERE</span> conv_id = <span class="n">42</span> <span class="k">AND</span> bucket = <span class="n">2031</span> <span class="k">AND</span> seq &gt; <span class="n">317</span>;  <span class="c">-- sync</span></code></pre>
+    <p class="hint">Try it locally: <code>npx wscat -c ws://localhost:8080</code> to talk to a WebSocket server by hand, and <code>docker run -p 6379:6379 redis</code> for the registry. A single-node Cassandra (<code>docker run -p 9042:9042 cassandra</code>) wants a few GB of RAM, so treat it as optional.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>Pick it when…</th><th>Watch out for…</th></tr>
+      <tr><td>WebSockets</td><td>Two-way, low-latency messaging on apps and web</td><td>Stateful servers, reconnect storms, proxies and load balancers that must allow long connections</td></tr>
+      <tr><td>Long polling / server-sent events</td><td>Simple, mostly server-to-client updates; restrictive networks</td><td>Overhead per message; one-way only for server-sent events</td></tr>
+      <tr><td>Wide-column message store</td><td>Huge write volume, reads by conversation</td><td>No joins, query patterns fixed up front, partitions must stay bounded</td></tr>
+      <tr><td>Server-side group fan-out</td><td>Groups up to hundreds or a few thousand</td><td>Huge channels: switch to pub/sub where online members subscribe (Discord, Slack)</td></tr>
+      <tr><td>End-to-end encryption</td><td>Privacy is the product</td><td>No server-side search, moderation or history for new devices</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Buy or keep it in one box: a managed real-time service (Pusher, Ably, Firebase), or Socket.IO/Phoenix with Redis pub/sub and Postgres. Get the protocol right from day one, because it's the part that's hard to change later: client message IDs, per-conversation sequence numbers, acks, and “sync since”.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Dedicated gateway fleets in many regions, a registry and presence service, a sharded chat tier, ScyllaDB/Cassandra clusters with dedicated teams, region draining for failures, and E2E multi-device key management. Discord replaced 177 Cassandra nodes with 72 ScyllaDB nodes; that kind of migration is a multi-quarter project at this scale.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>What's evaluated: <b>connection management</b> (gateways, registry, capacity math), <b>message flow with acks</b>, <b>ordering</b> (per-conversation sequence), <b>offline delivery</b>, <b>storage choice with a partition key</b>, and <b>group fan-out</b>.</p>
+    <ul>
+      <li><b>Common mistakes:</b> “use WebSockets” without saying how one server finds another's user; ordering by timestamps; no acks (“fire and forget”); storing messages in one giant relational table with no partitioning plan; forgetting multiple devices; ignoring reconnect storms.</li>
+      <li><b>Likely follow-ups:</b> “How do you scale to 100,000-member channels?” (pub/sub, members pull), “How does presence work without melting the system?”, “What happens when a region fails?”, “How do you sync a new laptop?”, “How do you do search with E2E encryption?” (on the device).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Millions of connections per box</b> <span class="tag co">🏢 WhatsApp · 2012</span> <a href="https://blog.whatsapp.com/1-million-is-so-2011" target="_blank" rel="noopener">1 million is so 2011</a></div>
+      <p><b>How:</b> FreeBSD 8.2 with tuned kernel limits (max sockets 2.4 million, max files 3 million) and Erlang, on a 24-core Xeon box with about 100 GB of RAM, holding 2,277,845 TCP connections at about 42% idle CPU.</p>
+      <p><b>Why this method:</b> Erlang's lightweight processes make one process per connection cheap, so very few servers could serve a huge user base.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Messages partitioned by channel and time</b> <span class="tag co">🏢 Discord · 2017 &amp; 2023</span> <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages" target="_blank" rel="noopener">How Discord Stores Trillions of Messages</a></div>
+      <p><b>How:</b> after outgrowing MongoDB (around 100 million stored messages in 2015), Discord moved to Cassandra with key <code>((channel_id, bucket), message_id)</code>, buckets of about 10 days to stay under ~100 MB per partition (<a href="https://discord.com/blog/how-discord-stores-billions-of-messages" target="_blank" rel="noopener">2017 post</a>). In May 2022 it switched from 177 Cassandra nodes to 72 ScyllaDB nodes.</p>
+      <p><b>Why this method:</b> every read is “recent messages in a channel”, so one bounded partition per channel and time range keeps reads to a single sorted scan.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Gateways, channel servers, presence servers</b> <span class="tag co">🏢 Slack · 2023</span> <a href="https://slack.engineering/real-time-messaging/" target="_blank" rel="noopener">Real-time Messaging</a></div>
+      <p><b>How:</b> stateful Channel Servers are mapped to channels with consistent hashing (about 16 million channels per host at peak); Gateway Servers in multiple regions hold users' WebSocket subscriptions; Presence Servers track who is online. Messages reach users worldwide in about 500 ms.</p>
+      <p><b>Why this method:</b> splitting connection-holding (gateways near users) from channel ownership (one server per channel) lets each scale and fail independently; a replaced channel server is serving again in under 20 seconds.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Fan-out to every connected session</b> <span class="tag co">🏢 Discord · 2017</span> <a href="https://discord.com/blog/how-discord-scaled-elixir-to-5-000-000-concurrent-users" target="_blank" rel="noopener">How Discord Scaled Elixir to 5,000,000 Concurrent Users</a></div>
+      <p><b>How:</b> each user's WebSocket gets a session process; each server (“guild”) is a process on a remote Erlang node; anything published in a guild is fanned out to every connected session, including presence updates.</p>
+      <p><b>Why this method:</b> “most of it boils down to pub/sub”. The Erlang VM's cheap processes map naturally onto one process per session and per guild.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>End-to-end encryption by default</b> <span class="tag co">🏢 WhatsApp · 2016</span> <a href="https://www.whatsapp.com/security/WhatsApp-Security-Whitepaper.pdf" target="_blank" rel="noopener">WhatsApp Encryption Overview (whitepaper)</a></div>
+      <p><b>How:</b> built on the Signal Protocol (rollout <a href="https://signal.org/blog/whatsapp-complete/" target="_blank" rel="noopener">completed in April 2016</a>). For groups, the sender encrypts once with a “Sender Key” and the server does server-side fan-out of that single ciphertext.</p>
+      <p><b>Why this method:</b> the server can route and store messages without being able to read them, while group sends stay efficient.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · fewer nodes, faster tail</span>
+    <p>When Discord moved its message store from Cassandra to ScyllaDB, it went from <b>177 nodes to 72</b>, and reading historical messages went from a p99 of <b>40–125 ms to about 15 ms</b>; inserts went from 5–70 ms p99 to a steady 5 ms. Same data model, same partition key: the storage engine underneath made the difference.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Chat combines WebSockets (Lesson 0.4), consistent hashing (Lesson 2.4), wide-column storage (Lessons 2.1 and 2.2), pub/sub and Kafka (Lessons 3.1 and 3.2), idempotent retries (Lesson 3.3) and backoff with jitter (Lesson 4.4). Group fan-out is the news feed's push-vs-pull question again (Lesson 7.3); IDs come from Lesson 7.2; push notifications are Lesson 7.8. Streaming LLM responses to a chat UI use the same long-lived connections, usually server-sent events or WebSockets.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://slack.engineering/real-time-messaging/" target="_blank" rel="noopener">Slack: Real-time Messaging</a>. A short, clear tour of a production chat architecture with diagrams.</li>
+      <li><span class="kind">Blog</span> <a href="https://discord.com/blog/how-discord-stores-trillions-of-messages" target="_blank" rel="noopener">Discord: How Discord Stores Trillions of Messages</a>. Partitions, hot channels, request coalescing and a giant migration.</li>
+      <li><span class="kind">Docs</span> <a href="https://www.rfc-editor.org/rfc/rfc6455" target="_blank" rel="noopener">RFC 6455: The WebSocket Protocol</a>. The handshake, frames and ping/pong heartbeats underneath every chat app.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. 100M users are online at peak, each gateway holds 500,000 connections, and you want 50% headroom. How many gateway servers?</div>
+    <div class="opts"><button class="opt">About 30</button><button class="opt" data-ok>About 300</button><button class="opt">About 3,000</button></div>
+    <div class="explain">100M ÷ 500k = 200 servers; × 1.5 headroom = <b>300</b>. Then check memory: 500k × ~20 KB ≈ 10 GB per server, which fits comfortably.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A message arrives for Bob while his phone is offline. What should the system do?</div>
+    <div class="opts"><button class="opt">Keep it in the gateway's memory until he reconnects to that gateway</button><button class="opt" data-ok>It's already in the message store; send a push notification, and when Bob reconnects his device syncs everything after its last sequence number</button><button class="opt">Tell Alice the send failed and ask her to retry later</button></div>
+    <div class="explain">Store first, deliver later. Gateways are disposable and Bob may reconnect anywhere, so the durable store plus “sync since seq” is the source of truth; APNs/FCM just wakes the app.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. How do you make sure everyone in a group sees messages in the same order?</div>
+    <div class="opts"><button class="opt">Sort by the timestamp each phone attaches when sending</button><button class="opt">Take a global lock for every message in the system</button><button class="opt" data-ok>One owner per conversation assigns increasing sequence numbers; clients sort by them and fill gaps</button></div>
+    <div class="explain">Phone clocks drift and can be wrong by minutes, and a global lock would serialise the whole planet. Ordering only needs to hold within a conversation, so one sequencer per conversation is enough, and it shards naturally by conversation ID.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>500M users → ~230k messages/s, ~2 TB/day of text, ~150M open WebSockets → hundreds of gateway servers at ~500k connections each.</li>
+      <li>Stateful gateways hold sockets; a registry (user → gateway, TTL by heartbeat) routes messages; chat logic lives behind the gateways.</li>
+      <li>Store first with a per-conversation sequence number, deliver at least once with device acks, dedupe by message ID, sync “since seq” on reconnect, push notifications for offline devices.</li>
+      <li>Wide-column store keyed by (conversation, time bucket); server-side group fan-out; presence only to those watching; E2E means the server sees only ciphertext.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const human = n => n >= 1e9 ? (n / 1e9).toFixed(1) + "B" : n >= 1e6 ? (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M" : n >= 1e3 ? Math.round(n / 1e3) + "k" : Math.round(n) + "";
+
+  // ---------- message delivery simulator ----------
+  const F = new Flow($("cf"), { width: 790, height: 300 });
+  F.node("alice", { x: 60, y: 150, w: 100, label: "📱 Alice", sub: "", kind: "cl" })
+   .node("gw1", { x: 190, y: 150, w: 110, label: "Gateway 1", sub: "", kind: "sv" })
+   .node("chat", { x: 365, y: 150, w: 130, label: "Chat service", sub: "assigns seq", kind: "sv" })
+   .node("reg", { x: 365, y: 45, w: 150, label: "⚡ Session registry", sub: "bob → gw2", kind: "ca" })
+   .node("store", { x: 365, y: 258, w: 150, label: "🗄️ Message store", sub: "0 messages", kind: "db" })
+   .node("gw2", { x: 560, y: 60, w: 110, label: "Gateway 2", sub: "", kind: "sv" })
+   .node("gw3", { x: 560, y: 160, w: 110, label: "Gateway 3", sub: "", kind: "sv" })
+   .node("push", { x: 560, y: 258, w: 130, label: "🔔 Push (APNs/FCM)", sub: "", kind: "nw" })
+   .node("bob", { x: 715, y: 60, w: 100, label: "📱 Bob", sub: "online", kind: "cl" })
+   .node("carol", { x: 715, y: 160, w: 100, label: "📱 Carol", sub: "online", kind: "cl" })
+   .node("dan", { x: 715, y: 258, w: 100, label: "📱 Dan", sub: "offline", kind: "cl" })
+   .edge("alice", "gw1").edge("gw1", "chat").edge("chat", "reg").edge("chat", "store")
+   .edge("chat", "gw2").edge("chat", "gw3").edge("chat", "push")
+   .edge("gw2", "bob").edge("gw3", "carol").edge("push", "dan", { dashed: true }).edge("gw3", "bob", { hidden: true }).render();
+  const getAck = seg("ack", () => {});
+  let S;
+  function reset() {
+    S = { seq: { ab: 0, g: 0 }, msgs: [], bobOnline: true, bobGw: "gw2", gw2Down: false, dup: 0, lost: 0, busy: false, log: [] };
+    F.set("gw2", { down: false, sub: "" }).set("bob", { sub: "online", down: false }).set("reg", { sub: "bob → gw2" }).set("dan", { sub: "offline" });
+    F.edgeStyle("gw3", "bob", { hidden: true }).edgeStyle("gw2", "bob", { hidden: false });
+    $("bobToggle").textContent = "Bob goes offline";
+    paint();
+  }
+  const tick = m => m.state === "read" ? "👁" : m.state === "delivered" ? "✓✓" : m.state === "lost" ? "✗ lost" : m.state === "waiting" ? "✓ 🔔" : "✓";
+  function paint() {
+    const c = st => S.msgs.filter(m => m.state === st).length;
+    const uniq = new Set(S.msgs.map(m => m.id)).size;
+    $("mSt").textContent = uniq;
+    $("mDl").textContent = c("delivered") + c("read");
+    $("mWt").textContent = c("waiting");
+    $("mLs").textContent = S.lost; $("mLs").style.color = S.lost ? "var(--bad)" : "";
+    $("mDp").textContent = S.dup;
+    F.set("store", { sub: `${uniq} message${uniq === 1 ? "" : "s"}` });
+    $("mlog").innerHTML = S.log.slice(-12).map(x => `<div>${x}</div>`).join("") || "<div class='muted'>No messages yet.</div>";
+    $("mlog").scrollTop = 1e6;
+  }
+  const log = s => { S.log.push(s); paint(); };
+  function store(conv, to, seq, id) { // one delivery record per recipient; same seq and id for the whole group
+    const m = { id, conv, seq, to, state: "stored" };
+    S.msgs.push(m); return m;
+  }
+  const label = m => `${m.conv === "ab" ? "Alice→Bob" : "group"} seq ${m.seq} to ${m.to}`;
+  async function deliver(m, crash) {
+    if (m.to === "dan" || (m.to === "bob" && !S.bobOnline)) {
+      m.state = "waiting";
+      await F.packet(["chat", "push", m.to], { color: "--c-nw", dur: 450 });
+      log(`🔔 ${label(m)}: device offline → push notification sent, message waits in the store`);
+      return;
+    }
+    const gw = m.to === "carol" ? "gw3" : S.bobGw;
+    await F.packet(["chat", "reg"], { color: "--c-ca", dur: 250, back: true });
+    if (crash) {
+      await F.packet(["chat", gw, m.to], { color: "--c-cl", dur: 450 });
+      S.gw2Down = true; F.set("gw2", { down: true, sub: "crashed" }).set("bob", { sub: "reconnecting…" });
+      if (getAck() === "off") {
+        m.state = "lost"; S.lost++;
+        log(`💥 ${label(m)}: gateway died before the device rendered it. Fire and forget, so the server thinks it was delivered. Lost.`);
+      } else {
+        m.state = "stored";
+        log(`💥 ${label(m)}: the device got it, but the gateway died before the ack came back. No ack → the server will resend.`);
+      }
+      await sleep(900);
+      S.bobGw = "gw3"; F.set("reg", { sub: "bob → gw3" }).set("bob", { sub: "online (gw3)" });
+      F.edgeStyle("gw2", "bob", { hidden: true }).edgeStyle("gw3", "bob", { hidden: false });
+      await F.packet(["bob", "gw3", "chat"], { color: "--c-cl", dur: 400 });
+      log(`🔌 Bob reconnected to gateway 3 and sent “sync since seq ${m.seq - 1}”.`);
+      if (getAck() === "on") {
+        await F.packet(["chat", "gw3", "bob"], { color: "--c-cl", dur: 400 });
+        S.dup++; m.state = "delivered";
+        await F.packet(["bob", "gw3", "chat", "gw1", "alice"], { color: "--c-db", dur: 500 });
+        log(`♻️ Resent seq ${m.seq}. Bob's phone already had msg ${m.id}: duplicate dropped, ✓✓ sent to Alice.`);
+      } else log(`… the server has nothing pending for Bob (it assumed delivery), so seq ${m.seq} never shows up live.`);
+      return;
+    }
+    await F.packet(["chat", gw, m.to], { color: "--c-cl", dur: 450 });
+    if (getAck() === "on") {
+      await F.packet([m.to, gw, "chat", "gw1", "alice"], { color: "--c-db", dur: 450 });
+      m.state = "delivered";
+      log(`✓✓ ${label(m)}: delivered, ack returned to Alice`);
+    } else { m.state = "delivered"; log(`→ ${label(m)}: handed to ${gw} (no ack: the server just hopes)`); }
+  }
+  async function send(targets, conv, crash) {
+    if (S.busy) return; S.busy = true;
+    await F.packet(["alice", "gw1", "chat", "store"], { color: "--c-cl", dur: 450 });
+    const seq = ++S.seq[conv], id = 1000 + (S.nextId = (S.nextId || 0) + 1);
+    const ms = targets.map(t => store(conv, t, seq, id));
+    await F.packet(["chat", "gw1", "alice"], { color: "--c-db", dur: 350 });
+    log(`✓ stored ${conv === "ab" ? "Alice→Bob" : "group"} seq ${S.seq[conv]}${targets.length > 1 ? `, fanning out to ${targets.length} members` : ""}`);
+    if (targets.length > 1) await Promise.all(ms.map((m, i) => sleep(i * 150).then(() => deliver(m, false))));
+    else await deliver(ms[0], crash);
+    S.busy = false; paint();
+  }
+  $("toBob").onclick = () => send(["bob"], "ab", false);
+  $("toGroup").onclick = () => send(["bob", "carol", "dan"], "g", false);
+  $("crash").onclick = () => {
+    if (!S.bobOnline) { log("Bob is offline: bring him online first, so there's a live delivery to interrupt."); return; }
+    if (S.bobGw !== "gw2") { log("Bob already moved to gateway 3. Press Reset to try the crash again."); return; }
+    send(["bob"], "ab", true);
+  };
+  $("bobToggle").onclick = async () => {
+    if (S.busy) return; S.busy = true;
+    S.bobOnline = !S.bobOnline;
+    const gw = S.bobGw;
+    if (!S.bobOnline) {
+      F.set("bob", { sub: "offline" }).set("reg", { sub: "bob: offline" });
+      $("bobToggle").textContent = "Bob comes online";
+      log("📴 Bob's phone went offline; his registry entry expired.");
+    } else {
+      F.set("bob", { sub: `online (${gw})` }).set("reg", { sub: `bob → ${gw}` });
+      $("bobToggle").textContent = "Bob goes offline";
+      const pend = S.msgs.filter(m => m.to === "bob" && m.state === "waiting").sort((a, b) => (a.conv + a.seq).localeCompare(b.conv + b.seq));
+      await F.packet(["bob", gw, "chat"], { color: "--c-cl", dur: 400 });
+      log(`🔌 Bob is back and syncs: ${pend.length} waiting message${pend.length === 1 ? "" : "s"}.`);
+      for (const m of pend) {
+        await F.packet(["store", "chat", gw, "bob"], { color: "--c-cl", dur: 400 });
+        m.state = "delivered";
+        log(`✓✓ ${label(m)} delivered on sync, in sequence order`);
+      }
+      if (pend.length) await F.packet(["chat", "gw1", "alice"], { color: "--c-db", dur: 350 });
+    }
+    S.busy = false; paint();
+  };
+  $("bobRead").onclick = async () => {
+    if (S.busy) return;
+    const unread = S.msgs.filter(m => m.to === "bob" && m.state === "delivered");
+    if (!S.bobOnline || !unread.length) { log(S.bobOnline ? "Bob has nothing new to read." : "Bob is offline."); return; }
+    S.busy = true;
+    await F.packet(["bob", S.bobGw, "chat", "gw1", "alice"], { color: "--c-ca", dur: 500 });
+    unread.forEach(m => (m.state = "read"));
+    log(`👁 Bob read ${unread.length} message${unread.length === 1 ? "" : "s"}; one small “read up to” receipt went back to Alice.`);
+    S.busy = false; paint();
+  };
+  $("cReset").onclick = reset;
+  reset();
+
+  // ---------- connection capacity + reconnect storm ----------
+  const DAUS = [5e7, 1e8, 5e8, 1e9, 2e9], CPS = [5e4, 1e5, 2.5e5, 5e5, 1e6, 2e6], CAP = 1e5, RAM = 64;
+  function cap() {
+    const dau = DAUS[+$("dau").value], onl = +$("onl").value / 100, cps = CPS[+$("cps").value], kb = +$("kb").value, hb = +$("hb").value;
+    $("dauv").textContent = human(dau); $("onlv").textContent = Math.round(onl * 100) + "%";
+    $("cpsv").textContent = human(cps); $("kbv").textContent = kb + " KB"; $("hbv").textContent = hb + " s";
+    const conns = dau * onl, servers = Math.ceil(conns / cps * 1.5), ramGB = cps * kb / 1e6;
+    $("cConn").textContent = human(conns);
+    $("cSrv").textContent = servers.toLocaleString("en-US");
+    $("cRam").textContent = `${ramGB.toFixed(ramGB < 10 ? 1 : 0)} GB of ${RAM}`;
+    $("cRam").style.color = ramGB > RAM * 0.8 ? "var(--bad)" : "";
+    $("cHb").textContent = human(conns / hb) + " /s";
+    return { cps };
+  }
+  const goodput = (a, capB) => a <= capB ? a : capB * capB / a; // overload: useful work collapses
+  function storm(N) {
+    const dt = 0.5, capB = CAP * dt, T = 150, B = T / dt;
+    // instant retry: every failed client retries every 0.2 s
+    let P = N; const imm = []; let tImm = null;
+    for (let b = 0; b < B; b++) {
+      const a = P * 2.5, s = Math.min(P, goodput(a, capB)); P -= s;
+      imm.push([b * dt, 100 * (1 - P / N)]);
+      if (tImm === null && P < 1) tImm = (b + 1) * dt;
+    }
+    // exponential backoff with full jitter: attempt k waits uniform(0, min(64, 2^(k+1))) s
+    const K = 12, sched = [...Array(K)].map(() => new Float64Array(B + 300));
+    for (let b = 0; b < 4; b++) sched[0][b] = N / 4; // first try within 2 s
+    let done = 0; const jit = []; let tJit = null;
+    for (let b = 0; b < B; b++) {
+      let A = 0; for (let k = 0; k < K; k++) A += sched[k][b];
+      if (A > 0) {
+        const fr = goodput(A, capB) / A;
+        for (let k = 0; k < K; k++) {
+          const x = sched[k][b]; if (!x) continue;
+          done += x * fr; const f = x * (1 - fr);
+          if (f > 0) { const kk = Math.min(K - 1, k + 1), nb = Math.max(1, Math.round(Math.min(64, 2 ** (k + 1)) / dt)); for (let j = 1; j <= nb; j++) sched[kk][b + j] += f / nb; }
+        }
+      }
+      jit.push([b * dt, 100 * Math.min(1, done / N)]);
+      if (tJit === null && done >= N - 1) tJit = (b + 1) * dt;
+    }
+    return { imm, jit, tImm, tJit };
+  }
+  function runStorm() {
+    const { cps } = cap();
+    const r = storm(cps);
+    Plot.line($("sc"), { series: [
+      { label: "instant retry: % reconnected", color: MX.css("--c-er"), data: r.imm },
+      { label: "backoff + jitter: % reconnected", color: MX.css("--c-db"), data: r.jit, fill: true } ],
+      xLabel: "seconds after the server died", yMin: 0, yMax: 100 });
+    const f = t => t === null ? "> 150 s" : t.toFixed(t < 10 ? 1 : 0) + " s";
+    $("tImm").textContent = f(r.tImm); $("tJit").textContent = f(r.tJit);
+    $("tImm").style.color = r.tImm === null || (r.tJit !== null && r.tImm > r.tJit) ? "var(--bad)" : "";
+    $("cmsg").textContent = cps <= CAP ? `${human(cps)} clients is less than one second of session-service capacity: any retry policy works. Raise connections per server.` :
+      `${human(cps)} clients hit a service that handles ${human(CAP)}/s. Instant retries multiply the load and most of it is wasted on failures; jittered backoff spreads the herd so the service stays useful.`;
+  }
+  ["dau", "onl", "cps", "kb", "hb"].forEach(id => ($(id).oninput = () => { cap(); }));
+  $("cps").oninput = () => { cap(); runStorm(); };
+  $("killGw").onclick = runStorm;
+  cap(); runStorm();
+})();
+</script>
+</body>
+</html>

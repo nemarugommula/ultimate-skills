@@ -1,0 +1,547 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>0.5 Calling models: chat APIs, sampling, streaming, SDKs · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  textarea, .txt { width: 100%; box-sizing: border-box; font-family: var(--mono); font-size: .86rem; padding: 6px 8px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); }
+  .txt { width: 160px; }
+  pre.wire { max-height: 320px; overflow: auto; font-size: .78rem; white-space: pre-wrap; word-break: break-word; }
+  .answer { font-size: 1rem; padding: 10px 12px; border: 1px solid var(--line); border-left: 4px solid var(--c-md); border-radius: 10px; background: var(--bg2); min-height: 44px; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+</style>
+</head>
+<body data-lesson="a0-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 0 · Lesson 5</div>
+  <h1>Calling models: chat APIs, sampling, streaming, SDKs</h1>
+  <p class="subtitle">An LLM call is an HTTP request with a JSON body. Know exactly what's in it, what comes back, and what to do when it fails.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>Temperature and top-p change how the next token is chosen (Lesson 0.2).</li>
+      <li>You pay per input and output token; output is generated one token at a time, so TTFT (time to first token) ≠ total time (Lesson 0.3).</li>
+      <li>Providers offer small, balanced and frontier models, some with a reasoning-effort knob (Lesson 0.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>When OpenAI opened the model behind ChatGPT to developers as an API, <code>gpt-3.5-turbo</code>, it was priced at <b>$0.002 per 1,000 tokens</b>, which OpenAI said was <b>10× cheaper</b> than its existing GPT-3.5 models. Snap, Quizlet, Instacart and Shopify were among the early builders named in the announcement.</p>
+    <p>Suddenly a chat model was one HTTP request away for any developer. That's the moment AI engineering as a job really starts: the hard part stopped being the model and became <b>everything around the request</b>.</p>
+  </div>
+
+  <h2>Numbers first: what one call contains</h2>
+  <table>
+    <tr><th>Part of the request</th><th>Example</th><th>Tokens (typical)</th></tr>
+    <tr><td class="in">System prompt</td><td>“You are a concise support assistant for Acme…”</td><td class="tk">200–3,000</td></tr>
+    <tr><td class="cx">Conversation history</td><td>Every earlier user and assistant message</td><td class="tk">grows every turn</td></tr>
+    <tr><td class="in">The new user message</td><td>“Where is my refund?”</td><td class="tk">10–200</td></tr>
+    <tr><td>Parameters</td><td><code>model</code>, <code>max_tokens</code>, streaming, effort…</td><td class="tk">0 (not billed)</td></tr>
+    <tr><td class="md">Response</td><td>The answer + <code>stop_reason</code> + <code>usage</code> (token counts)</td><td class="tk">your output tokens</td></tr>
+  </table>
+  <p>Chat APIs like Anthropic's Messages API are <b>stateless</b>: the model remembers nothing between calls, so <b>you resend the whole conversation every turn</b>. (OpenAI's Responses API can optionally keep state server-side with <code>previous_response_id</code>; you're still billed for the history as input.)</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    A model call is just <b>messages in, message out</b>: a list of role-tagged messages (system, user, assistant), a few parameters, and a response with text, a stop reason and token usage. Everything production-grade (streaming, retries, structured output, tools) is built on that one request shape. Treat it like any remote API that is <b>slow, metered and sometimes unavailable</b>.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a brilliant contractor with no memory</span>
+    <p>Every morning the contractor arrives with no memory of yesterday. So each job ticket must include the standing instructions (system prompt), the whole email thread so far (history) and today's request (user message). You pay by the word read and the word written. Sometimes the office is too busy and says “come back in 20 seconds” (a 429). A good dispatcher waits, doesn't send the same ticket 50 times, and has a second contractor on call.</p>
+  </div>
+
+  <h2>Roles and the request shape</h2>
+  <ul>
+    <li><b class="in">system</b>: standing instructions and persona. Anthropic takes it as a top-level <code>system</code> field; OpenAI's Responses API as <code>instructions</code> (or a system/developer message).</li>
+    <li><b class="in">user</b>: what the person (or your code) asks.</li>
+    <li><b class="md">assistant</b>: the model's earlier replies, which you send back as history.</li>
+    <li>Tool calls and tool results are extra message types (Lessons 1.3 and 6.2).</li>
+  </ul>
+
+  <h3>Parameters you'll set</h3>
+  <table>
+    <tr><th>Parameter</th><th>What it does</th><th>Watch out for</th></tr>
+    <tr><td><code>model</code></td><td>Which model (and snapshot) to run</td><td>Pin a specific ID in production; aliases can move</td></tr>
+    <tr><td><code>max_tokens</code> (Anthropic) / <code>max_output_tokens</code> (OpenAI Responses)</td><td>Hard cap on generated tokens</td><td>Hit the cap and the answer is <b>cut off mid-sentence</b> (<code>stop_reason: "max_tokens"</code>; OpenAI: <code>status: "incomplete"</code>). On OpenAI it includes reasoning tokens</td></tr>
+    <tr><td><code>temperature</code>, <code>top_p</code></td><td>Sampling randomness (Lesson 0.2)</td><td>As of Oct 2026 many frontier models reject them: Anthropic's Claude 4.7+ models (and API version 2026-10-21 for every model); OpenAI when reasoning effort isn't <code>none</code>. Open models via vLLM/Ollama still accept them</td></tr>
+    <tr><td><code>stop_sequences</code> (Anthropic) / <code>stop</code> (Chat Completions)</td><td>End generation when a string appears</td><td>The Responses API has no stop parameter</td></tr>
+    <tr><td>effort / reasoning</td><td>How much the model thinks first (Lesson 0.4)</td><td>More effort = more output tokens and latency</td></tr>
+    <tr><td><code>stream</code></td><td>Send tokens as they're generated</td><td>Errors can arrive mid-stream, after a 200 OK</td></tr>
+    <tr><td>structured output</td><td>Force JSON that matches a schema</td><td>Covered properly in Lesson 1.3</td></tr>
+  </table>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what statelessness costs</span>
+    <p>A chat with a 500-token system prompt. Each turn the user writes 100 tokens and the assistant replies with 300.</p>
+    <ul>
+      <li>Turn 1 input: 500 + 100 = <b>600</b> tokens.</li>
+      <li>Turn 10 input: 500 + 9 × (100 + 300) + 100 = <b>4,200</b> tokens.</li>
+      <li>Total input over 10 turns: 600 + 1,000 + … + 4,200 = <b>24,000</b> tokens, versus 6,000 if each turn only sent the system prompt and the new message. Long chats cost <b>4×</b> more input here, and it keeps growing roughly with the square of the number of turns.</li>
+    </ul>
+    <p>That's why prompt caching (the history is a stable prefix), summarizing old turns and trimming history matter (Lessons 1.4, 6.4).</p>
+  </div>
+
+  <div class="playground" id="pg-req">
+    <span class="label">🎮 Playground · Build a request, watch it stream</span>
+    <p class="hint">Pick an API style, edit the messages and parameters, and press <b>Send</b>. You'll see the exact HTTP request (key redacted) and a simulated response: streamed as server-sent events, or as one JSON body. Then break it: add <code>temperature</code> on a frontier model, set max tokens to 20, add a stop sequence like <code>Plus</code>. No real API is called; the reply is scripted.</p>
+    <div class="controls">
+      <span class="seg" id="apiSeg"><button id="api-anthropic" class="on">Anthropic Messages</button><button id="api-openai">OpenAI Responses</button><button id="api-compat">Open model (vLLM, OpenAI-compatible)</button></span>
+    </div>
+    <div class="two-col">
+      <div>
+        <label class="muted">system</label>
+        <textarea id="sys" rows="2">You are a concise support assistant for Acme Gear.</textarea>
+        <label class="muted">user</label>
+        <textarea id="usr" rows="2">Where is my refund? I'm a Plus member.</textarea>
+      </div>
+      <div>
+        <div class="controls">
+          <label>max tokens <input type="range" id="maxTok" min="5" max="200" step="5" value="120"> <b class="mono" id="maxTokv"></b></label>
+        </div>
+        <div class="controls">
+          <label><input type="checkbox" id="useTemp"> send temperature <input type="range" id="temp" min="0" max="1.5" step="0.1" value="0.2"> <b class="mono" id="tempv"></b></label>
+        </div>
+        <div class="controls">
+          <label>stop sequence <input class="txt" id="stopSeq" placeholder="(none)"></label>
+          <label id="effortLbl">effort <select id="effort" class="btn small"><option value="none">none</option><option value="low" selected>low</option><option value="medium">medium</option></select></label>
+        </div>
+        <div class="controls">
+          <label><input type="checkbox" id="stream" checked> stream</label>
+          <button class="btn primary" id="send">▶ Send</button>
+        </div>
+      </div>
+    </div>
+    <pre class="wire" id="reqOut"></pre>
+    <div class="answer" id="answer"><span class="muted">The answer appears here.</span></div>
+    <pre class="wire" id="respOut">(response events appear here)</pre>
+    <div class="stat-row">
+      <div class="stat">HTTP status <b id="rStatus">–</b></div>
+      <div class="stat">time to first token <b id="rTtft">–</b></div>
+      <div class="stat">total <b id="rTotal">–</b></div>
+      <div class="stat">input / output tokens <b id="rTok">–</b></div>
+      <div class="stat">stop reason <b id="rStop">–</b></div>
+    </div>
+    <div class="verdict" id="reqMsg"></div>
+  </div>
+  <p>What you should see: streaming shows the first words after about half a second while the non-streamed version shows nothing until the end. A frontier Claude or OpenAI model at non-<code>none</code> effort rejects <code>temperature</code> with a 400 error, while the open model happily accepts it. A tight max-tokens cap cuts the answer off and tells you so in the stop reason: always check it.</p>
+
+  <h2>Streaming: server-sent events</h2>
+  <p>With <code>stream: true</code> the HTTP response stays open and the server sends <b>server-sent events</b> (SSE), plain-text lines like <code>event: …</code> and <code>data: {json}</code>, as tokens are generated. Anthropic's stream goes <code>message_start</code> → <code>content_block_start</code> → many <code>content_block_delta</code> → <code>content_block_stop</code> → <code>message_delta</code> (stop reason, final usage) → <code>message_stop</code>, with occasional <code>ping</code>s. OpenAI's Responses stream sends typed events such as <code>response.created</code>, <code>response.output_text.delta</code> and <code>response.completed</code>.</p>
+  <ul>
+    <li>Streaming cuts <b>perceived</b> latency to TTFT; total time is the same.</li>
+    <li>Your server must pass the stream through (don't buffer it in a proxy), and your UI must render partial text.</li>
+    <li>Errors can arrive <b>inside</b> a stream that started with 200 OK; handle an error event and a dropped connection.</li>
+    <li>For very long generations, streaming (or the batch API) also avoids idle-connection timeouts.</li>
+  </ul>
+
+  <h2>When calls fail</h2>
+  <table>
+    <tr><th>Status</th><th>Meaning (Anthropic error type)</th><th>Retry?</th></tr>
+    <tr><td>400</td><td><code>invalid_request_error</code>: bad parameter, unsupported setting, too many tokens</td><td class="rk">No: fix the request</td></tr>
+    <tr><td>401 / 403</td><td><code>authentication_error</code> / <code>permission_error</code></td><td class="rk">No: fix keys or access</td></tr>
+    <tr><td>404 / 413</td><td><code>not_found_error</code> (wrong model ID or path) / <code>request_too_large</code></td><td class="rk">No</td></tr>
+    <tr><td>429</td><td><code>rate_limit_error</code>: too many requests or tokens per minute, or a spend cap</td><td class="ev">Yes, with backoff and the <code>retry-after</code> header; but a spend-cap 429 has no <code>retry-after</code> and keeps failing</td></tr>
+    <tr><td>500 / 504</td><td><code>api_error</code> / <code>timeout_error</code></td><td class="ev">Yes, with exponential backoff (stream long requests)</td></tr>
+    <tr><td>529 (OpenAI: 503)</td><td><code>overloaded_error</code> (OpenAI: <code>server_is_overloaded</code>)</td><td class="ev">Yes, with backoff; consider a fallback model or provider</td></tr>
+  </table>
+  <p>The standard fix for transient errors is <b>exponential backoff with jitter</b>: wait 0.5 s, 1 s, 2 s, 4 s… (doubling, with a cap), each wait randomized so thousands of clients don't retry in lockstep, and give up after a few tries. Both the OpenAI and Anthropic SDKs already retry connection errors, 429s and 5xx errors <b>twice by default</b> with backoff; you can raise that with <code>max_retries</code>.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: a backoff schedule</span>
+    <p>Base 0.5 s, factor 2, 5 retries: waits of 0.5, 1, 2, 4, 8 s = <b>15.5 s</b> worst case before giving up. With <b>full jitter</b> each wait is a random value between 0 and that number, so the average total is about 7.75 s, and twenty clients that failed together spread out instead of hitting the server again at the same instant. If the server sends <code>retry-after: 3</code>, wait at least 3 s instead.</p>
+  </div>
+
+  <div class="playground" id="pg-retry">
+    <span class="label">🎮 Playground · Rate limits and retries</span>
+    <p class="hint">A batch job: 200 documents, 20 workers, each request takes 2 s. The provider allows about 5 requests per second, so many requests get a 429. Pick a retry strategy and run it. Compare the time to finish, failed jobs and wasted calls. Then tick “spend cap reached”: a 429 that never clears.</p>
+    <div class="controls">
+      <label>strategy <select id="strat" class="btn small">
+        <option value="none">No retries</option>
+        <option value="immediate">Retry immediately</option>
+        <option value="exp">Exponential backoff</option>
+        <option value="jitter">Exponential backoff + jitter</option>
+        <option value="ra" selected>Honor retry-after (+ a little jitter)</option>
+      </select></label>
+      <label>max retries <input type="range" id="maxRetry" min="0" max="12" step="1" value="10"> <b class="mono" id="maxRetryv"></b></label>
+      <label><input type="checkbox" id="quota"> spend cap reached (429s never clear)</label>
+      <button class="btn primary" id="simRun">▶ Run</button>
+      <button class="btn small" id="simAll">Compare all strategies</button>
+    </div>
+    <canvas class="chart" id="simChart" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">jobs done <b id="sDone">–</b></div>
+      <div class="stat">jobs failed <b id="sFail">–</b></div>
+      <div class="stat">requests sent <b id="sSent">–</b></div>
+      <div class="stat">429s <b id="s429">–</b></div>
+      <div class="stat">time to finish <b id="sTime">–</b></div>
+    </div>
+    <div class="verdict" id="simMsg"></div>
+    <p class="hint">A simplified token-bucket rate limiter; real limits are per minute on requests and on tokens (RPM, TPM). The best possible finish here is 40 s (200 jobs ÷ 5 per second).</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>The provider SDKs: <b>OpenAI</b> (<code>pip install openai</code>), <b>Anthropic</b> (<code>pip install anthropic</code>), <b>Google Gen AI</b> (<code>pip install google-genai</code>); and provider-agnostic layers such as <b>LiteLLM</b>, which calls 100+ models in the OpenAI format and adds retries and fallbacks. Open models served by <b>vLLM</b> or <b>Ollama</b> expose an OpenAI-compatible endpoint, so the OpenAI SDK works with a different <code>base_url</code>.</p>
+<pre><code><span class="k">import</span> anthropic
+<span class="k">from</span> openai <span class="k">import</span> OpenAI
+
+<span class="c"># Anthropic Messages API: system is top-level, history goes in messages</span>
+claude = anthropic.Anthropic(max_retries=<span class="n">4</span>)          <span class="c"># default is 2</span>
+msg = claude.messages.create(
+    model=<span class="s">"claude-sonnet-5-5"</span>,
+    max_tokens=<span class="n">500</span>,
+    system=<span class="s">"You are a concise support assistant."</span>,
+    messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">"Where is my refund?"</span>}],
+)
+text = <span class="s">""</span>.join(b.text <span class="k">for</span> b <span class="k">in</span> msg.content <span class="k">if</span> b.type == <span class="s">"text"</span>)  <span class="c"># skip thinking blocks</span>
+<span class="k">if</span> msg.stop_reason == <span class="s">"max_tokens"</span>:
+    <span class="k">raise</span> RuntimeError(<span class="s">"answer was cut off"</span>)
+print(text, msg.usage.input_tokens, msg.usage.output_tokens)
+
+<span class="k">with</span> claude.messages.stream(                           <span class="c"># streaming (SSE) helper</span>
+    model=<span class="s">"claude-sonnet-5-5"</span>, max_tokens=<span class="n">500</span>,
+    messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">"Where is my refund?"</span>}],
+) <span class="k">as</span> stream:
+    <span class="k">for</span> chunk <span class="k">in</span> stream.text_stream:
+        print(chunk, end=<span class="s">""</span>, flush=<span class="k">True</span>)
+
+<span class="c"># OpenAI Responses API</span>
+oai = OpenAI(max_retries=<span class="n">4</span>)
+r = oai.responses.create(
+    model=<span class="s">"gpt-6-luna"</span>,
+    instructions=<span class="s">"You are a concise support assistant."</span>,
+    input=<span class="s">"Where is my refund?"</span>,
+    max_output_tokens=<span class="n">500</span>,
+)
+print(r.output_text, r.usage)
+
+<span class="k">for</span> event <span class="k">in</span> oai.responses.create(model=<span class="s">"gpt-6-luna"</span>, input=<span class="s">"Where is my refund?"</span>, stream=<span class="k">True</span>):
+    <span class="k">if</span> event.type == <span class="s">"response.output_text.delta"</span>:
+        print(event.delta, end=<span class="s">""</span>, flush=<span class="k">True</span>)
+
+<span class="c"># Google Gen AI SDK (Interactions API)</span>
+<span class="k">from</span> google <span class="k">import</span> genai
+interaction = genai.Client().interactions.create(model=<span class="s">"gemini-3.8-flash"</span>, input=<span class="s">"Where is my refund?"</span>)
+print(interaction.output_text)
+
+<span class="c"># Provider-agnostic: LiteLLM with retries and a fallback model</span>
+<span class="k">import</span> litellm
+resp = litellm.completion(
+    model=<span class="s">"anthropic/claude-haiku-5-5"</span>,
+    messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">"Where is my refund?"</span>}],
+    max_tokens=<span class="n">300</span>, num_retries=<span class="n">3</span>, fallbacks=[<span class="s">"openai/gpt-6-luna"</span>],
+)
+print(resp.choices[<span class="n">0</span>].message.content)</code></pre>
+    <p class="hint">Model IDs and SDK shapes are current as of October 2026 (official quickstarts). Anthropic's Python SDK 2.0 switches to API version 2026-10-21, which drops <code>temperature</code>, <code>top_p</code> and <code>top_k</code>. Read provider changelogs when you upgrade SDKs.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Provider SDK directly</td><td>Every feature (caching, thinking, batch, tools) on day one; typed errors</td><td>Code tied to one provider's request shape</td></tr>
+      <tr><td>LiteLLM / gateway layer</td><td>One interface, fallbacks, cost tracking, easy model swaps</td><td>New features arrive later; a translation layer to debug</td></tr>
+      <tr><td>Streaming</td><td>Fast perceived response, no idle timeouts</td><td>More complex client and error handling; harder to post-process</td></tr>
+      <tr><td>Aggressive retries</td><td>Fewer user-visible failures</td><td>Amplifies overload, burns quota, long tail latency</td></tr>
+      <tr><td>Fallback to another model</td><td>Survives provider outages</td><td>Different behaviour and formats: needs its own evals</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Startup</h4><p>One provider SDK, streaming on, the SDK's built-in retries, a timeout, and logging of <code>usage</code> and request IDs on every call. Add LiteLLM or a fallback provider once an outage has hurt you, or before a big launch.</p></div>
+      <div><h4>Big tech</h4><p>All calls go through an internal LLM gateway: auth, quotas per team, retries with jitter, circuit breakers, multi-provider fallbacks, prompt and response logging with PII controls, and cost attribution. Product code calls the gateway, never a provider directly.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Your LLM feature starts failing at peak traffic. What do you do?” A senior answer:</p>
+    <ul>
+      <li>Reads the errors first: 429 (rate or quota), 529/503 (provider overload), 400 (our bug), timeouts.</li>
+      <li>Transient errors: exponential backoff with jitter, honor <code>retry-after</code>, cap retries, set timeouts; never retry 400s.</li>
+      <li>Capacity: request higher limits or provisioned throughput, smooth bursts with a queue, cut tokens per request (Lesson 0.3).</li>
+      <li>Resilience: a fallback model or provider behind a gateway, streaming for long outputs, alerts on error rates and spend.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The event stream, documented</b> <span class="tag co">🏢 Anthropic</span> <a href="https://platform.claude.com/docs/en/build-with-claude/streaming" target="_blank" rel="noopener">Streaming messages</a></div>
+      <p><b>How:</b> with <code>stream: true</code>, responses arrive as SSE events (message_start, content_block_delta…, message_delta, message_stop), and the SDKs offer helpers that yield text or assemble the final message.</p>
+      <p><b>Why this method:</b> users see text immediately, and long generations don't hit idle-connection timeouts; the docs recommend streaming or batches for long requests.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Not every 429 is temporary</b> <span class="tag co">🏢 OpenAI</span> <a href="https://developers.openai.com/api/docs/guides/deployment-checklist" target="_blank" rel="noopener">API deployment checklist</a></div>
+      <p><b>How:</b> check the HTTP status and error code before choosing a recovery; follow <code>Retry-After</code> when present; otherwise exponential backoff with jitter and bounded retries.</p>
+      <p><b>Why this method:</b> billing, spend and quota errors need action, not retries. Classifying errors is what separates resilience from a retry storm.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Why jitter</b> <span class="tag hist">📜 AWS · 2015</span> <a href="https://aws.amazon.com/blogs/architecture/exponential-backoff-and-jitter/" target="_blank" rel="noopener">Exponential Backoff and Jitter</a></div>
+      <p><b>How:</b> simulated many clients competing for a contended resource and compared backoff variants.</p>
+      <p><b>Why this method:</b> backoff alone leaves clients retrying in synchronized waves; adding randomness spreads them out, so the work completes with fewer calls. The playground above reproduces it.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One interface, many providers</b> <span class="tag oss">🧰 Open source</span> <a href="https://docs.litellm.ai/docs/" target="_blank" rel="noopener">LiteLLM</a></div>
+      <p><b>How:</b> a Python SDK and proxy that call 100+ LLMs (OpenAI, Anthropic, Vertex AI, Bedrock and more) through the OpenAI request format, with retries, fallbacks and spend tracking.</p>
+      <p><b>Why this method:</b> swapping or adding a provider becomes a config change, which makes model bake-offs (Lesson 0.4) and outage fallbacks cheap.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the knob that disappeared</span>
+    <p>Temperature was the most famous LLM parameter of the early API years. As of October 2026, Anthropic's newest API version (2026-10-21) returns a 400 error if you send <code>temperature</code> at all, <b>even at its default value</b>; its docs note that <code>temperature = 0</code> never guaranteed identical outputs anyway. On frontier reasoning models, you steer with prompts, effort and structured output instead.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Lesson 0.6 asks the question before any call: should this be an LLM at all? Phase 1 is what goes <i>inside</i> the messages: prompting (1.1), reasoning (1.2), structured output and function calling (1.3), context and caching (1.4). Gateways, tracing and fallbacks are Lesson 8.1; streaming UX is 9.2. The distributed-systems side of retries is in the System Design course: <a href="../../system-design-course/phase1/5-rate-limiting.html">rate limiting</a>, <a href="../../system-design-course/phase4/4-resilience.html">resilience (timeouts, retries, circuit breakers)</a> and <a href="../../system-design-course/phase3/3-idempotency.html">idempotency</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://platform.claude.com/docs/en/build-with-claude/working-with-messages" target="_blank" rel="noopener">Anthropic: Using the Messages API</a>. Multi-turn, stop reasons, system messages.</li>
+      <li><span class="kind">Docs</span> <a href="https://developers.openai.com/api/docs/guides/streaming-responses" target="_blank" rel="noopener">OpenAI: Streaming API responses</a>. The event types and how to consume them.</li>
+      <li><span class="kind">Docs</span> <a href="https://platform.claude.com/docs/en/api/errors" target="_blank" rel="noopener">Anthropic: API errors</a>. Every status code, retry behaviour, request IDs.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Retries with base 1 s, doubling, no jitter, 4 retries. Worst-case total wait before giving up?</div>
+    <div class="opts"><button class="opt">4 s</button><button class="opt">8 s</button><button class="opt" data-ok>15 s</button></div>
+    <div class="explain">1 + 2 + 4 + 8 = <b>15 s</b>. Add the request times themselves, and set a total deadline so a user isn't left waiting forever; with full jitter the average wait halves.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After an SDK upgrade, every request fails with a 400 <code>invalid_request_error</code>. Your retry wrapper retries each one 5 times. What's wrong?</div>
+    <div class="opts"><button class="opt">The provider is overloaded; increase retries</button><button class="opt" data-ok>A 400 means the request itself is invalid (for example a parameter the new API version rejects); don't retry it, read the message and fix the request</button><button class="opt">Switch to streaming</button></div>
+    <div class="explain">Retrying a 400 can never succeed and multiplies load and cost. Retry only transient errors (429, 5xx, 529, timeouts); surface 400s loudly. A newer API version dropping <code>temperature</code> is exactly this kind of bug.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. You turn on streaming. What changes?</div>
+    <div class="opts"><button class="opt">Total generation time halves</button><button class="opt" data-ok>Users see the first words at TTFT instead of waiting for the whole answer; total time and cost stay about the same</button><button class="opt">Output tokens become cheaper</button></div>
+    <div class="explain">Streaming changes delivery, not generation: same tokens, same price, same total time. It fixes <b>perceived</b> latency, and it means errors can arrive mid-stream.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>A call = role-tagged messages (system, user, assistant) + parameters → text + stop reason + usage. The API is stateless: resend history.</li>
+      <li>Always set a max-token cap and check the stop reason; sampling knobs are disappearing on frontier models, so check what your model accepts.</li>
+      <li>Stream for perceived latency; handle errors mid-stream.</li>
+      <li>Classify errors: fix 4xx, retry 429/5xx/529 with exponential backoff + jitter, honor retry-after, cap retries, have a fallback.</li>
+      <li>Use the provider SDKs (built-in retries) or a layer like LiteLLM to switch providers cheaply.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  // ---------- request builder ----------
+  const API = {
+    anthropic: { url: "POST https://api.anthropic.com/v1/messages", headers: ["x-api-key: sk-ant-•••• (redacted)", "anthropic-version: 2023-06-01   (newest: 2026-10-21)", "content-type: application/json"], model: "claude-sonnet-5-5" },
+    openai: { url: "POST https://api.openai.com/v1/responses", headers: ["Authorization: Bearer sk-•••• (redacted)", "content-type: application/json"], model: "gpt-6-luna" },
+    compat: { url: "POST http://localhost:8000/v1/chat/completions   (vLLM)", headers: ["Authorization: Bearer local-dev", "content-type: application/json"], model: "Qwen/Qwen3-0.6B" },
+  };
+  const REPLY = "Your refund goes back to your original payment method within 5 business days of us receiving the item. As a Plus member you can return items within 60 days of delivery. Anything else I can help with?";
+  let api = "anthropic", busy = false;
+  const segB = ["anthropic", "openai", "compat"].map(k => $("api-" + k));
+  segB.forEach(b => (b.onclick = () => { segB.forEach(x => x.classList.toggle("on", x === b)); api = b.id.slice(4); build(); }));
+
+  function body() {
+    const maxT = +$("maxTok").value, sys = $("sys").value, usr = $("usr").value, stop = $("stopSeq").value;
+    const b = {};
+    if (api === "anthropic") {
+      b.model = API.anthropic.model; b.max_tokens = maxT; if (sys) b.system = sys;
+      b.messages = [{ role: "user", content: usr }];
+      if (stop) b.stop_sequences = [stop];
+    } else if (api === "openai") {
+      b.model = API.openai.model; if (sys) b.instructions = sys; b.input = usr; b.max_output_tokens = maxT;
+      b.reasoning = { effort: $("effort").value };
+    } else {
+      b.model = API.compat.model; b.messages = (sys ? [{ role: "system", content: sys }] : []).concat([{ role: "user", content: usr }]);
+      b.max_tokens = maxT; if (stop) b.stop = [stop];
+    }
+    if ($("useTemp").checked) b.temperature = +$("temp").value;
+    if ($("stream").checked) b.stream = true;
+    return b;
+  }
+  function build() {
+    $("maxTokv").textContent = $("maxTok").value; $("tempv").textContent = (+$("temp").value).toFixed(1);
+    $("effortLbl").style.display = api === "openai" ? "" : "none";
+    $("stopSeq").disabled = api === "openai";
+    $("stopSeq").placeholder = api === "openai" ? "(Responses API: no stop parameter)" : "(none)";
+    const A = API[api];
+    $("reqOut").textContent = A.url + "\n" + A.headers.join("\n") + "\n\n" + JSON.stringify(body(), null, 2);
+  }
+  ["sys", "usr", "stopSeq"].forEach(id => ($(id).oninput = build));
+  ["maxTok", "temp"].forEach(id => ($(id).oninput = build));
+  ["useTemp", "stream", "effort"].forEach(id => ($(id).onchange = build));
+
+  function validate(b) {
+    if ("temperature" in b && api === "anthropic" && b.temperature !== 1) return "temperature is not accepted by this model (Claude 4.7 and later reject non-default values; API version 2026-10-21 rejects the parameter at any value). Remove it and steer with the prompt.";
+    if ("temperature" in b && api === "openai" && b.reasoning.effort !== "none") return `temperature is not supported when reasoning effort is “${b.reasoning.effort}”. Remove it, or set effort to none on a model that allows it.`;
+    if (api === "openai" && b.max_output_tokens < 16) return "max_output_tokens must be at least 16.";
+    return null;
+  }
+  $("send").onclick = async () => {
+    if (busy) return; busy = true;
+    build();
+    const b = body(), err = validate(b), streamOn = !!b.stream;
+    $("answer").innerHTML = ""; $("respOut").textContent = ""; $("reqMsg").innerHTML = "";
+    ["rTtft", "rTotal", "rTok", "rStop"].forEach(id => ($(id).textContent = "…")); $("rStatus").textContent = "…";
+    const inTok = AI.countTokens(($("sys").value || "") + " " + $("usr").value) + 8;
+    await sleep(250);
+    if (err) {
+      const e = api === "anthropic" ? { type: "error", error: { type: "invalid_request_error", message: "(simulated) " + err }, request_id: "req_011…" }
+        : { error: { message: "(simulated) " + err, type: "invalid_request_error", param: "temperature" in b ? "temperature" : "max_output_tokens", code: null } };
+      $("respOut").textContent = "HTTP/1.1 400 Bad Request\n\n" + JSON.stringify(e, null, 2);
+      $("rStatus").textContent = "400"; ["rTtft", "rTotal", "rTok", "rStop"].forEach(id => ($(id).textContent = "–"));
+      $("reqMsg").innerHTML = `<span class="rk">❌ 400: the request itself is invalid. Retrying won't help; fix the request.</span>`;
+      busy = false; return;
+    }
+    // generate the scripted answer, honoring stop sequence and max tokens
+    const stop = api !== "openai" ? $("stopSeq").value : "";
+    let text = REPLY, stopReason = api === "anthropic" ? "end_turn" : api === "openai" ? "completed" : "stop", hitStop = false;
+    if (stop && text.includes(stop)) { text = text.slice(0, text.indexOf(stop)); hitStop = true; stopReason = api === "anthropic" ? "stop_sequence" : "stop"; }
+    let toks = AI.toyTokens(text);
+    const maxT = +$("maxTok").value, think = api === "openai" ? { none: 0, low: 12, medium: 40 }[b.reasoning.effort] : 0;
+    let truncated = false;
+    if (toks.length + think > maxT) { toks = toks.slice(0, Math.max(0, maxT - think)); truncated = true; stopReason = api === "anthropic" ? "max_tokens" : api === "openai" ? "incomplete (max_output_tokens)" : "length"; }
+    const outTok = toks.length + think;
+    const ttft = 450 + think * 25, perTok = 30;
+    const lines = [];
+    const push = s => { lines.push(s); $("respOut").textContent = lines.join("\n"); $("respOut").scrollTop = 1e9; };
+    const t0 = performance.now();
+    if (streamOn) {
+      push("HTTP/1.1 200 OK\ncontent-type: text/event-stream\n");
+      if (api === "anthropic") push(`event: message_start\ndata: {"type":"message_start","message":{"role":"assistant","content":[],"model":"${b.model}","usage":{"input_tokens":${inTok},"output_tokens":1}}}\n\nevent: content_block_start\ndata: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}\n`);
+      else if (api === "openai") push(`event: response.created\ndata: {"type":"response.created","response":{"status":"in_progress","model":"${b.model}"}}\n`);
+      await sleep(ttft);
+      $("rTtft").textContent = Math.round(performance.now() - t0) + " ms";
+      let shown = "";
+      for (let i = 0; i < toks.length; i++) {
+        const d = JSON.stringify(toks[i]);
+        if (api === "anthropic") push(`event: content_block_delta\ndata: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":${d}}}\n`);
+        else if (api === "openai") push(`event: response.output_text.delta\ndata: {"type":"response.output_text.delta","delta":${d}}\n`);
+        else push(`data: {"choices":[{"index":0,"delta":{"content":${d}}}]}\n`);
+        shown += toks[i]; $("answer").textContent = shown;
+        await sleep(perTok);
+      }
+      if (api === "anthropic") push(`event: content_block_stop\ndata: {"type":"content_block_stop","index":0}\n\nevent: message_delta\ndata: {"type":"message_delta","delta":{"stop_reason":"${stopReason}","stop_sequence":${hitStop ? JSON.stringify(stop) : null}},"usage":{"output_tokens":${outTok}}}\n\nevent: message_stop\ndata: {"type":"message_stop"}`);
+      else if (api === "openai") push(`event: response.completed\ndata: {"type":"response.completed","response":{"status":"${truncated ? "incomplete" : "completed"}"${truncated ? ',"incomplete_details":{"reason":"max_output_tokens"}' : ""},"usage":{"input_tokens":${inTok},"output_tokens":${outTok},"output_tokens_details":{"reasoning_tokens":${think}}}}}`);
+      else push(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"${stopReason}"}],"usage":{"prompt_tokens":${inTok},"completion_tokens":${outTok}}}\n\ndata: [DONE]`);
+    } else {
+      await sleep(ttft + toks.length * perTok);
+      $("rTtft").textContent = "(not visible)";
+      const full = toks.join("");
+      let resp;
+      if (api === "anthropic") resp = { id: "msg_01…", type: "message", role: "assistant", model: b.model, content: [{ type: "text", text: full }], stop_reason: stopReason, stop_sequence: hitStop ? stop : null, usage: { input_tokens: inTok, output_tokens: outTok } };
+      else if (api === "openai") resp = { id: "resp_…", object: "response", status: truncated ? "incomplete" : "completed", incomplete_details: truncated ? { reason: "max_output_tokens" } : null, model: b.model, output_text: full, usage: { input_tokens: inTok, output_tokens: outTok, output_tokens_details: { reasoning_tokens: think } } };
+      else resp = { object: "chat.completion", model: b.model, choices: [{ index: 0, message: { role: "assistant", content: full }, finish_reason: stopReason }], usage: { prompt_tokens: inTok, completion_tokens: outTok } };
+      push("HTTP/1.1 200 OK\ncontent-type: application/json\n\n" + JSON.stringify(resp, null, 2));
+      $("answer").textContent = full;
+    }
+    $("rStatus").textContent = "200";
+    $("rTotal").textContent = Math.round(performance.now() - t0) + " ms";
+    $("rTok").textContent = `${inTok} / ${outTok}${think ? ` (incl. ${think} reasoning)` : ""}`;
+    $("rStop").textContent = stopReason;
+    let m;
+    if (truncated) m = `<span class="rk">✂️ Cut off by the token cap (${stopReason}). Users would see a half sentence: check the stop reason and raise the cap or ask for shorter answers.</span>`;
+    else if (hitStop) m = `<span class="tk">⏹ Stopped at the stop sequence “${esc(stop)}”, which is not included in the output. Useful for formats, dangerous with common words.</span>`;
+    else m = streamOn ? `<span class="ev">✅ Streamed: text appeared at TTFT, long before the end.</span>` : `<span class="tk">Non-streamed: nothing visible until the whole answer was ready. Tick “stream” to compare.</span>`;
+    if (api === "compat" && "temperature" in b) m += ` <span class="muted">Open models served with vLLM accept temperature; hosted frontier models increasingly don't.</span>`;
+    $("reqMsg").innerHTML = m;
+    busy = false;
+  };
+  build();
+
+  // ---------- rate-limit simulator ----------
+  function sim(strategy, o) {
+    const DT = 0.1, T = 120, rate = 5, cap = 5, workers = 20, jobs = 200, lat = 2, base = 0.5;
+    const maxRetry = o.maxRetry, quota = o.quota, r = MX.seeded(42);
+    let bucket = cap, next = 0, done = 0, failed = 0, sent = 0, n429 = 0, finish = null;
+    const W = Array.from({ length: workers }, () => ({ state: "idle", t: 0, att: 0 }));
+    const okS = new Array(T).fill(0), errS = new Array(T).fill(0);
+    for (let step = 0; step < T / DT; step++) {
+      const now = step * DT; bucket = Math.min(cap, bucket + rate * DT);
+      for (const w of W) {
+        if (w.state === "busy" && now >= w.t) { done++; w.state = "idle"; }
+        if (w.state === "wait" && now >= w.t) w.state = "send";
+        if (w.state === "idle" && next < jobs) { next++; w.att = 0; w.state = "send"; }
+        if (w.state !== "send") continue;
+        sent++;
+        if (!quota && bucket >= 1) { bucket -= 1; w.state = "busy"; w.t = now + lat; okS[Math.floor(now)]++; continue; }
+        n429++; errS[Math.floor(now)]++;
+        if (strategy === "none" || w.att >= maxRetry) { failed++; w.state = "idle"; continue; }
+        w.att++;
+        const expo = Math.min(30, base * 2 ** (w.att - 1));
+        let d;
+        if (strategy === "immediate") d = DT;
+        else if (strategy === "exp") d = expo;
+        else if (strategy === "jitter") d = r() * expo;
+        else d = quota ? r() * expo : (W.filter(x => x.state === "wait").length + 1) / rate + r() * 0.3; // retry-after reflects the queue
+        w.state = "wait"; w.t = now + d;
+      }
+      if (finish === null && done + failed >= jobs) finish = now;
+    }
+    return { done, failed, sent, n429, finish, okS, errS };
+  }
+  const NAMES = { none: "No retries", immediate: "Retry immediately", exp: "Exponential backoff", jitter: "Backoff + jitter", ra: "Honor retry-after" };
+  function runSim() {
+    const s = $("strat").value, o = { maxRetry: +$("maxRetry").value, quota: $("quota").checked };
+    $("maxRetryv").textContent = o.maxRetry;
+    const R = sim(s, o);
+    const last = Math.min(120, Math.max(30, Math.ceil((R.finish ?? 120) + 5)));
+    Plot.line($("simChart"), {
+      series: [
+        { label: "accepted requests / s", color: MX.css("--c-ev"), data: R.okS.slice(0, last).map((v, i) => [i, v]), width: 2.5 },
+        { label: "429s / s", color: MX.css("--c-rk"), data: R.errS.slice(0, last).map((v, i) => [i, v]), width: 2 },
+      ], xLabel: "seconds", yMin: 0,
+    });
+    $("sDone").textContent = R.done; $("sFail").textContent = R.failed; $("sSent").textContent = R.sent; $("s429").textContent = R.n429;
+    $("sTime").textContent = R.finish == null ? "> 120 s" : R.finish.toFixed(1) + " s";
+    const wasted = Math.round(100 * R.n429 / Math.max(1, R.sent));
+    let m;
+    if (o.quota) m = `<span class="rk">A spend-cap 429 never clears: ${R.sent} calls and ${R.failed} failed jobs so far, none can succeed. Detect it (no retry-after, quota error code), stop retrying, and alert a human.</span>`;
+    else if (s === "none") m = `<span class="rk">${R.failed} of 200 jobs failed on the first 429. Transient errors need retries.</span>`;
+    else if (s === "immediate") m = `<span class="rk">Hammering: ${R.sent} requests sent, ${wasted}% of them 429s, and jobs still failed when retries ran out. Immediate retries make overload worse.</span>`;
+    else if (s === "exp") m = `<span class="tk">Everyone backs off by the same amounts, so retries arrive in synchronized waves (the red spikes) with idle gaps between: ${R.finish ? R.finish.toFixed(0) + " s" : "more than 120 s"} to finish.</span>`;
+    else if (s === "jitter") m = `<span class="ev">Jitter spreads the retries out: fewer collisions, ${R.finish ? "finished in " + R.finish.toFixed(0) + " s" : "still running"}.</span>`;
+    else m = `<span class="ev">The server tells each client when to come back, so retries line up with capacity: ${R.finish ? R.finish.toFixed(0) + " s" : "> 120 s"}, close to the 40 s minimum${R.failed ? `, though ${R.failed} jobs ran out of retries (raise the cap)` : ""}.</span>`;
+    $("simMsg").innerHTML = m;
+    return R;
+  }
+  $("simRun").onclick = runSim;
+  $("simAll").onclick = () => {
+    const o = { maxRetry: +$("maxRetry").value, quota: $("quota").checked };
+    const rows = Object.keys(NAMES).map(k => { const R = sim(k, o); return `${NAMES[k]}: ${R.finish == null ? ">120" : R.finish.toFixed(0)} s, ${R.failed} failed, ${R.sent} calls`; });
+    runSim();
+    $("simMsg").innerHTML += `<br><span class="muted">${rows.join(" · ")}</span>`;
+  };
+  ["strat"].forEach(id => ($(id).onchange = runSim));
+  $("maxRetry").oninput = runSim; $("quota").onchange = runSim;
+  runSim();
+  window.addEventListener("themechange", runSim);
+})();
+</script>
+</body>
+</html>

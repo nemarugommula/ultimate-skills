@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>8.2 Cutting cost &amp; latency · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .tog { display: grid; grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); gap: 6px 14px; margin: 8px 0; font-size: .9rem; }
+  .crow { display: grid; grid-template-columns: 1fr 1fr 70px 90px; gap: 8px; align-items: center; font-size: .86rem; border-bottom: 1px solid var(--line); padding: 4px 2px; }
+  .crow .s { font-family: var(--mono); text-align: right; }
+  .crow.head { font-weight: 700; color: var(--muted); }
+  @media (max-width: 640px) { .crow { grid-template-columns: 1fr 60px 80px; } .crow .m { display: none; } }
+</style>
+</head>
+<body data-lesson="a8-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 8 · Lesson 2</div>
+  <h1>Cutting cost &amp; latency: caching, routing, batching</h1>
+  <p class="subtitle">Most LLM bills are full of tokens nobody needed to pay for: the same system prompt sent a million times, a frontier model answering “what are your opening hours?”, a nightly job paying interactive prices. Here are the levers, what each saves, and what each can break.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li>You pay per <b>input</b> and <b>output</b> token; output tokens usually cost several times more each (Lesson 0.3).</li>
+      <li><b>TTFT</b> (time to first token) is how long until the first word appears; streaming shows words as they're generated (Lesson 0.5).</li>
+      <li><b>Embeddings</b> map text to vectors; cosine similarity near 1 means “similar meaning” (Lesson 2.1). Lesson 8.1 showed where a request's cost comes from.</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2023, Stanford researchers asked a simple question: do you really need the most expensive model for every query? Their system, <b>FrugalGPT</b>, sends each query to a cheap model first and only escalates to a pricier one when a small scorer thinks the cheap answer isn't good enough.</p>
+    <p>The result: it could match the best single model they tested (GPT-4) with <b>up to 98% lower cost</b>, or beat its accuracy by 4% at the same cost. Most queries are easy. The trick is spending big only on the hard ones.</p>
+  </div>
+
+  <h2>Numbers first: where the money goes</h2>
+  <p>A support assistant: <b>2 million requests a month</b>. Each sends a 3,000-token fixed prefix (system prompt, tool definitions, examples), 2,000 tokens of retrieved chunks and history, and gets 350 tokens back. Illustrative prices: <b>$3 / $15 per million</b> input/output tokens for a large model.</p>
+  <table>
+    <tr><th>Part of each request</th><th>Tokens</th><th>Cost per request</th><th>Per month</th></tr>
+    <tr><td>Fixed prefix (identical every time)</td><td>3,000</td><td>$0.0090</td><td class="rk">$18,000</td></tr>
+    <tr><td>Retrieved chunks + history</td><td>2,000</td><td>$0.0060</td><td>$12,000</td></tr>
+    <tr><td>Output</td><td>350</td><td>$0.00525</td><td>$10,500</td></tr>
+    <tr><td><b>Total</b></td><td>5,350</td><td><b>$0.02025</b></td><td><b>$40,500</b></td></tr>
+  </table>
+  <p class="muted">Prices are illustrative; real prices vary by model and change often.</p>
+  <p>The biggest line is text that is <b>identical on every request</b>. That's the first thing to stop paying full price for.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    Every cost lever is one of four moves: <b>don't recompute</b> (prompt caching, semantic caching), <b>use a smaller model when it's enough</b> (routing, cascades, distillation), <b>send and generate fewer tokens</b> (trim context, shorter outputs), or <b>pay less per token by waiting</b> (batch APIs). Latency mostly follows cost: fewer tokens and smaller models are faster too. Each move has a quality risk you must measure.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: running a restaurant kitchen</span>
+    <p><b>Prompt caching</b> is mise en place: chop the onions once in the morning, not per order. A <b>semantic cache</b> is the counter of ready-made sandwiches: instant, but if someone orders “no mustard” and you hand them the standard one, that's a wrong order. <b>Routing</b> is letting the junior cook make the salads and saving the head chef for the soufflé. <b>Batching</b> is catering: order a day ahead and it's half price.</p>
+  </div>
+
+  <h2>The levers</h2>
+  <table>
+    <tr><th>Lever</th><th>How it works</th><th>Typical saving</th><th>Risk</th></tr>
+    <tr><td><b>Prompt caching</b></td><td>The provider stores the model's internal state for a prompt <b>prefix</b>; later requests starting with the exact same tokens reuse it.</td><td>Cached tokens cost a fraction of the price (0.1× on Anthropic); lower TTFT on long prompts</td><td>Almost none for quality. Only exact-prefix matches count, so put fixed content first.</td></tr>
+    <tr><td><b>Semantic caching</b></td><td>Embed each question; if a past question is similar enough, return its stored answer without calling the model.</td><td>The whole call, for the share of traffic that repeats</td><td class="rk">Wrong answers when similar ≠ same (“cancel my order” vs “cancel my subscription”)</td></tr>
+    <tr><td><b>Routing / cascades</b></td><td>Send easy queries to a small model; a router or a confidence check escalates hard ones.</td><td>Often large: small models can cost 10× or more less</td><td class="rk">Quality drops if the router misjudges difficulty</td></tr>
+    <tr><td><b>Batch APIs</b></td><td>Submit many requests as one asynchronous job with results within hours.</td><td>50% at OpenAI and Anthropic</td><td>Only for work nobody waits on</td></tr>
+    <tr><td><b>Trim the prompt</b></td><td>Fewer, better chunks (rerank to top 5), summarize old history, shorter instructions.</td><td>Proportional to tokens removed</td><td>Dropping the chunk that held the answer</td></tr>
+    <tr><td><b>Shorter outputs</b></td><td>Ask for concise answers, set <code>max_tokens</code>, use structured output instead of prose.</td><td>Output tokens are the expensive ones</td><td>Truncated answers if the cap is too low</td></tr>
+    <tr><td><b>Smaller or distilled model</b></td><td>Fine-tune or distill a small model on your task (Lesson 7.2), or self-host one (Lesson 7.4).</td><td>Large at high volume</td><td>Training and evaluation effort; you own the quality</td></tr>
+  </table>
+
+  <h2>Prompt caching: stop paying for the same prefix</h2>
+  <p>When a model reads a prompt, it computes internal state (the KV cache, Lesson 7.4) for every token. If the next request starts with the <b>same tokens</b>, the provider can reuse that state instead of recomputing it. Two things follow: put the <b>stable stuff first</b> (system prompt, tools, examples, documents) and the variable stuff (the user's question) last, and keep the stable part byte-for-byte identical (no timestamps at the top).</p>
+  <ul>
+    <li><b>Anthropic</b> (as of 2026): you mark cache breakpoints with <code>cache_control</code>. Reading cached tokens costs <b>0.1×</b> the base input price on most models; writing them costs <b>1.25×</b> for a 5-minute lifetime or <b>2×</b> for 1 hour. The minimum cacheable prompt length depends on the model (512 to 4,096 tokens). At launch in 2024 Anthropic reported up to 90% lower cost and up to 85% lower latency for long prompts.</li>
+    <li><b>OpenAI</b>: caching is automatic for prompts of 1,024 tokens or more. The cached-token discount differs by model, and the newest models also bill cache writes, so check the pricing page for yours.</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: caching the 3,000-token prefix</span>
+    <p>1 million requests a month, a 3,000-token prefix, $3 per million input tokens, and suppose 90% of requests hit the cache (traffic is steady enough that the cache rarely expires).</p>
+    <ul>
+      <li>No caching: 3,000 × 1,000,000 × $3 / 1,000,000 = <b>$9,000</b>.</li>
+      <li>Hits pay 0.1×, misses pay the 1.25× write: 0.9 × 0.1 + 0.1 × 1.25 = 0.09 + 0.125 = <b>0.215</b> of full price.</li>
+      <li>With caching: $9,000 × 0.215 = <b>$1,935</b>. A 78% saving on that line, for moving the question to the end of the prompt.</li>
+    </ul>
+    <p>If traffic is sparse and the cache expires between requests, every request pays the 1.25× write: caching then <b>costs</b> you 25% more. Watch the cached-token counts the API returns.</p>
+  </div>
+
+  <div class="playground" id="pg-cost">
+    <span class="label">🎮 Playground · Cost optimizer</span>
+    <p class="hint">The support assistant above. Switch levers on and watch the monthly bill, the quality (share of answers a judge marks correct) and the average latency. Try <b>Sensible stack</b>, then <b>Too aggressive</b>, then turn on the cascade and see what it rescues.</p>
+    <div class="controls">
+      <button class="btn" id="co-off">All off</button>
+      <button class="btn primary" id="co-good">Sensible stack</button>
+      <button class="btn" id="co-bad">Too aggressive</button>
+    </div>
+    <div class="controls">
+      <label>requests / month <input type="range" id="coR" min="0.1" max="10" step="0.1" value="2"> <b class="mono" id="coRv"></b></label>
+      <label>share routed to the small model <input type="range" id="coF" min="0" max="90" step="5" value="0"> <b class="mono" id="coFv"></b></label>
+    </div>
+    <div class="tog">
+      <label><input type="checkbox" id="coCache"> prompt caching (90% prefix hits)</label>
+      <label><input type="checkbox" id="coTrim"> trim context (8 chunks → 4)</label>
+      <label><input type="checkbox" id="coShort"> concise output (350 → 200 tokens)</label>
+      <label><input type="checkbox" id="coSem"> semantic cache (15% of traffic)</label>
+      <label><input type="checkbox" id="coCasc"> cascade: escalate when the small model is unsure</label>
+      <label><input type="checkbox" id="coBatch"> batch API for the 25% async traffic</label>
+    </div>
+    <canvas class="chart" id="coc" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">monthly cost <b id="coCost">–</b></div>
+      <div class="stat">saving <b id="coSave">–</b></div>
+      <div class="stat">quality <b id="coQ">–</b></div>
+      <div class="stat">avg interactive latency <b id="coT">–</b></div>
+    </div>
+    <div class="verdict" id="coMsg"></div>
+    <p class="hint">A scripted model with assumed numbers: large model $3/$15 and 92% correct; small model $0.25/$1.25, 90% correct on the 60% of queries that are easy, 50% on hard ones; the router misjudges 8% of what it sends; the semantic cache is wrong on 4% of its hits. Your own numbers come from your evals and traces.</p>
+  </div>
+  <p>What you should see: caching, trimming, concise outputs and batching cut the bill a lot with almost no quality cost. Routing is where quality is won or lost: past the share of traffic that is truly easy, the small model starts failing hard queries. A cascade buys most of that quality back for a little extra cost, because only the queries the small model is unsure about pay for both models.</p>
+
+  <h2>Semantic caching: the threshold is everything</h2>
+  <p>A semantic cache embeds each incoming question and finds the most similar past question. If the similarity is above a <b>threshold</b>, it returns the stored answer, skipping the model completely. A low threshold gives many hits and some <b>confidently wrong</b> answers; a high one is safe but rarely hits.</p>
+
+  <div class="playground" id="pg-sem">
+    <span class="label">🎮 Playground · Semantic cache threshold</span>
+    <p class="hint">Six answered questions sit in the cache. Eighteen new questions arrive: ten are rephrasings that <b>should</b> reuse a cached answer, eight only look similar and need a fresh one. Move the threshold and watch hits and wrong answers. Then press <b>Sweep</b>.</p>
+    <div class="controls">
+      <label>similarity threshold <input type="range" id="th" min="0.70" max="1.00" step="0.01" value="0.80"> <b class="mono" id="thv"></b></label>
+      <button class="btn" id="sweep2">▶ Sweep thresholds</button>
+    </div>
+    <div class="crow head"><span>incoming question</span><span class="m">closest cached question</span><span class="s">sim.</span><span class="s">result</span></div>
+    <div id="crows"></div>
+    <div class="stat-row">
+      <div class="stat">hit rate <b id="hr">–</b></div>
+      <div class="stat">correct reuses <b id="good">–</b></div>
+      <div class="stat">wrong answers served <b id="bad">–</b></div>
+      <div class="stat">model calls saved <b id="saved">–</b></div>
+    </div>
+    <canvas class="chart" id="thc" style="height:200px"></canvas>
+    <p class="hint" id="thmsg">Similarity uses this course's tiny offline embedding. Real embedding models score differently, so real thresholds differ (RedisVL's default, for example, is a cosine <b>distance</b> of 0.1, i.e. similarity ≈ 0.9), but the trade-off has the same shape.</p>
+  </div>
+  <p>What you should see: there is no threshold that catches every rephrasing without serving a wrong answer. “How much does express shipping cost?” stays very similar to “How much does shipping cost?” at any setting, yet the answer differs. Real systems add guards: only cache answers that don't depend on the user (no order status, no account data), include key entities (plan, product, locale) in the cache key, expire entries, and measure the wrong-answer rate on a labelled sample.</p>
+
+  <h2>Latency: what users actually feel</h2>
+  <table>
+    <tr><th>Technique</th><th>What it cuts</th><th>Typical effect</th></tr>
+    <tr><td><b>Streaming</b></td><td>Perceived wait: the first words appear at TTFT instead of after the whole answer</td><td>A 5 s answer starts showing in well under a second</td></tr>
+    <tr><td>Prompt caching</td><td>Prefill time for long, repeated prefixes</td><td>Lower TTFT on long prompts</td></tr>
+    <tr><td>Fewer output tokens</td><td>Generation time, which grows with every token</td><td>Halve the tokens ≈ halve the generation time</td></tr>
+    <tr><td>Smaller model / routing</td><td>Both TTFT and tokens per second</td><td>Small models often generate several times faster</td></tr>
+    <tr><td>Parallel calls</td><td>Independent steps (retrieval + a classifier) run at once</td><td>Wall time = slowest branch, not the sum</td></tr>
+    <tr><td>Fewer round trips</td><td>Agent steps and chained calls</td><td>Each model call you remove saves its whole latency</td></tr>
+  </table>
+  <p class="muted">These are typical effects, not guarantees; measure TTFT and total time per step in your traces (Lesson 8.1).</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Provider features first: <b>prompt caching</b> and <b>batch APIs</b> (Anthropic Message Batches, OpenAI Batch API). For semantic caching: <b>RedisVL</b> <code>SemanticCache</code>, <b>GPTCache</b>, or a cache in your gateway (LiteLLM, Cloudflare AI Gateway). For routing: your gateway's routing rules, or a trained router such as <b>RouteLLM</b>.</p>
+<pre><code><span class="k">import</span> anthropic
+client = anthropic.Anthropic()
+
+<span class="c"># 1) Prompt caching: stable content first, marked with a cache breakpoint</span>
+resp = client.messages.create(
+    model=MODEL, max_tokens=<span class="n">400</span>,
+    system=[{<span class="s">"type"</span>: <span class="s">"text"</span>, <span class="s">"text"</span>: LONG_SYSTEM_PROMPT_AND_POLICIES,
+             <span class="s">"cache_control"</span>: {<span class="s">"type"</span>: <span class="s">"ephemeral"</span>}}],   <span class="c"># 5-minute cache by default</span>
+    messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: question}],             <span class="c"># the variable part goes last</span>
+)
+print(resp.usage.cache_read_input_tokens, resp.usage.cache_creation_input_tokens)
+
+<span class="c"># 2) Batch API: half price for work nobody is waiting on</span>
+batch = client.messages.batches.create(requests=[
+    {<span class="s">"custom_id"</span>: <span class="s">f"doc-{i}"</span>,
+     <span class="s">"params"</span>: {<span class="s">"model"</span>: MODEL, <span class="s">"max_tokens"</span>: <span class="n">300</span>,
+                <span class="s">"messages"</span>: [{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: <span class="s">"Summarize:\n"</span> + d}]}}
+    <span class="k">for</span> i, d <span class="k">in</span> enumerate(docs)])
+
+<span class="c"># 3) Semantic cache with RedisVL (distance, not similarity: lower = stricter)</span>
+<span class="k">from</span> redisvl.extensions.cache.llm <span class="k">import</span> SemanticCache
+cache = SemanticCache(name=<span class="s">"faq"</span>, redis_url=<span class="s">"redis://localhost:6379"</span>, distance_threshold=<span class="n">0.1</span>)
+<span class="k">if</span> hit := cache.check(prompt=question):
+    answer = hit[<span class="n">0</span>][<span class="s">"response"</span>]
+<span class="k">else</span>:
+    answer = call_model(question)
+    cache.store(prompt=question, response=answer)</code></pre>
+    <p class="hint">OpenAI caches prompts of 1,024+ tokens automatically; its Batch API takes a JSONL file of requests with a 24-hour completion window. Anthropic says most batches finish in under an hour (24-hour limit). Set <code>MODEL</code> from your provider's models page.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Prompt caching</td><td>Big input savings, faster TTFT, no quality risk</td><td>Prompt layout constraints; write premium if the cache expires</td></tr>
+      <tr><td>Semantic caching</td><td>Zero-cost, instant answers for repeats</td><td>Wrong or stale answers; personal data must never be shared across users</td></tr>
+      <tr><td>Routing / cascades</td><td>Large savings when most traffic is easy</td><td>A router to train and evaluate; quality risk on misrouted queries; two models to maintain</td></tr>
+      <tr><td>Batch APIs</td><td>50% off</td><td>Results in minutes to hours; more moving parts (polling, retries)</td></tr>
+      <tr><td>Trimming context</td><td>Fewer tokens, often better focus</td><td>Recall risk: measure retrieval (Lesson 5.4)</td></tr>
+      <tr><td>Self-hosted small model</td><td>Lowest cost per token at high, steady volume</td><td>GPUs, ops, and you own the evals (Lessons 7.3–7.4)</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Order prompts stable-first and turn on prompt caching; stream every user-facing answer; cap <code>max_tokens</code>; move anything nightly to a batch API. Don't build a router until traces show which traffic is expensive and evals show a cheaper model is good enough on it.</p></div>
+      <div><h4>At scale</h4><p>A cost dashboard per feature, routers trained on real traffic and checked against evals, cascades with a confidence check, distilled task-specific models for the highest-volume paths, semantic caches scoped per tenant, and capacity reservations negotiated with providers.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Our LLM bill is $200k a month. Cut it in half without hurting quality.” A senior answer:</p>
+    <ul>
+      <li>Starts with <b>measurement</b>: cost per feature and per step from traces; where are the tokens (prefix, context, output)?</li>
+      <li>Takes the <b>safe wins</b> first: prompt caching with a stable prefix, trimming context, shorter outputs, batch for async work.</li>
+      <li>Then <b>routing or a cascade</b> on the high-volume, easy traffic, gated by an offline eval and an online A/B test.</li>
+      <li>Semantic caching only where answers don't depend on the user, with a measured wrong-answer rate.</li>
+      <li>Names the guardrail: a quality metric that must not drop, checked continuously (Lesson 5.6).</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Cheap model first, escalate when unsure</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2305.05176" target="_blank" rel="noopener">FrugalGPT (Chen, Zaharia, Zou)</a></div>
+      <p><b>How:</b> an LLM cascade: query models in order of price, score each answer with a small model, stop when the score is high enough.</p>
+      <p><b>Why this method:</b> matched GPT-4's performance with up to 98% cost reduction, or improved accuracy by 4% at the same cost, across their benchmarks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Learned routers between a strong and a weak model</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2406.18665" target="_blank" rel="noopener">RouteLLM</a></div>
+      <p><b>How:</b> train a router on human preference data to predict when the weak model's answer will be as good as the strong one's.</p>
+      <p><b>Why this method:</b> cut costs by over 2× in some cases without hurting response quality, and routers transferred to model pairs they weren't trained on.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Prompt caching</b> <span class="tag co">🏢 Anthropic · 2024</span> <a href="https://platform.claude.com/docs/en/build-with-claude/prompt-caching" target="_blank" rel="noopener">Prompt caching docs</a></div>
+      <p><b>How:</b> mark a prefix with <code>cache_control</code>; later requests with the same prefix read it at a fraction of the input price.</p>
+      <p><b>Why this method:</b> long, repeated prompts (big documents, many examples, tool definitions) are where most input spend goes; the launch reported up to 90% lower cost and 85% lower latency for long prompts.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Half price for waiting</b> <span class="tag co">🏢 OpenAI</span> <a href="https://developers.openai.com/api/docs/guides/batch" target="_blank" rel="noopener">Batch API guide</a></div>
+      <p><b>How:</b> upload a file of requests, get results within a 24-hour window.</p>
+      <p><b>Why this method:</b> 50% lower cost (and separate rate limits) for evals, backfills, classification and summarization jobs.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A semantic cache library</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/zilliztech/GPTCache" target="_blank" rel="noopener">GPTCache (Zilliz)</a></div>
+      <p><b>How:</b> embeds queries, stores answers in a vector store, and returns a cached answer above a similarity threshold, with pluggable similarity checks.</p>
+      <p><b>Why this method:</b> FAQ-style traffic repeats a lot; a cache answers it in milliseconds without a model call.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · you may already be saving</span>
+    <p>OpenAI's prompt caching is on by default for prompts of 1,024 tokens or more, so many apps get the discount without changing a line, as long as their prompts start with the same tokens. Put a timestamp or the user's name at the very top and you quietly turn it off.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Prompt caching builds on the KV cache (Lesson 7.4) and the prompt-ordering advice in Lesson 1.4; routing is the workflow pattern from Lesson 6.3; distillation is Lesson 7.2. You find what to optimise with the traces from Lesson 8.1, and prove you didn't break anything with evals (Lessons 5.1 and 5.6). The general capacity-and-cost thinking is in the System Design course: <a href="../../system-design-course/phase6/5-capacity-cost.html">capacity &amp; cost</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2305.05176" target="_blank" rel="noopener">FrugalGPT</a>. Prompt adaptation, LLM approximation and cascades, with cost-accuracy curves.</li>
+      <li><span class="kind">Docs</span> <a href="https://developers.openai.com/api/docs/guides/prompt-caching" target="_blank" rel="noopener">OpenAI prompt caching</a>. How automatic caching works and how to structure prompts for it.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.redisvl.com/en/latest/user_guide/03_llmcache.html" target="_blank" rel="noopener">RedisVL semantic cache guide</a>. Thresholds, TTLs and filtering by user or tenant.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. A 10,000-token prefix, 500,000 requests a month, $3 per million input tokens. With 80% cache hits at 0.1× and misses paying a 1.25× write, what does the prefix cost per month?</div>
+    <div class="opts"><button class="opt" data-ok>About $4,950</button><button class="opt">About $1,500</button><button class="opt">About $15,000</button></div>
+    <div class="explain">Full price: 10,000 × 500,000 × $3/M = $15,000. Multiplier: 0.8 × 0.1 + 0.2 × 1.25 = 0.08 + 0.25 = 0.33, so <b>$4,950</b>. $1,500 forgets the misses' write premium; $15,000 is no caching at all.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After adding a semantic cache, customers report being told the wrong refund window: Plus members get the regular-customer answer. What's the best fix?</div>
+    <div class="opts"><button class="opt">Lower the similarity threshold so more questions hit</button><button class="opt" data-ok>Scope cache entries by the facts that change the answer (plan type, locale), raise the threshold, and measure wrong-hit rate on labelled samples</button><button class="opt">Remove prompt caching</button></div>
+    <div class="explain">“Refund as a Plus member” and “refund for an order” are similar texts with different answers. Putting plan type in the cache key stops cross-plan reuse; a stricter threshold and a measured wrong-answer rate keep it honest. Prompt caching never changes answers.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. 70% of your traffic is simple FAQ questions. A small model is 15× cheaper and as good on those, but much worse on the rest. What do you ship?</div>
+    <div class="opts"><button class="opt">Switch everything to the small model</button><button class="opt">Keep the large model for everything; quality first</button><button class="opt" data-ok>A router or cascade: small model first, escalate hard or low-confidence queries, verified by evals before and after</button></div>
+    <div class="explain">Switching everything breaks the 30% hard queries; keeping the large model wastes most of the bill. Routing captures most of the saving; a cascade's confidence check catches the router's mistakes. Evals prove the quality held.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Measure first: which feature and which part of the prompt costs the most.</li>
+      <li>Safe wins: stable-first prompts with prompt caching, trimmed context, shorter outputs, batch APIs (50%) for async work, streaming for perceived latency.</li>
+      <li>Routing and cascades save the most but risk quality: escalate when unsure and gate with evals.</li>
+      <li>Semantic caching trades hit rate for wrong answers at a threshold: scope it, measure it, and never share personal answers.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/ai.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  // ---------- cost optimizer (scripted model, numbers in the hint) ----------
+  const L = { i: 3, o: 15, tps: 80 }, S = { i: 0.25, o: 1.25, tps: 200 };
+  function model(o) {
+    const P = 3000, D = o.trim ? 1000 : 2000, O = o.concise ? 200 : 350;
+    const prefMult = o.cache ? 0.9 * 0.1 + 0.1 * 1.25 : 1;
+    const parts = m => ({ pre: P * prefMult * m.i / 1e6, ctx: D * m.i / 1e6, out: O * m.o / 1e6 });
+    const lat = m => 0.3 + (P * (o.cache ? 0.1 : 1) + D) / 20000 + O / m.tps;
+    const f = o.route, E = 0.6;
+    const hard = f <= E ? 0.08 * f : 0.08 * E + (f - E), easy = f - hard;
+    let wL = 1 - f, q = (1 - f) * 0.92, t = (1 - f) * lat(L);
+    if (o.cascade) {
+      const escH = 0.85 * hard, escE = 0.10 * easy;
+      wL += escH + escE;
+      q += (easy - escE) * 0.90 + (hard - escH) * 0.50 + (escH + escE) * 0.92;
+      t += f * lat(S) + (escH + escE) * lat(L);
+    } else { q += easy * 0.90 + hard * 0.50; t += f * lat(S); }
+    const sc = o.sem ? 0.15 : 0;
+    q = q * (1 - sc) + sc * 0.96 * 0.92; t = t * (1 - sc) + sc * 0.05;
+    if (o.trim) q -= 0.005;
+    const batchMul = o.batch ? 1 - 0.25 * 0.5 : 1, k = o.R * (1 - sc) * batchMul;
+    const pl = parts(L), ps = parts(S);
+    const bars = {
+      "large: fixed prefix": k * wL * pl.pre, "large: context": k * wL * pl.ctx, "large: output": k * wL * pl.out,
+      "small model": k * f * (ps.pre + ps.ctx + ps.out),
+    };
+    return { bars, cost: MX.sum(Object.values(bars)), q: 100 * q, t };
+  }
+  const ids = ["coCache", "coTrim", "coShort", "coSem", "coCasc", "coBatch"];
+  const read = () => ({ R: +$("coR").value * 1e6, cache: $("coCache").checked, trim: $("coTrim").checked, concise: $("coShort").checked, sem: $("coSem").checked, cascade: $("coCasc").checked, batch: $("coBatch").checked, route: +$("coF").value / 100 });
+  function renderCost() {
+    const o = read(), r = model(o), base = model({ R: o.R, route: 0 });
+    $("coRv").textContent = (+$("coR").value).toFixed(1) + " M"; $("coFv").textContent = Math.round(o.route * 100) + "%";
+    const c = [MX.css("--c-tk"), MX.css("--c-cx"), MX.css("--c-md"), MX.css("--c-ev")];
+    Plot.bars($("coc"), { bars: Object.entries(r.bars).map(([label, v], i) => ({ label, value: Math.round(v), color: c[i] })), yMin: 0, yLabel: "$ per month" });
+    $("coCost").textContent = "$" + Math.round(r.cost).toLocaleString();
+    $("coSave").textContent = Math.round(100 * (1 - r.cost / base.cost)) + "%";
+    $("coQ").textContent = r.q.toFixed(1) + "%";
+    $("coT").textContent = r.t.toFixed(1) + " s";
+    const drop = base.q - r.q;
+    $("coMsg").innerHTML = drop > 3 ? `<span class="rk">❌ Quality fell ${drop.toFixed(1)} points. The small model is now answering hard questions it gets wrong${o.cascade ? "" : "; try the cascade"}.</span>`
+      : r.cost < base.cost * 0.5 ? `<span class="ev">✅ ${Math.round(100 * (1 - r.cost / base.cost))}% cheaper for ${drop.toFixed(1)} quality points. Ship it behind an A/B test.</span>`
+      : `Baseline-ish: $${Math.round(r.cost).toLocaleString()} a month. Switch on levers to see what each saves.`;
+  }
+  const preset = (on, route) => { ids.forEach((id, i) => ($(id).checked = on[i])); $("coF").value = route; renderCost(); };
+  $("co-off").onclick = () => preset([0, 0, 0, 0, 0, 0], 0);
+  $("co-good").onclick = () => preset([1, 1, 1, 1, 1, 1], 50);
+  $("co-bad").onclick = () => preset([1, 1, 1, 1, 0, 1], 90);
+  ids.forEach(id => ($(id).onchange = renderCost));
+  ["coR", "coF"].forEach(id => ($(id).oninput = renderCost));
+  renderCost();
+
+  // ---------- semantic cache ----------
+  const CACHE = [["How do I reset my password?", "pw"], ["How long do refunds take to arrive?", "rt"], ["Can I cancel my subscription?", "cs"], ["How much does shipping cost?", "sc"], ["Is my data encrypted?", "en"], ["How do I get a refund for an order?", "rf"]];
+  const Q = [["I forgot my password, how can I reset it?", "pw"], ["password reset", "pw"], ["When will my refund money arrive?", "rt"], ["How do I cancel my subscription?", "cs"], ["What does shipping cost?", "sc"], ["Is my data encrypted at rest?", "en"], ["Can I get my money back for an order?", "rf"], ["How long until my refund arrives?", "rt"], ["Can I cancel my subscription today?", "cs"], ["Shipping cost?", "sc"],
+    ["How do I cancel my order?", null], ["How long does shipping take?", null], ["Is my data sold to advertisers?", null], ["How do I get a refund as a Plus member?", null], ["How do I change my password?", null], ["Can I pause my subscription?", null], ["How much does express shipping cost?", null], ["How do I change my email?", null]];
+  const cv = CACHE.map(c => AI.embed(c[0]));
+  const rows = Q.map(([q, k]) => {
+    const v = AI.embed(q); let b = -1, bi = 0;
+    cv.forEach((c, i) => { const s = AI.cosine(v, c); if (s > b) { b = s; bi = i; } });
+    return { q, k, bi, s: b, right: CACHE[bi][1] === k };
+  }).sort((a, b) => b.s - a.s);
+  const stats = th => { const hit = rows.filter(r => r.s >= th - 1e-9); return { hit: hit.length, good: hit.filter(r => r.right).length, bad: hit.filter(r => !r.right).length }; };
+  const esc = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  function renderCache() {
+    const th = +$("th").value; $("thv").textContent = th.toFixed(2);
+    $("crows").innerHTML = rows.map(r => {
+      const hit = r.s >= th - 1e-9;
+      const res = hit ? (r.right ? '<span class="ev">✅ reuse</span>' : '<span class="rk">❌ wrong</span>') : (r.k ? '<span class="muted">miss (wasted)</span>' : '<span class="muted">miss ✓</span>');
+      return `<div class="crow"><span>${esc(r.q)}</span><span class="m muted">${esc(CACHE[r.bi][0])}</span><span class="s">${r.s.toFixed(2)}</span><span class="s">${res}</span></div>`;
+    }).join("");
+    const s = stats(th);
+    $("hr").textContent = Math.round(100 * s.hit / rows.length) + "%";
+    $("good").textContent = s.good + " / 10";
+    $("bad").textContent = s.bad;
+    $("saved").textContent = s.hit + " of " + rows.length;
+  }
+  $("th").oninput = renderCache;
+  $("sweep2").onclick = () => {
+    const hits = [], bads = [];
+    for (let th = 0.70; th <= 1.0001; th += 0.01) { const s = stats(th); hits.push([th, 100 * s.good / 10]); bads.push([th, 100 * s.bad / rows.length]); }
+    Plot.line($("thc"), {
+      series: [
+        { label: "rephrasings answered from cache %", color: MX.css("--c-ev"), data: hits, width: 3 },
+        { label: "wrong answers served (% of traffic)", color: MX.css("--c-rk"), data: bads, width: 3, dash: [6, 4] },
+      ], xLabel: "similarity threshold", yMin: 0, yMax: 100,
+    });
+    const zero = hits.find((h, i) => bads[i][1] === 0);
+    $("thmsg").textContent = `The first threshold with zero wrong answers is ${zero[0].toFixed(2)}, and there only ${Math.round(zero[1] / 10)} of 10 rephrasings hit. Every lower threshold buys hits with wrong answers. (Toy embedding; real thresholds differ, the shape doesn't.)`;
+  };
+  renderCache();
+  $("sweep2").onclick();
+})();
+</script>
+</body>
+</html>

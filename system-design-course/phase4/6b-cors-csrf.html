@@ -1,0 +1,683 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>4.6b Browser security for backends: CORS, CSRF & cookies · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .playground select { font: inherit; font-size: .85rem; padding: 2px 6px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+  .wire { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 10px; margin: 10px 0; }
+  .wire pre { margin: 0; font-size: .76rem; white-space: pre-wrap; word-break: break-all; min-height: 5em; }
+  .wire pre b { color: var(--accent); }
+  .wire .bad { color: var(--c-er); font-weight: 700; } .wire .ok { color: var(--c-db); font-weight: 700; }
+  .verdict { border: 2px solid var(--line); border-radius: 12px; padding: 8px 12px; background: var(--bg2); font-size: .9rem; margin: 8px 0; }
+  .verdict.ok { border-color: var(--c-db); } .verdict.bad { border-color: var(--c-er); }
+  .grp { border: 1px dashed var(--line); border-radius: 12px; padding: 4px 12px; margin: 8px 0; }
+  .grp > .hint { margin: 4px 0 0; font-weight: 700; }
+</style>
+</head>
+<body data-lesson="s4-6b" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 4 · Lesson 6b</div>
+  <h1>Browser security for backends: CORS, CSRF & cookies</h1>
+  <p class="subtitle">Browsers run code from every website you visit, and they attach your cookies to requests on their own. Three backend decisions, your CORS headers, your cookie flags and your CSRF defence, decide whether some other website can read your users' data or act as them.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Sessions vs tokens</b>: a session ID in a cookie, or a short-lived signed token (JWT) sent in an <code>Authorization</code> header (Lesson 4.6).</li>
+      <li><b>API gateway</b>: the front door that runs the same checks for every service (Lesson 1.6).</li>
+      <li><b>HTTP basics</b>: methods (GET, POST, PUT, DELETE), headers, and HTTPS = HTTP inside TLS encryption (Lessons 0.2 and 0.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In October 2016, James Kettle of PortSwigger published research on misconfigured CORS headers. One bitcoin exchange's API took whatever website was calling it and echoed it back as allowed, <b>with cookies allowed too</b>. So any web page a logged-in user visited could quietly call the exchange's “give me my API key” endpoint and <b>read the answer</b>.</p>
+    <p>With that key, he wrote, he could turn off the user's notifications, lock them out with two-factor login, and move their bitcoins. In his words: “That's pretty severe for a header misconfiguration.” He reported it instead, and the exchange fixed it within 20 minutes. By the end of this lesson you'll know exactly which header did it, and the three settings that stop that whole family of attacks.</p>
+  </div>
+
+  <h2>Numbers first: what CORS costs before it protects anything</h2>
+  <p>Your single-page app (an <b>SPA</b>: one page whose JavaScript calls APIs) lives at <code>https://app.shop.example</code>. Its API lives at <code>https://api.shop.example</code>. Different hostnames, so the browser treats every call as <b>cross-origin</b>. Calls that send JSON or an <code>Authorization</code> header need permission first: an extra <code>OPTIONS</code> request called a <b>preflight</b>.</p>
+  <table>
+    <tr><th>Setup (typical numbers: 100 ms phone round trip)</th><th>Requests on the wire per API call</th><th>Extra wait per call</th></tr>
+    <tr><td>Same origin: the gateway serves <code>app.shop.example/api/…</code></td><td class="db">1</td><td>0 ms</td></tr>
+    <tr><td>Cross-origin, “simple” request (plain GET, no custom headers)</td><td class="db">1</td><td>0 ms</td></tr>
+    <tr><td>Cross-origin JSON + <code>Authorization</code>, no <code>Access-Control-Max-Age</code></td><td class="er">2 almost every time</td><td class="lt">+100 ms</td></tr>
+    <tr><td>Same, with <code>Access-Control-Max-Age: 7200</code></td><td>2 the first time per URL, then 1</td><td class="lt">+100 ms once per URL per 2 h</td></tr>
+  </table>
+  <p>Without a max-age, the Fetch standard caches a preflight for just <b>5 seconds</b>. At 5,000 API calls per second, your gateway then answers up to <b>5,000 extra OPTIONS requests per second</b>: double the requests, for work that returns no data. The preflight cache is also per URL, so <code>/orders/1</code> and <code>/orders/2</code> each need their own.</p>
+  <div class="eq">
+    gateway load ≈ <span class="cl">API calls/s</span> × (1 + <span class="nw">share of calls that need a fresh preflight</span>)
+    <span class="say">“Every call that isn't covered by a cached preflight costs a second request, and a second round trip for the user.”</span>
+  </div>
+
+  <h2>The rule underneath everything: the same-origin policy</h2>
+  <p>An <b>origin</b> is three things together: <b>scheme</b> (https), <b>host</b> (app.shop.example) and <b>port</b> (443). The <b>same-origin policy</b> (SOP), built into every browser, decides what JavaScript from one origin may do with another. Compared with <code>https://app.shop.example</code>:</p>
+  <table>
+    <tr><th>URL</th><th>Same origin?</th><th>Same <i>site</i>?</th><th>Why</th></tr>
+    <tr><td><code>https://app.shop.example/orders</code></td><td class="db">✅ yes</td><td>✅</td><td>The path doesn't count</td></tr>
+    <tr><td><code>http://app.shop.example</code></td><td class="er">❌</td><td>❌</td><td>Different scheme</td></tr>
+    <tr><td><code>https://app.shop.example:8443</code></td><td class="er">❌</td><td>✅</td><td>Different port</td></tr>
+    <tr><td><code>https://api.shop.example</code></td><td class="er">❌</td><td>✅</td><td>Different host, same registrable domain</td></tr>
+    <tr><td><code>https://evilshop.example</code></td><td class="er">❌</td><td class="er">❌</td><td>Looks similar, totally different site</td></tr>
+  </table>
+  <p>A <b>site</b> is looser than an origin: the scheme plus the <b>registrable domain</b> (the part you buy, like <code>shop.example</code>). All subdomains of <code>shop.example</code> are “same-site”. Cookies' SameSite rule (below) works on sites, CORS works on origins. Remember that difference; attackers do.</p>
+  <p>MDN sums up the policy in three lines, and they explain this whole lesson:</p>
+  <ul>
+    <li><b>Cross-origin writes are typically allowed</b>: links, redirects, form submissions.</li>
+    <li><b>Cross-origin embedding is typically allowed</b>: images, scripts, stylesheets.</li>
+    <li><b>Cross-origin reads are typically disallowed</b>: your JavaScript can't read another origin's response… unless that server says so with <b>CORS</b>.</li>
+  </ul>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    The browser lets any page <b>send</b> requests almost anywhere, but stops it <b>reading</b> the answers. <b>CORS</b> (Cross-Origin Resource Sharing) is how your server lifts the read block for specific origins. <b>CSRF</b> (Cross-Site Request Forgery) abuses the send half: another site makes the browser send a request, and the browser attaches your user's cookies. So: CORS decides <b>who may read</b>; cookie flags and CSRF defences decide <b>whose writes you accept</b>. Neither one is authentication.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: an assistant carrying your ID badge</span>
+    <p>Your browser is an assistant who wears your company badge (cookies) everywhere. Any stranger (a website) can hand the assistant an envelope to deliver to your bank, and the assistant flashes your badge at the bank's door automatically. That's CSRF. The assistant won't hand the bank's reply back to the stranger unless the bank wrote “OK to show this to X” on it: that's CORS. <b>SameSite</b> teaches the assistant to hide the badge for strangers' envelopes. A <b>CSRF token</b> is the bank asking for a code that's printed only on its own forms.</p>
+  </div>
+
+  <h2>CORS: how a server says “this origin may read”</h2>
+  <p>When JavaScript calls another origin, the browser adds an <code>Origin</code> header saying who's asking. What happens next depends on whether the request is <b>simple</b>. Per MDN and the Fetch standard, a request is simple when:</p>
+  <ul>
+    <li>the method is <code>GET</code>, <code>HEAD</code> or <code>POST</code>, and</li>
+    <li>it sets only safelisted headers (like <code>Accept</code>, <code>Content-Language</code>), with no <code>Authorization</code> and no custom <code>X-…</code> headers, and</li>
+    <li>any <code>Content-Type</code> is one an HTML form could send: <code>application/x-www-form-urlencoded</code>, <code>multipart/form-data</code> or <code>text/plain</code>. <b><code>application/json</code> is not on the list.</b></li>
+  </ul>
+  <p><b>Simple requests go straight to the server.</b> The browser only checks the response headers afterwards to decide whether JavaScript may read it. <b>Everything else is preflighted</b>: the browser first sends <code>OPTIONS</code> with <code>Access-Control-Request-Method</code> and <code>Access-Control-Request-Headers</code>, and only sends the real request if the server's answer allows it. Preflights never carry cookies.</p>
+  <table>
+    <tr><th>Response header</th><th>What it says</th><th>Gotcha</th></tr>
+    <tr><td><code>Access-Control-Allow-Origin</code></td><td>Which origin may read: one exact origin, or <code>*</code></td><td><code>*</code> is refused when the request includes cookies</td></tr>
+    <tr><td><code>Access-Control-Allow-Credentials: true</code></td><td>Reads are allowed even when cookies were sent</td><td>Combined with a sloppy origin check, this is the dangerous one</td></tr>
+    <tr><td><code>Access-Control-Allow-Methods</code></td><td>Methods allowed beyond GET/HEAD/POST (preflight)</td><td>Forget <code>PUT</code> and every update fails</td></tr>
+    <tr><td><code>Access-Control-Allow-Headers</code></td><td>Request headers allowed (preflight)</td><td><code>Authorization</code> and JSON's <code>Content-Type</code> must be listed</td></tr>
+    <tr><td><code>Access-Control-Max-Age</code></td><td>Seconds the preflight may be cached</td><td>Default 5 s; Chromium caps it at 7,200, Firefox at 86,400</td></tr>
+    <tr><td><code>Vary: Origin</code></td><td>Tells caches and CDNs (content delivery networks, Lesson 1.4) the answer depends on <code>Origin</code></td><td>Without it, a CDN can serve one origin's headers to another</td></tr>
+  </table>
+  <p>One more thing the CORS error hides: for security, JavaScript only learns “it failed” (<code>TypeError: Failed to fetch</code>). The reason is printed only in the browser's DevTools console. That's why CORS bugs feel mysterious: always look at the console and the network tab.</p>
+
+  <div class="playground" id="pg-cors">
+    <span class="label">🎮 Playground · The CORS simulator</span>
+    <p class="hint">The default is the classic bug: your SPA calls its own API and gets a CORS error. Make it work by changing <b>only the server</b>. Then press <b>🪤 Load the trap</b> to replay the 2016 bitcoin exchange: a hostile page, an API that reflects any origin with credentials, and a cookie with <code>SameSite=None</code>. Fix it two ways.</p>
+    <svg id="cfl"></svg>
+    <div class="grp">
+      <p class="hint">🌐 The browser side: what the page's JavaScript does</p>
+      <div class="controls">
+        <label>page origin <select id="cpage">
+          <option value="app">https://app.shop.example (your SPA)</option>
+          <option value="dev">http://localhost:3000 (dev server)</option>
+          <option value="evil">https://evil.example (hostile)</option>
+          <option value="evilshop">https://evilshop.example (hostile look-alike)</option>
+          <option value="nul">null (sandboxed iframe)</option>
+        </select></label>
+        <label>API origin <select id="capi">
+          <option value="api">https://api.shop.example</option>
+          <option value="same">https://app.shop.example/api (same origin, via the gateway)</option>
+          <option value="dev">http://localhost:8080</option>
+        </select></label>
+      </div>
+      <div class="controls">
+        <label>method <select id="cmeth"><option>GET</option><option>POST</option><option selected>PUT</option><option>DELETE</option></select></label>
+        <label>body type <select id="ctype"><option value="none">none</option><option value="form">form-urlencoded</option><option value="text">text/plain</option><option value="json" selected>application/json</option></select></label>
+        <label><input type="checkbox" id="cauth" checked> <code>Authorization: Bearer …</code></label>
+        <label><input type="checkbox" id="ccred"> <code>credentials: "include"</code> (send cookies)</label>
+      </div>
+      <div class="controls">
+        <span class="hint">The API's session cookie:</span>
+        <span class="seg" id="ccookie"><button data-v="None" id="ck-none">SameSite=None; Secure</button><button data-v="Lax" class="on" id="ck-lax">SameSite=Lax</button></span>
+      </div>
+    </div>
+    <div class="grp">
+      <p class="hint">🖥️ The server side: your CORS configuration</p>
+      <div class="controls">
+        <span class="seg" id="csrv"><button data-v="none" class="on" id="sv-none">No CORS headers</button><button data-v="star" id="sv-star">Allow-Origin: *</button><button data-v="list" id="sv-list">Exact allowlist</button><button data-v="suffix" id="sv-suffix">Regex /shop\.example$/</button><button data-v="reflect" id="sv-reflect">Reflect any Origin</button></span>
+      </div>
+      <div class="controls">
+        <label><input type="checkbox" id="scred"> <code>Allow-Credentials: true</code></label>
+        <label><input type="checkbox" id="smeth"> methods incl. PUT, DELETE</label>
+        <label><input type="checkbox" id="shdr"> headers incl. Authorization, Content-Type</label>
+        <label>Max-Age <select id="smax"><option value="0">not sent (5 s)</option><option value="600">600 s</option><option value="7200">7,200 s</option><option value="86400">86,400 s</option></select></label>
+      </div>
+      <p class="hint">Exact allowlist = <code>https://app.shop.example</code>, plus <code>http://localhost:3000</code> in the dev config only.</p>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="csend">▶ Run fetch()</button>
+      <button class="btn" id="ctrap">🪤 Load the trap</button>
+      <button class="btn" id="cfix">🛠️ Fix: exact allowlist</button>
+      <button class="btn" id="cdev">💻 Local dev: :3000 → :8080</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">preflight? <b id="c-pre">–</b></div>
+      <div class="stat">request reached the server? <b id="c-reach">–</b></div>
+      <div class="stat">cookie sent? <b id="c-cookie">–</b></div>
+      <div class="stat">JS can read the response? <b id="c-read">–</b></div>
+      <div class="stat">OPTIONS per hour (call every 30 s, Chrome) <b id="c-opt">–</b></div>
+    </div>
+    <div class="verdict" id="cverdict">–</div>
+    <div class="wire">
+      <pre id="cw1"></pre>
+      <pre id="cw2"></pre>
+    </div>
+    <p class="hint" id="cmsg"></p>
+  </div>
+  <p>Things to try: with the default, turn on the allowlist only. The preflight still fails until you also allow <code>PUT</code> and the <code>Authorization</code> header. Then switch the API to “same origin, via the gateway”: no CORS at all, no preflight. In the trap, switching the cookie to <code>SameSite=Lax</code> also stops the leak, because the hostile page's request arrives without a cookie. That's good defence in depth, but the real bug is the reflected origin. Finally pick the look-alike <code>evilshop.example</code> with the regex config: a suffix match lets it straight in.</p>
+
+  <h3>The misconfigurations attackers look for</h3>
+  <ul>
+    <li><b>Reflect any <code>Origin</code> + <code>Allow-Credentials: true</code></b>: every website on the internet can read logged-in users' data. Common because it “makes the CORS error go away”.</li>
+    <li><b>Sloppy matching</b>: <code>endsWith("shop.example")</code> or a regex without a dot and anchors also matches <code>evilshop.example</code>. The <code>cors</code> package for Express documents this exact example: <code>/example\.com$/</code> reflects any origin ending in example.com.</li>
+    <li><b>Allowing <code>null</code></b>: sandboxed iframes and some redirects send <code>Origin: null</code>, and any attacker can create one. Never allow it.</li>
+    <li><b>Believing CORS protects the API</b>. It doesn't: curl, Postman and servers ignore it entirely. The <code>cors</code> README says it plainly: CORS is not access control. You still need authentication and authorization (Lesson 4.6).</li>
+  </ul>
+
+  <h2>CSRF: when the request itself is the attack</h2>
+  <p>Look again at the simple-request rule: a form <code>POST</code> goes straight to the server, cookies and all. CORS only stops the attacker <i>reading</i> the reply. For a money transfer, the reply doesn't matter: the money already moved. PortSwigger's Web Security Academy lists three conditions for CSRF: an <b>action worth inducing</b>, <b>cookie-only session handling</b>, and <b>no unpredictable parameters</b> in the request. Remove any one and the attack dies.</p>
+  <pre><code><span class="c">&lt;!-- on https://evil.example: the victim only has to visit the page --&gt;</span>
+&lt;form action=<span class="s">"https://bank.example/transfer"</span> method=<span class="s">"POST"</span>&gt;
+  &lt;input type=<span class="s">"hidden"</span> name=<span class="s">"to"</span> value=<span class="s">"mallory"</span>&gt;
+  &lt;input type=<span class="s">"hidden"</span> name=<span class="s">"amount"</span> value=<span class="s">"1000"</span>&gt;
+&lt;/form&gt;
+&lt;script&gt;document.forms[<span class="n">0</span>].submit()&lt;/script&gt;</code></pre>
+  <table>
+    <tr><th>Defence</th><th>How it works</th><th>Weak spot</th></tr>
+    <tr><td><b>SameSite cookies</b></td><td><code>Strict</code>: never sent on requests started by another site. <code>Lax</code>: sent on cross-site top-level navigations with safe methods (clicking a link), not on cross-site POSTs, images or fetches. <code>None</code> (needs <code>Secure</code>): always sent.</td><td>Lax still sends cookies on cross-site GET links, so a state-changing GET is exploitable. And all subdomains are same-site.</td></tr>
+    <tr><td><b>CSRF token</b> (synchronizer)</td><td>The server puts a random token in its own forms and checks it on every state-changing request. Another site can't read it (same-origin policy).</td><td>Must cover every unsafe method; per-request tokens can break the Back button</td></tr>
+    <tr><td><b>Signed double-submit cookie</b></td><td>Token in a cookie and in the request; the server checks they match, and that it's an HMAC (a keyed hash) bound to the session. No server-side storage.</td><td>OWASP (the Open Worldwide Application Security Project, Lesson 6.6) discourages the unsigned “naive” version: a sibling subdomain that can write cookies can forge it</td></tr>
+    <tr><td><b>Origin / Fetch Metadata check</b></td><td>Browsers send <code>Origin</code> on cross-origin POSTs and <code>Sec-Fetch-Site: cross-site | same-site | same-origin | none</code> on requests. Reject unsafe methods that aren't same-origin.</td><td>Older clients may omit them; decide what to do when they're missing</td></tr>
+    <tr><td><b>JSON-only + a custom header</b></td><td>Accept only <code>application/json</code> or require <code>X-Requested-With</code>: that forces a preflight, which your CORS config refuses for other origins</td><td>Breaks if any endpoint also accepts form posts</td></tr>
+  </table>
+  <p>Chrome made <b><code>SameSite=Lax</code> the default</b> for cookies that don't say (Chrome 80, rolled out during 2020), with a 2-minute exception that still lets brand-new cookies ride on top-level POSTs. MDN notes that only <i>some</i> browsers default to Lax, and OWASP calls SameSite defence in depth, not a replacement. So: set <code>SameSite</code> explicitly, never change state on GET, and still use your framework's CSRF protection.</p>
+
+  <div class="playground" id="pg-csrf">
+    <span class="label">🎮 Playground · The CSRF attack</span>
+    <p class="hint">You're logged in to bank.example with $5,000. You open a link to a funny video on evil.example, which tries to send $1,000 to Mallory. Pick the attack, the bank's cookie setting and its defences, and press <b>Visit the page</b>. Then check the defences don't break real users: a legit transfer, and arriving from a link in an email.</p>
+    <svg id="xfl"></svg>
+    <div class="controls">
+      <span class="hint">Attack:</span>
+      <span class="seg" id="xvec"><button data-v="form" class="on" id="xv-form">Hidden form POST</button><button data-v="img" id="xv-img">&lt;img&gt; GET</button><button data-v="link" id="xv-link">Link click GET</button><button data-v="fetch" id="xv-fetch">fetch() JSON</button><button data-v="sib" id="xv-sib">From forum.bank.example</button></span>
+    </div>
+    <div class="controls">
+      <span class="hint">Session cookie:</span>
+      <span class="seg" id="xss"><button data-v="none" class="on" id="xs-none">SameSite=None</button><button data-v="unset" id="xs-unset">not set (Chrome default)</button><button data-v="lax" id="xs-lax">Lax</button><button data-v="strict" id="xs-strict">Strict</button></span>
+      <label><input type="checkbox" id="xfresh"> logged in under 2 minutes ago</label>
+    </div>
+    <div class="controls">
+      <span class="hint">Bank's server:</span>
+      <label><input type="checkbox" id="xtok"> requires a CSRF token</label>
+      <label><input type="checkbox" id="xorig"> checks Origin / Sec-Fetch-Site</label>
+      <label><input type="checkbox" id="xget"> 🐛 /transfer also works via GET</label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="xatk">▶ Visit the page</button>
+      <button class="btn" id="xlegit">✅ Legit transfer on bank.example</button>
+      <button class="btn" id="xemail">📧 Open bank.example from an email link</button>
+      <button class="btn" id="xreset">Reset balance</button>
+    </div>
+    <div class="stat-row">
+      <div class="stat">cookie sent? <b id="x-cookie">–</b></div>
+      <div class="stat">server's answer <b id="x-ans">–</b></div>
+      <div class="stat">money moved <b id="x-moved">–</b></div>
+      <div class="stat">your balance <b id="x-bal">$5,000</b></div>
+    </div>
+    <div class="verdict" id="xverdict">–</div>
+    <div class="wire"><pre id="xw"></pre></div>
+  </div>
+  <p>Things to try: the default (SameSite=None, no defences) loses money with every attack except <code>fetch()</code>, which the browser preflights and the bank's CORS refuses. Switch to Lax: the form is stopped, but turn on the 🐛 GET bug and the link click works, even with a CSRF token, because frameworks only check tokens on unsafe methods. Try “not set” with a fresh login to see Chrome's 2-minute exception. Then attack from <code>forum.bank.example</code>: it's the same site, so even Strict sends the cookie. Only the token or the Origin check stops it.</p>
+
+  <h2>Cookie flags: the backend's half of browser security</h2>
+  <p>Every session cookie is a <code>Set-Cookie</code> header your server writes. The flags are cheap and most breaches involve one that was missing (details on MDN's <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Set-Cookie" target="_blank" rel="noopener">Set-Cookie page</a>):</p>
+  <table>
+    <tr><th>Flag</th><th>Effect</th><th>Default to use</th></tr>
+    <tr><td><code>HttpOnly</code></td><td>JavaScript can't read the cookie (<code>document.cookie</code>)</td><td>Always, for session cookies</td></tr>
+    <tr><td><code>Secure</code></td><td>Only sent over HTTPS</td><td>Always</td></tr>
+    <tr><td><code>SameSite</code></td><td>When it rides on cross-site requests (above)</td><td><code>Lax</code>; <code>Strict</code> for high-value apps</td></tr>
+    <tr><td><code>Domain</code></td><td>Setting it shares the cookie with <b>every subdomain</b></td><td>Leave it out (host-only)</td></tr>
+    <tr><td><code>Path</code>, <code>Max-Age</code></td><td>Which paths get it; how long it lives</td><td><code>Path=/</code>; hours to days, not years</td></tr>
+    <tr><td><code>__Host-</code> name prefix</td><td>Browser rejects it unless <code>Secure</code>, no <code>Domain</code>, <code>Path=/</code>: a sibling subdomain can't overwrite it</td><td><code>__Host-session=…</code></td></tr>
+  </table>
+  <h3>Where should a token live: cookie or localStorage?</h3>
+  <p><b>XSS</b> (cross-site scripting: an attacker's JavaScript running on <i>your</i> page) is the other half of this story (Lesson 6.6). A token in <code>localStorage</code> is readable by any script on the page, so XSS can copy it and use it from anywhere, for as long as it lives. An <code>HttpOnly</code> cookie can't be copied, but it rides along automatically, so you need CSRF defences. OWASP's warning applies to both: XSS can defeat all CSRF defences, because the attacker's script runs as you while the page is open. The 2026 best practice for browser apps from the IETF (Internet Engineering Task Force, the internet's standards body), <a href="https://www.rfc-editor.org/rfc/rfc10017.html" target="_blank" rel="noopener">RFC 10017</a>, strongly recommends a <b>backend for frontend</b> (BFF, Lesson 1.6) for business and personal-data apps: the SPA holds only an <code>HttpOnly</code>, <code>Secure</code> cookie, and the BFF keeps the OAuth tokens server-side.</p>
+
+  <h2>Do CORS once, at the gateway</h2>
+  <p>Thirty services each writing their own CORS rules means thirty chances to reflect any origin. Put it at the gateway (Lesson 1.6): one reviewed allowlist, preflights answered at the edge without touching services, <code>Vary: Origin</code> on every response so the CDN (Lesson 1.4) keeps per-origin copies, and a long <code>Max-Age</code>. Better still, <b>avoid CORS</b>: route <code>app.shop.example/api/*</code> to the API through the same gateway, and the browser sees one origin. In development, the same trick is a dev-server proxy (Vite's <code>server.proxy</code>, for example), instead of loosening production CORS.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: what preflights cost a dashboard</span>
+    <p>An analytics SPA makes <b>200 API calls</b> in a 30-minute session, across <b>40 distinct URLs</b>, all JSON with an <code>Authorization</code> header. Phone round trip: 100 ms. Across all users: <b>5,000 calls/s</b>.</p>
+    <ul>
+      <li><b>No Max-Age</b> (5 s cache): almost every call is preflighted: 200 preflights × 100 ms = <b>20 s</b> of extra waiting per session; the gateway sees 5,000 + 5,000 = <b>10,000 requests/s</b>.</li>
+      <li><b>Max-Age 7,200</b>: one preflight per URL per session: 40 × 100 ms = <b>4 s</b>; preflights are 40 ÷ 200 = 20% of calls, so the gateway sees 5,000 × 1.2 = <b>6,000 requests/s</b>.</li>
+      <li><b>Same origin via the gateway</b>: 0 preflights, 0 s, <b>5,000 requests/s</b>.</li>
+    </ul>
+    <p>One header saves 16 seconds per session and 4,000 requests per second. One routing rule saves all of it.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>Express</b>'s <code>cors</code> package, <b>nginx</b> / <b>Envoy</b> / <b>Kong</b> CORS settings, <b>AWS API Gateway</b> and <b>Cloudflare</b> CORS options; built-in CSRF protection in <b>Django</b>, <b>Rails</b>, <b>ASP.NET Core</b>, <b>Spring Security</b>, and Go 1.25's <code>http.CrossOriginProtection</code>; Burp Suite (PortSwigger) for testing. An exact allowlist in Express:</p>
+<pre><code><span class="k">import</span> cors <span class="k">from</span> <span class="s">"cors"</span>;
+<span class="k">const</span> allowed = [<span class="s">"https://app.shop.example"</span>, <span class="s">"https://admin.shop.example"</span>];
+app.use(cors({
+  origin: (origin, cb) => cb(<span class="k">null</span>, allowed.includes(origin)), <span class="c">// exact match: never endsWith, never reflect</span>
+  credentials: <span class="k">true</span>,
+  methods: [<span class="s">"GET"</span>, <span class="s">"POST"</span>, <span class="s">"PUT"</span>, <span class="s">"DELETE"</span>],
+  allowedHeaders: [<span class="s">"Content-Type"</span>, <span class="s">"Authorization"</span>],
+  maxAge: <span class="n">7200</span>,                                       <span class="c">// Chromium's cap</span>
+}));</code></pre>
+    <p>The same at an nginx gateway, answering preflights at the edge:</p>
+<pre><code>map $http_origin $cors_origin {             <span class="c"># exact allowlist; anything else gets ""</span>
+    default                     <span class="s">""</span>;
+    <span class="s">"https://app.shop.example"</span>  $http_origin;
+}
+location /api/ {
+    <span class="k">if</span> ($request_method = OPTIONS) {
+        add_header Access-Control-Allow-Origin      $cors_origin always;
+        add_header Access-Control-Allow-Credentials <span class="s">"true"</span> always;
+        add_header Access-Control-Allow-Methods     <span class="s">"GET, POST, PUT, DELETE"</span> always;
+        add_header Access-Control-Allow-Headers     <span class="s">"Content-Type, Authorization"</span> always;
+        add_header Access-Control-Max-Age           <span class="n">7200</span> always;
+        add_header Vary Origin always;
+        <span class="k">return</span> <span class="n">204</span>;                              <span class="c"># never reaches the service</span>
+    }
+    add_header Access-Control-Allow-Origin      $cors_origin always;
+    add_header Access-Control-Allow-Credentials <span class="s">"true"</span> always;
+    add_header Vary Origin always;
+    proxy_pass http://api;
+}</code></pre>
+    <p>The session cookie, and CSRF protection in Go 1.25+ (it checks <code>Sec-Fetch-Site</code> and <code>Origin</code>, and lets safe methods through):</p>
+<pre><code>Set-Cookie: __Host-session=9f8a…; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=86400
+
+<span class="c">// Go: reject cross-origin unsafe requests, no tokens needed</span>
+cop := http.NewCrossOriginProtection()
+cop.AddTrustedOrigin(<span class="s">"https://admin.shop.example"</span>)
+http.ListenAndServe(<span class="s">":8080"</span>, cop.Handler(mux))</code></pre>
+    <p class="hint">Try it locally: ask your API what it would tell a hostile origin. If the answer echoes <code>evil.example</code> with <code>Allow-Credentials: true</code>, you've found the 2016 bug: <code>curl -si -X OPTIONS https://api.yours.example/me -H 'Origin: https://evil.example' -H 'Access-Control-Request-Method: GET' | grep -i access-control</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Good</th><th>❌ Costs</th></tr>
+      <tr><td>Same origin (gateway routes <code>/api</code>)</td><td>No CORS, no preflights, cookies just work</td><td>One domain for app and API; harder for third-party sites to call you (often what you want)</td></tr>
+      <tr><td>CORS with an exact allowlist</td><td>Separate API domain, several frontends</td><td>Preflight round trips; one more config to review</td></tr>
+      <tr><td><code>Allow-Origin: *</code> without credentials</td><td>Fine for truly public, read-only data (open APIs, fonts)</td><td>Never for anything a logged-in user sees</td></tr>
+      <tr><td>HttpOnly session cookie</td><td>XSS can't steal it; instant revocation server-side</td><td>Needs CSRF defences; awkward for mobile apps and third parties</td></tr>
+      <tr><td>Bearer token in JS memory or localStorage</td><td>No CSRF (the browser never attaches it); works across domains</td><td>XSS can steal it; keep it short-lived, or use a BFF</td></tr>
+      <tr><td><code>SameSite=Strict</code></td><td>Strongest cookie-level CSRF block</td><td>Users arriving from a link (email, search) look logged out on the first page</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Serve the SPA and the API from one origin, so CORS never comes up. Use your framework's sessions with a <code>__Host-</code>, <code>HttpOnly</code>, <code>Secure</code>, <code>SameSite=Lax</code> cookie, keep its built-in CSRF protection on, and never change state on GET. If you must use CORS, write an exact allowlist once, at the edge.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>A central edge policy: CORS allowlists per API, reviewed like firewall rules; Fetch Metadata checks for every unsafe request; user-generated content on a separate registrable domain (GitHub moved Pages to <code>github.io</code> for exactly this); BFFs for web apps (RFC 10017); and automated scanners that probe every endpoint with hostile <code>Origin</code> headers.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>This rarely gets its own question, but it comes up in any web-facing design. A senior answer:</p>
+    <ul>
+      <li>Separates the jobs: <b>CORS controls reads by other origins</b>, <b>SameSite + tokens/Origin checks control forged writes</b>, <b>authn/authz</b> still protect the API from everything else.</li>
+      <li>Avoids CORS where it can (same-origin routing at the gateway), and otherwise uses an exact allowlist with <code>Vary: Origin</code> and a long <code>Max-Age</code>.</li>
+      <li>Names the session cookie flags, and the cookie vs localStorage trade-off against XSS.</li>
+      <li>Knows why <code>SameSite=Lax</code> isn't enough alone: GET endpoints, sibling subdomains, older browsers.</li>
+    </ul>
+    <p class="hint">Common follow-ups: “Your API is called from a partner's website with the user's session. How?” · “Why doesn't CORS protect against CSRF?” · “Where would you put CORS in a 50-service system?”</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Reflected origin + credentials</b> <span class="tag hist">📜 PortSwigger · 2016</span> <a href="https://portswigger.net/research/exploiting-cors-misconfigurations-for-bitcoins-and-bounties" target="_blank" rel="noopener">Exploiting CORS misconfigurations for Bitcoins and bounties</a></div>
+      <p><b>How:</b> a bitcoin exchange's API echoed any <code>Origin</code> back with <code>Access-Control-Allow-Credentials: true</code>, so a few lines of attacker JavaScript could read a visitor's private API key. Another site trusted any origin <i>ending</i> in its domain (so <code>definitelynotadvisor.com</code> got in), a second exchange any origin <i>starting</i> with its domain, and a third exchange allowed <code>null</code>. The first exchange patched within 20 minutes of the report.</p>
+      <p><b>Why this method:</b> dynamically generating CORS headers from the request is the easy way to make errors disappear, which is why it's so common; the fix is a fixed allowlist with exact matching.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>SameSite=Lax by default</b> <span class="tag co">🏢 Google Chrome · 2020</span> <a href="https://www.chromium.org/updates/same-site/" target="_blank" rel="noopener">SameSite updates (Chromium)</a></div>
+      <p><b>How:</b> Chrome 80 (stable on February 4, 2020) began treating cookies without <code>SameSite</code> as Lax and rejecting <code>SameSite=None</code> without <code>Secure</code>. The rollout was paused in April 2020 because of COVID-19, resumed on July 14, and on August 11 the target became 100% of Chrome 80+ users. <a href="https://web.dev/articles/samesite-cookies-explained" target="_blank" rel="noopener">web.dev explains the change</a>.</p>
+      <p><b>Why this method:</b> changing the browser's default protected millions of sites that never set the flag, without anyone deploying code.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>User content off the main domain</b> <span class="tag co">🏢 GitHub · 2013</span> <a href="https://github.blog/news-insights/the-library/new-github-pages-domain-github-io/" target="_blank" rel="noopener">New GitHub Pages domain: github.io</a></div>
+      <p><b>How:</b> GitHub Pages sites ran users' JavaScript on <code>github.com</code> subdomains, which could write (not read) github.com cookies, enough to fixate a user's CSRF token or lock them out. GitHub moved all Pages to a dedicated <code>github.io</code> domain.</p>
+      <p><b>Why this method:</b> SameSite and cookie scope stop at the registrable domain. A separate domain makes untrusted content cross-site, so none of the main site's cookies apply.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Tokens, Fetch Metadata, built-ins</b> <span class="tag oss">🧰 OWASP · Go</span> <a href="https://cheatsheetseries.owasp.org/cheatsheets/Cross-Site_Request_Forgery_Prevention_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP CSRF Prevention Cheat Sheet</a></div>
+      <p><b>How:</b> OWASP's guide says to use your framework's built-in protection first, recommends synchronizer tokens or the <i>signed</i> double-submit cookie, and describes <code>Sec-Fetch-Site</code> as the primary signal for a Fetch Metadata policy. Go 1.25 shipped <a href="https://pkg.go.dev/net/http#CrossOriginProtection" target="_blank" rel="noopener"><code>http.CrossOriginProtection</code></a>, which uses those headers with no tokens or cookies.</p>
+      <p><b>Why this method:</b> hand-rolled token schemes are easy to get subtly wrong; letting the browser report where a request came from removes the shared secret entirely.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Tokens out of the browser</b> <span class="tag hist">📜 IETF · 2026</span> <a href="https://www.rfc-editor.org/rfc/rfc10017.html" target="_blank" rel="noopener">RFC 10017: OAuth 2.0 for Browser-Based Applications</a></div>
+      <p><b>How:</b> the best current practice describes three architectures and strongly recommends the backend-for-frontend for business, sensitive and personal-data apps. Its BFF cookies must be <code>Secure</code> and <code>HttpOnly</code>, and should be <code>SameSite=Strict</code> with no <code>Domain</code>.</p>
+      <p><b>Why this method:</b> if tokens never reach the browser, XSS has nothing to steal; the remaining risk is an attacker acting through the open page.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · why “simple” requests skip permission</span>
+    <p>CORS lets a cross-origin form-style <code>POST</code> through without asking the server first. That looks like a hole, but it's deliberate. MDN explains that HTML forms could already send these requests to any origin long before <code>fetch()</code> existed, so servers had to defend against CSRF anyway. CORS was designed not to make the web any less safe than it already was. That's also exactly why CSRF still exists: the old hole was never closed, only fenced.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Sessions, tokens and OAuth come from Lesson 4.6; the gateway that should own CORS is Lesson 1.6, and <code>Vary: Origin</code> matters because of CDN caching (Lessons 1.3 and 1.4). XSS, injection and the OWASP Top 10 are in Lesson 6.6. Payment flows (Lesson 7.7) are the classic CSRF target. In AI products, the same rules apply to chat widgets embedded on customers' sites (CORS) and to agents that browse the web while logged in: a page they read can try to make them send requests with the user's cookies.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/CORS" target="_blank" rel="noopener">MDN: Cross-Origin Resource Sharing</a>. Simple vs preflighted requests, every header, with example exchanges.</li>
+      <li><span class="kind">Course</span> <a href="https://portswigger.net/web-security/cors" target="_blank" rel="noopener">PortSwigger Web Security Academy: CORS</a> and <a href="https://portswigger.net/web-security/csrf" target="_blank" rel="noopener">CSRF</a>. Free labs where you exploit both yourself.</li>
+      <li><span class="kind">Docs</span> <a href="https://fetch.spec.whatwg.org/#http-cors-protocol" target="_blank" rel="noopener">Fetch standard: the CORS protocol</a>. The actual rules browsers implement, including the preflight cache.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Your SPA on app.example makes 6,000 calls per second to api.example, all JSON with an Authorization header, and the API sends no Access-Control-Max-Age. Roughly how many requests per second reach the gateway?</div>
+    <div class="opts"><button class="opt">6,000</button><button class="opt" data-ok>About 12,000</button><button class="opt">About 6,005</button></div>
+    <div class="explain">JSON and <code>Authorization</code> make every call preflighted, and the default preflight cache lasts only 5 seconds per URL, so nearly every call costs an extra <code>OPTIONS</code>: <b>≈ 12,000/s</b>, half of them returning no data. A long <code>Max-Age</code> cuts that; same-origin routing removes it.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. To make a CORS error go away, a teammate set the API to copy the request's Origin into Access-Control-Allow-Origin and to send Access-Control-Allow-Credentials: true. What should you change it to?</div>
+    <div class="opts"><button class="opt">Access-Control-Allow-Origin: * with credentials, so it's simpler</button><button class="opt" data-ok>An exact allowlist of your own origins, plus Vary: Origin</button><button class="opt">Keep it, but block Postman and curl</button></div>
+    <div class="explain">Reflecting any origin with credentials lets every website read your logged-in users' data: the 2016 bitcoin-exchange bug. Browsers refuse <code>*</code> with credentials anyway, and curl was never the threat: CORS only constrains browsers. Match exact origins and add <code>Vary: Origin</code> so caches don't mix them up.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A bank's session cookie is SameSite=Lax and its POST /transfer requires a CSRF token. But GET /settings/email?new=… changes the account email. Which attack works?</div>
+    <div class="opts"><button class="opt">A hidden form POST to /transfer from evil.example</button><button class="opt" data-ok>A link on evil.example to the GET email-change URL that the user clicks</button><button class="opt">A fetch() with a JSON body and credentials: "include"</button></div>
+    <div class="explain">Lax still sends cookies on cross-site <b>top-level GET navigations</b>, and token checks usually cover only unsafe methods. Changing the email lets the attacker reset the password: account takeover. The form POST is blocked by Lax and the token; the JSON fetch is preflighted and refused. Rule: <b>never change state on GET</b>.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Origin = scheme + host + port. The same-origin policy allows cross-origin sends but blocks reads; CORS lets a server allow reads for chosen origins.</li>
+      <li>Simple requests (GET/HEAD/POST with form-like bodies) skip the preflight; JSON or <code>Authorization</code> costs an <code>OPTIONS</code> round trip unless <code>Max-Age</code> caches it (default 5 s, Chromium cap 7,200 s).</li>
+      <li>Never reflect any origin with credentials, never suffix-match, never allow <code>null</code>; do CORS once at the gateway, or avoid it with same-origin routing.</li>
+      <li>CSRF: the browser attaches cookies to forged requests. Defend with <code>SameSite</code>, framework CSRF tokens or Origin/<code>Sec-Fetch-Site</code> checks, and no state changes on GET.</li>
+      <li>Session cookie: <code>__Host-</code>, <code>Secure</code>, <code>HttpOnly</code>, <code>SameSite=Lax</code> or Strict, no <code>Domain</code>. Tokens in localStorage trade CSRF for XSS risk; a BFF keeps tokens off the browser.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const esc = s => String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return {
+      get: () => bs.find(b => b.classList.contains("on")).dataset.v,
+      set: v => bs.forEach(x => x.classList.toggle("on", x.dataset.v === v)),
+    };
+  };
+
+  // ================= CORS simulator =================
+  const PAGES = { app: "https://app.shop.example", dev: "http://localhost:3000", evil: "https://evil.example", evilshop: "https://evilshop.example", nul: "null" };
+  const APIS = { api: "https://api.shop.example", same: "https://app.shop.example", dev: "http://localhost:8080" };
+  const HOSTILE = { evil: 1, evilshop: 1, nul: 1 };
+  const ALLOW = ["https://app.shop.example", "http://localhost:3000"];
+  const site = o => { if (o === "null") return "opaque"; const u = new URL(o), h = u.hostname.split("."); return u.protocol + "//" + h.slice(-2).join("."); };
+  const hostOf = o => o === "null" ? "null" : new URL(o).host;
+
+  const CF = new Flow($("cfl"), { width: 720, height: 130 });
+  CF.node("page", { x: 100, y: 65, w: 170, label: "📄 Page JavaScript", sub: "", kind: "cl" })
+    .node("br", { x: 360, y: 65, w: 150, label: "🌐 Browser", sub: "same-origin policy", kind: "nw" })
+    .node("api", { x: 620, y: 65, w: 170, label: "🖥️ API", sub: "", kind: "sv" })
+    .edge("page", "br").edge("br", "api").render();
+
+  const cookieSeg = seg("ccookie", () => crun(true));
+  const srvSeg = seg("csrv", () => crun(true));
+  ["cpage", "capi", "cmeth", "ctype", "smax"].forEach(id => ($(id).onchange = () => crun(true)));
+  ["cauth", "ccred", "scred", "smeth", "shdr"].forEach(id => ($(id).onchange = () => crun(true)));
+
+  function allowOrigin(cfg, origin) {
+    if (cfg === "none") return null;
+    if (cfg === "star") return "*";
+    if (cfg === "reflect") return origin;
+    if (cfg === "list") return ALLOW.includes(origin) ? origin : null;
+    if (cfg === "suffix") return /shop\.example$/.test(origin) ? origin : null;
+  }
+  // can the browser hand a (preflight or actual) response to JS?  returns null if OK, else the console reason
+  function corsCheck(acao, acac, origin, withCreds) {
+    if (acao == null) return "No ‘Access-Control-Allow-Origin’ header is present on the requested resource.";
+    if (acao === "*" && withCreds) return "The value of ‘Access-Control-Allow-Origin’ must not be the wildcard ‘*’ when the request's credentials mode is ‘include’.";
+    if (acao !== "*" && acao !== origin) return `‘Access-Control-Allow-Origin’ has a value ‘${acao}’ that is not equal to the supplied origin.`;
+    if (withCreds && !acac) return "The value of ‘Access-Control-Allow-Credentials’ is ‘’ which must be ‘true’ when the request's credentials mode is ‘include’.";
+    return null;
+  }
+  const optionsPerHour = maxAge => {
+    const e = Math.min(maxAge || 5, 7200); let n = 0, until = -1;
+    for (let t = 0; t < 3600; t += 30) if (t >= until) { n++; until = t + e; }
+    return n;
+  };
+
+  let cbusy = false;
+  async function crun(animate) {
+    const pageK = $("cpage").value, apiK = $("capi").value;
+    const po = PAGES[pageK], ao = APIS[apiK], method = $("cmeth").value;
+    const ctype = method === "GET" ? "none" : $("ctype").value;
+    $("ctype").disabled = method === "GET";
+    const auth = $("cauth").checked, credInc = $("ccred").checked;
+    const cfg = srvSeg.get(), scred = $("scred").checked, smeth = $("smeth").checked, shdr = $("shdr").checked, smax = +$("smax").value;
+    const cookieSS = cookieSeg.get(), hostile = !!HOSTILE[pageK];
+    const path = (apiK === "same" ? "/api" : "") + (method === "GET" ? "/me" : "/orders/42");
+    const host = hostOf(ao);
+    const sameOrigin = po === ao, sameSite = site(po) === site(ao);
+    const ctypeHdr = { none: null, form: "application/x-www-form-urlencoded", text: "text/plain", json: "application/json" }[ctype];
+    const simple = ["GET", "HEAD", "POST"].includes(method) && !auth && ctype !== "json";
+    const needPre = !sameOrigin && !simple;
+    const withCreds = sameOrigin || credInc;
+    const cookieSent = withCreds && (sameSite || cookieSS === "None");
+    const authed = cookieSent || (auth && !hostile);
+    CF.set("page", { sub: hostOf(po), down: false }).set("api", { sub: host, down: false, hot: false }).set("br", { sub: sameOrigin ? "same origin: no CORS" : "cross-origin: CORS check", down: false, hot: false });
+
+    let preFail = null, w1 = "", w2 = "", reached, readable, reason = null;
+    const acao = allowOrigin(cfg, po);
+    const respCors = () => {
+      const L = [];
+      if (acao != null) L.push(`Access-Control-Allow-Origin: ${acao}`);
+      if (acao != null && scred) L.push("Access-Control-Allow-Credentials: true");
+      if (cfg !== "none" && cfg !== "star") L.push("Vary: Origin");
+      return L;
+    };
+    if (needPre) {
+      const reqH = [auth && "authorization", ctype === "json" && "content-type"].filter(Boolean);
+      const allowM = cfg === "none" ? null : smeth ? ["GET", "POST", "PUT", "DELETE"] : ["GET", "POST"];
+      const allowH = cfg === "none" || !shdr ? [] : ["content-type", "authorization"];
+      const pre = [`<b>① Preflight (sent by the browser, no cookies)</b>`, `OPTIONS ${path} HTTP/1.1`, `Host: ${host}`, `Origin: ${po}`, `Access-Control-Request-Method: ${method}`];
+      if (reqH.length) pre.push(`Access-Control-Request-Headers: ${reqH.join(", ")}`);
+      pre.push("", "HTTP/1.1 204 No Content");
+      if (cfg === "none") pre.push("Allow: GET, POST, PUT, DELETE");
+      respCors().forEach(l => pre.push(l));
+      if (allowM) pre.push(`Access-Control-Allow-Methods: ${allowM.join(", ")}`);
+      if (allowH.length) pre.push("Access-Control-Allow-Headers: Content-Type, Authorization");
+      if (cfg !== "none" && smax) pre.push(`Access-Control-Max-Age: ${smax}`);
+      preFail = corsCheck(acao, scred, po, withCreds);
+      if (!preFail && !["GET", "HEAD", "POST"].includes(method) && !(allowM || []).includes(method)) preFail = `Method ${method} is not allowed by Access-Control-Allow-Methods in preflight response.`;
+      if (!preFail) { const miss = reqH.find(h => !allowH.includes(h)); if (miss) preFail = `Request header field ${miss} is not allowed by Access-Control-Allow-Headers in preflight response.`; }
+      pre.push("", preFail ? `<span class="bad">✗ preflight refused: the real ${method} is never sent</span>` : `<span class="ok">✓ preflight OK${smax && cfg !== "none" ? `: cached ${Math.min(smax, 7200)} s in Chrome` : ": cached only 5 s (default)"}</span>`);
+      w1 = pre.join("\n");
+    } else w1 = sameOrigin ? "<b>① No preflight</b>\nSame origin: the same-origin policy has nothing to check." : "<b>① No preflight</b>\nA “simple” request: method and headers are ones an HTML form could send, so the browser sends it straight away.";
+
+    if (preFail) { reached = false; readable = false; reason = preFail; w2 = "<b>② Actual request</b>\n(never sent)"; }
+    else {
+      reached = true;
+      const R = [`<b>② Actual request</b>`, `${method} ${path} HTTP/1.1`, `Host: ${host}`];
+      if (!sameOrigin || method !== "GET") R.push(`Origin: ${po}`);
+      R.push(cookieSent ? "Cookie: session=7f3a…" : withCreds ? `(no Cookie: SameSite=${cookieSS} withholds it on cross-site requests)` : "(no Cookie: credentials not included)");
+      if (auth) R.push(hostile ? "Authorization: Bearer (attacker's guess)" : "Authorization: Bearer eyJhbGciOi…");
+      if (ctypeHdr) R.push(`Content-Type: ${ctypeHdr}`);
+      R.push("", authed ? "HTTP/1.1 200 OK" : "HTTP/1.1 401 Unauthorized");
+      if (!sameOrigin) respCors().forEach(l => R.push(l));
+      R.push("");
+      R.push(authed ? (method === "GET" ? `{"user":"alice","email":"alice@mail.example","cards":2}` : `{"order":42,"status":"updated"}`) : `{"error":"not logged in"}`);
+      reason = sameOrigin ? null : corsCheck(acao, scred, po, withCreds);
+      readable = !reason;
+      R.push("", readable ? `<span class="ok">✓ JavaScript can read this response</span>` : `<span class="bad">✗ the server answered, but the browser hides the response from JavaScript</span>`);
+      w2 = R.join("\n");
+    }
+    $("cw1").innerHTML = w1.split("\n").map(l => /^<(b|span)/.test(l) ? l : esc(l)).join("\n");
+    $("cw2").innerHTML = w2.split("\n").map(l => /^<(b|span)/.test(l) ? l : esc(l)).join("\n");
+    $("c-pre").textContent = needPre ? (preFail ? "yes: refused" : "yes: OK") : "no";
+    $("c-reach").textContent = reached ? (needPre ? "yes (after preflight)" : "yes") : "no";
+    $("c-cookie").textContent = reached ? (cookieSent ? "yes" : "no") : "–";
+    $("c-read").textContent = readable ? "✅ yes" : "❌ no";
+    $("c-opt").textContent = needPre && !preFail ? optionsPerHour(cfg === "none" ? 0 : smax) + " / 120 calls" : "0";
+    const leak = hostile && readable && authed;
+    const v = $("cverdict");
+    v.className = "verdict " + (leak ? "bad" : readable ? "ok" : "bad");
+    if (leak) v.innerHTML = `🔥 <b>${esc(po)} just read the logged-in user's private data.</b> Any website your users visit can do the same. This is the 2016 bug.`;
+    else if (readable && hostile) v.innerHTML = `⚠️ The hostile page can read the response, but no session came with it: it only sees what an anonymous visitor would (401). Still fix the CORS config: one <code>SameSite=None</code> cookie and it leaks.`;
+    else if (readable) v.innerHTML = `✅ <code>fetch()</code> resolves: the page reads <b>${authed ? "200" : "401"}</b>${sameOrigin ? " (same origin, so CORS never ran)" : ""}.`;
+    else v.innerHTML = `❌ JavaScript sees <code>TypeError: Failed to fetch</code>. DevTools console: <i>${esc(reason)}</i>`;
+    let m;
+    if (hostile && !readable) m = `Good: ${po} can't read the answer. ${reached && cookieSent && method !== "GET" ? "But note: the request still reached the server with the user's cookie. If it changed something, that's CSRF (next playground)." : ""}`;
+    else if (pageK === "dev" && apiK === "dev" && !readable) m = "The classic local-dev CORS error: ports 3000 and 8080 are different origins. Fix it with a dev-server proxy (same origin), or allow http://localhost:3000 in the dev config only, never in production.";
+    else if (!readable && needPre && preFail) m = "The real request was never sent. Fix it on the server: allow this origin exactly, plus the method and headers the preflight asked for.";
+    else if (readable && needPre && smax < 600) m = "It works, but every call pays a preflight round trip. Set Max-Age (7,200 s is Chromium's cap) to cache it.";
+    else if (sameOrigin) m = "Same origin: no CORS, no preflight, cookies just work. This is why routing /api through the same gateway is often the best fix.";
+    else if (cfg === "suffix") m = "The regex matches app.shop.example… and evilshop.example. Try the look-alike page origin.";
+    else m = "";
+    $("cmsg").textContent = m;
+    if (!animate || cbusy) return;
+    cbusy = true;
+    try {
+      await CF.packet(["page", "br"], { color: "--c-cl", dur: 350 });
+      if (needPre) {
+        CF.set("api", { sub: "OPTIONS " + path });
+        await CF.packet(["br", "api"], { color: "--c-nw", dur: 450, back: true });
+        if (preFail) { CF.set("br", { sub: "preflight refused", down: true }).set("api", { sub: host }); return; }
+      }
+      CF.set("api", { sub: `${method} ${path}`, hot: leak });
+      await CF.packet(["br", "api"], { color: cookieSent ? "--c-lt" : "--c-cl", dur: 450, back: true });
+      if (!readable) { CF.set("br", { sub: "response hidden from JS", down: true }); return; }
+      CF.set("br", { sub: leak ? "handed private data to a hostile page" : "response allowed", hot: leak });
+      await CF.packet(["br", "page"], { color: leak ? "--c-er" : "--c-db", dur: 350 });
+    } finally { cbusy = false; }
+  }
+  const setC = o => { Object.entries(o).forEach(([k, v]) => { const e = $(k); if (e.type === "checkbox") e.checked = v; else e.value = v; }); };
+  $("csend").onclick = () => crun(true);
+  $("ctrap").onclick = () => { setC({ cpage: "evil", capi: "api", cmeth: "GET", ctype: "none", cauth: false, ccred: true, scred: true, smeth: false, shdr: false, smax: "0" }); cookieSeg.set("None"); srvSeg.set("reflect"); crun(true); };
+  $("cfix").onclick = () => { setC({ scred: true, smeth: true, shdr: true, smax: "7200" }); srvSeg.set("list"); crun(true); };
+  $("cdev").onclick = () => { setC({ cpage: "dev", capi: "dev", cmeth: "POST", ctype: "json", cauth: false, ccred: false, scred: false, smeth: false, shdr: false, smax: "0" }); srvSeg.set("none"); crun(true); };
+  crun(false);
+
+  // ================= CSRF simulator =================
+  const XF = new Flow($("xfl"), { width: 720, height: 130 });
+  XF.node("src", { x: 95, y: 65, w: 160, label: "😈 evil.example", sub: "funny video", kind: "er" })
+    .node("br", { x: 300, y: 65, w: 150, label: "🌐 Your browser", sub: "logged in to the bank", kind: "cl" })
+    .node("bank", { x: 500, y: 65, w: 150, label: "🏦 bank.example", sub: "/transfer", kind: "sv" })
+    .node("db", { x: 650, y: 65, w: 110, label: "💰 Balance", sub: "$5,000", kind: "db" })
+    .edge("src", "br").edge("br", "bank").edge("bank", "db").render();
+  const vecSeg = seg("xvec", () => xshow());
+  const ssSeg = seg("xss", () => xshow());
+  ["xfresh", "xtok", "xorig", "xget"].forEach(id => ($(id).onchange = () => xshow()));
+  let balance = 5000;
+  const money = v => "$" + v.toLocaleString("en-US");
+
+  const VEC = {
+    form:  { from: "https://evil.example", label: "😈 evil.example", method: "POST", top: true, sameSite: false, sfs: "cross-site", origin: "https://evil.example", body: "to=mallory&amount=1000", ct: "application/x-www-form-urlencoded", what: "a hidden form auto-submits" },
+    img:   { from: "https://evil.example", label: "😈 evil.example", method: "GET", top: false, sameSite: false, sfs: "cross-site", origin: null, q: "?to=mallory&amount=1000", what: "an invisible &lt;img&gt; loads the URL" },
+    link:  { from: "https://evil.example", label: "😈 evil.example", method: "GET", top: true, sameSite: false, sfs: "cross-site", origin: null, q: "?to=mallory&amount=1000", what: "you click “watch video”, a link to the bank" },
+    fetch: { from: "https://evil.example", label: "😈 evil.example", method: "POST", top: false, sameSite: false, sfs: "cross-site", origin: "https://evil.example", body: `{"to":"mallory","amount":1000}`, ct: "application/json", preflight: true, what: "fetch() sends JSON with credentials" },
+    sib:   { from: "https://forum.bank.example", label: "🧟 forum.bank.example", method: "POST", top: true, sameSite: true, sfs: "same-site", origin: "https://forum.bank.example", body: "to=mallory&amount=1000", ct: "application/x-www-form-urlencoded", what: "a compromised forum on a bank subdomain posts a form" },
+    legit: { from: "https://bank.example", label: "🏦 bank.example page", method: "POST", top: true, sameSite: true, sfs: "same-origin", origin: "https://bank.example", body: "to=landlord&amount=100&csrf_token=a91c…", ct: "application/x-www-form-urlencoded", token: true, what: "you press Send on the bank's own form" },
+    email: { from: "https://mail.example", label: "📧 mail.example", method: "GET", top: true, sameSite: false, sfs: "cross-site", origin: null, nav: true, what: "you click a link in an email" },
+  };
+  function cookieRides(r, ss, fresh) {
+    if (r.sameSite) return true; // same-site requests carry the cookie whatever SameSite says
+    if (ss === "none") return true;
+    if (ss === "strict") return false;
+    const safe = r.method === "GET";
+    if (ss === "lax") return r.top && safe;
+    return (r.top && safe) || (r.top && !safe && fresh); // unset: Lax by default, plus Chrome's 2-minute POST exception
+  }
+  function xsim(key) {
+    const r = VEC[key], ss = ssSeg.get(), fresh = $("xfresh").checked;
+    const tok = $("xtok").checked, orig = $("xorig").checked, getok = $("xget").checked;
+    const out = { r, cookie: null, ans: "", moved: 0, ux: "", lines: [] };
+    const path = r.nav ? "/account" : "/transfer" + (r.method === "GET" ? r.q || "" : "");
+    if (r.preflight) {
+      out.lines = [`OPTIONS /transfer HTTP/1.1`, `Host: bank.example`, `Origin: ${r.from}`, `Access-Control-Request-Method: POST`, `Access-Control-Request-Headers: content-type`, ``, `HTTP/1.1 204 No Content`, `(no Access-Control-Allow-Origin: the bank allows no other origins)`, ``, `✗ The browser never sends the POST.`];
+      out.ans = "never asked"; out.ux = "Nothing happens. JSON with credentials needs a preflight, and the bank's CORS refuses evil.example. (If /transfer also accepted form posts, the hidden form would still work.)";
+      return out;
+    }
+    out.cookie = cookieRides(r, ss, fresh);
+    const L = [`${r.method} ${path} HTTP/1.1`, `Host: bank.example`];
+    if (r.origin) L.push(`Origin: ${r.origin}`);
+    L.push(`Sec-Fetch-Site: ${r.sfs}`);
+    L.push(out.cookie ? "Cookie: session=7f3a…" : `(no Cookie: SameSite=${ss === "unset" ? "Lax by default" : ss[0].toUpperCase() + ss.slice(1)} withholds it)`);
+    if (r.ct) L.push(`Content-Type: ${r.ct}`);
+    if (r.body) L.push("", r.body);
+    out.lines = L;
+    if (r.nav) {
+      out.ans = out.cookie ? "200 account page" : "login page";
+      out.ux = out.cookie ? "You land on your account, logged in. Smooth." : "You look logged out on arrival: SameSite=Strict withheld the cookie on a cross-site navigation. Safe, but users find it annoying.";
+      return out;
+    }
+    if (r.method === "GET" && !getok) { out.ans = "405 Method Not Allowed"; out.ux = "Nothing moves: /transfer only accepts POST."; return out; }
+    if (!out.cookie) { out.ans = "302 → /login"; out.ux = "The bank sees an anonymous visitor and asks to log in. Your money is safe; you might not even notice."; return out; }
+    if (r.method !== "GET") {
+      if (orig && r.sfs !== "same-origin") { out.ans = "403 cross-origin request"; out.ux = `Blocked: the bank saw Sec-Fetch-Site: ${r.sfs} and Origin: ${r.origin} on a state-changing request.`; return out; }
+      if (tok && !r.token) { out.ans = "403 CSRF token missing"; out.ux = "Blocked: the forged request can't include the secret token printed on the bank's own forms."; return out; }
+    }
+    out.ans = "200 transfer done"; out.moved = key === "legit" ? 100 : 1000;
+    out.ux = key === "legit" ? "Your $100 rent payment went through. The defences didn't get in your way." :
+      r.method === "GET" ? "💸 $1,000 sent to Mallory. A GET that changes state skips the token and Origin checks (frameworks only check unsafe methods)." :
+      key === "sib" ? "💸 $1,000 sent to Mallory. forum.bank.example is the same site, so SameSite never applies." :
+      "💸 $1,000 sent to Mallory. You saw a blank page flash, then the video.";
+    return out;
+  }
+  function xrender(o) {
+    $("x-cookie").textContent = o.cookie == null ? "–" : o.cookie ? "yes" : "no";
+    $("x-ans").textContent = o.ans;
+    $("x-moved").textContent = o.moved ? money(o.moved) : "$0";
+    $("x-bal").textContent = money(balance);
+    const bad = o.moved && o.r !== VEC.legit, v = $("xverdict");
+    v.className = "verdict " + (bad ? "bad" : "ok");
+    v.innerHTML = `<b>${o.r.what[0].toUpperCase() + o.r.what.slice(1)}.</b> ${o.ux}`;
+    $("xw").textContent = o.lines.join("\n");
+  }
+  function xshow() { xrender(xsim(vecSeg.get())); }
+  let xbusy = false;
+  async function xplay(key) {
+    const o = xsim(key);
+    if (o.moved) balance -= o.moved;
+    xrender(o);
+    XF.set("src", { label: o.r.label, sub: o.r.nav ? "a link" : key === "legit" ? "your own form" : o.r.method + " /transfer", kind: key === "legit" || o.r.nav ? "cl" : "er" })
+      .set("br", { sub: o.cookie == null ? "preflight first" : o.cookie ? "attaches the cookie 🍪" : "cookie withheld", hot: false })
+      .set("bank", { sub: o.ans, hot: !!o.moved && key !== "legit", down: false })
+      .set("db", { sub: money(balance), hot: !!o.moved && key !== "legit" });
+    if (xbusy) return;
+    xbusy = true;
+    try {
+      await XF.packet(["src", "br"], { color: "--c-cl", dur: 350 });
+      if (o.cookie == null) { await XF.packet(["br", "bank"], { color: "--c-nw", dur: 400, back: true }); return; }
+      await XF.packet(["br", "bank"], { color: o.cookie ? "--c-lt" : "--c-cl", dur: 400 });
+      if (o.moved) await XF.packet(["bank", "db"], { color: key === "legit" ? "--c-db" : "--c-er", dur: 300 });
+    } finally { xbusy = false; }
+  }
+  $("xatk").onclick = () => xplay(vecSeg.get());
+  $("xlegit").onclick = () => xplay("legit");
+  $("xemail").onclick = () => xplay("email");
+  $("xreset").onclick = () => { balance = 5000; XF.set("db", { sub: money(balance), hot: false }).set("bank", { hot: false }); xshow(); };
+  xshow();
+})();
+</script>
+</body>
+</html>

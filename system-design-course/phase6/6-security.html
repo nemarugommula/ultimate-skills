@@ -1,0 +1,458 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.6 Security in production · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; flex-wrap: wrap; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .sqlbox { font-family: var(--mono); font-size: .85rem; background: #1e2130; color: #e6e6f0; border-radius: 10px; padding: 10px 14px; overflow-x: auto; white-space: pre-wrap; word-break: break-all; }
+  .sqlbox .inj { background: #e1705555; color: #ffb3a3; border-radius: 3px; }
+  .sqlbox .prm { background: #00b89455; color: #b5f5e3; border-radius: 3px; }
+  .rows { width: 100%; font-size: .85rem; }
+  #sq-in { font: inherit; font-family: var(--mono); padding: 5px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--bg2); color: var(--text); min-width: 260px; }
+</style>
+</head>
+<body data-lesson="s6-6" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 6</div>
+  <h1>Security in production: secrets, OWASP, DDoS</h1>
+  <p class="subtitle">At scale, you are attacked all the time, mostly by automated tools looking for the same few mistakes. Security in production means not making those mistakes, and making sure that when one slips through, the damage stays small.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Authentication vs authorization</b>: who you are vs what you're allowed to do; OAuth2, JWT and mTLS (Lesson 4.6).</li>
+      <li><b>CDNs, rate limiting and API gateways</b> sit in front of your servers (Lessons 1.4, 1.5 and 1.6).</li>
+      <li><b>The CI pipeline</b> builds and scans every artifact (Lesson 6.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In December 2021 the world learned about <b>Log4Shell</b> (CVE-2021-44228), a flaw in <b>Log4j</b>, a Java <i>logging</i> library. In versions 2.0-beta9 to 2.14.1, a special string in something that got logged could make the server fetch and run code from an attacker's server. Apache rated it <b>10.0 out of 10</b> (critical). The US cybersecurity agency CISA reported “active, widespread exploitation.”</p>
+    <p>Most affected teams had never chosen Log4j: it came in as a dependency of a dependency. Every company had to answer one question fast: “where do we run it?” Many couldn't. This lesson is about answering questions like that before the attack, not during it.</p>
+  </div>
+
+  <h2>Numbers first: the scale of attacks</h2>
+  <p>Cloudflare's report on 2025 gives a sense of what's out there:</p>
+  <table>
+    <tr><th>Number (Cloudflare, 2025)</th><th>What it means for you</th></tr>
+    <tr><td class="er"><b>47.1 million</b> DDoS attacks in the year, up 121%</td><td>About <b>5,376 attacks per hour</b> mitigated automatically: no human could respond to that by hand</td></tr>
+    <tr><td class="er">A record <b>31.4 Tbps</b> attack (terabits per second) that lasted just <b>35 seconds</b></td><td>A typical server's network link is roughly 1–25 Gbps (gigabits). 31.4 Tbps = 31,400 Gbps: over 1,000× a fast server link. You can't absorb that yourself.</td></tr>
+  </table>
+  <p>And for application bugs, the OWASP Top 10:2025 reports that <b>100% of the applications tested</b> had some form of <b>broken access control</b>, the #1 category for the second edition running.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Assume breach, limit the blast radius.</b> You will have a bug, a leaked key, or a vulnerable dependency at some point. Defense in depth means several independent layers (edge filtering, authentication, authorization on every request, least-privilege credentials, encryption, audit logs) so one failure doesn't become a catastrophe.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: a hotel, not a castle</span>
+    <p>A castle has one big wall: once you're over it, you're everywhere. A hotel assumes strangers are inside. The front desk checks who you are (authentication), your key card opens only your room and only until checkout (least privilege, short-lived credentials), staff cards open more but are logged (audit), and the safe in your room protects valuables even if someone gets in (encryption at rest).</p>
+  </div>
+
+  <h2>The OWASP Top 10: the mistakes attackers look for</h2>
+  <p><b>OWASP</b> (the Open Worldwide Application Security Project) publishes the Top 10 web application security risks, based on data from many tested applications. The 2025 list:</p>
+  <table>
+    <tr><th>#</th><th>Risk</th><th>In plain words</th></tr>
+    <tr><td>A01</td><td><b>Broken Access Control</b></td><td>User A can see or change user B's data, e.g. by changing <code>?acct=123</code> to <code>?acct=124</code></td></tr>
+    <tr><td>A02</td><td>Security Misconfiguration</td><td>Default passwords, public storage buckets, debug mode on in production</td></tr>
+    <tr><td>A03</td><td>Software Supply Chain Failures</td><td>Vulnerable or malicious dependencies, build tools and images (Log4Shell)</td></tr>
+    <tr><td>A04</td><td>Cryptographic Failures</td><td>Unencrypted data, weak algorithms, badly stored passwords</td></tr>
+    <tr><td>A05</td><td><b>Injection</b></td><td>User input runs as code: SQL injection, command injection, XSS</td></tr>
+    <tr><td>A06</td><td>Insecure Design</td><td>The flaw is in the design itself (e.g. no limit on password-reset attempts)</td></tr>
+    <tr><td>A07</td><td>Authentication Failures</td><td>Weak logins, credential stuffing, broken session handling</td></tr>
+    <tr><td>A08</td><td>Software or Data Integrity Failures</td><td>Trusting updates or data without checking signatures</td></tr>
+    <tr><td>A09</td><td>Security Logging and Alerting Failures</td><td>An attack happens and nobody notices</td></tr>
+    <tr><td>A10</td><td>Mishandling of Exceptional Conditions</td><td>Errors that fail open, leak details, or crash</td></tr>
+  </table>
+  <p>The fix for A01 is boring and essential: <b>check authorization on the server, on every request</b>, against the logged-in user. “The URL is hard to guess” is not a check.</p>
+
+  <h3>Injection: when data becomes code</h3>
+  <p>If you build a SQL query by gluing strings together, the user's input becomes part of the code:</p>
+<pre><code>query = <span class="s">"SELECT * FROM users WHERE name = '"</span> + name + <span class="s">"'"</span>   <span class="c"># ❌ never</span></code></pre>
+  <p>The fix is the <b>parameterized query</b> (also called a prepared statement): you send the query shape and the values separately, so the database never treats the value as SQL. OWASP's SQL injection cheat sheet lists it as defense option 1. Try breaking the first version:</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · SQL injection</span>
+    <p class="hint">A login-style lookup on a tiny <code>users</code> table. Type a name, or use the attacker's inputs. Then switch to a parameterized query and try them again.</p>
+    <div class="controls">
+      <input id="sq-in" value="alice" aria-label="name to look up">
+      <button class="btn primary" id="sq-run">▶ Run query</button>
+      <label><input type="checkbox" id="sq-param"> use a parameterized query</label>
+      <button class="btn" id="sq-reset">Restore the table</button>
+    </div>
+    <div class="controls">
+      <span class="hint">Try:</span>
+      <button class="btn small" id="sq-p1" data-q="alice">alice</button>
+      <button class="btn small" id="sq-p2" data-q="' OR '1'='1">' OR '1'='1</button>
+      <button class="btn small" id="sq-p3" data-q="' OR 1=1 --">' OR 1=1 --</button>
+      <button class="btn small" id="sq-p4" data-q="x'; DROP TABLE users; --">x'; DROP TABLE users; --</button>
+      <button class="btn small" id="sq-p5" data-q="O'Brien">O'Brien</button>
+    </div>
+    <div class="sqlbox" id="sq-sql"></div>
+    <div class="stat-row">
+      <div class="stat">rows returned <b id="sq-n">–</b></div>
+      <div class="stat">result <b id="sq-res">–</b></div>
+    </div>
+    <div id="sq-rows"></div>
+    <p class="hint" id="sq-msg"></p>
+  </div>
+  <p>Notice <code>O'Brien</code>: string-gluing doesn't just let attackers in, it breaks for real customers too. Parameterized queries fix both. ORMs (object-relational mappers) parameterize for you, until someone writes a raw query “just this once.” Add least privilege as a second layer: the app's database user shouldn't be allowed to <code>DROP</code> tables at all.</p>
+
+  <h2>Secrets: keys, passwords and tokens</h2>
+  <p>A <b>secret</b> is anything that grants access: database passwords, API keys, cloud credentials, signing keys. Rules that prevent most breaches:</p>
+  <ul>
+    <li><b>Never in git.</b> Not in code, not in a committed <code>.env</code> file. Git history is forever: deleting the line later doesn't remove it from history. GitHub's secret scanning checks a repository's entire Git history on all branches, and its push protection can block a commit that contains a known secret type.</li>
+    <li><b>If one leaks, rotate it immediately.</b> GitHub's own guidance: rotating the credential matters more than scrubbing history.</li>
+    <li><b>Use a secrets manager</b>: HashiCorp Vault, AWS Secrets Manager, Google Secret Manager, Azure Key Vault. Apps fetch secrets at startup or runtime; access is logged.</li>
+    <li><b>Prefer short-lived, per-service credentials.</b> Vault's database secrets engine creates a unique database username and password for each requester, with a lease (for example, 1 hour) after which they're revoked. No shared password to leak, and every query is traceable to one service.</li>
+    <li><b>Use cloud identities instead of keys</b> where possible: workloads get temporary credentials from their role (Kubernetes service accounts, cloud IAM roles, OIDC from CI), so there's no long-lived key at all.</li>
+  </ul>
+
+  <h3>Least privilege: what can a leaked credential do?</h3>
+  <p><b>IAM</b> (identity and access management) policies say who can do which actions on which resources. AWS's IAM best practices start with temporary credentials and least-privilege permissions. The difference between a scary incident and a footnote is usually the scope of the credential that leaked.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Blast radius of a leaked key</span>
+    <p class="hint">An access key for your image-upload service has leaked (pushed to a public repo by accident). What can an attacker reach? Change how the key was scoped, whether it's short-lived, and how long until you revoke it. The data sizes are illustrative.</p>
+    <svg id="br-fl"></svg>
+    <div class="controls">
+      <span class="hint">Permissions:</span>
+      <span class="seg" id="br-s"><button id="br-s-admin" data-v="admin" class="on">AdministratorAccess (*)</button><button id="br-s-app" data-v="app">s3:* on all buckets + database</button><button id="br-s-least" data-v="least">s3:GetObject on avatars/*</button></span>
+    </div>
+    <div class="controls">
+      <label>time until revoked <input type="range" id="br-t" min="0" max="4" step="1" value="3"> <b class="mono" id="br-tv"></b></label>
+      <label><input type="checkbox" id="br-short"> short-lived credential (expires in 15 min)</label>
+      <label><input type="checkbox" id="br-push"> push protection on the repo</label>
+    </div>
+    <div class="stat-row">
+      <div class="stat">resources reachable <b id="br-n">–</b></div>
+      <div class="stat">records exposed <b id="br-rec">–</b></div>
+      <div class="stat">can delete data <b id="br-del">–</b></div>
+      <div class="stat">can create backdoor users <b id="br-iam">–</b></div>
+      <div class="stat">exposure window <b id="br-win">–</b></div>
+    </div>
+    <p class="hint" id="br-msg"></p>
+  </div>
+  <p>The middle option is the realistic trap: nobody grants admin on purpose, but <code>s3:*</code> on all buckets “to make it work” quietly includes the backups bucket, which holds a full copy of the database. Least privilege plus short-lived credentials turns the same leak from a breach notice into a non-event.</p>
+
+  <h2>Encryption, supply chain, DDoS and audit</h2>
+  <table>
+    <tr><th>Layer</th><th>Do this</th><th>Tools</th></tr>
+    <tr><td><b>In transit</b></td><td>TLS everywhere, including between internal services (mTLS via a service mesh, Lesson 4.3/4.6)</td><td>Let's Encrypt, cert-manager, Istio/Linkerd</td></tr>
+    <tr><td><b>At rest</b></td><td>Encrypt disks, databases, backups and buckets with keys from a key management service (KMS); hash passwords with a slow algorithm (bcrypt, scrypt, Argon2), never plain or fast hashes</td><td>AWS KMS, Google Cloud KMS, Azure Key Vault</td></tr>
+    <tr><td><b>Supply chain</b></td><td>Lock dependency versions, scan them and your images in CI, keep an <b>SBOM</b> (software bill of materials: the list of every component inside your software, so “where do we run Log4j?” takes a minute), sign artifacts</td><td>Dependabot, Renovate, Trivy, Grype, Syft, Sigstore cosign</td></tr>
+    <tr><td><b>DDoS</b></td><td>Put a CDN / anycast network in front (it spreads volumetric floods across hundreds of locations), rate-limit at the edge (Lesson 1.5), keep origin IPs private</td><td>Cloudflare, AWS Shield + CloudFront, Google Cloud Armor, Akamai</td></tr>
+    <tr><td><b>WAF</b></td><td>A web application firewall blocks known-bad requests (injection patterns, bad bots) before they reach your code. Roll out new rules gradually: a bad WAF rule caused Cloudflare's 2019 outage (Lesson 6.2)</td><td>Cloudflare WAF, AWS WAF, ModSecurity / OWASP Core Rule Set</td></tr>
+    <tr><td><b>Audit logs</b></td><td>Record who did what, when, from where: every admin action, every secret read, every permission change. Store them where the people being audited can't delete them.</td><td>AWS CloudTrail, GCP Cloud Audit Logs, Vault audit devices</td></tr>
+  </table>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: answering “are we affected by Log4Shell?”</span>
+    <p>You run 120 services. A critical CVE (a published vulnerability ID) lands on a Friday.</p>
+    <ul>
+      <li><b>Without SBOMs:</b> someone greps 120 repos, misses the ones that pull the library in transitively and the vendor images nobody built, and you're still finding copies weeks later.</li>
+      <li><b>With SBOMs stored per image:</b> one query over 120 SBOMs lists every image containing <code>log4j-core</code> in the affected range. Patch, rebuild through the pipeline, and redeploy with the canary process from Lesson 6.2.</li>
+      <li>Meanwhile, a WAF rule blocking the attack pattern at the edge buys time, as a mitigation, not a fix.</li>
+    </ul>
+    <p>Same shape as incidents in Lesson 6.4: mitigate at the edge first, then fix properly.</p>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Parameterized queries, a least-privilege IAM policy, dynamic secrets from Vault, and scans in CI:</p>
+<pre><code><span class="c"># Python + psycopg: the value travels separately from the SQL</span>
+cur.execute(<span class="s">"SELECT id, name, email FROM users WHERE name = %s"</span>, (name,))   <span class="c"># ✅</span>
+<span class="c"># Node + pg</span>
+<span class="k">await</span> client.query(<span class="s">'SELECT id, name, email FROM users WHERE name = $1'</span>, [name]) <span class="c">// ✅</span></code></pre>
+<pre><code><span class="c">// AWS IAM policy: the upload service may only read and write its own prefix</span>
+{
+  <span class="s">"Version"</span>: <span class="s">"2012-10-17"</span>,
+  <span class="s">"Statement"</span>: [{
+    <span class="s">"Effect"</span>: <span class="s">"Allow"</span>,
+    <span class="s">"Action"</span>: [<span class="s">"s3:GetObject"</span>, <span class="s">"s3:PutObject"</span>],
+    <span class="s">"Resource"</span>: <span class="s">"arn:aws:s3:::acme-media/avatars/*"</span>
+  }]
+}</code></pre>
+<pre><code><span class="c"># Vault: a fresh database login for each requester, revoked when the lease ends</span>
+$ vault secrets enable database
+$ vault read database/creds/my-role
+<span class="c">lease_duration   1h</span>
+<span class="c">username         v-vaultuser-e2978cd0-...</span>
+<span class="c">password         (random, unique to this lease)</span>
+
+<span class="c"># In CI: scan the image for known vulnerabilities, and produce an SBOM</span>
+$ trivy image --severity HIGH,CRITICAL ghcr.io/acme/shop:$GIT_SHA
+$ syft ghcr.io/acme/shop:$GIT_SHA -o spdx-json &gt; sbom.json</code></pre>
+    <p class="hint">Try it locally: <code>docker run --rm -p 8200:8200 hashicorp/vault server -dev</code> starts a throwaway Vault in dev mode (in-memory, never for production). Secret scanning on your laptop: <code>gitleaks detect</code> scans a repo's history for committed secrets.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Strict least privilege</td><td>Small blast radius; easier audits</td><td>More policies to write; “access denied” friction. Tools like IAM Access Analyzer can generate policies from real usage.</td></tr>
+      <tr><td>Short-lived dynamic credentials</td><td>Leaks expire on their own; per-service traceability</td><td>Another critical system (Vault) to run and keep available</td></tr>
+      <tr><td>WAF in blocking mode</td><td>Stops common attacks at the edge</td><td>False positives block real users; bad rules can cause outages. Start in log-only mode.</td></tr>
+      <tr><td>Scanning in CI, failing on HIGH/CRITICAL</td><td>Vulnerable libraries don't reach production</td><td>Noise from issues that don't apply; need a triage process and exceptions with expiry dates</td></tr>
+      <tr><td>Managed DDoS protection</td><td>Absorbs attacks far bigger than you could</td><td>Cost and dependence on one vendor (whose own outages become yours)</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>The cheap 80%: parameterized queries (use the ORM), an authorization check on every endpoint, secrets in the platform's secret store (never in git), push protection on, MFA everywhere, Dependabot or Renovate, a CDN with DDoS protection in front, encrypted managed databases, and one IAM role per service instead of one shared admin key.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>A security team, threat modeling in design reviews, zero-trust networking with mTLS between services, central secrets platforms with dynamic credentials, SBOMs and signed artifacts for everything, bug bounties, red teams, and tamper-proof audit logs feeding a security operations team that has its own on-call and incident process.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>Security often comes up as “what could go wrong?” or “how do you protect this data?” A senior answer covers:</p>
+    <ul>
+      <li><b>AuthN and AuthZ</b> on every request (and the IDOR trap: never trust an ID from the client without checking ownership).</li>
+      <li><b>Secrets</b> in a manager, short-lived and least-privilege; <b>encryption</b> in transit and at rest.</li>
+      <li><b>Edge protection</b>: CDN, DDoS mitigation, WAF, rate limits.</li>
+      <li><b>Supply chain</b> (scans, SBOMs, signing) and <b>audit logs</b>, plus a plan for “a key leaked” (rotate, scope, detect).</li>
+    </ul>
+    <p class="hint">Follow-ups: “An engineer committed an AWS key to a public repo an hour ago. What do you do?” (revoke and rotate now, check the audit logs for its use, then fix the process with push protection and short-lived credentials). “How do you store passwords?” (a slow salted hash like bcrypt or Argon2, never encryption you can reverse).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>The industry's checklist</b> <span class="tag oss">🧰 Open source · OWASP · 2025</span> <a href="https://owasp.org/Top10/2025/" target="_blank" rel="noopener">OWASP Top 10:2025</a></div>
+      <p><b>How:</b> a consensus list of the most critical web application risks. Broken Access Control kept the #1 spot, with 100% of tested applications showing some form of it; Software Supply Chain Failures is A03, and its guidance starts with generating and managing an SBOM for all your software.</p>
+      <p><b>Why this method:</b> attackers automate the common mistakes, so fixing the top 10 removes most of the easy wins.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A dependency nobody chose</b> <span class="tag co">🏢 CISA · 2021</span> <a href="https://www.cisa.gov/news-events/news/apache-log4j-vulnerability-guidance" target="_blank" rel="noopener">Apache Log4j Vulnerability Guidance</a></div>
+      <p><b>How:</b> CISA and partners responded to active, widespread exploitation of CVE-2021-44228 in Log4j 2.0-beta9 to 2.14.1, added it to the Known Exploited Vulnerabilities catalog, and told organizations to upgrade to fixed versions such as 2.17.1 for Java 8.</p>
+      <p><b>Why this method:</b> a single library embedded in countless products meant the response had to start with an inventory: knowing where you run it.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Attacks too big to absorb yourself</b> <span class="tag co">🏢 Cloudflare · 2026</span> <a href="https://blog.cloudflare.com/ddos-threat-report-2025-q4/" target="_blank" rel="noopener">2025 Q4 DDoS threat report</a></div>
+      <p><b>How:</b> Cloudflare reports 47.1 million DDoS attacks in 2025, an average of 5,376 automatically mitigated every hour, and a record 31.4 Tbps attack that lasted 35 seconds.</p>
+      <p><b>Why this method:</b> at that size and speed, only a large network that detects and drops attacks automatically, close to their source, can keep a site up.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Credentials that expire on their own</b> <span class="tag oss">🧰 Open source · HashiCorp Vault</span> <a href="https://developer.hashicorp.com/vault/docs/secrets/databases" target="_blank" rel="noopener">Vault database secrets engine</a></div>
+      <p><b>How:</b> instead of a shared password in config, each service asks Vault for credentials; Vault creates a unique database user with a lease and revokes it when the lease ends.</p>
+      <p><b>Why this method:</b> no long-lived secret to leak, and since every service has its own login, questionable data access can be traced back to one service.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Catching secrets before they leak</b> <span class="tag prod">🏭 In production · GitHub</span> <a href="https://docs.github.com/en/code-security/secret-scanning/introduction/about-secret-scanning" target="_blank" rel="noopener">About secret scanning</a></div>
+      <p><b>How:</b> secret scanning searches a repository's entire Git history on all branches for API keys, passwords and tokens; push protection can stop a push containing a secret; partner integrations notify service providers about detected keys.</p>
+      <p><b>Why this method:</b> leaked keys are found by automated scanners quickly, so detection has to be automatic too, and the fix is always to rotate.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · 35 seconds</span>
+    <p>The record 31.4 Tbps attack in Cloudflare's report lasted only 35 seconds. That's shorter than it takes a human to read an alert and open a laptop. Big modern attacks are short bursts, which is why DDoS defense has to be fully automatic.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Authentication and mTLS come from Lesson 4.6; rate limiting from 1.5; edge networks from 1.4. Scans and SBOMs live in the pipeline (6.1), audit logs are part of observability (6.3), and security incidents use the same incident process (6.4). The payment system design (Lesson 7.7) puts all of this together. In AI systems, there's a new injection: <b>prompt injection</b>, where text in a document or web page tries to give the model instructions. The defense has the same shape: treat input as data, never as commands, and give the AI system least-privilege tools.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://owasp.org/Top10/2025/" target="_blank" rel="noopener">OWASP Top 10:2025</a>. Each risk with examples, prevention and attack scenarios.</li>
+      <li><span class="kind">Docs</span> <a href="https://cheatsheetseries.owasp.org/cheatsheets/SQL_Injection_Prevention_Cheat_Sheet.html" target="_blank" rel="noopener">OWASP SQL Injection Prevention Cheat Sheet</a>. Prepared statements in every major language.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.aws.amazon.com/IAM/latest/UserGuide/best-practices.html" target="_blank" rel="noopener">AWS IAM security best practices</a>. Temporary credentials, least privilege, Access Analyzer.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. An attacker leaks your API key and it stays valid until someone notices, about 3 days later. If you switch to credentials that expire after 15 minutes, by roughly what factor does the window to use a leaked credential shrink?</div>
+    <div class="opts"><button class="opt">About 3×</button><button class="opt">About 30×</button><button class="opt" data-ok>About 300×</button></div>
+    <div class="explain">3 days = 4,320 minutes; 4,320 ÷ 15 = 288, so about 300× less time. Combined with least privilege (less reachable) this shrinks the blast radius enormously, without anyone needing to notice the leak.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. Your API serves <code>GET /orders/{id}</code>. Logged-in users can fetch other people's orders by changing the number. Which fix is right?</div>
+    <div class="opts"><button class="opt">Switch to random, hard-to-guess order IDs</button><button class="opt" data-ok>On every request, check on the server that the order belongs to the logged-in user</button><button class="opt">Add a WAF rule that blocks sequential IDs</button></div>
+    <div class="explain">This is broken access control (an insecure direct object reference), OWASP's #1. Random IDs only make it harder to guess; they leak through logs, links and referrers. Authorization must be checked on the server, every time.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. A startup is hit by a 2 Tbps DDoS attack. Its servers have 10 Gbps network links. What actually keeps the site up?</div>
+    <div class="opts"><button class="opt">Autoscaling to more servers</button><button class="opt">Blocking the attacking IP addresses in the app</button><button class="opt" data-ok>A CDN / DDoS protection network in front, which absorbs and filters the flood at the edge</button></div>
+    <div class="explain">2 Tbps is 200× a 10 Gbps link: the traffic saturates the pipe before it reaches any code, and botnets use huge numbers of addresses. Only a network much bigger than the attack, spread across many locations, can absorb it.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Assume breach; defend in depth; keep each credential's blast radius small (least privilege + short-lived).</li>
+      <li>OWASP Top 10:2025 starts with broken access control: authorize every request on the server. Stop injection with parameterized queries.</li>
+      <li>Secrets: never in git, in a manager, rotated on leak; prefer dynamic credentials and workload identities.</li>
+      <li>Encrypt in transit and at rest; track dependencies with SBOMs and scans; put DDoS protection and a WAF at the edge; keep audit logs.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const esc = s => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+
+  // ---------- SQL injection ----------
+  const SEED = [
+    { id: 1, name: "alice", email: "alice@example.com", role: "user" },
+    { id: 2, name: "bob", email: "bob@example.com", role: "user" },
+    { id: 3, name: "O'Brien", email: "obrien@example.com", role: "user" },
+    { id: 4, name: "admin", email: "root@example.com", role: "admin" },
+  ];
+  let table = SEED.slice();
+  // a tiny SQL evaluator: enough for WHERE a = b [AND|OR ...], comments and stacked statements
+  function tokenize(src) {
+    const t = []; let i = 0;
+    while (i < src.length) {
+      const c = src[i];
+      if (/\s/.test(c)) { i++; continue; }
+      if (c === "'") {
+        let j = i + 1, v = "";
+        for (;;) {
+          if (j >= src.length) throw new Error("unterminated quoted string");
+          if (src[j] === "'") { if (src[j + 1] === "'") { v += "'"; j += 2; continue; } break; }
+          v += src[j++];
+        }
+        t.push({ k: "str", v }); i = j + 1; continue;
+      }
+      if (c === "=") { t.push({ k: "op" }); i++; continue; }
+      const m = /^[A-Za-z_][A-Za-z_0-9]*|^\d+/.exec(src.slice(i));
+      if (!m) throw new Error("syntax error near " + src.slice(i, i + 8));
+      const w = m[0], up = w.toUpperCase();
+      t.push(/^\d+$/.test(w) ? { k: "num", v: +w } : up === "AND" || up === "OR" ? { k: up } : { k: "id", v: w.toLowerCase() });
+      i += w.length;
+    }
+    return t;
+  }
+  function whereFn(clause) {
+    const t = tokenize(clause), conds = []; let i = 0;
+    const val = tok => { if (!tok) throw new Error("syntax error at end of input"); if (tok.k === "str" || tok.k === "num") return () => tok.v; if (tok.k === "id") { if (!["id", "name", "email", "role"].includes(tok.v)) throw new Error("column " + tok.v + " does not exist"); return r => r[tok.v]; } throw new Error("syntax error"); };
+    for (;;) {
+      const a = val(t[i]); if (!t[i + 1] || t[i + 1].k !== "op") throw new Error("syntax error"); const b = val(t[i + 2]);
+      conds.push((r => String(a(r)) === String(b(r)))); i += 3;
+      if (i >= t.length) break;
+      if (t[i].k !== "AND" && t[i].k !== "OR") throw new Error("syntax error near a stray token"); conds.push(t[i].k); i++;
+    }
+    return r => { // AND binds tighter than OR
+      let any = false, all = true;
+      for (let k = 0; k < conds.length; k++) {
+        const c = conds[k];
+        if (c === "OR") { any = any || all; all = true; } else if (c !== "AND") all = all && c(r);
+      }
+      return any || all;
+    };
+  }
+  function runSql() {
+    const input = $("sq-in").value, param = $("sq-param").checked;
+    let rows = [], res = "", msg = "", dropped = false;
+    if (param) {
+      $("sq-sql").innerHTML = `SELECT id, name, email FROM users WHERE name = <span class="prm">$1</span>\n-- parameters: [ <span class="prm">${esc(JSON.stringify(input))}</span> ]`;
+      if (!table) { res = "error"; msg = "The table is gone from an earlier attack. Restore it first."; }
+      else { rows = table.filter(r => r.name === input); res = "OK"; msg = rows.length ? "The value matched a real name exactly." : "No user has that exact name. The attack text was treated as a (very odd) name, never as SQL."; }
+    } else {
+      const sql = "SELECT id, name, email FROM users WHERE name = '" + input + "'";
+      const pre = "SELECT id, name, email FROM users WHERE name = '";
+      $("sq-sql").innerHTML = esc(pre) + `<span class="inj">${esc(input)}</span>` + "'";
+      try {
+        let code = sql; const cm = code.indexOf("--"); if (cm >= 0) code = code.slice(0, cm);
+        const stmts = code.split(";").map(s => s.trim()).filter(Boolean);
+        const where = stmts[0].slice(stmts[0].toUpperCase().indexOf("WHERE") + 5);
+        if (!table) throw new Error('relation "users" does not exist');
+        const f = whereFn(where);
+        rows = table.filter(f); res = "OK";
+        for (const s of stmts.slice(1)) {
+          if (/^DROP\s+TABLE\s+users$/i.test(s)) { table = null; dropped = true; }
+        }
+        msg = dropped ? "The second statement ran too: the users table is deleted. (Least privilege would have stopped this: the app's DB user shouldn't be allowed to DROP.)" :
+          rows.length > 1 ? `The input rewrote the WHERE clause into something always true: ${rows.length} rows, including the admin. In a login form, this logs the attacker in.` :
+          rows.length ? "Normal lookup, normal result." : "No match.";
+        if (cm >= 0) msg += " The -- turned the rest of the query into a comment.";
+      } catch (e) {
+        res = "SQL error"; msg = !table ? "The users table is gone, so every lookup now fails: the whole login page is down. Press Restore the table." : "The database rejected the query: " + e.message + "." + (input.includes("'") && !/OR|DROP/i.test(input) ? " A real customer named O'Brien just broke your app. Gluing strings fails honest users too." : " Error messages like this also teach attackers how your query is built.");
+      }
+    }
+    $("sq-n").textContent = rows.length; $("sq-res").textContent = dropped ? "OK… table dropped" : res;
+    $("sq-rows").innerHTML = rows.length ? `<table class="rows"><tr><th>id</th><th>name</th><th>email</th></tr>${rows.map(r => `<tr><td>${r.id}</td><td>${esc(r.name)}</td><td>${esc(r.email)}</td></tr>`).join("")}</table>` : "";
+    $("sq-msg").textContent = msg;
+  }
+  ["sq-p1", "sq-p2", "sq-p3", "sq-p4", "sq-p5"].forEach(id => ($(id).onclick = () => { $("sq-in").value = $(id).dataset.q; runSql(); }));
+  $("sq-run").onclick = runSql; $("sq-param").onchange = runSql;
+  $("sq-in").onkeydown = e => { if (e.key === "Enter") runSql(); };
+  $("sq-reset").onclick = () => { table = SEED.slice(); runSql(); };
+  runSql();
+
+  // ---------- blast radius ----------
+  const F = new Flow($("br-fl"), { width: 720, height: 330 });
+  const RES = [
+    { id: "av", label: "🖼️ avatars/ · 2M images", rec: 2e6, kind: "db" },
+    { id: "cd", label: "🗂️ customer-docs · 800K files", rec: 8e5, kind: "db" },
+    { id: "lg", label: "📜 logs bucket · emails in logs", rec: 3e6, kind: "db" },
+    { id: "bk", label: "💾 backups · full DB copy", rec: 5e6, kind: "db" },
+    { id: "udb", label: "🗄️ users DB · 5M users", rec: 5e6, kind: "db" },
+    { id: "pdb", label: "💳 payments DB · 1M customers", rec: 1e6, kind: "db" },
+    { id: "vm", label: "🖥️ 200 VMs · compute", rec: 0, kind: "sv" },
+    { id: "iam", label: "👤 IAM · create users + roles", rec: 0, kind: "nw" },
+  ];
+  F.node("key", { x: 120, y: 165, w: 150, label: "🔑 leaked key", sub: "upload-service", kind: "er" });
+  RES.forEach((r, i) => F.node(r.id, { x: 560, y: 25 + 40 * i, w: 250, h: 32, label: r.label, kind: r.kind }));
+  RES.forEach(r => F.edge("key", r.id, { dashed: true }));
+  F.render();
+  const SCOPE = {
+    admin: { reach: RES.map(r => r.id), del: true, iam: true },
+    app: { reach: ["av", "cd", "lg", "bk", "udb"], del: true, iam: false },
+    least: { reach: ["av"], del: false, iam: false },
+  };
+  const TW = [[60, "1 hour"], [1440, "1 day"], [4320, "3 days"], [10080, "1 week"], [43200, "30 days"]];
+  const getS = seg("br-s", () => blast());
+  function blast() {
+    const sc = SCOPE[getS()], short = $("br-short").checked, push = $("br-push").checked;
+    const [tw, tl] = TW[+$("br-t").value]; $("br-tv").textContent = tl;
+    const win = push ? 0 : short ? Math.min(15, tw) : tw;
+    const live = win > 0;
+    RES.forEach(r => {
+      const hit = live && sc.reach.includes(r.id);
+      F.set(r.id, { hot: hit, down: false, load: hit ? 1 : 0 });
+      F.edgeStyle("key", r.id, { color: hit ? "--c-er" : "--line", width: hit ? 2.5 : 1, dashed: !hit, hidden: !live });
+      const e = F.edges.find(x => x.b === r.id); if (e && e.line) e.line.style.stroke = MX.css(hit ? "--c-er" : "--line"); // inline style beats the stylesheet's edge color
+    });
+    F.set("key", { sub: push ? "blocked at push" : short ? "expires in 15 min" : "valid until revoked", down: push });
+    const reach = live ? sc.reach.length : 0;
+    const rec = live ? RES.filter(r => sc.reach.includes(r.id)).reduce((a, r) => a + r.rec, 0) : 0;
+    $("br-n").textContent = reach + " / " + RES.length;
+    $("br-rec").textContent = rec ? (rec >= 1e6 ? (rec / 1e6).toFixed(1) + "M" : (rec / 1e3).toFixed(0) + "K") : "0";
+    $("br-del").textContent = live && sc.del ? "yes" : "no";
+    $("br-iam").textContent = live && sc.iam ? "yes" : "no";
+    $("br-win").textContent = push ? "none" : win < 60 ? win + " min" : tl;
+    $("br-msg").textContent = push ? "Push protection rejected the commit: the key never became public. Still rotate it: it was on a laptop and in a terminal history." :
+      getS() === "admin" ? "Everything, including creating new admin users that survive even after you revoke this key. This is how a leak becomes a takeover." :
+      getS() === "app" ? "No admin rights, but the wildcard reaches the backups bucket: a full copy of the users database. The breach notice goes to 5M+ people." :
+      short ? "One bucket, read-only, for at most 15 minutes. A footnote, not a breach." :
+      "Read-only access to public-ish images. Annoying, but no customer data, nothing deleted.";
+  }
+  $("br-t").oninput = blast; ["br-short", "br-push"].forEach(id => ($(id).onchange = blast));
+  blast();
+})();
+</script>
+</body>
+</html>

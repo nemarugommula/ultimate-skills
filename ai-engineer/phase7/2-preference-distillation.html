@@ -1,0 +1,467 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>7.2 Preference tuning, distillation &amp; synthetic data · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .pair { border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 8px 0; background: var(--bg2); }
+  .pair .q { font-weight: 700; margin-bottom: 4px; }
+  .pair .ab { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  @media (max-width: 640px) { .pair .ab { grid-template-columns: 1fr; } }
+  .resp { font: inherit; text-align: left; font-size: .88rem; border: 2px solid var(--line); border-radius: 8px; padding: 6px 8px; background: var(--panel); color: var(--text); cursor: pointer; }
+  .resp.chosen { border-color: var(--good); background: color-mix(in srgb, var(--good) 12%, var(--panel)); }
+  .resp.rejected { opacity: .6; }
+  .resp .tr { display: block; margin-top: 4px; font-size: .75rem; color: var(--muted); }
+  .pair .m { font-size: .8rem; color: var(--muted); margin-top: 4px; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+</style>
+</head>
+<body data-lesson="a7-2" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 7 · Lesson 2</div>
+  <h1>Preference tuning, distillation &amp; synthetic data</h1>
+  <p class="subtitle">SFT teaches a model to copy good answers. Preference tuning teaches it which of two answers is better. Distillation lets a big model write the training data for a small one. All three are powerful, cheap, and full of traps.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>SFT</b> (supervised fine-tuning) on (prompt, ideal answer) pairs, and <b>LoRA</b> adapters (Lesson 7.1).</li>
+      <li><b>LLM-as-judge</b>: using a model to grade outputs, and its biases (position, length) (Lesson 5.3).</li>
+      <li><b>Log-probability</b>: how likely the model thinks a piece of text is; a whole answer's log-prob is the sum over its tokens (Lesson 0.2).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In March 2023, Stanford researchers asked OpenAI's <code>text-davinci-003</code> to write <b>52,000</b> instruction-and-answer examples, for <b>less than $500</b> of API calls. They fine-tuned Meta's LLaMA 7B on them. The result, <b>Alpaca</b>, behaved qualitatively like <code>text-davinci-003</code> in their tests, and the whole thing cost under $600.</p>
+    <p>Then came the twist: Alpaca was released for research only, with commercial use prohibited. LLaMA's licence was non-commercial, and OpenAI's terms forbade using its outputs to develop competing models. <b>Distillation is cheap; permission isn't.</b></p>
+  </div>
+
+  <h2>Numbers first: a teacher's homework is cheap</h2>
+  <p>You want a small model to handle 100,000 requests a day, as well as your big model does. Have the big model (the <b>teacher</b>) answer 20,000 real prompts, then SFT a small model (the <b>student</b>) on its answers.</p>
+  <table>
+    <tr><th></th><th>Teacher (big API model)</th><th>Student (fine-tuned 8B, self-hosted)</th></tr>
+    <tr><td>Tokens per request</td><td colspan="2">800 in, 500 out</td></tr>
+    <tr><td>Illustrative price per million in / out</td><td>$3 / $15</td><td>$0.10 / $0.40 (effective GPU cost)</td></tr>
+    <tr><td>Cost per request</td><td>$0.0099</td><td>$0.00028</td></tr>
+    <tr><td>Generate 20,000 training answers</td><td class="tk">20,000 × $0.0099 = <b>$198</b>, once</td><td></td></tr>
+    <tr><td>Serving 100,000 requests a day</td><td class="rk">$990 a day</td><td class="ev">$28 a day</td></tr>
+  </table>
+  <p>The training data pays for itself in about <b>5 hours</b> of traffic. That's why distillation is everywhere. What decides whether it works is not the money, it's <b>quality</b> (how close the student gets), <b>coverage</b> (do the 20,000 prompts look like real traffic?), and <b>permission</b> (are you allowed to train on that teacher's outputs?).</p>
+  <p class="muted">Prices are illustrative; GPU costs depend on utilization (Lesson 7.3). Fine-tuning compute for 20,000 examples on rented GPUs is usually tens of dollars.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    It's often easier to <b>judge</b> than to <b>write</b>. Preference tuning turns “A is better than B” into training signal, so the model learns what people prefer, not just what one example said. Distillation turns a big model's answers into training data for a small one. Both move behaviour into weights cheaply; both copy the flaws of whoever did the judging or writing.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the apprentice chef</span>
+    <p>SFT is the apprentice copying the head chef's recipes exactly. Preference tuning is the head chef tasting two of the apprentice's dishes and saying “this one”: no recipe needed, and the apprentice learns taste. Distillation is the apprentice learning from a famous chef's cookbook instead of from the chef: cheap, fast, and only as good as the cookbook, which you may not be licensed to copy.</p>
+  </div>
+
+  <h2>RLHF in one picture</h2>
+  <p><b>RLHF</b> (reinforcement learning from human feedback) is the recipe behind InstructGPT and early ChatGPT. The model being trained is called the <b>policy</b>. It writes two answers; a person picks the better one; a <b>reward model</b> learns to predict those picks; then an RL algorithm (usually <b>PPO</b>, proximal policy optimization) nudges the policy toward answers the reward model scores highly, with a <b>KL penalty</b> (a measure of how far it drifts) that keeps it close to a frozen copy of the starting model, the <b>reference</b>. Without that leash, the policy finds answers that fool the reward model.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Diagram · RLHF vs DPO</span>
+    <p class="hint">Play one round of the RLHF loop, then switch to DPO and see which boxes disappear.</p>
+    <div class="controls"><button class="btn primary" id="rl-play">▶ Play one round</button> <button class="btn" id="rl-dpo">Switch to DPO</button></div>
+    <svg id="rl-svg"></svg>
+    <p class="hint" id="rl-msg"></p>
+  </div>
+
+  <h2>DPO: preference tuning without the RL</h2>
+  <p><b>DPO</b> (direct preference optimization; Rafailov et al., 2023) showed you can skip the reward model and the RL loop. Its paper title says why: “your language model is secretly a reward model”. For each preference pair (prompt <i>x</i>, chosen answer <i>y<sub>w</sub></i>, rejected answer <i>y<sub>l</sub></i>), DPO compares how much the policy has <i>raised</i> each answer's log-probability relative to the reference model:</p>
+  <div class="eq">loss = −log σ( β · [ (log <span class="md">π<sub>θ</sub></span>(y<sub>w</sub>|x) − log <span class="cx">π<sub>ref</sub></span>(y<sub>w</sub>|x)) − (log <span class="md">π<sub>θ</sub></span>(y<sub>l</sub>|x) − log <span class="cx">π<sub>ref</sub></span>(y<sub>l</sub>|x)) ] )
+    <span class="say">The bracket is the <b>margin</b>: how much more the model now favours the chosen answer than the rejected one, compared with where it started. σ is the sigmoid; β (often 0.1) sets how strongly preferences push the model away from the reference.</span></div>
+  <p>It's just a classification loss on pairs: no sampling during training, no reward model to host, and it runs in the same trainer library as SFT. The usual recipe is <b>SFT first, then DPO</b>. Variants you'll see: <b>KTO</b> (works with single thumbs-up/down instead of pairs), <b>IPO</b>, <b>ORPO</b> and <b>SimPO</b> (simplified losses), and online DPO (fresh pairs from the current model). The full derivation is in the RL from Zero course: <a href="../../rl-course/phase7/3-reward-models.html">reward models</a>, <a href="../../rl-course/phase7/4-rlhf-ppo.html">RLHF with PPO</a> and <a href="../../rl-course/phase7/5-dpo.html">DPO and its family</a>.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: one DPO pair by hand</span>
+    <ul>
+      <li>Start: the policy equals the reference, so both log-ratios are 0. Margin = 0, loss = −log σ(0) = −log 0.5 = <b>0.693</b>.</li>
+      <li>After some training: log-ratio of the chosen answer is +1.0, of the rejected −1.0. With β = 0.1, margin = 0.1 × (1.0 − (−1.0)) = 0.2. σ(0.2) ≈ 0.55, so loss ≈ <b>0.598</b>.</li>
+      <li>Same model, β = 0.5: margin = 1.0, σ(1.0) ≈ 0.73, loss ≈ <b>0.313</b>. A bigger β makes each nat of change count for more, so the loss saturates after smaller moves away from the reference.</li>
+    </ul>
+    <p>The gradient on a pair is proportional to σ(−margin): pairs the model already gets right barely move it; pairs it gets wrong move it most.</p>
+  </div>
+
+  <h2>Collecting preference data</h2>
+  <ul>
+    <li><b>Pairwise beats scores.</b> People disagree on whether an answer is a 6 or a 7 out of 10, but agree far more on “A or B”.</li>
+    <li><b>Your product already produces it</b>: thumbs up/down (KTO-style), regenerate clicks, “which response do you prefer?” prompts, and user edits (the edited version is <i>chosen</i>, the original <i>rejected</i>).</li>
+    <li><b>AI feedback</b> (RLAIF): an LLM judge labels the pairs, guided by written principles (Anthropic's Constitutional AI). Swap A/B order and average to cancel position bias (Lesson 5.3).</li>
+    <li><b>Write labelling guidelines</b> and measure agreement between labellers. Raters (human or AI) tend to prefer longer, more confident answers; if you don't control for that, your model learns verbosity, not quality.</li>
+  </ul>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Build preference pairs, train a toy DPO</span>
+    <p class="hint">Click the better answer in each pair, then train. This is a <b>toy</b>: each answer is described by five traits, and the “model” is one weight per trait, updated with the real DPO gradient. A real model has billions of weights and compares whole-answer log-probabilities, but it learns from your clicks the same way. Then hit “Label like a rushed rater” and see what it learns instead.</p>
+    <div class="controls">
+      <button class="btn small" id="pp-good">Label with a careful rubric</button>
+      <button class="btn small" id="pp-biased">Label like a rushed rater (always the longer one)</button>
+      <button class="btn small" id="pp-reset">Reset</button>
+    </div>
+    <div id="pp-pairs"></div>
+    <div class="controls">
+      <label>β <input type="range" id="pp-beta" min="0" max="3" step="1" value="1"> <b class="mono" id="pp-bv"></b></label>
+      <button class="btn primary" id="pp-train">▶ Train 25 steps</button>
+    </div>
+    <canvas class="chart" id="pp-chart" style="height:200px"></canvas>
+    <div class="stat-row">
+      <div class="stat">steps <b id="pp-steps">0</b></div>
+      <div class="stat">avg DPO loss <b id="pp-loss">–</b></div>
+      <div class="stat">labelled pairs <b id="pp-n">0 / 6</b></div>
+    </div>
+    <div class="verdict" id="pp-verdict"></div>
+    <div id="pp-test"></div>
+  </div>
+  <p>What you should see: with the careful rubric, the model learns to like <b>concise</b>, <b>cited</b> and <b>honest-about-uncertainty</b> answers. With the rushed rater, “long &amp; padded” gets the biggest positive weight, and on the unseen test pairs the model now prefers the waffle. Same algorithm, different labels: <b>preference tuning learns your raters, flaws included.</b></p>
+
+  <h2>Distillation: teacher outputs → student SFT</h2>
+  <p><b>Distillation</b> trains a small student to imitate a big teacher. For LLMs the simplest form is just SFT on the teacher's answers to your prompts (“sequence-level” distillation). If you can see the teacher's token probabilities (open models only), the student can also match its whole probability distribution at each token, which carries more information per example; <b>on-policy</b> distillation lets the teacher grade the student's own attempts so it learns from its own mistakes.</p>
+  <ol>
+    <li><b>Prompts</b>: sample real traffic (with consent and PII handling, Lesson 8.3), or generate varied ones.</li>
+    <li><b>Teacher answers</b>: the best prompt you can write, maybe several samples per prompt.</li>
+    <li><b>Filter</b>: keep answers that pass tests, a schema check or an LLM judge. Filtering usually matters more than volume.</li>
+    <li><b>Train</b> the student (SFT, often LoRA), optionally followed by DPO on teacher-ranked pairs.</li>
+    <li><b>Evaluate</b> against the teacher on a held-out set the teacher never saw in its prompts.</li>
+  </ol>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Distillation: cost vs quality</span>
+    <p class="hint">Slide the number of teacher-written examples and watch the student's quality curve, the one-off cost and the serving savings. Then push “rounds of training on its own outputs” to see what happens when the student is retrained only on synthetic data. Curves and prices are <b>illustrative</b>: the shape is typical, the numbers are not measurements.</p>
+    <div class="controls">
+      <label>teacher examples <input type="range" id="ds-n" min="0" max="9" step="1" value="5"> <b class="mono" id="ds-nv"></b></label>
+      <label>student <select id="ds-st" class="btn small"><option value="1">1B (phone, CPU)</option><option value="8" selected>8B (one GPU)</option></select></label>
+      <label><input type="checkbox" id="ds-filt"> filter teacher outputs with a checker</label>
+    </div>
+    <div class="controls">
+      <label>requests per day <input type="range" id="ds-q" min="0" max="5" step="1" value="3"> <b class="mono" id="ds-qv"></b></label>
+      <label>rounds of training on its own outputs <input type="range" id="ds-k" min="0" max="5" step="1" value="0"> <b class="mono" id="ds-kv"></b></label>
+      <button class="btn small" id="ds-collapse">Show model collapse</button>
+    </div>
+    <canvas class="chart" id="ds-chart" style="height:230px"></canvas>
+    <div class="stat-row">
+      <div class="stat">student quality <b id="ds-qual">–</b></div>
+      <div class="stat">rare-case coverage <b id="ds-tail">–</b></div>
+      <div class="stat">data cost (once) <b id="ds-cost">–</b></div>
+      <div class="stat">saved per month <b id="ds-save">–</b></div>
+    </div>
+    <p class="verdict" id="ds-msg"></p>
+  </div>
+
+  <h2>Synthetic data and its risks</h2>
+  <p><b>Synthetic data</b> is training data written by a model. It's now a normal part of training: Self-Instruct (2022) bootstrapped instructions from GPT-3 itself, and Microsoft's phi-1 (2023) reached 50.6% on the HumanEval coding benchmark with just 1.3B parameters, trained partly on 1B tokens of GPT-3.5-written “textbooks” and exercises. The risks:</p>
+  <table>
+    <tr><th>Risk</th><th>What happens</th><th>Mitigation</th></tr>
+    <tr><td class="rk">Model collapse</td><td>Training repeatedly on model outputs loses the rare cases first: a 2024 <i>Nature</i> paper found the tails of the original distribution disappear.</td><td>Keep real data in every round; never train only on your own outputs.</td></tr>
+    <tr><td class="rk">Contamination</td><td>The teacher reproduces benchmark or test items, so your eval looks great and means nothing.</td><td>Deduplicate synthetic data against eval sets (n-gram or embedding overlap, Lesson 2.5).</td></tr>
+    <tr><td class="rk">Homogeneity</td><td>Thousands of answers in one voice with the same structure; the student becomes bland and brittle.</td><td>Vary seeds, personas, prompts and temperature; measure diversity.</td></tr>
+    <tr><td class="rk">Inherited errors &amp; bias</td><td>The student copies the teacher's mistakes, confidently.</td><td>Filter with tests and judges; spot-check by hand.</td></tr>
+    <tr><td class="rk">Licence / terms</td><td>The provider's terms may forbid training competing models on its outputs.</td><td>Read the terms; prefer permissively licensed open teachers.</td></tr>
+  </table>
+
+  <div class="box warn">
+    <span class="label">⚠️ Licences and terms (as of 2026; not legal advice)</span>
+    <ul>
+      <li><b>OpenAI</b>'s terms of use forbid using output “to develop models that compete with OpenAI”.</li>
+      <li><b>Anthropic</b>'s commercial terms forbid using the services to build a competing product, “including to train competing AI models”.</li>
+      <li><b>Llama 3.1</b>'s community licence allows using its outputs to improve other models, but a distributed model must start its name with “Llama” and you must display “Built with Llama”.</li>
+      <li>Open models under <b>Apache 2.0</b> or <b>MIT</b> (for example Qwen3, gpt-oss, DeepSeek-R1) are far less restrictive. Terms change between model versions, so check each one (Lesson 7.3), and ask your legal team before you ship.</li>
+    </ul>
+  </div>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p><b>TRL</b>'s <code>DPOTrainer</code> (and <code>KTOTrainer</code> for thumbs-up/down data, <code>GKDTrainer</code> for on-policy distillation); any <b>OpenAI-compatible client</b> to call the teacher; <b>Amazon Bedrock</b> has a managed distillation feature; Argilla or Label Studio for human preference labelling.</p>
+<pre><code><span class="c"># 1) Distil: teacher answers → filtered SFT data</span>
+<span class="k">import</span> json
+<span class="k">from</span> openai <span class="k">import</span> OpenAI
+teacher = OpenAI(base_url=TEACHER_URL, api_key=KEY)   <span class="c"># an open model you're allowed to distil</span>
+<span class="k">with</span> open(<span class="s">"distil.jsonl"</span>, <span class="s">"w"</span>) <span class="k">as</span> f:
+    <span class="k">for</span> p <span class="k">in</span> prompts:
+        a = teacher.chat.completions.create(model=TEACHER, messages=[{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: p}])
+        ans = a.choices[<span class="n">0</span>].message.content
+        <span class="k">if</span> passes_checks(p, ans):                      <span class="c"># schema, tests, LLM judge…</span>
+            f.write(json.dumps({<span class="s">"messages"</span>: [{<span class="s">"role"</span>: <span class="s">"user"</span>, <span class="s">"content"</span>: p},
+                                             {<span class="s">"role"</span>: <span class="s">"assistant"</span>, <span class="s">"content"</span>: ans}]}) + <span class="s">"\n"</span>)
+<span class="c"># → train the student with SFTTrainer exactly as in Lesson 7.1</span>
+
+<span class="c"># 2) Preference-tune: rows {"prompt": [...], "chosen": [...], "rejected": [...]}</span>
+<span class="k">from</span> datasets <span class="k">import</span> load_dataset
+<span class="k">from</span> peft <span class="k">import</span> LoraConfig
+<span class="k">from</span> trl <span class="k">import</span> DPOConfig, DPOTrainer
+pairs = load_dataset(<span class="s">"json"</span>, data_files=<span class="s">"pairs.jsonl"</span>, split=<span class="s">"train"</span>)
+trainer = DPOTrainer(
+    model=<span class="s">"./student-sft"</span>,                          <span class="c"># start from the SFT model</span>
+    args=DPOConfig(output_dir=<span class="s">"student-dpo"</span>, beta=<span class="n">0.1</span>, learning_rate=<span class="n">5e-6</span>),
+    train_dataset=pairs,
+    peft_config=LoraConfig(r=<span class="n">16</span>, target_modules=<span class="s">"all-linear"</span>, task_type=<span class="s">"CAUSAL_LM"</span>),
+)
+trainer.train()</code></pre>
+    <p class="hint">If you don't pass a <code>ref_model</code>, TRL uses the model as it was before DPO started as the reference. In TRL's docs, β defaults to 0.1, and a higher β means less deviation from the reference.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>SFT only</td><td>Simple, needs ideal answers</td><td>Copies one answer per prompt; can't learn “better vs worse”</td></tr>
+      <tr><td>DPO</td><td>Learns from pairs; one training run, no reward model</td><td>Offline: learns only from the pairs you have; sensitive to label noise and length bias</td></tr>
+      <tr><td>RLHF (PPO)</td><td>Online: explores and improves on its own samples</td><td>Several models in memory, unstable, reward hacking; mostly a lab-scale tool</td></tr>
+      <tr><td>Distillation from an API teacher</td><td>Fast, cheap data, big serving savings</td><td>Licence/terms risk; student capped near the teacher on that task</td></tr>
+      <tr><td>Heavy synthetic data</td><td>Unlimited volume, privacy-friendly</td><td>Collapse, contamination, homogeneity unless you mix in real data and filter</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Startup</h4><p>Distil a permissively licensed open teacher on your real prompts into a small model, filter hard, and evaluate against the teacher. Collect thumbs and edits from day one; when you have a few thousand pairs, one DPO run on top of the SFT model is usually the next big win.</p></div>
+      <div><h4>Big tech</h4><p>Paid labelling teams with guidelines and agreement checks, AI judges for scale, reward models and on-policy RL for frontier models, synthetic-data pipelines with decontamination against every benchmark, and legal review of every data source.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“We want a cheaper model that's as good as our GPT-class one on our task. How?” A senior answer:</p>
+    <ul>
+      <li>Distillation: teacher answers on <b>real, representative prompts</b>, filtered by checks, then SFT a small model; optionally DPO on teacher-ranked pairs.</li>
+      <li>Names the <b>risks</b>: licence/terms, coverage of rare cases, contamination of the eval set, inherited errors.</li>
+      <li><b>Evaluates</b> student vs teacher on a held-out set, plus a canary set of rare cases, and keeps a fallback route to the teacher for low-confidence requests (Lesson 8.2).</li>
+      <li>Knows DPO vs RLHF: DPO is the default for product teams; PPO-style RL needs a reward model and is harder to run.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Reasoning distilled into small models</b> <span class="tag co">🏢 DeepSeek · 2025</span> <a href="https://github.com/deepseek-ai/DeepSeek-R1" target="_blank" rel="noopener">DeepSeek-R1 (GitHub)</a></div>
+      <p><b>How:</b> fine-tuned open Qwen2.5 and Llama 3 models (1.5B to 70B) on 800k samples curated with DeepSeek-R1, and released the weights (each keeps its base model's licence: Apache 2.0 for Qwen, Llama's for Llama).</p>
+      <p><b>Why this method:</b> distilling the big model's reasoning beat running RL directly on small models; their 32B distilled model outperformed OpenAI's o1-mini across various benchmarks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>AI feedback + DPO, no human labels</b> <span class="tag res">🧪 Research · 2023</span> <a href="https://arxiv.org/abs/2310.16944" target="_blank" rel="noopener">Zephyr: Direct Distillation of LM Alignment</a></div>
+      <p><b>How:</b> Hugging Face distilled SFT from a teacher, then ran DPO on pairs ranked by a teacher model (“dDPO”), in a few hours of training.</p>
+      <p><b>Why this method:</b> Zephyr-7B beat Llama2-Chat-70B, the best open RLHF model at the time, on MT-Bench, with no human annotation.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A fully open post-training recipe</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://arxiv.org/abs/2411.15124" target="_blank" rel="noopener">Tülu 3 (Allen Institute for AI)</a></div>
+      <p><b>How:</b> SFT, then DPO, then RL with verifiable rewards (answers that can be checked), on Llama 3.1 base models, with all data and code released.</p>
+      <p><b>Why this method:</b> each stage fixes something the previous one can't; the result beat the official Llama 3.1 instruct models and closed models like GPT-4o-mini on their benchmarks.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The warning shot on synthetic data</b> <span class="tag res">🧪 Research · 2024</span> <a href="https://www.nature.com/articles/s41586-024-07566-y" target="_blank" rel="noopener">AI models collapse when trained on recursively generated data (Nature)</a></div>
+      <p><b>How:</b> trained models generation after generation on the previous generation's outputs.</p>
+      <p><b>Why this method:</b> indiscriminate use of model-generated data caused irreversible defects, with the tails of the original distribution disappearing first.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · the 175B model lost to the 1.3B one</span>
+    <p>In OpenAI's InstructGPT paper, people preferred the answers of a <b>1.3B</b> model trained with SFT and RLHF to those of the <b>175B</b> GPT-3 base model, despite 100× fewer parameters. Preference tuning doesn't add knowledge, but it makes the knowledge usable.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>This builds on SFT and LoRA (7.1) and on judges (5.3), which become your labellers. Distilled students are what you self-host (7.3) and serve at scale (7.4), and routing between student and teacher is a cost lever (8.2). The RL side, from Bradley–Terry reward models to PPO, DPO, RLAIF and best-of-N distillation, is in RL from Zero: <a href="../../rl-course/phase7/5-dpo.html">DPO and the preference family</a>, <a href="../../rl-course/phase7/6-rlaif.html">RLAIF &amp; Constitutional AI</a>, <a href="../../rl-course/phase7/7-best-of-n.html">best-of-N, rejection sampling &amp; distillation</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Paper</span> <a href="https://arxiv.org/abs/2305.18290" target="_blank" rel="noopener">Direct Preference Optimization</a>. The derivation in 10 readable pages.</li>
+      <li><span class="kind">Docs</span> <a href="https://huggingface.co/docs/trl/dpo_trainer" target="_blank" rel="noopener">TRL DPO Trainer</a>. Dataset formats, loss variants, β.</li>
+      <li><span class="kind">Blog</span> <a href="https://crfm.stanford.edu/2023/03/13/alpaca.html" target="_blank" rel="noopener">Stanford Alpaca</a>. The original cheap-distillation story, licence caveats included.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You need 50,000 teacher answers of ~600 output tokens each (ignore input). At an illustrative $15 per million output tokens, roughly what does generation cost?</div>
+    <div class="opts"><button class="opt">$45</button><button class="opt" data-ok>$450</button><button class="opt">$4,500</button></div>
+    <div class="explain">50,000 × 600 = 30 M tokens; 30 × $15 = <b>$450</b>. Data generation is rarely the expensive part. Filtering, evaluation and permission are.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. After DPO on your users' thumbs-up/down and A/B picks, answers got 40% longer and support agents complain they're padded. Most likely cause?</div>
+    <div class="opts"><button class="opt">β was too high</button><button class="opt" data-ok>The preference data rewarded length: raters favoured longer answers, and DPO learned that</button><button class="opt">DPO always makes answers longer</button></div>
+    <div class="explain">Preference tuning learns whatever separates chosen from rejected. If longer answers win more often, length is the easiest signal. Fix the data: guidelines, length-controlled comparisons, or pairs where the concise answer wins.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. To save money, a team plans to retrain its model every month only on conversations its own model generated. What's the main long-term risk?</div>
+    <div class="opts"><button class="opt" data-ok>Model collapse: rare cases vanish first and errors compound; keep real data in every round</button><button class="opt">The model gets too big</button><button class="opt">The KL penalty stops working</button></div>
+    <div class="explain">Each round trains on a slightly narrower, slightly wronger copy of the last. Mixing in fresh human data and filtering synthetic data is the standard defence.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Preference tuning learns from “A beats B”; RLHF uses a reward model and RL with a KL leash, DPO does it with one classification-style loss.</li>
+      <li>Your model learns your raters, including their length and confidence biases: write guidelines and check them.</li>
+      <li>Distillation = SFT a small student on a big teacher's filtered answers; cheap to generate, big serving savings, capped near the teacher.</li>
+      <li>Synthetic data risks: collapse, contamination, homogeneity, inherited errors, and licence terms. Keep real data, filter, decontaminate, read the terms.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script src="../assets/flow.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const sig = x => 1 / (1 + Math.exp(-x));
+
+  // ---------- RLHF vs DPO diagram ----------
+  const F = new Flow($("rl-svg"), { width: 720, height: 250 });
+  F.node("p", { x: 70, y: 60, w: 110, label: "Prompts", sub: "real or generated", kind: "cl" })
+   .node("pol", { x: 245, y: 60, w: 140, label: "Policy", sub: "the SFT model", kind: "nw" })
+   .node("ans", { x: 430, y: 60, w: 130, label: "Answers A, B", sub: "2 samples", kind: "db" })
+   .node("hum", { x: 615, y: 60, w: 130, label: "Human picks", sub: "A ≻ B", kind: "cl" })
+   .node("rm", { x: 615, y: 190, w: 130, label: "Reward model", sub: "learns the picks", kind: "ca" })
+   .node("ppo", { x: 400, y: 190, w: 150, label: "RL update (PPO)", sub: "max reward − β·KL", kind: "sv" })
+   .node("ref", { x: 150, y: 190, w: 160, label: "Reference model", sub: "frozen copy: KL leash", kind: "er" })
+   .edge("p", "pol").edge("pol", "ans").edge("ans", "hum").edge("hum", "rm", { label: "train" })
+   .edge("rm", "ppo", { label: "score" }).edge("ppo", "pol", { label: "update" }).edge("ref", "ppo", { dashed: true, label: "KL" }).render();
+  let dpo = false, busy = false;
+  const MSG = {
+    rlhf: "RLHF: sample → humans compare → train a reward model → RL pushes the policy toward high reward while the KL penalty keeps it near the reference. Four models in play: policy, reference, reward model, and (for PPO) a value model.",
+    dpo: "DPO: the pairs you already have go straight into one loss that compares policy vs reference log-probs. No reward model to train, no sampling during training, no RL loop.",
+  };
+  $("rl-msg").textContent = MSG.rlhf;
+  $("rl-dpo").onclick = () => {
+    dpo = !dpo;
+    F.set("rm", { down: dpo, sub: dpo ? "not needed" : "learns the picks" });
+    F.set("ppo", { label: dpo ? "DPO loss" : "RL update (PPO)", sub: dpo ? "−log σ(β·margin)" : "max reward − β·KL", kind: dpo ? "ca" : "sv" });
+    F.set("ans", { label: dpo ? "Pairs (chosen, rejected)" : "Answers A, B", sub: dpo ? "a fixed dataset" : "2 samples", w: 130 });
+    F.edgeStyle("rm", "ppo", { hidden: dpo }); F.edgeStyle("hum", "rm", { hidden: dpo });
+    F.edgeStyle("ans", "hum", { label: dpo ? "labelled once" : "" });
+    $("rl-dpo").textContent = dpo ? "Switch to RLHF" : "Switch to DPO";
+    $("rl-msg").textContent = dpo ? MSG.dpo : MSG.rlhf;
+  };
+  $("rl-play").onclick = async () => {
+    if (busy) return; busy = true;
+    if (dpo) { await F.packet(["ans", "ppo"], { color: "--c-cx", dur: 700 }); await F.packet(["ref", "ppo"], { color: "--c-rk", dur: 500 }); await F.packet(["ppo", "pol"], { color: "--c-md", dur: 600 }); }
+    else {
+      await F.packet(["p", "pol", "ans", "hum"], { color: "--c-in", dur: 1200 });
+      await F.packet(["hum", "rm", "ppo"], { color: "--c-ev", dur: 900 });
+      await F.packet(["ref", "ppo"], { color: "--c-rk", dur: 500 });
+      await F.packet(["ppo", "pol"], { color: "--c-md", dur: 600 });
+    }
+    F.set("pol", { hot: true }); setTimeout(() => F.set("pol", { hot: false }), 700);
+    busy = false;
+  };
+
+  // ---------- Preference-pair builder (toy DPO) ----------
+  const TRAITS = ["concise", "cites a source", "warm tone", "admits uncertainty", "long & padded"];
+  // each answer: [text, trait vector]
+  const PAIRS = [
+    { q: "How do I reset my password?", A: ["Settings → Security → Reset password. You'll get an email link valid for 30 minutes.", [1, 0, 1, 0, 0]], B: ["Great question! Passwords are an important part of staying safe online, and there are many reasons you might want to change yours. To begin the process, first consider…", [0, 0, 1, 0, 1]] },
+    { q: "Can I take ibuprofen with my blood-pressure tablets?", A: ["Yes, that's fine.", [1, 0, 0, 0, 0]], B: ["It depends on which tablets you take, so please check with a pharmacist before combining them. Here is why, in detail…", [0, 0, 0, 1, 1]] },
+    { q: "Summarize clause 7 of this contract.", A: ["• Either side may end it with 30 days' notice (7.1) • Fees are owed to the end date (7.2) • Data is deleted within 60 days (7.4)", [1, 1, 0, 0, 0]], B: ["Clause 7 is a really interesting part of the agreement which covers many different topics relating to how the relationship between the parties might eventually come to an end…", [0, 0, 0, 0, 1]] },
+    { q: "What's the refund window?", A: ["30 days from delivery (Refund policy, section 2).", [1, 1, 0, 0, 0]], B: ["Thanks so much for reaching out! We truly value every customer. Our generous policy lets you request a refund within 30 days, and our wonderful team…", [0, 0, 1, 0, 1]] },
+    { q: "Write a haiku about autumn.", A: ["Red leaves let go first / the maple keeps one secret / for the first cold wind", [1, 0, 1, 0, 0]], B: ["Red leaves let go first / the maple keeps one secret / for the first cold wind. Now let me explain each line and the history of the haiku form…", [0, 0, 1, 0, 1]] },
+    { q: "When did we release API v2?", A: ["I can't find that in the docs I have; the changelog page will have the exact date.", [1, 0, 0, 1, 0]], B: ["API v2 was released in March 2021.", [1, 0, 0, 0, 0]] },
+  ];
+  const TESTS = [
+    { q: "Unseen: “What is DNS?”", A: ["The internet's phone book: it turns names like example.com into IP addresses.", [1, 0, 1, 0, 0]], B: ["DNS is a fascinating and deeply important technology with a long history going back decades, and to really understand it we first need to discuss…", [0, 0, 1, 0, 1]] },
+    { q: "Unseen: “What's our uptime SLA?”", A: ["99.9% monthly (Service terms, section 4).", [1, 1, 0, 0, 0]], B: ["Definitely 99.99%, always.", [1, 0, 0, 0, 0]] },
+  ];
+  const GOOD = ["A", "B", "A", "A", "A", "A"], RUSHED = ["B", "B", "B", "B", "B", "B"]; // rushed rater: always the longer / more confident one
+  const BETAS = [0.05, 0.1, 0.3, 0.5];
+  let labels = Array(PAIRS.length).fill(null), w = [0, 0, 0, 0, 0], steps = 0;
+  const esc = s => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+  const tr = v => v.map((x, k) => x ? TRAITS[k] : null).filter(Boolean).join(" · ");
+  const delta = f => f.reduce((s, v, k) => s + v * w[k], 0); // toy log π/π_ref for an answer
+  function margin(p, lab) { const c = lab === "A" ? p.A[1] : p.B[1], r = lab === "A" ? p.B[1] : p.A[1]; return BETAS[+$("pp-beta").value] * (delta(c) - delta(r)); }
+  function renderPairs() {
+    $("pp-pairs").innerHTML = PAIRS.map((p, i) => {
+      const m = labels[i] ? margin(p, labels[i]) : null;
+      const cls = s => labels[i] ? (labels[i] === s ? " chosen" : " rejected") : "";
+      return `<div class="pair"><div class="q">${i + 1}. ${esc(p.q)}</div><div class="ab">
+        <button class="resp${cls("A")}" id="pp-a${i}" data-i="${i}" data-s="A">A · ${esc(p.A[0])}<span class="tr">${tr(p.A[1])}</span></button>
+        <button class="resp${cls("B")}" id="pp-b${i}" data-i="${i}" data-s="B">B · ${esc(p.B[0])}<span class="tr">${tr(p.B[1])}</span></button></div>
+        <div class="m">${m == null ? "not labelled yet" : `margin ${m.toFixed(2)} · model now prefers your choice with P = σ(margin) = ${sig(m).toFixed(2)} · loss ${(-Math.log(sig(m))).toFixed(3)}`}</div></div>`;
+    }).join("");
+    $("pp-pairs").querySelectorAll(".resp").forEach(b => (b.onclick = () => { labels[+b.dataset.i] = b.dataset.s; renderPairs(); }));
+    const lab = labels.map((l, i) => [l, i]).filter(([l]) => l);
+    $("pp-n").textContent = `${lab.length} / ${PAIRS.length}`;
+    $("pp-steps").textContent = steps;
+    $("pp-loss").textContent = lab.length ? (lab.reduce((s, [l, i]) => s - Math.log(sig(margin(PAIRS[i], l))), 0) / lab.length).toFixed(3) : "–";
+    $("pp-bv").textContent = BETAS[+$("pp-beta").value];
+    Plot.bars($("pp-chart"), { bars: TRAITS.map((t, k) => ({ label: t, value: w[k], color: w[k] >= 0 ? MX.css("--c-ev") : MX.css("--c-rk") })), yMin: Math.min(-1, ...w), yMax: Math.max(1, ...w), yLabel: "learned weight" });
+    $("pp-test").innerHTML = TESTS.map(t => {
+      const d = delta(t.A[1]) - delta(t.B[1]), pA = sig(BETAS[+$("pp-beta").value] * d * 4);
+      const pick = Math.abs(d) < 0.05 ? "no preference yet" : d > 0 ? "prefers A" : "prefers B";
+      return `<div class="hit${d < -0.05 ? " miss" : ""}"><span class="sc">${esc(t.q)} → ${pick}</span>A: ${esc(t.A[0])} <span class="muted">(${tr(t.A[1])})</span><br>B: ${esc(t.B[0])} <span class="muted">(${tr(t.B[1])})</span></div>`;
+    }).join("");
+    let v = "";
+    if (steps && w[4] > 0.5) v = `<span class="rk">⚠️ Your model learned that “long &amp; padded” is good (weight ${w[4].toFixed(1)}). That's verbosity bias, learned straight from the labels.</span>`;
+    else if (steps && w[3] > 0.5 && w[1] > 0.5) v = `<span class="ev">✅ It learned to value sources and honesty about uncertainty, and to avoid padding. Check the unseen pairs: it generalizes to new questions.</span>`;
+    else if (steps) v = `<span class="md">It learned something from your ${lab.length} labels; compare the trait weights with what you meant to teach.</span>`;
+    $("pp-verdict").innerHTML = v;
+  }
+  $("pp-train").onclick = () => {
+    const lab = labels.map((l, i) => [l, i]).filter(([l]) => l);
+    if (!lab.length) { $("pp-verdict").innerHTML = `<span class="tk">Label at least one pair first (or use a labelling button).</span>`; return; }
+    const beta = BETAS[+$("pp-beta").value], lr = 4;
+    for (let s = 0; s < 25; s++) {
+      const g = [0, 0, 0, 0, 0];
+      lab.forEach(([l, i]) => {
+        const p = PAIRS[i], c = l === "A" ? p.A[1] : p.B[1], r = l === "A" ? p.B[1] : p.A[1], m = margin(p, l);
+        c.forEach((v, k) => (g[k] += beta * sig(-m) * (v - r[k]) / lab.length)); // −∂loss/∂w
+      });
+      w = w.map((v, k) => v + lr * g[k]);
+      steps++;
+    }
+    renderPairs();
+  };
+  $("pp-good").onclick = () => { labels = GOOD.slice(); w = [0, 0, 0, 0, 0]; steps = 0; renderPairs(); };
+  $("pp-biased").onclick = () => { labels = RUSHED.slice(); w = [0, 0, 0, 0, 0]; steps = 0; renderPairs(); };
+  $("pp-reset").onclick = () => { labels = Array(PAIRS.length).fill(null); w = [0, 0, 0, 0, 0]; steps = 0; renderPairs(); };
+  $("pp-beta").oninput = renderPairs;
+  renderPairs();
+
+  // ---------- Distillation simulator (illustrative) ----------
+  const NS = [100, 300, 1000, 3000, 10000, 20000, 50000, 100000, 200000, 300000], QD = [1000, 10000, 100000, 300000, 1000000, 3000000];
+  const ST = { 1: { q0: 45, qmax: 76, n0: 8000, inP: 0.03, outP: 0.12 }, 8: { q0: 60, qmax: 86, n0: 4000, inP: 0.10, outP: 0.40 } };
+  const TEACH = 90, IN = 800, OUTT = 500, tIn = 3, tOut = 15; // illustrative $ per million tokens
+  const qual = (n, s, filt, k) => { const ceil = s.qmax + (filt ? 3 : 0); return (s.q0 + (ceil - s.q0) * (1 - Math.exp(-n / s.n0))) * Math.pow(0.95, k); };
+  function distil() {
+    const n = NS[+$("ds-n").value], s = ST[$("ds-st").value], filt = $("ds-filt").checked, qd = QD[+$("ds-q").value], k = +$("ds-k").value;
+    $("ds-nv").textContent = n.toLocaleString(); $("ds-qv").textContent = qd.toLocaleString(); $("ds-kv").textContent = k;
+    const perT = (IN * tIn + OUTT * tOut) / 1e6, perS = (IN * s.inP + OUTT * s.outP) / 1e6;
+    const gen = n * perT / (filt ? 0.7 : 1); // filtering throws away ~30%, so generate more
+    const save = qd * 30 * (perT - perS), q = qual(n, s, filt, k), tail = 100 * Math.pow(0.7, k);
+    const xs = NS.map(x => Math.log10(x));
+    Plot.line($("ds-chart"), {
+      series: [
+        { label: "teacher", color: MX.css("--c-md"), data: xs.map(x => [x, TEACH]), dash: [6, 4] },
+        { label: "student (fresh teacher data)", color: MX.css("--c-ev"), data: NS.map((x, i) => [xs[i], qual(x, s, filt, 0)]), width: 3 },
+        ...(k ? [{ label: `after ${k} round(s) on its own outputs`, color: MX.css("--c-rk"), data: NS.map((x, i) => [xs[i], qual(x, s, filt, k)]), width: 2 }] : []),
+        { label: "", color: MX.css("--c-tk"), data: [[Math.log10(n), q]], dots: true, width: 0.01 },
+      ], xMin: 2, xMax: Math.log10(300000), yMin: 30, yMax: 100, xLabel: "log10(teacher examples)", yLabel: "quality (illustrative)",
+    });
+    $("ds-qual").textContent = `${Math.round(q)} / teacher ${TEACH}`;
+    $("ds-tail").textContent = Math.round(tail) + "%";
+    $("ds-cost").textContent = "$" + Math.round(gen).toLocaleString();
+    $("ds-save").textContent = "$" + Math.round(save).toLocaleString();
+    const payDays = gen / (save / 30);
+    let m;
+    if (k >= 2) m = `<span class="rk">⚠️ Model collapse: after ${k} rounds without fresh data the student lost ${Math.round(100 - tail)}% of its rare cases, and quality falls each round. The fix is to keep real data (or the teacher) in every round.</span>`;
+    else if (n >= 100000 && q > qual(n / 3, s, filt, 0) - 1) m = `<span class="tk">Diminishing returns: tripling the data barely moves quality now. Spend on better prompts, filtering, or a bigger student instead.</span>`;
+    else m = `<span class="ev">The data costs $${Math.round(gen).toLocaleString()} and pays back in ${payDays < 1 ? Math.max(1, Math.round(payDays * 24)) + " hours" : payDays.toFixed(1) + " days"} at ${qd.toLocaleString()} requests a day. The student reaches ${Math.round(100 * q / TEACH)}% of the teacher's quality.</span>`;
+    $("ds-msg").innerHTML = m;
+  }
+  ["ds-n", "ds-st", "ds-q", "ds-k"].forEach(id => ($(id).oninput = distil));
+  $("ds-filt").onchange = distil;
+  $("ds-collapse").onclick = () => { $("ds-k").value = 4; distil(); };
+  distil();
+})();
+</script>
+</body>
+</html>

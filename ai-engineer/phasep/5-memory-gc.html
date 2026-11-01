@@ -1,0 +1,524 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>P.5 Memory & garbage collection · AI Engineer</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🤖</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; flex-wrap: wrap; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .verdict { font-weight: 700; margin: 8px 0; }
+  .objs { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 10px; margin: 10px 0; }
+  .obj { border: 2px solid var(--line); border-radius: 10px; padding: 8px 10px; background: var(--bg2); font-size: .86rem; min-height: 92px; }
+  .obj h5 { margin: 0 0 4px; font-size: .95rem; font-family: var(--mono); }
+  .obj .rc { font-family: var(--mono); font-weight: 800; font-size: 1.05rem; }
+  .obj.live { border-color: var(--c-cx); }
+  .obj.garbage { border-color: var(--c-rk); background: color-mix(in srgb, var(--c-rk) 8%, var(--bg2)); }
+  .obj.freed { opacity: .45; border-style: dashed; }
+  .obj.none { opacity: .3; border-style: dotted; }
+  .obj .by { color: var(--muted); font-size: .8rem; margin-top: 4px; }
+  .names { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0; }
+  .name { font-family: var(--mono); font-size: .85rem; padding: 2px 10px; border-radius: 999px; border: 1px solid var(--c-in); color: var(--c-in); }
+  .name.gone { opacity: .35; text-decoration: line-through; border-style: dashed; }
+  .log { max-height: 220px; overflow-y: auto; }
+</style>
+</head>
+<body data-lesson="ap-5" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase P · Lesson 5</div>
+  <h1>Memory & garbage collection: references, cycles, leaks</h1>
+  <p class="subtitle">Your RAG service holds documents, chunks, caches and embedding matrices for days at a time. Know how Python decides when memory is freed, and you'll stop leaks before they page you at 3 a.m.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Classes and attributes</b>: <code>doc.chunks = [...]</code> stores a list inside an object; dataclasses (Lesson P.1).</li>
+      <li><b>Generators</b> process data one item at a time instead of loading it all (Lesson P.2).</li>
+      <li><b>Processes</b>: a server can start several worker processes by copying (forking) a parent (Lesson P.4).</li>
+      <li><b>Embeddings</b>: a list of numbers (say 768 of them) that represents the meaning of a text chunk (Lesson 2.1).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2017 Instagram, whose web servers run Python (Django) across a large fleet, did something that sounds reckless: they <b>turned off Python's garbage collector</b> across their web fleet. Plain <code>gc.disable()</code> didn't even stick, because a third-party library switched it back on, so they used <code>gc.set_threshold(0)</code>. The result: about a <b>10% capacity win</b>.</p>
+    <p>Why would collecting less garbage make servers faster? Their worker processes were forked from a parent and shared its memory pages, and the collector's bookkeeping kept writing to those shared objects, forcing the operating system to copy the pages for every worker. They later upstreamed <code>gc.freeze()</code> to Python 3.7 so anyone can avoid this. To understand that story, and to keep your own AI services from leaking, you need to know how CPython actually frees memory.</p>
+  </div>
+
+  <h2>Numbers first: what a Python object really costs</h2>
+  <p>Measured with <code>sys.getsizeof</code> on 64-bit CPython 3.13 (sizes vary a little by version; check yours):</p>
+  <table>
+    <tr><th>Object</th><th>Bytes</th><th>Why</th></tr>
+    <tr><td><code>1</code> (an int)</td><td class="tk">28</td><td>Every Python value is a full object: a reference count, a type pointer, then the value.</td></tr>
+    <tr><td><code>0.5</code> (a float)</td><td class="tk">24</td><td>8 bytes of number, 16 bytes of object header.</td></tr>
+    <tr><td><code>[]</code> (empty list)</td><td class="tk">56</td><td>Plus <b>8 bytes per item</b>: a list stores <i>pointers</i> to objects, not the objects.</td></tr>
+    <tr><td><code>{}</code> (empty dict)</td><td class="tk">64</td><td>Grows as keys are added (a 5-key dict is about 224).</td></tr>
+    <tr><td>a 768-number embedding as a list of floats</td><td class="rk">≈ 24,600</td><td>56 + 768 × (8-byte pointer + 24-byte float).</td></tr>
+    <tr><td>the same embedding as a NumPy <code>float32</code> array</td><td class="ev">3,072 (+ ~112 header)</td><td>768 × 4 raw bytes in one block.</td></tr>
+  </table>
+  <p>That's an <b>8× difference</b> for the same numbers. At one million embeddings it is the difference between about <b>24.6 GB</b> and <b>3.1 GB</b>: one needs a big machine, the other fits on a laptop. And none of it matters if the memory is never freed, which is the other half of this lesson.</p>
+
+  <h2>Names point to objects</h2>
+  <p>A Python variable is not a box that holds a value. It's a <b>name</b> (a label) that <b>refers to</b> an object somewhere in memory. Several names, list slots or attributes can refer to the same object:</p>
+<pre><code>chunks = [<span class="s">"refunds..."</span>, <span class="s">"shipping..."</span>]
+batch = chunks              <span class="c"># no copy: a second name for the same list</span>
+batch.append(<span class="s">"warranty..."</span>)
+print(len(chunks))          <span class="c"># 3, because there is only one list</span>
+batch = chunks.copy()       <span class="c"># now a new list (the strings inside are still shared)</span></code></pre>
+  <p>Assigning never copies. That's why a “harmless” <code>debug_log.append(doc)</code> keeps an entire 50 MB document alive: the list holds a reference to it.</p>
+
+  <h2>Rule 1: reference counting frees most memory instantly</h2>
+  <p>Every CPython object carries a <b>reference count</b> (refcount): how many names, list slots, dict values or attributes currently point at it. Assigning a name adds one; <code>del</code>, reassigning, or a function returning removes one. The moment the count hits <b>zero</b>, the object is freed immediately, and anything it pointed to loses a reference too (which can free them in turn).</p>
+<pre><code><span class="k">import</span> sys
+x = []
+sys.getrefcount(x)   <span class="c"># 2: the name x + the temporary reference from the call itself</span>
+y = x
+sys.getrefcount(x)   <span class="c"># 3</span>
+d = {<span class="s">"k"</span>: x}
+sys.getrefcount(x)   <span class="c"># 4</span>
+<span class="k">del</span> x, y, d          <span class="c"># count drops to 0: the list is freed right here</span></code></pre>
+  <p class="muted">The docs warn not to rely on the exact number (only 0 or 1 is meaningful), and some objects like <code>None</code> are “immortal” since Python 3.12, with a huge fake count. It's a teaching tool, not an API.</p>
+
+  <h2>Rule 2: cycles need the cyclic garbage collector</h2>
+  <p>Reference counting has one blind spot: a <b>reference cycle</b>. If a document points to its chunks and every chunk points back to its parent document, each object always has at least one reference, from the others. Delete every name you have, and the counts never reach zero. The group is unreachable but not freed.</p>
+  <p>That's what the <b>cyclic garbage collector</b> (the <code>gc</code> module, usually just “the GC”) is for. Every so often it scans container objects (lists, dicts, class instances…), finds groups that are only referenced from inside the group, and frees them. To keep scans cheap it's <b>generational</b>:</p>
+  <ul>
+    <li>New container objects start in <b>generation 0</b>. A collection of gen 0 starts when allocations minus deallocations pass <code>threshold0</code> (700 in older versions, 2,000 in recent CPython; check <code>gc.get_threshold()</code>).</li>
+    <li>Objects that survive move to generation 1, then 2. Older generations are scanned less often, because most objects die young.</li>
+    <li>A full collection of the oldest generation only runs when the objects waiting there exceed 25% of all long-lived objects, so its cost stays bounded.</li>
+  </ul>
+  <p>Two consequences for AI services: cyclic garbage sits in memory <b>until the next collection</b> (so memory shows a sawtooth), and the collector can only free what is unreachable. If your code still holds a reference (a global list, a cache), no collector will help.</p>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    CPython frees an object the moment nothing refers to it. The GC exists only for <b>cycles</b>. So almost every “memory leak” in Python is not the runtime's fault: it's a <b>reference you forgot you were holding</b> (an unbounded cache, a global list, a closure, a task set), or a cycle that waits for the collector. Find the reference, and you've found the leak.
+  </div>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: library books and sticky notes</span>
+    <p>Every book in a library has a tally of who has it checked out. When the tally hits zero, it goes straight back on the shelf: that's reference counting. But two books that are only “checked out” to each other (each one's card says the other has it) never come back on their own. Once in a while a librarian walks the stacks and spots books no actual person holds: that's the cyclic collector. And if <i>you</i> keep a book on your desk “just in case”, no librarian will take it: that's a cache that grows forever.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · References, cycles and the collector</span>
+    <p class="hint">A simulation of CPython's rules, with a <code>Document</code> holding 50 MB of extracted text. Run the steps in order: create the document, give it chunks, then <b>del doc</b>. With strong parent pointers the objects turn red: unreachable, but still holding memory until <b>gc.collect()</b>. Reset, tick “weak parent pointers”, and do it again.</p>
+    <div class="controls">
+      <button class="btn small" id="rc-new">doc = Document()</button>
+      <button class="btn small" id="rc-alias">alias = doc</button>
+      <button class="btn small" id="rc-chunks">doc.chunks = [Chunk(doc), Chunk(doc)]</button>
+      <button class="btn small" id="rc-deldoc">del doc</button>
+      <button class="btn small" id="rc-delalias">del alias</button>
+      <button class="btn small primary" id="rc-gc">gc.collect()</button>
+      <button class="btn small" id="rc-reset">reset</button>
+    </div>
+    <div class="controls">
+      <label><input type="checkbox" id="rc-weak"> weak parent pointers (<code>weakref.ref(doc)</code>)</label>
+    </div>
+    <div class="names" id="rc-names"></div>
+    <div class="objs" id="rc-objs"></div>
+    <div class="verdict" id="rc-verdict"></div>
+    <div class="stat-row">
+      <div class="stat">live objects <b id="rc-live">0</b></div>
+      <div class="stat">memory still held <b id="rc-mem">0 MB</b></div>
+      <div class="stat">freed by refcount <b id="rc-fr">0</b></div>
+      <div class="stat">freed by the GC <b id="rc-fg">0</b></div>
+    </div>
+    <div class="prompt log" id="rc-log"></div>
+
+    <h4>Now serve traffic</h4>
+    <p class="hint">Each simulated request loads a document (0.25 MB), chunks it and drops it. The settings above (weak pointers) apply, plus two server-level switches. The automatic GC runs when about 2,000 new container objects have piled up (5 per request here). Cause a leak, then fix it.</p>
+    <div class="controls">
+      <label><input type="checkbox" id="ld-gcoff"> <code>gc.disable()</code></label>
+      <label><input type="checkbox" id="ld-list"> keep every doc in a global <code>RECENT_DOCS</code> list “for debugging”</label>
+      <button class="btn primary" id="ld-run">▶ Serve 2,000 requests</button>
+    </div>
+    <canvas class="chart" id="ld-chart" style="height:220px"></canvas>
+    <div class="stat-row">
+      <div class="stat">peak memory <b id="ld-peak">–</b></div>
+      <div class="stat">after 2,000 requests <b id="ld-end">–</b></div>
+      <div class="stat">automatic GC runs <b id="ld-runs">–</b></div>
+    </div>
+    <p class="hint" id="ld-msg"></p>
+  </div>
+  <p>What you should see: strong parent pointers make a cycle, so memory climbs in a sawtooth and drops only when the collector runs. Disable the GC and it climbs forever. Weak pointers break the cycle, so reference counting frees each document the instant the request ends: a flat line, no collector needed. And the global list leaks <b>no matter what</b>, because those documents are still reachable. That last one is the most common leak in real services.</p>
+
+  <h2>Tools that break cycles and shrink objects</h2>
+  <ul>
+    <li><b><code>weakref</code></b>: a <i>weak reference</i> points to an object without adding to its refcount. <code>weakref.ref(doc)()</code> returns the document, or <code>None</code> once it's gone. Use it for back-pointers (chunk → parent) and observers. <code>weakref.WeakValueDictionary</code> makes a cache that never keeps its values alive by itself.</li>
+    <li><b>Bounded caches</b>: <code>functools.lru_cache(maxsize=1024)</code>, not the unbounded <code>@cache</code>, for embedding or prompt caches. Watch out: on a method, the cache holds <code>self</code> (the docs warn about this), so instances live as long as the cache.</li>
+    <li><b><code>__slots__</code></b>: by default each instance carries a dict for its attributes. Declaring <code>__slots__</code> (or <code>@dataclass(slots=True)</code>, Python 3.10+) stores attributes in fixed slots. For 100,000 three-field chunk objects we measured 13.6 MB → 9.6 MB on Python 3.13 (1.4×) and 18.8 → 9.2 MB on 3.9 (2×). Newer Pythons already shrank instance dicts, so measure before bothering.</li>
+    <li><b><code>gc.freeze()</code></b> (3.7+): for servers that load models or indexes then fork workers. The docs' recipe: <code>gc.disable()</code> early in the parent, <code>gc.freeze()</code> right before forking, <code>gc.enable()</code> early in each child. Frozen objects are never scanned, so their pages stay shared.</li>
+  </ul>
+
+  <h2>Leaks you will actually meet in AI services</h2>
+  <table>
+    <tr><th>Leak</th><th>What it looks like</th><th>Fix</th></tr>
+    <tr><td>Unbounded cache</td><td><code>EMBED_CACHE[text] = vec</code> on every request; memory grows with unique queries forever.</td><td><code>lru_cache(maxsize=…)</code>, a TTL cache, or Redis with eviction.</td></tr>
+    <tr><td>Global debug list</td><td><code>RECENT.append(response)</code> to inspect later.</td><td><code>collections.deque(maxlen=100)</code>, or log it and drop it.</td></tr>
+    <tr><td>Closure holding a big object</td><td>A callback defined inside a function “captures” the 2 GB matrix it never uses again, and the callback is stored in a registry.</td><td>Pass only what the callback needs; unregister callbacks.</td></tr>
+    <tr><td>Exceptions kept around</td><td>Saving <code>e</code> (with its traceback) keeps every local variable of every frame alive, including the request's documents.</td><td>Store <code>str(e)</code> or <code>repr(e)</code>, not the exception.</td></tr>
+    <tr><td>Fire-and-forget tasks</td><td>A set of background tasks that's added to but never cleaned up.</td><td><code>task.add_done_callback(tasks.discard)</code> (Lesson P.3).</td></tr>
+    <tr><td>float64 by accident</td><td><code>np.array(list_of_floats)</code> defaults to <code>float64</code>: twice the memory of float32, with no gain for embeddings.</td><td><code>np.asarray(x, dtype=np.float32)</code>.</td></tr>
+  </table>
+  <p>One more surprise: after a big spike, the process's resident memory (RSS, what your dashboard shows) often doesn't fall all the way back, because Python's allocator keeps freed blocks for reuse and memory can be fragmented. A <b>leak</b> is memory that keeps growing under steady traffic; a <b>high-water mark</b> is memory that went up once and stays flat. Tell them apart before you start debugging.</p>
+
+  <h2>Big matrices: dtype and memory-mapping</h2>
+  <p>Embedding matrices are where AI services spend most of their RAM. Two levers:</p>
+  <ul>
+    <li><b>dtype</b> (the number format): float64 = 8 bytes, float32 = 4, float16 = 2, int8 = 1 per number. Most embedding models output float32; float16 or int8 quantization (Lesson 2.2) halves or quarters memory again, at a small accuracy cost you should measure.</li>
+    <li><b>Memory-mapping</b>: <code>np.load("emb.npy", mmap_mode="r")</code> returns an array whose data stays in the file; the operating system pages in only the parts you touch, and several processes can share the same pages. Great for read-only indexes that are larger than you want in each worker's private memory.</li>
+  </ul>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: will the index fit in the pod?</span>
+    <p>You have <b>2 million chunks</b> embedded with a <b>1,024</b>-dimension model, and a 16 GB container.</p>
+    <ul>
+      <li>Numbers: 2,000,000 × 1,024 = 2.048 billion.</li>
+      <li>As Python lists of floats: 2M × (56 + 1,024 × 32) bytes ≈ <b>65.6 GB</b>. Doesn't fit.</li>
+      <li>NumPy float64 (the accidental default): 2.048 B × 8 = <b>16.4 GB</b>. Doesn't fit (and the app needs memory too).</li>
+      <li>NumPy float32: 2.048 B × 4 = <b>8.2 GB</b>. Fits, with half the pod left.</li>
+      <li>float16: <b>4.1 GB</b>; int8: <b>2.0 GB</b>, if your recall eval says quality holds.</li>
+    </ul>
+    <p>And with 4 worker processes each loading their own copy, multiply by 4, unless you memory-map one file (shared pages) or move the vectors into a vector database (Lesson 2.3).</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Embedding memory calculator</span>
+    <p class="hint">Pick how many embeddings, their dimension, and your machine. Bars show the memory for each representation (GB, 1 GB = 10⁹ bytes); the Python-list estimate uses 32 bytes per number plus 56 per list, as measured above. Try 1M × 1,536 on 16 GB, then find the representation that fits.</p>
+    <div class="controls">
+      <label>embeddings <input type="range" id="mc-n" min="0" max="8" step="1" value="3"> <b class="mono" id="mc-nv"></b></label>
+      <label>dimensions <select id="mc-d" class="btn small"><option>384</option><option selected>768</option><option>1024</option><option>1536</option><option>3072</option></select></label>
+      <label>machine RAM <select id="mc-ram" class="btn small"><option>8</option><option selected>16</option><option>32</option><option>64</option><option>128</option></select> GB</label>
+      <label>worker processes, each with a copy <input type="range" id="mc-w" min="1" max="8" step="1" value="1"> <b class="mono" id="mc-wv"></b></label>
+    </div>
+    <canvas class="chart" id="mc-chart" style="height:230px"></canvas>
+    <div id="mc-rows"></div>
+    <div class="verdict" id="mc-verdict"></div>
+    <div class="prompt" id="mc-code"></div>
+  </div>
+
+  <h2>Finding a leak: measure, don't guess</h2>
+  <ol>
+    <li><b>Confirm the shape</b>: memory per pod over a day of steady traffic. Steady growth = leak; one step up = high-water mark.</li>
+    <li><b>Snapshot twice</b> with <code>tracemalloc</code> (standard library): take a snapshot, serve 1,000 requests, take another, and compare. The top lines show which source lines allocated the memory that's still alive.</li>
+    <li><b>Native memory too</b>: NumPy, tokenizers and model runtimes allocate outside Python's allocator. <b>memray</b> (by Bloomberg) tracks Python and native allocations and draws flame graphs; it runs on Linux and macOS.</li>
+    <li><b>Ask who holds it</b>: <code>gc.get_referrers(obj)</code> in a debugging session shows what still points at a suspicious object.</li>
+  </ol>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Standard library: <b>sys</b>, <b>gc</b>, <b>weakref</b>, <b>tracemalloc</b>, <b>functools.lru_cache</b>, <b>collections.deque</b>. Profilers: <b>memray</b> (<code>memray run app.py</code>, then <code>memray flamegraph</code>), and <b>py-spy</b> for CPU. Arrays: <b>NumPy</b> dtypes and <code>mmap_mode</code>.</p>
+<pre><code><span class="k">import</span> gc, tracemalloc, weakref
+<span class="k">from</span> collections <span class="k">import</span> deque
+<span class="k">import</span> numpy <span class="k">as</span> np
+
+<span class="c"># 1. Break parent/child cycles with a weak back-pointer</span>
+<span class="k">class</span> Document:
+    <span class="k">def</span> __init__(self, text):
+        self.text = text
+        self.chunks = [Chunk(self, t) <span class="k">for</span> t <span class="k">in</span> text.split(<span class="s">"\n\n"</span>)]
+
+<span class="k">class</span> Chunk:
+    __slots__ = (<span class="s">"_parent"</span>, <span class="s">"text"</span>)          <span class="c"># no per-instance __dict__</span>
+    <span class="k">def</span> __init__(self, parent, text):
+        self._parent = weakref.ref(parent)    <span class="c"># doesn't keep the Document alive</span>
+        self.text = text
+    @property
+    <span class="k">def</span> parent(self):
+        <span class="k">return</span> self._parent()                 <span class="c"># None once the Document is gone</span>
+
+<span class="c"># 2. Bounded "recent" buffer instead of an ever-growing global list</span>
+RECENT = deque(maxlen=<span class="n">100</span>)
+
+<span class="c"># 3. Find what is still allocated after a batch of work</span>
+tracemalloc.start()
+before = tracemalloc.take_snapshot()
+<span class="k">for</span> i <span class="k">in</span> range(<span class="n">1_000</span>):
+    doc = Document(<span class="s">"refunds...\n\nshipping...\n\nwarranty..."</span> * <span class="n">50</span>)
+    RECENT.append(doc)                        <span class="c"># only the last 100 stay alive</span>
+after = tracemalloc.take_snapshot()
+<span class="k">for</span> stat <span class="k">in</span> after.compare_to(before, <span class="s">"lineno"</span>)[:<span class="n">3</span>]:
+    print(stat)                               <span class="c"># file:line, size and count growth</span>
+
+<span class="c"># 4. Embeddings: float32, and memory-map big read-only matrices</span>
+emb = np.asarray(np.random.rand(<span class="n">10_000</span>, <span class="n">768</span>), dtype=np.float32)
+print(emb.nbytes / <span class="n">1e6</span>, <span class="s">"MB"</span>)                 <span class="c"># 30.72 MB (float64 would be 61.44)</span>
+np.save(<span class="s">"emb.npy"</span>, emb)
+shared = np.load(<span class="s">"emb.npy"</span>, mmap_mode=<span class="s">"r"</span>)  <span class="c"># pages load on demand, shared between processes</span>
+
+<span class="c"># 5. Pre-fork servers (load models, then fork workers): keep shared pages shared</span>
+gc.disable()      <span class="c"># early in the parent ...load models / indexes...</span>
+gc.freeze()       <span class="c"># right before fork(): move everything to a permanent generation</span>
+<span class="c"># ...in each child process, early: gc.enable()</span></code></pre>
+    <p class="hint">Run with <code>python -X tracemalloc=25 app.py</code> to record 25 frames of traceback per allocation instead of 1.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Weak references for back-pointers</td><td>No cycles, freed instantly, flat memory</td><td>Must handle <code>None</code> when the target is gone</td></tr>
+      <tr><td>Disabling or freezing the GC</td><td>No collection pauses; shared pages stay shared after fork</td><td>Any cycle you create is leaked until you collect manually</td></tr>
+      <tr><td><code>__slots__</code></td><td>Smaller, slightly faster instances</td><td>No new attributes at runtime; savings smaller on new Pythons</td></tr>
+      <tr><td>float16 / int8 embeddings</td><td>2–4× less memory than float32</td><td>Some recall loss: measure it on your retrieval eval</td></tr>
+      <tr><td>Memory-mapped arrays</td><td>Datasets bigger than RAM; pages shared across workers</td><td>First access reads from disk; read-only for safety</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Week one</h4><p>Store embeddings as float32 NumPy arrays (or straight in a vector database), bound every cache with a <code>maxsize</code>, set a memory limit on the container so a leak restarts one pod instead of the whole node, and put memory per pod on a dashboard. When it climbs, take two <code>tracemalloc</code> snapshots.</p></div>
+      <div><h4>At scale</h4><p>Memory is a capacity line item. Teams preload models and indexes in a parent process and fork workers with <code>gc.freeze()</code>, tune or disable the GC per service, run memray in CI on long-running jobs, and treat a 10% memory win like Instagram did: as a fleet-wide cost saving.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>“Our FastAPI RAG service's memory grows about 200 MB an hour until Kubernetes kills it. How do you debug it?” A senior answer:</p>
+    <ul>
+      <li>Separates a <b>leak</b> (growth under steady load) from a <b>high-water mark</b>, and checks whether growth tracks unique queries (a cache) or requests (a list, tasks).</li>
+      <li>Explains <b>refcounting vs the cyclic GC</b>: the GC can't free anything still referenced, so look for module-level dicts, lists, <code>lru_cache</code> on methods, stored exceptions, task sets.</li>
+      <li>Uses <b>tracemalloc snapshot diffs</b> for Python objects and <b>memray</b> for native allocations (NumPy, tokenizers).</li>
+      <li>Fixes and guards: bounded caches, weak back-pointers, float32, a memory limit plus an alert, and a soak test that replays an hour of traffic in CI.</li>
+    </ul>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Turning the GC off for a 10% win</b> <span class="tag co">🏢 Instagram · 2017</span> <a href="https://medium.com/instagram-engineering/dismissing-python-garbage-collection-at-instagram-4dca40b29172" target="_blank" rel="noopener">Dismissing Python Garbage Collection at Instagram</a></div>
+      <p><b>How:</b> Django workers forked from a parent process; the team found GC activity was turning shared memory pages into private copies, then set <code>gc.set_threshold(0)</code> (because <code>gc.disable()</code> got re-enabled by a library) and skipped cleanup at exit.</p>
+      <p><b>Why this method:</b> with less memory per worker they could run more processes per host, a 10% global capacity win.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>gc.freeze() goes into Python</b> <span class="tag co">🏢 Instagram · 2017</span> <a href="https://medium.com/instagram-engineering/copy-on-write-friendly-python-garbage-collection-ad6ed5233ddf" target="_blank" rel="noopener">Copy-on-write friendly Python garbage collection</a></div>
+      <p><b>How:</b> instead of disabling the collector everywhere, they added an API that moves all current objects into a permanent generation the GC never scans, and upstreamed it to Python 3.7.</p>
+      <p><b>Why this method:</b> objects loaded before the fork stay shared, while the GC keeps working for new objects in each worker.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>A new GC, then a rollback</b> <span class="tag oss">🧰 CPython 3.14.5</span> <a href="https://docs.python.org/3/whatsnew/3.14.html" target="_blank" rel="noopener">What's new in Python 3.14 (gc section)</a></div>
+      <p><b>How:</b> Python 3.14.0–3.14.4 shipped an incremental collector with much shorter pauses on large heaps; 3.14.5 reverted to the 3.13 generational GC after reports of significant memory pressure in production.</p>
+      <p><b>Why this method:</b> even the runtime's authors trade pause time against peak memory, and production memory won. Pin and test your Python minor and patch versions.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Memory-mapping a whole Wikipedia</b> <span class="tag co">🏢 Hugging Face</span> <a href="https://huggingface.co/docs/datasets/about_arrow" target="_blank" rel="noopener">Datasets 🤝 Arrow</a></div>
+      <p><b>How:</b> the <code>datasets</code> library stores data in Apache Arrow files and memory-maps them instead of loading them.</p>
+      <p><b>Why this method:</b> their docs show loading the English Wikipedia dataset using about 50 MB of RAM, because the operating system pages data in from disk only when it's read.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Finding native leaks</b> <span class="tag oss">🧰 Open source</span> <a href="https://github.com/bloomberg/memray" target="_blank" rel="noopener">memray (Bloomberg)</a></div>
+      <p><b>How:</b> traces every allocation in Python code, native extension modules and the interpreter itself, then renders flame graphs or tables.</p>
+      <p><b>Why this method:</b> AI services allocate most memory in C/C++ libraries (NumPy, tokenizers, runtimes), which <code>tracemalloc</code> can't see.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · objects that never die</span>
+    <p>On Python 3.13, <code>sys.getrefcount(None)</code> returns <b>4294967295</b>. Since Python 3.12 (PEP 683), objects like <code>None</code>, <code>True</code> and small integers are <b>immortal</b>: their refcount is set to a special huge value and never changes. Writing to their counts would dirty shared memory pages after a fork; the PEP cites Instagram among the projects hurt by this, alongside the effort to give each interpreter its own GIL (Lesson P.4).</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>Generators (P.2) keep memory flat by never holding the whole dataset; fork and shared pages tie into processes (P.4); NumPy arrays (P.7) are the compact way to hold vectors. Embedding dtypes and quantization come back in Lessons 2.1–2.3, and model memory (weights, KV cache) in Lesson 7.4. Bounding caches with eviction is covered in depth in the System Design course: <a href="../../system-design-course/phase1/3-caching.html">caching</a>.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/library/gc.html" target="_blank" rel="noopener">gc — Garbage Collector interface</a>. Thresholds, generations, freeze, debugging flags.</li>
+      <li><span class="kind">Design</span> <a href="https://github.com/python/cpython/blob/main/InternalDocs/garbage_collector.md" target="_blank" rel="noopener">CPython garbage collector design</a>. How cycle detection actually works, by the core developers.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.python.org/3/library/tracemalloc.html" target="_blank" rel="noopener">tracemalloc</a>. Snapshot comparison recipes for finding leaks.</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. You keep 500,000 embeddings of 1,536 dimensions in a NumPy float32 array. About how much memory is that?</div>
+    <div class="opts"><button class="opt">0.8 GB</button><button class="opt" data-ok>3.1 GB</button><button class="opt">24.6 GB</button></div>
+    <div class="explain">500,000 × 1,536 = 768 million numbers × 4 bytes = <b>3.07 GB</b>. As float64 it would be 6.1 GB, and as Python lists of floats about 24.6 GB (32 bytes per number).</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A chat service appends every response to a module-level list <code>HISTORY</code> for a debug page. Memory grows all day. A teammate adds <code>gc.collect()</code> after each request. What happens?</div>
+    <div class="opts"><button class="opt">The leak is fixed: the collector frees old responses</button><button class="opt" data-ok>Nothing improves (and requests get slower): the responses are still reachable from HISTORY, so they aren't garbage</button><button class="opt">Python crashes because the list is collected while in use</button></div>
+    <div class="explain">The GC frees only unreachable objects. A global list is reachable forever. Bound it (<code>deque(maxlen=100)</code>) or log and drop the responses.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Each <code>Chunk</code> stores <code>self.parent = doc</code>, and each document stores its chunks. The service runs with <code>gc.disable()</code> for latency. What do you expect, and what's the cleanest fix?</div>
+    <div class="opts"><button class="opt">No problem: reference counting frees documents when requests end</button><button class="opt">Call <code>del doc</code> at the end of every request</button><button class="opt" data-ok>Every document leaks (the cycle keeps counts above zero); make the back-pointer a <code>weakref.ref</code> so refcounting frees them</button></div>
+    <div class="explain">Doc → chunks → doc is a cycle. With the GC off it's never freed; <code>del doc</code> only removes one name. A weak back-pointer breaks the cycle, so freeing is immediate with or without the GC.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>Names refer to objects; assignment never copies. Objects die when their refcount reaches zero, immediately.</li>
+      <li>The generational GC exists only for cycles; it can't free anything you still reference.</li>
+      <li>Real leaks are forgotten references: unbounded caches, global lists, closures, stored exceptions, task sets. Find them with tracemalloc diffs and memray.</li>
+      <li>Python floats cost ~32 bytes each in a list; NumPy float32 costs 4. Use float32 (or less), and memory-map big read-only matrices.</li>
+      <li>Pre-fork servers: <code>gc.freeze()</code> before forking keeps shared memory shared.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  // ---------- Playground 1: reference counting simulator ----------
+  const SPEC = {
+    D: { label: "Document", mb: 50, note: "50 MB of text" },
+    L: { label: "list (doc.chunks)", mb: 0.001, note: "2 pointers" },
+    C1: { label: "Chunk #1", mb: 0.01, note: "chunk text" },
+    C2: { label: "Chunk #2", mb: 0.01, note: "chunk text" },
+  };
+  let S;
+  function reset() {
+    S = { names: {}, gone: {}, objs: {}, edges: [], freedRc: 0, freedGc: 0, log: ["# simulated CPython: refcounts update on every step"], msg: "" };
+    render();
+  }
+  const exists = id => S.objs[id] && S.objs[id].state !== "freed";
+  const rc = id => Object.values(S.names).filter(v => v === id).length + S.edges.filter(e => !e.weak && e.to === id && exists(e.from)).length;
+  function refBy(id) {
+    const out = Object.entries(S.names).filter(([, v]) => v === id).map(([n]) => "name " + n);
+    S.edges.filter(e => e.to === id && exists(e.from)).forEach(e => out.push(`${e.from === "D" ? "Document" : e.from === "L" ? "list" : SPEC[e.from].label}.${e.attr}${e.weak ? " (weak)" : ""}`));
+    return out;
+  }
+  function cascade() {
+    let changed = true;
+    while (changed) {
+      changed = false;
+      Object.keys(S.objs).forEach(id => {
+        if (exists(id) && rc(id) === 0) { S.objs[id].state = "freed"; S.freedRc++; changed = true; S.log.push(`#   refcount(${SPEC[id].label}) hit 0 → freed immediately`); }
+      });
+    }
+  }
+  function reachable() {
+    const seen = new Set(Object.values(S.names).filter(exists)), stack = [...seen];
+    while (stack.length) { const id = stack.pop(); S.edges.filter(e => e.from === id && !e.weak && exists(e.to)).forEach(e => { if (!seen.has(e.to)) { seen.add(e.to); stack.push(e.to); } }); }
+    return seen;
+  }
+  function act(fn) { fn(); cascade(); render(); }
+  $("rc-new").onclick = () => act(() => {
+    if (S.objs.D) { S.msg = "Already created in this run: press reset to start over."; return; }
+    S.objs.D = { state: "live" }; S.names.doc = "D"; delete S.gone.doc; S.msg = "";
+    S.log.push('doc = Document("handbook.pdf")     # refcount(Document) = 1');
+  });
+  $("rc-alias").onclick = () => act(() => {
+    if (!S.names.doc) { S.msg = "There is no name doc to copy. Create the document first."; return; }
+    S.names.alias = S.names.doc; delete S.gone.alias; S.msg = "";
+    S.log.push(`alias = doc                         # same object, refcount = ${rc("D")}`);
+  });
+  $("rc-chunks").onclick = () => act(() => {
+    if (!S.names.doc || !exists("D")) { S.msg = "Needs a live document bound to doc."; return; }
+    if (S.objs.L) { S.msg = "The document already has chunks."; return; }
+    const weak = $("rc-weak").checked;
+    ["L", "C1", "C2"].forEach(id => (S.objs[id] = { state: "live" }));
+    S.edges.push({ from: "D", to: "L", attr: "chunks" }, { from: "L", to: "C1", attr: "[0]" }, { from: "L", to: "C2", attr: "[1]" },
+      { from: "C1", to: "D", attr: "parent", weak }, { from: "C2", to: "D", attr: "parent", weak });
+    S.msg = "";
+    S.log.push(`doc.chunks = [Chunk(doc), Chunk(doc)]  # parent pointers are ${weak ? "WEAK: no cycle" : "strong: a cycle doc → list → chunk → doc"}`);
+    S.log.push(`#   refcount(Document) = ${rc("D")}`);
+  });
+  const delName = n => act(() => {
+    if (!(n in S.names)) { S.msg = `There is no name ${n} right now.`; return; }
+    const id = S.names[n]; delete S.names[n]; S.gone[n] = true; S.msg = "";
+    S.log.push(`del ${n}${" ".repeat(Math.max(1, 32 - n.length))}# refcount(Document) = ${exists(id) ? rc(id) : 0}`);
+  });
+  $("rc-deldoc").onclick = () => delName("doc");
+  $("rc-delalias").onclick = () => delName("alias");
+  $("rc-gc").onclick = () => act(() => {
+    const live = reachable(); let n = 0;
+    Object.keys(S.objs).forEach(id => { if (exists(id) && !live.has(id)) { S.objs[id].state = "freed"; n++; } });
+    S.freedGc += n; S.msg = "";
+    S.log.push(`gc.collect()                        # → ${n} (unreachable objects found in cycles and freed)`);
+  });
+  $("rc-reset").onclick = reset;
+  $("rc-weak").onchange = () => { if (!S.objs.L) render(); else { S.msg = "The setting applies the next time chunks are created: press reset."; render(); } };
+
+  function render() {
+    const live = reachable();
+    $("rc-names").innerHTML = ["doc", "alias"].filter(n => n in S.names || S.gone[n]).map(n => `<span class="name${n in S.names ? "" : " gone"}">${n} → ${n in S.names ? "Document" : "(deleted)"}</span>`).join("") || '<span class="muted">no names yet</span>';
+    let garbage = 0, mem = 0, nLive = 0;
+    $("rc-objs").innerHTML = Object.keys(SPEC).map(id => {
+      const o = S.objs[id];
+      if (!o) return `<div class="obj none"><h5>${SPEC[id].label}</h5><span class="muted">not created</span></div>`;
+      if (o.state === "freed") return `<div class="obj freed"><h5>${SPEC[id].label}</h5>freed ✔<div class="by">memory returned</div></div>`;
+      const isG = !live.has(id); garbage += isG; mem += SPEC[id].mb; nLive++;
+      const by = refBy(id);
+      return `<div class="obj ${isG ? "garbage" : "live"}"><h5>${SPEC[id].label}</h5><span class="rc">refcount ${rc(id)}</span> · ${SPEC[id].note}<div class="by">referenced by: ${by.join(" · ") || "nothing"}</div>${isG ? '<div class="rk">unreachable: waiting for the GC</div>' : ""}</div>`;
+    }).join("");
+    $("rc-live").textContent = nLive;
+    $("rc-mem").textContent = mem >= 1 ? Math.round(mem) + " MB" : mem > 0 ? "< 1 MB" : "0 MB";
+    $("rc-fr").textContent = S.freedRc; $("rc-fg").textContent = S.freedGc;
+    $("rc-verdict").innerHTML = S.msg ? `<span class="muted">${S.msg}</span>`
+      : garbage ? `<span class="rk">⚠️ ${garbage} objects (${Math.round(mem)} MB) are unreachable but alive: each still has a reference from inside the cycle. Only the cyclic GC can free them.</span>`
+      : nLive ? `<span class="ev">Everything alive is reachable from a name. Nothing to collect.</span>`
+      : S.freedRc + S.freedGc ? `<span class="ev">✅ All memory returned${S.freedGc ? " (with the collector's help)" : " by reference counting alone, no GC needed"}.</span>` : "";
+    $("rc-log").textContent = S.log.join("\n");
+    $("rc-log").scrollTop = 1e6;
+  }
+  reset();
+
+  // ---------- Playground 1b: serve traffic ----------
+  function load() {
+    const weak = $("rc-weak").checked, off = $("ld-gcoff").checked, keep = $("ld-list").checked;
+    const BASE = 150, PER = 0.25, THRESH = 2000, ALLOC = 5;
+    let garbage = 0, kept = 0, allocs = 0, runs = 0, peak = BASE;
+    const pts = [[0, BASE]];
+    for (let r = 1; r <= 2000; r++) {
+      if (keep) kept++; else if (!weak) garbage++;
+      allocs += ALLOC;
+      const memNow = BASE + PER * (garbage + kept);
+      peak = Math.max(peak, memNow);
+      if (!off && allocs >= THRESH) { allocs = 0; runs++; garbage = 0; }
+      pts.push([r, BASE + PER * (garbage + kept)]);
+    }
+    const end = pts[pts.length - 1][1];
+    Plot.line($("ld-chart"), { series: [{ label: "process memory (MB, simulated)", color: MX.css(end > 400 ? "--c-rk" : "--c-tl"), data: pts, width: 2.5 }], xLabel: "requests served", yLabel: "MB", yMin: 0, yMax: 700 });
+    $("ld-peak").textContent = Math.round(peak) + " MB";
+    $("ld-end").textContent = Math.round(end) + " MB";
+    $("ld-runs").textContent = off ? "0 (disabled)" : runs;
+    $("ld-msg").textContent = keep ? "Leak: RECENT_DOCS still references every document, so they're reachable and neither refcounting nor the GC may free them. Bound it with deque(maxlen=100)."
+      : !weak && off ? "Leak: every request leaves a cycle behind and the collector never runs. This is the risk Instagram accepted (and managed) when they disabled the GC."
+      : !weak ? "Sawtooth: cycles pile up between collections, then the GC frees them all. It works, but memory and pause times depend on the collector's schedule."
+      : "Flat: weak parent pointers mean no cycles, so each document is freed the moment its request ends, even with the GC disabled.";
+  }
+  $("ld-run").onclick = load;
+  ["ld-gcoff", "ld-list"].forEach(id => ($(id).onchange = load));
+  load();
+
+  // ---------- Playground 2: memory calculator ----------
+  const NS = [10e3, 100e3, 500e3, 1e6, 2e6, 5e6, 10e6, 50e6, 100e6];
+  const fmtN = n => n >= 1e6 ? n / 1e6 + "M" : n / 1e3 + "k";
+  const fmtGB = b => b >= 1e9 ? (b / 1e9).toFixed(b >= 1e11 ? 0 : 2) + " GB" : (b / 1e6).toFixed(1) + " MB";
+  function calc() {
+    const n = NS[+$("mc-n").value], d = +$("mc-d").value, ram = +$("mc-ram").value * 1e9, w = +$("mc-w").value;
+    $("mc-nv").textContent = fmtN(n); $("mc-wv").textContent = w;
+    const reps = [
+      ["Python lists", n * (56 + 32 * d), "--c-rk"],
+      ["float64", n * d * 8, "--c-tk"],
+      ["float32", n * d * 4, "--c-cx"],
+      ["float16", n * d * 2, "--c-ev"],
+      ["int8", n * d, "--c-md"],
+    ].map(([l, b, c]) => [l, b * w, c]);
+    Plot.bars($("mc-chart"), { bars: reps.map(([l, b, c]) => ({ label: l, value: b / 1e9, color: MX.css(c), marker: ram / 1e9 })), yLabel: "GB", yMin: 0 });
+    $("mc-rows").innerHTML = reps.map(([l, b]) => {
+      const f = b <= 0.6 * ram ? ["ev", "fits with room"] : b <= ram ? ["tk", "tight: little left for the app"] : ["rk", "doesn't fit"];
+      return `<div class="hit${f[0] === "rk" ? " miss" : ""}"><span class="sc">${fmtGB(b)}</span><b>${l}</b> · <span class="${f[0]}">${f[1]}</span></div>`;
+    }).join("");
+    const best = reps.find(([, b]) => b <= 0.6 * ram);
+    $("mc-verdict").innerHTML = best ? `Most precise format that fits with room: <span class="ev">${best[0]}</span>${best[0] !== "Python lists" && best[0] !== "float64" && best[0] !== "float32" ? " (check recall on your eval first)" : ""}${w > 1 ? `. With ${w} workers, a single memory-mapped file shared by all of them would need only ${fmtGB(best[1] / w)} of page cache.` : "."}`
+      : `<span class="rk">Nothing fits in ${ram / 1e9} GB: shard the index, memory-map from disk, or use a vector database with compressed vectors (Lessons 2.2–2.3).</span>`;
+    $("mc-code").textContent = `import numpy as np\nemb = np.zeros((${n.toLocaleString("en-US").replace(/,/g, "_")}, ${d}), dtype=np.float32)\nemb.nbytes / 1e9   # ${(n * d * 4 / 1e9).toFixed(3)} GB per copy`;
+  }
+  ["mc-n", "mc-w"].forEach(id => ($(id).oninput = calc));
+  ["mc-d", "mc-ram"].forEach(id => ($(id).onchange = calc));
+  calc();
+})();
+</script>
+</body>
+</html>

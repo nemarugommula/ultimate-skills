@@ -1,0 +1,425 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>6.1 CI/CD pipelines · System Design at Scale</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🏗️</text></svg>">
+<link rel="stylesheet" href="../assets/style.css">
+<style>
+  .seg { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; overflow: hidden; }
+  .seg button { font: inherit; font-size: .85rem; padding: 4px 12px; border: 0; background: var(--bg2); color: var(--text); cursor: pointer; }
+  .seg button.on { background: var(--accent); color: #fff; }
+  .gantt { background: var(--bg2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; }
+  .grow { display: grid; grid-template-columns: 150px 1fr; align-items: center; gap: 8px; margin: 4px 0; font-size: .85rem; }
+  .gtrack { position: relative; height: 18px; background: var(--panel); border-radius: 6px; }
+  .gbar { position: absolute; top: 0; height: 18px; border-radius: 6px; font-size: .72rem; color: #fff; padding-left: 5px; white-space: nowrap; overflow: hidden; line-height: 18px; }
+  .dots { display: flex; flex-wrap: wrap; gap: 4px; margin: 8px 0; }
+  .dots i { width: 14px; height: 14px; border-radius: 50%; display: inline-block; }
+</style>
+</head>
+<body data-lesson="s6-1" data-root="..">
+<main class="lesson">
+  <div class="kicker">Phase 6 · Lesson 1</div>
+  <h1>CI/CD pipelines: from commit to production, automatically</h1>
+  <p class="subtitle">A pipeline is the robot that tests, builds and ships every change. A fast, trustworthy one lets a team ship many small changes a day; a slow, flaky one quietly becomes the bottleneck of the whole company.</p>
+
+  <div class="box prereq">
+    <span class="label">🧰 You'll need (quick reminders)</span>
+    <ul>
+      <li><b>Docker images</b>: a packaged, versioned copy of your app and everything it needs (Lesson 5.1).</li>
+      <li><b>Kubernetes Deployments</b> roll a new image out to running servers (Lessons 5.2 and 5.3).</li>
+      <li><b>Infrastructure as code / GitOps</b>: the desired state lives in git, and tools apply it (Lesson 5.4).</li>
+    </ul>
+  </div>
+
+  <div class="box hook">
+    <span class="label">🎯 Hook</span>
+    <p>In 2016 Google's testing team wrote that about <b>1.5% of all test runs</b> across its huge test corpus gave a <b>“flaky”</b> result: the test passed and failed on the same code. That sounds tiny. But they did the math for a project with about <b>1,000 tests</b>: around <b>15 of them</b> will likely fail on any given run, for no real reason.</p>
+    <p>Small per-test problems multiply across a pipeline. By the end of this lesson you'll be able to design a pipeline, measure it, and explain why its speed and trustworthiness decide how fast a company can move.</p>
+  </div>
+
+  <h2>Numbers first: what a pipeline costs you</h2>
+  <p>Picture a team of <b>20 engineers</b>. Each pushes about <b>3 changes a day</b>, so <b>60 pipeline runs a day</b>. Suppose a run takes <b>40 minutes</b>.</p>
+  <table>
+    <tr><th></th><th>40-minute pipeline</th><th>10-minute pipeline</th></tr>
+    <tr><td>Wait before you know your change works</td><td class="lt">40 min (you switch tasks, lose focus)</td><td class="ca">10 min (grab a coffee)</td></tr>
+    <tr><td>Engineer-hours spent waiting per day (if each run blocks someone)</td><td class="er">60 × 40 min = 40 hours</td><td class="db">60 × 10 min = 10 hours</td></tr>
+    <tr><td>Fixes you can ship in a 1-hour outage</td><td>1, maybe</td><td>5 or 6</td></tr>
+  </table>
+  <p>Forty engineer-hours a day is five people doing nothing but waiting. That's why big companies have whole teams that only work on build speed.</p>
+
+  <h2>The words, spelled out</h2>
+  <ul>
+    <li><b>CI</b> (continuous integration): everyone merges small changes into the shared main branch often, and every merge is automatically built and tested. The goal: find conflicts and bugs within minutes, not weeks.</li>
+    <li><b>CD</b> means two related things. <b>Continuous delivery</b>: every change that passes is <i>ready</i> to ship with one click. <b>Continuous deployment</b>: every change that passes is shipped automatically, no click.</li>
+    <li>A <b>pipeline</b> is the ordered list of automated steps (called <b>stages</b> or <b>jobs</b>) a change goes through.</li>
+    <li>An <b>artifact</b> is the thing the pipeline produces and ships: a Docker image, a jar file, a static website bundle. It's tagged with the git commit it came from.</li>
+    <li>An <b>environment</b> is a place the artifact runs: <b>dev</b>, <b>staging</b> (a production look-alike for final checks) and <b>production</b> (real users).</li>
+  </ul>
+
+  <div class="box bigidea">
+    <span class="label">💡 Big idea</span>
+    <b>Build once, promote the same artifact.</b> The pipeline builds one image, tags it with the commit hash, and moves that exact image from staging to production. If you rebuild for each environment, you're shipping something you never tested.
+  </div>
+
+  <h2>The stages of a typical pipeline</h2>
+  <table>
+    <tr><th>Stage</th><th>What it does</th><th>Typical time</th><th>Catches</th></tr>
+    <tr><td>Install</td><td>Check out code, download dependencies</td><td class="lt">1–5 min (seconds with a cache)</td><td>Missing or broken packages</td></tr>
+    <tr><td>Lint &amp; type-check</td><td>Style and static checks, no code runs</td><td class="lt">under 1–2 min</td><td>Typos, unused variables, type errors</td></tr>
+    <tr><td><span class="sv">Unit tests</span></td><td>Test small pieces in isolation</td><td class="lt">seconds to a few min</td><td>Logic bugs</td></tr>
+    <tr><td><span class="db">Build</span></td><td>Compile and package the artifact (e.g. <code>docker build</code>)</td><td class="lt">1–10 min</td><td>“Works on my machine” problems</td></tr>
+    <tr><td><span class="nw">Security scan</span></td><td>Scan dependencies and the image for known vulnerabilities (Lesson 6.6)</td><td class="lt">1–3 min</td><td>A library with a published hole</td></tr>
+    <tr><td><span class="sv">Integration tests</span></td><td>Run the app against a real database or queue</td><td class="lt">5–20 min</td><td>Wrong SQL, broken API contracts</td></tr>
+    <tr><td><span class="cl">Deploy</span></td><td>Ship to staging, smoke-test, then production gradually (Lesson 6.2)</td><td class="lt">5–30 min</td><td>Config and environment problems</td></tr>
+  </table>
+  <p>Order matters: <b>cheap, fast checks first</b>. A lint error should fail the run in 1 minute, not after 15 minutes of integration tests.</p>
+
+  <h3>The test pyramid</h3>
+  <p>Tests come in three sizes, and you want <b>many small ones and few big ones</b>:</p>
+  <table>
+    <tr><th>Level</th><th>How many (typical)</th><th>Speed of one test</th><th>Flakiness</th></tr>
+    <tr><td><b>Unit</b> (bottom, wide)</td><td>thousands</td><td>milliseconds</td><td>low: no network, no clock</td></tr>
+    <tr><td><b>Integration</b> (middle)</td><td>hundreds</td><td>seconds</td><td>medium: real database, real ports</td></tr>
+    <tr><td><b>End-to-end</b> (top, narrow)</td><td>tens</td><td>tens of seconds to minutes</td><td>high: browsers, timeouts, many services</td></tr>
+  </table>
+  <p>An “ice-cream cone” (mostly end-to-end tests) feels thorough but gives a slow, flaky pipeline. Push each check down to the lowest level that can catch it.</p>
+
+  <div class="box analogy">
+    <span class="label">🧠 Analogy: the airport security line</span>
+    <p>The pipeline is airport security for code. Cheap checks first (is that your boarding pass?), expensive ones later (the body scanner). Several lanes run in parallel so the line moves. And if the scanner beeps randomly at 1 in 100 people (a flaky test), soon nobody trusts the beep, and people start waving travellers through. That's the moment security stops working.</p>
+  </div>
+
+  <h2>Trunk-based development: merge small, merge daily</h2>
+  <p>Two ways to work in git. With long-lived <b>feature branches</b>, a few people work on a branch for days or weeks, then merge a big change. With <b>trunk-based development</b>, everyone merges small changes into the main branch (the “trunk”) at least once a day.</p>
+  <p>The DORA research program (dora.dev) lists the practices that go with trunk-based development: <b>three or fewer active branches</b>, merging to trunk <b>at least once a day</b>, and <b>no code freezes</b>. Unfinished features hide behind <b>feature flags</b> (Lesson 6.2), so half-built code can be merged safely without users seeing it.</p>
+
+  <h2>How you measure delivery: the DORA metrics</h2>
+  <p>DORA (DevOps Research and Assessment) studies thousands of teams. It originally used four “key” metrics and now uses five. They split into <b>speed</b> (throughput) and <b>safety</b> (instability):</p>
+  <table>
+    <tr><th>Metric</th><th>Question it answers</th><th>Type</th></tr>
+    <tr><td><b>Change lead time</b></td><td>How long from commit to running in production?</td><td class="ca">speed</td></tr>
+    <tr><td><b>Deployment frequency</b></td><td>How often do we deploy?</td><td class="ca">speed</td></tr>
+    <tr><td><b>Failed deployment recovery time</b></td><td>When a deploy breaks things, how fast do we recover?</td><td class="ca">speed</td></tr>
+    <tr><td><b>Change fail rate</b></td><td>What share of deploys need an immediate fix or rollback?</td><td class="er">safety</td></tr>
+    <tr><td><b>Deployment rework rate</b></td><td>What share of deploys are unplanned, done because of an incident?</td><td class="er">safety</td></tr>
+  </table>
+  <p>The surprising finding behind DORA's work: speed and safety are <b>not</b> a trade-off. Teams that ship small changes often tend to break less, because each change is small and easy to undo.</p>
+
+  <div class="box walk">
+    <span class="label">✏️ Worked example: speeding up a 40-minute pipeline</span>
+    <p>A pipeline runs everything one after another: install 4 min, lint 1, unit tests 8, build 6, scan 2, integration tests 10, deploy to staging 3, smoke tests 2, deploy to production 8. Total: <b>4 + 1 + 8 + 6 + 2 + 10 + 3 + 2 + 8 = 44 minutes</b>.</p>
+    <ul>
+      <li><b>Cache dependencies</b>: install drops from 4 to 1 min. Saves 3. Install from a committed lockfile with npm ci so every run gets the same versions (Lesson 6.1b).</li>
+      <li><b>Cache Docker layers</b>: the build only redoes the layers that changed, 6 → 1.5 min. Saves 4.5.</li>
+      <li><b>Run in parallel</b>: lint, unit tests and the build don't depend on each other. Scan and integration tests both need only the image. Now the slowest branch sets the pace.</li>
+      <li><b>Shard</b> the unit tests across 4 runners: 8 min becomes about 2 min each (plus a little setup overhead).</li>
+    </ul>
+    <p>Now the critical path is install + build (2.5) → integration tests (10) → staging (3) → smoke (2) → production (8) ≈ <b>25.5 minutes</b>, down from 44, with no test removed. Build it yourself below.</p>
+  </div>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · Build a pipeline</span>
+    <p class="hint">Each bar is a job. Turn on the speed-ups and watch the <b>critical path</b> (the longest chain of jobs that wait on each other) shrink. Parallel jobs each run on their own machine, so each one pays its own install step: that's why caching matters more once you go parallel.</p>
+    <div class="controls">
+      <label><input type="checkbox" id="pp-cache"> cache dependencies</label>
+      <label><input type="checkbox" id="pp-layer"> cache Docker layers</label>
+      <label><input type="checkbox" id="pp-par"> run independent jobs in parallel</label>
+      <label>unit-test shards <input type="range" id="pp-sh" min="1" max="8" step="1" value="1"> <b class="mono" id="pp-shv"></b></label>
+      <label><input type="checkbox" id="pp-gate"> manual approval before production</label>
+    </div>
+    <div class="controls">
+      <button class="btn primary" id="pp-best">⚡ Apply all speed-ups</button>
+      <button class="btn" id="pp-reset">Reset</button>
+    </div>
+    <div class="gantt" id="pp-g"></div>
+    <div class="stat-row">
+      <div class="stat">commit → production <b id="pp-lead">–</b></div>
+      <div class="stat">first test feedback <b id="pp-fb">–</b></div>
+      <div class="stat">runner-minutes billed <b id="pp-rm">–</b></div>
+      <div class="stat">deploys possible per 8-hour day <b id="pp-dpd">–</b></div>
+    </div>
+    <p class="hint" id="pp-msg"></p>
+  </div>
+  <p>Things to notice: parallelism cuts wall-clock time but <b>raises</b> runner-minutes (you pay for more machines at once). The manual approval gate often costs more than all the automation combined: a human who's in a meeting is the slowest stage there is.</p>
+
+  <h2>Flaky tests: small odds, multiplied</h2>
+  <p>A <b>flaky test</b> passes and fails on the same code: a race condition, a timeout that's a bit too tight, a test that depends on another test's leftovers, a call to a real network. Say each test has a tiny chance <b>p</b> of failing for no reason, and you have <b>n</b> tests. A run is clean only if <i>every</i> test behaves:</p>
+  <div class="eq">
+    P(run fails for no reason) = 1 − (1 − <span class="er">p</span>)<sup><span class="sv">n</span></sup>
+    <span class="say">“The chance at least one test flakes is one minus the chance that all n of them pass.” With p = 0.1% and n = 1,000 tests, that's 1 − 0.999<sup>1000</sup> ≈ 63%.</span>
+  </div>
+  <div class="legend"><span class="er">p: chance one test flakes on one run</span><span class="sv">n: number of tests in the run</span></div>
+  <p>Each test is 99.9% reliable, yet nearly two out of three runs go red. People learn to click “re-run” without reading the failure, and then a <i>real</i> failure gets re-run too.</p>
+
+  <div class="playground">
+    <span class="label">🎮 Playground · The flaky test tax</span>
+    <p class="hint">Pick how many tests you have and how flaky each one is. “Retries” re-runs a failed test before declaring failure, which hides flakes (and, sometimes, real intermittent bugs). Press <b>Run 50 pipelines</b> to simulate a day of runs on code that is actually fine: every red dot is a false alarm.</p>
+    <div class="controls">
+      <label>tests <input type="range" id="fl-n" min="0" max="7" step="1" value="5"> <b class="mono" id="fl-nv"></b></label>
+      <label>flake rate per test <input type="range" id="fl-p" min="0" max="6" step="1" value="2"> <b class="mono" id="fl-pv"></b></label>
+      <span class="hint">Retries:</span>
+      <span class="seg" id="fl-r"><button id="fl-r-0" data-v="0" class="on">0</button><button id="fl-r-1" data-v="1">1</button><button id="fl-r-2" data-v="2">2</button></span>
+      <button class="btn primary" id="fl-run">▶ Run 50 pipelines</button>
+    </div>
+    <div class="dots" id="fl-dots"></div>
+    <div class="stat-row">
+      <div class="stat">chance a run fails for no reason <b id="fl-pf">–</b></div>
+      <div class="stat">flaky test failures per run <b id="fl-ex">–</b></div>
+      <div class="stat">false reds in this batch <b id="fl-red">–</b></div>
+      <div class="stat">engineer-hours lost per 50 runs <b id="fl-hrs">–</b></div>
+    </div>
+    <canvas class="chart" id="fl-c" style="height:200px"></canvas>
+    <p class="hint" id="fl-msg">Chance a run fails falsely, as the test suite grows (current flake rate and retries).</p>
+  </div>
+  <p>Try it: with 1,000 tests at 0.1%, about 63% of runs fail. One retry brings it down to about 0.1%, because a flake now has to happen twice in a row. That's why most CI systems offer retries, and also why Google's team <b>tracks</b> flaky tests and quarantines the worst ones instead of just retrying forever: a retry hides the symptom, not the cause.</p>
+
+  <div class="box tools">
+    <span class="label">🧰 Tools you'll actually use</span>
+    <p>Hosted CI: <b>GitHub Actions</b>, <b>GitLab CI</b>, <b>CircleCI</b>, <b>Buildkite</b>. Self-hosted: <b>Jenkins</b>. Kubernetes-native delivery: <b>Argo CD</b> or <b>Flux</b> (GitOps, Lesson 5.4), <b>Spinnaker</b>. Big monorepos use build systems that cache and only rebuild what changed, like <b>Bazel</b>. A GitHub Actions workflow that lints and tests on every pull request, shards tests, and builds one image tagged with the commit on <code>main</code>:</p>
+<pre><code><span class="c"># .github/workflows/ci.yml</span>
+<span class="k">name:</span> ci
+<span class="k">on:</span>
+  <span class="k">pull_request:</span>
+  <span class="k">push:</span>
+    <span class="k">branches:</span> [main]
+<span class="k">concurrency:</span>                         <span class="c"># a newer push cancels the older run</span>
+  <span class="k">group:</span> ${{ github.workflow }}-${{ github.ref }}
+  <span class="k">cancel-in-progress:</span> <span class="n">true</span>
+<span class="k">jobs:</span>
+  <span class="k">test:</span>
+    <span class="k">runs-on:</span> ubuntu-latest
+    <span class="k">strategy:</span>
+      <span class="k">matrix:</span>
+        <span class="k">shard:</span> [<span class="n">1</span>, <span class="n">2</span>, <span class="n">3</span>, <span class="n">4</span>]             <span class="c"># 4 runners in parallel</span>
+    <span class="k">steps:</span>
+      - <span class="k">uses:</span> actions/checkout@v4
+      - <span class="k">uses:</span> actions/setup-node@v4
+        <span class="k">with:</span>
+          <span class="k">node-version:</span> <span class="n">20</span>
+          <span class="k">cache:</span> npm                     <span class="c"># dependency cache keyed on package-lock.json</span>
+      - <span class="k">run:</span> npm ci
+      - <span class="k">run:</span> npm run lint                 <span class="c"># cheap checks first</span>
+      - <span class="k">run:</span> npx jest --shard=${{ matrix.shard }}/4
+  <span class="k">build:</span>
+    <span class="k">needs:</span> test                         <span class="c"># waits for all 4 shards</span>
+    <span class="k">if:</span> github.ref == <span class="s">'refs/heads/main'</span>
+    <span class="k">runs-on:</span> ubuntu-latest
+    <span class="k">steps:</span>
+      - <span class="k">uses:</span> actions/checkout@v4
+      - <span class="k">run:</span> docker build -t ghcr.io/acme/shop:${{ github.sha }} .   <span class="c"># build ONCE, tag = commit</span>
+      - <span class="k">run:</span> docker push ghcr.io/acme/shop:${{ github.sha }}
+  <span class="k">deploy-staging:</span>
+    <span class="k">needs:</span> build
+    <span class="k">environment:</span> staging                <span class="c"># environments can require approvals and hold secrets</span>
+    <span class="k">runs-on:</span> ubuntu-latest
+    <span class="k">steps:</span>
+      - <span class="k">run:</span> ./deploy.sh staging ${{ github.sha }}   <span class="c"># same image goes to prod later</span></code></pre>
+    <p class="hint">Try it locally: the open-source tool <code>act</code> runs GitHub Actions workflows on your laptop in Docker (<code>act pull_request</code>). For GitLab, the same ideas live in <code>.gitlab-ci.yml</code> with <code>stages:</code>, <code>needs:</code> and <code>cache:</code>.</p>
+  </div>
+
+  <div class="box tradeoff">
+    <span class="label">⚖️ Trade-offs</span>
+    <table>
+      <tr><th>Choice</th><th>✅ Gains</th><th>❌ Costs</th></tr>
+      <tr><td>Continuous deployment (no human click)</td><td>Tiny changes, fast feedback, high deploy frequency</td><td>Needs great tests, gradual rollouts and fast rollback (Lesson 6.2). Some industries require sign-off.</td></tr>
+      <tr><td>Manual approval gate</td><td>A human double-checks risky releases; may satisfy auditors</td><td>Hours of waiting; changes pile up into bigger, riskier batches</td></tr>
+      <tr><td>More parallelism and shards</td><td>Shorter wall-clock time</td><td>More runner-minutes (money); flaky tests show up more often</td></tr>
+      <tr><td>Many end-to-end tests</td><td>Confidence the whole flow works</td><td>Slow and flaky. Keep a handful for the critical paths (sign-up, checkout)</td></tr>
+      <tr><td>Monorepo (one repo for everything)</td><td>One version of every library, atomic changes across projects</td><td>Needs smart build tools that only test what changed, or CI time explodes</td></tr>
+    </table>
+  </div>
+
+  <div class="box startup">
+    <span class="label">🚀 Startup vs big tech</span>
+    <div class="cols">
+      <div><h4>Founding engineer (0 → 1)</h4><p>Day one: a GitHub Actions workflow that runs lint and tests on every pull request and deploys <code>main</code> automatically to a managed platform. Keep the pipeline under 10 minutes. No staging environment yet is fine if you have preview deploys and quick rollback. Don't build a release process: build a habit of tiny pull requests.</p></div>
+      <div><h4>Big tech (1 → 100)</h4><p>Monorepos or thousands of repos, a build system with remote caching (Bazel-style) that only rebuilds what changed, test sharding across hundreds of machines, flaky-test tracking and quarantine, signed artifacts, and release trains or progressive delivery tied to SLOs. A dedicated developer-productivity team owns pipeline speed as a metric.</p></div>
+    </div>
+  </div>
+
+  <div class="box interview">
+    <span class="label">🎤 Interview angle</span>
+    <p>CI/CD rarely gets its own interview question, but “how would you ship this safely?” comes up in almost every senior design and behavioral round. A strong answer covers:</p>
+    <ul>
+      <li>The <b>stages</b> in order (fast checks first), and <b>build once, promote the same artifact</b> tagged by commit.</li>
+      <li><b>Trunk-based development + feature flags</b>, so merging isn't the same as releasing.</li>
+      <li>How you'd <b>measure</b> delivery: the DORA metrics (lead time, deploy frequency, change fail rate, recovery time).</li>
+      <li>How you keep the pipeline <b>fast and trusted</b>: caching, parallelism, the test pyramid, handling flaky tests.</li>
+    </ul>
+    <p class="hint">Follow-ups: “Your pipeline takes an hour. Where do you start?” (measure the critical path first). “How do you handle database migrations in CD?” (Lesson 6.2: expand and contract).</p>
+  </div>
+
+  <div class="box used">
+    <span class="label">🏭 In the real world</span>
+    <div class="use">
+      <div class="use-head"><b>Measuring and fighting flaky tests</b> <span class="tag co">🏢 Google · 2016</span> <a href="https://testing.googleblog.com/2016/05/flaky-tests-at-google-and-how-we.html" target="_blank" rel="noopener">Flaky Tests at Google and How We Mitigate Them</a></div>
+      <p><b>How:</b> Google reported a steady rate of about 1.5% of test runs being flaky, and that almost 16% of its tests showed some flakiness. It re-runs failing tests automatically, tracks flakiness per test, and can quarantine badly flaky tests.</p>
+      <p><b>Why this method:</b> at Google's scale even a tiny per-test flake rate turns into many false failures per release, so flakiness has to be measured and managed like any other reliability problem.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>The delivery metrics everyone uses</b> <span class="tag hist">📜 Research · DORA</span> <a href="https://dora.dev/guides/dora-metrics-four-keys/" target="_blank" rel="noopener">DORA's software delivery performance metrics</a></div>
+      <p><b>How:</b> DORA measures throughput (change lead time, deployment frequency, failed deployment recovery time) and instability (change fail rate, deployment rework rate). It moved from the original four keys to a five-metric model.</p>
+      <p><b>Why this method:</b> a few outcome metrics that any team can compute from its deploy history, so teams improve the delivery system instead of arguing about tools.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>One repository for a whole company</b> <span class="tag co">🏢 Google · 2016</span> <a href="https://research.google/pubs/why-google-stores-billions-of-lines-of-code-in-a-single-repository/" target="_blank" rel="noopener">Why Google Stores Billions of Lines of Code in a Single Repository (CACM)</a></div>
+      <p><b>How:</b> Google keeps most of its code in one custom-built monolithic repository that is the common source of truth for tens of thousands of developers, with systems and workflows built to make that practical.</p>
+      <p><b>Why this method:</b> one source of truth means one version of each library and changes that can touch many projects at once; the paper also lays out the trade-offs, such as needing heavy tooling investment.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Where CI came from</b> <span class="tag hist">📜 History · Extreme Programming</span> <a href="https://martinfowler.com/articles/continuousIntegration.html" target="_blank" rel="noopener">Martin Fowler: Continuous Integration</a></div>
+      <p><b>How:</b> the article lists the core practices: everything in a version-controlled mainline, an automated self-testing build, everyone pushing to mainline every day, every push triggering a build, fixing broken builds immediately and keeping the build fast.</p>
+      <p><b>Why this method:</b> CI was developed as part of Extreme Programming; integrating often keeps each merge small, so problems are cheap to find and fix.</p>
+    </div>
+    <div class="use">
+      <div class="use-head"><b>Dependency caching in CI</b> <span class="tag prod">🏭 In production · GitHub Actions</span> <a href="https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching" target="_blank" rel="noopener">GitHub Actions: dependency caching</a></div>
+      <p><b>How:</b> <code>actions/cache</code> saves folders like <code>~/.npm</code> under a key (often a hash of the lock file); on the next run it looks for an exact key match, then partial matches, then <code>restore-keys</code>.</p>
+      <p><b>Why this method:</b> downloading the same packages on every run is pure waste; a cache keyed on the lock file is only invalidated when dependencies actually change.</p>
+    </div>
+  </div>
+
+  <div class="box fact">
+    <span class="label">🤯 Fun fact · “a couple of hours”</span>
+    <p>Martin Fowler's CI article quotes Kent Beck, one of the creators of Extreme Programming: “No code sits unintegrated for more than a couple of hours.” In the 1990s that sounded extreme, when many teams merged every few weeks. Today it's simply what trunk-based teams do.</p>
+  </div>
+
+  <div class="box bridge">
+    <span class="label">🌉 How it connects</span>
+    <p>The pipeline packages the <b>Docker image</b> from Lesson 5.1 and hands it to <b>Kubernetes</b> or a <b>GitOps</b> tool (Lessons 5.2–5.4). Next, Lesson 6.2 covers the last stage, <b>deploying safely</b> with canaries and feature flags. Lesson 6.6 adds the <b>security scans</b> and supply-chain checks. In AI systems, the same pipeline idea becomes an evaluation pipeline: every new model or prompt version runs an eval suite before it's promoted.</p>
+  </div>
+
+  <div class="box explore">
+    <span class="label">📚 Explore more</span>
+    <ul>
+      <li><span class="kind">Blog</span> <a href="https://martinfowler.com/articles/continuousIntegration.html" target="_blank" rel="noopener">Martin Fowler: Continuous Integration</a>. The classic description of CI practices, updated in 2024.</li>
+      <li><span class="kind">Docs</span> <a href="https://dora.dev/guides/dora-metrics-four-keys/" target="_blank" rel="noopener">DORA metrics guide</a>. How to measure your own team's delivery.</li>
+      <li><span class="kind">Docs</span> <a href="https://docs.github.com/en/actions/reference/workflows-and-actions/workflow-syntax" target="_blank" rel="noopener">GitHub Actions workflow syntax</a>. Every key you saw in the YAML above (<code>needs</code>, <code>matrix</code>, <code>concurrency</code>, <code>environment</code>).</li>
+    </ul>
+  </div>
+
+  <h2>Check yourself</h2>
+  <div class="quiz">
+    <div class="qtext">1. Your suite has 800 tests, and each one flakes 0.1% of the time. Roughly how often does a run fail even though the code is fine?</div>
+    <div class="opts"><button class="opt">About 0.1% of runs</button><button class="opt">About 8% of runs</button><button class="opt" data-ok>About 55% of runs</button></div>
+    <div class="explain">1 − 0.999<sup>800</sup> ≈ 0.55. A run is clean only if all 800 tests behave, so tiny per-test odds multiply. That's why flaky tests have to be tracked and fixed, not just retried.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">2. A team works on feature branches for 3 weeks at a time, and every merge turns into a day of conflicts and broken tests. What's the best change?</div>
+    <div class="opts"><button class="opt">Add a code freeze before every merge</button><button class="opt" data-ok>Merge small changes to main at least daily, hiding unfinished features behind feature flags</button><button class="opt">Add more end-to-end tests to the feature branches</button></div>
+    <div class="explain">Big merges are painful because they're big. Trunk-based development keeps each integration small, and feature flags separate “merged” from “released”. DORA lists merging to trunk daily and avoiding code freezes as part of the practice.</div>
+  </div>
+  <div class="quiz">
+    <div class="qtext">3. Why should the pipeline build one Docker image, tagged with the commit hash, and deploy that same image to staging and then production?</div>
+    <div class="opts"><button class="opt">Because rebuilding is not allowed by Docker</button><button class="opt">To save disk space in the registry</button><button class="opt" data-ok>So production runs exactly the bytes that passed the tests in staging</button></div>
+    <div class="explain">Rebuilding per environment can pull different dependency versions or base images, so you'd ship something nobody tested. The commit tag also tells you exactly what's running, which makes rollback a one-line change.</div>
+  </div>
+
+  <div class="box tldr">
+    <span class="label">📝 TL;DR</span>
+    <ul>
+      <li>CI = merge small changes often, each one built and tested automatically. CD = every passing change is ready to ship (delivery) or shipped (deployment).</li>
+      <li>Order stages cheap-to-expensive; build once and promote the same artifact, tagged by commit.</li>
+      <li>Speed comes from caching, parallel jobs and sharding; the critical path sets the wall-clock time.</li>
+      <li>Flakes multiply: P(false failure) = 1 − (1 − p)<sup>n</sup>. Track and quarantine flaky tests.</li>
+      <li>Measure delivery with DORA: lead time, deploy frequency, recovery time, change fail rate, rework rate.</li>
+    </ul>
+  </div>
+</main>
+
+<script src="../assets/course.js"></script>
+<script src="../assets/plot.js"></script>
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  const seg = (id, cb) => {
+    const bs = [...$(id).querySelectorAll("button")];
+    bs.forEach(b => (b.onclick = () => { bs.forEach(x => x.classList.toggle("on", x === b)); cb(b.dataset.v); }));
+    return () => bs.find(b => b.classList.contains("on")).dataset.v;
+  };
+  const fm = m => m >= 60 ? Math.floor(m / 60) + " h " + Math.round(m % 60) + " min" : (Math.round(m * 10) / 10) + " min";
+
+  // ---------- pipeline builder ----------
+  const KC = { setup: "--c-lt", test: "--c-sv", build: "--c-db", scan: "--c-nw", deploy: "--c-cl", gate: "--c-er" };
+  function pipeline() {
+    const cache = $("pp-cache").checked, layer = $("pp-layer").checked, par = $("pp-par").checked, gate = $("pp-gate").checked;
+    const sh = +$("pp-sh").value; $("pp-shv").textContent = sh;
+    const inst = cache ? 1 : 4, unit = sh > 1 ? 8 / sh + 0.5 : 8, build = layer ? 1.5 : 6;
+    let jobs;
+    if (!par) {
+      const seq = [["install", inst, "setup"], ["lint", 1, "test"], ["unit tests" + (sh > 1 ? " ×" + sh : ""), unit, "test"], ["build image", build, "build"], ["security scan", 2, "scan"], ["integration tests", 10, "test"], ["deploy staging", 3, "deploy"], ["smoke tests", 2, "test"]];
+      if (gate) seq.push(["wait for approval", 120, "gate"]);
+      seq.push(["deploy production", 8, "deploy"]);
+      jobs = seq.map((s, i) => ({ name: s[0], dur: s[1], kind: s[2], deps: i ? [i - 1] : [], runners: s[0].startsWith("unit") ? sh : 1 }));
+    } else {
+      // separate runners: each parallel job pays its own install
+      jobs = [
+        { name: "lint (+ install)", dur: inst + 1, kind: "test", deps: [] },
+        { name: "unit tests" + (sh > 1 ? " ×" + sh : "") + " (+ install)", dur: inst + unit, kind: "test", deps: [], runners: sh },
+        { name: "build image (+ install)", dur: inst + build, kind: "build", deps: [] },
+        { name: "security scan", dur: 2, kind: "scan", deps: [2] },
+        { name: "integration tests", dur: 10, kind: "test", deps: [2] },
+        { name: "deploy staging", dur: 3, kind: "deploy", deps: [0, 1, 3, 4] },
+        { name: "smoke tests", dur: 2, kind: "test", deps: [5] },
+      ];
+      if (gate) jobs.push({ name: "wait for approval", dur: 120, kind: "gate", deps: [jobs.length - 1] });
+      jobs.push({ name: "deploy production", dur: 8, kind: "deploy", deps: [jobs.length - 1] });
+    }
+    jobs.forEach(j => { j.start = Math.max(0, ...j.deps.map(d => jobs[d].end)); j.end = j.start + j.dur; });
+    const total = Math.max(...jobs.map(j => j.end));
+    const rm = jobs.filter(j => j.kind !== "gate").reduce((a, j) => a + (j.runners || 1) * (j.name.startsWith("unit") ? unit + (par ? inst : 0) : j.dur), 0);
+    const unitJob = jobs.find(j => j.name.startsWith("unit"));
+    $("pp-g").innerHTML = jobs.map(j => `<div class="grow"><span>${j.name}</span><div class="gtrack"><div class="gbar" style="left:${100 * j.start / total}%;width:${Math.max(0.6, 100 * j.dur / total)}%;background:${MX.css(KC[j.kind])}">${fm(j.dur)}</div></div></div>`).join("");
+    $("pp-lead").textContent = fm(total);
+    $("pp-fb").textContent = fm(unitJob.end);
+    $("pp-rm").textContent = Math.round(rm) + " min";
+    $("pp-dpd").textContent = Math.floor(480 / total);
+    $("pp-msg").textContent = gate && total > 100 ? "The approval wait dwarfs everything else. Teams that need sign-off often move it earlier (code review) or make it automatic for low-risk changes." :
+      total <= 25 ? `Under half an hour from commit to production: about ${Math.floor(480 / total)} sequential deploys fit in a working day.` :
+      "Look at the longest bars on the critical path first: that's where every minute you save shortens the whole run.";
+  }
+  ["pp-cache", "pp-layer", "pp-par", "pp-gate"].forEach(id => ($(id).onchange = pipeline));
+  $("pp-sh").oninput = pipeline;
+  $("pp-best").onclick = () => { $("pp-cache").checked = $("pp-layer").checked = $("pp-par").checked = true; $("pp-gate").checked = false; $("pp-sh").value = 4; pipeline(); };
+  $("pp-reset").onclick = () => { ["pp-cache", "pp-layer", "pp-par", "pp-gate"].forEach(id => ($(id).checked = false)); $("pp-sh").value = 1; pipeline(); };
+  pipeline();
+
+  // ---------- flaky tests ----------
+  const NS = [10, 50, 100, 200, 500, 1000, 2000, 5000], PS = [0.0001, 0.0005, 0.001, 0.002, 0.005, 0.01, 0.02];
+  const getR = seg("fl-r", () => flaky());
+  const pFail = (p, n, r) => 1 - Math.pow(1 - Math.pow(p, r + 1), n);
+  let batch = null;
+  function flaky(runBatch) {
+    const n = NS[+$("fl-n").value], p = PS[+$("fl-p").value], r = +getR();
+    $("fl-nv").textContent = n.toLocaleString(); $("fl-pv").textContent = (p * 100) + "%";
+    const pf = pFail(p, n, r);
+    $("fl-pf").textContent = (pf * 100 < 0.1 ? (pf * 100).toFixed(3) : (pf * 100).toFixed(1)) + "%";
+    $("fl-ex").textContent = (n * p).toFixed(n * p < 1 ? 2 : 1) + (r ? " (then retried)" : "");
+    if (runBatch) {
+      const rng = MX.seeded(Date.now() % 100000);
+      batch = [];
+      for (let k = 0; k < 50; k++) {
+        let red = false;
+        for (let t = 0; t < n && !red; t++) { let f = rng() < p; for (let a = 0; a < r && f; a++) f = rng() < p; if (f) red = true; }
+        batch.push(red);
+      }
+    }
+    if (batch) {
+      const reds = batch.filter(Boolean).length;
+      $("fl-dots").innerHTML = batch.map(b => `<i style="background:${MX.css(b ? "--c-er" : "--good")}" title="${b ? "false failure" : "green"}"></i>`).join("");
+      $("fl-red").textContent = reds + " / 50";
+      $("fl-hrs").textContent = (reds * 25 / 60).toFixed(1) + " h";
+    } else { $("fl-red").textContent = "press Run"; $("fl-hrs").textContent = "–"; }
+    const data = []; for (let x = 0; x <= 5000; x += 100) data.push([x, 100 * pFail(p, Math.max(1, x), r)]);
+    Plot.line($("fl-c"), { series: [{ label: `P(false red) %, flake ${p * 100}%, ${r} retr${r === 1 ? "y" : "ies"}`, color: MX.css("--c-er"), data, fill: true }], xLabel: "number of tests", yMin: 0, yMax: 100, hlines: [{ y: 100 * pf, label: `you: ${n.toLocaleString()} tests`, color: MX.css("--c-lt") }] });
+    $("fl-msg").textContent = pf > 0.3 ? "Most runs go red for no reason. People will start re-running without reading, and real failures slip through." :
+      pf > 0.05 ? "Noticeable noise: several false reds a day. Worth tracking the flakiest tests." :
+      "The suite is trustworthy: a red run almost always means a real problem. (Each false red is assumed to cost 25 minutes of someone's time.)";
+  }
+  ["fl-n", "fl-p"].forEach(id => ($(id).oninput = () => { batch = null; flaky(); }));
+  $("fl-run").onclick = () => flaky(true);
+  flaky();
+})();
+</script>
+</body>
+</html>
